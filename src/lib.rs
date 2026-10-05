@@ -1,4 +1,4 @@
-pub mod qr;
+pub mod onboarding;
 
 use std::sync::{Arc, Mutex};
 
@@ -235,7 +235,7 @@ async fn delete_room(State(db): State<Db>, Path(id): Path<i64>) -> ApiResult<Sta
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// A device as listed: the QR payload holds the setup passcode, so it is
+/// A device as listed: its setup code holds the setup passcode, so it is
 /// returned only by the single-device endpoint.
 #[derive(Serialize)]
 struct Device {
@@ -246,12 +246,16 @@ struct Device {
     created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     qr_payload: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manual_code: Option<String>,
 }
 
+/// A device to register with exactly one of its QR payload or manual pairing code.
 #[derive(Deserialize)]
 struct DeviceInput {
     room_id: i64,
-    qr_payload: String,
+    qr_payload: Option<String>,
+    manual_code: Option<String>,
     #[serde(default)]
     name: String,
 }
@@ -259,14 +263,21 @@ struct DeviceInput {
 const DEVICE_SELECT: &str = "SELECT devices.id, room_id, rooms.name, devices.name, created_at,
     qr_payload FROM devices JOIN rooms ON rooms.id = room_id";
 
+/// The `qr_payload` column stores either form; a QR payload starts with `MT:`.
 fn device_row(row: &rusqlite::Row, with_payload: bool) -> rusqlite::Result<Device> {
+    let code: Option<String> = if with_payload { row.get(5)? } else { None };
+    let (qr_payload, manual_code) = match code {
+        Some(code) if !code.starts_with("MT:") => (None, Some(code)),
+        code => (code, None),
+    };
     Ok(Device {
         id: row.get(0)?,
         room_id: row.get(1)?,
         room_name: row.get(2)?,
         name: row.get(3)?,
         created_at: row.get(4)?,
-        qr_payload: if with_payload { row.get(5)? } else { None },
+        qr_payload,
+        manual_code,
     })
 }
 
@@ -299,18 +310,63 @@ async fn get_device(State(db): State<Db>, Path(id): Path<i64>) -> ApiResult<Json
     Ok(Json(find_device(&db.lock().unwrap(), id, true)?))
 }
 
+/// Validates the one setup code of `input` and returns the form to store.
+fn setup_code(input: &DeviceInput) -> ApiResult<String> {
+    match (&input.qr_payload, &input.manual_code) {
+        (Some(payload), None) => {
+            let payload = payload.trim();
+            (payload.len() <= MAX_QR_CHARS && onboarding::is_valid(payload))
+                .then(|| payload.to_owned())
+                .ok_or_else(|| {
+                    ApiError(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_qr_payload",
+                        "MatterのQRコード（MT:で始まる）ではありません".into(),
+                    )
+                })
+        }
+        (None, Some(code)) => onboarding::normalize_manual(code.trim()).ok_or_else(|| {
+            ApiError(
+                StatusCode::BAD_REQUEST,
+                "invalid_manual_code",
+                "Matterの手動ペアリングコード（11桁の数字）として正しくありません".into(),
+            )
+        }),
+        _ => Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "missing_setup_code",
+            "QRコードか手動ペアリングコードのどちらか一方を送ってください".into(),
+        )),
+    }
+}
+
+fn duplicate_device() -> ApiError {
+    ApiError(
+        StatusCode::CONFLICT,
+        "duplicate_qr_payload",
+        "この機器は登録済みです".into(),
+    )
+}
+
+/// Whether a stored device shares a passcode and short discriminator with `code`.
+// ponytail: scans every device per insert; a key column if the ledger outgrows a home.
+fn is_registered(db: &Connection, code: &str) -> rusqlite::Result<bool> {
+    let new = onboarding::keys(code).unwrap_or_default();
+    let mut statement = db.prepare("SELECT qr_payload FROM devices")?;
+    let stored = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(stored
+        .iter()
+        .flat_map(|code| onboarding::keys(code).unwrap_or_default())
+        .any(|key| new.contains(&key)))
+}
+
 async fn create_device(
     State(db): State<Db>,
     Json(input): Json<DeviceInput>,
 ) -> ApiResult<(StatusCode, Json<Device>)> {
-    let payload = input.qr_payload.trim();
-    if payload.len() > MAX_QR_CHARS || !qr::is_valid(payload) {
-        return Err(ApiError(
-            StatusCode::BAD_REQUEST,
-            "invalid_qr_payload",
-            "MatterのQRコード（MT:で始まる）ではありません".into(),
-        ));
-    }
+    let code = setup_code(&input)?;
     let name = clean_name(&input.name, true).ok_or_else(|| {
         ApiError(
             StatusCode::BAD_REQUEST,
@@ -320,15 +376,14 @@ async fn create_device(
     })?;
     let db = db.lock().unwrap();
     find_room(&db, input.room_id)?.ok_or_else(room_not_found)?;
+    if is_registered(&db, &code)? {
+        return Err(duplicate_device());
+    }
     match db.execute(
         "INSERT INTO devices (room_id, qr_payload, name) VALUES (?1, ?2, ?3)",
-        params![input.room_id, payload, name],
+        params![input.room_id, code, name],
     ) {
-        Err(error) if is_unique_violation(&error) => Err(ApiError(
-            StatusCode::CONFLICT,
-            "duplicate_qr_payload",
-            "このQRコードの機器は登録済みです".into(),
-        )),
+        Err(error) if is_unique_violation(&error) => Err(duplicate_device()),
         result => {
             result?;
             let device = find_device(&db, db.last_insert_rowid(), false)?;

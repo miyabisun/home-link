@@ -109,4 +109,33 @@ class RegisterFormTest {
         assertEquals("天井灯", form.name)
         assertEquals(1L, form.roomId)
     }
+
+    @Test fun aValidManualCodeIsAcceptedOnceAllDigitsAreTyped() {
+        val form = RegisterForm()
+        form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
+        form.scanned(qr)
+        assertFalse(form.typed("3497 011 233"))
+        assertEquals(qr, form.payload)
+        assertNull(form.manualError)
+        assertTrue(form.typed("3497 011 2332"))
+        assertEquals("34970112332", form.payload)
+        assertTrue(form.canRegister())
+        form.scanned(qr)
+        assertEquals(qr, form.payload)
+    }
+
+    @Test fun manualCodeErrorsShowAtOnceAndClearWhileEditing() {
+        val form = RegisterForm()
+        assertFalse(form.typed("3497 011 2331"))
+        assertEquals(ManualError.CHECK_DIGIT, form.manualError)
+        assertNull(form.payload)
+        form.typed("3497 011 233")
+        assertNull(form.manualError)
+        assertFalse(form.submitted("3497 011 233"))
+        assertEquals(ManualError.LENGTH, form.manualError)
+        assertFalse(form.submitted("3497 011 2331"))
+        assertEquals(ManualError.CHECK_DIGIT, form.manualError)
+        assertTrue(form.submitted("3497 011 2332"))
+        assertNull(form.manualError)
+    }
 }

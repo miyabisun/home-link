@@ -8,8 +8,12 @@ sealed interface Status {
     data class Failed(val error: ApiError) : Status
 }
 
+enum class ManualError { LENGTH, CHECK_DIGIT }
+
 class RegisterForm {
+    /** A scanned `MT:` payload or the 11 digits of a manual pairing code. */
     var payload: String? = null
+    var manualError: ManualError? = null
     var roomId: Long? = null
     var rooms: List<Room> = emptyList()
     var name = ""
@@ -28,6 +32,36 @@ class RegisterForm {
         } else {
             status = Status.NotMatter
         }
+    }
+
+    /** Takes the code once all digits are typed; a wrong check digit shows at once. */
+    fun typed(text: String): Boolean {
+        val digits = ManualCode.digits(text)
+        if (digits.length < ManualCode.LENGTH) {
+            manualError = null
+            return false
+        }
+        return accept(digits)
+    }
+
+    /** Like [typed], but also reports a code that is still too short. */
+    fun submitted(text: String): Boolean {
+        val digits = ManualCode.digits(text)
+        if (digits.length < ManualCode.LENGTH) {
+            manualError = ManualError.LENGTH
+            return false
+        }
+        return accept(digits)
+    }
+
+    private fun accept(digits: String): Boolean {
+        val valid = ManualCode.isValid(digits)
+        manualError = if (valid) null else ManualError.CHECK_DIGIT
+        if (valid) {
+            payload = digits
+            status = null
+        }
+        return valid
     }
 
     fun rooms(result: ApiResult<List<Room>>) {

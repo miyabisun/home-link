@@ -4,6 +4,7 @@ import com.sun.net.httpserver.HttpServer
 import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Test
 import java.net.InetSocketAddress
 import java.net.ServerSocket
@@ -51,11 +52,20 @@ class HttpHomeLinkApiTest {
         assertEquals("", body.getString("name"))
     }
 
+    @Test fun sendsADigitCodeAsTheManualCode() {
+        respond("/api/devices", 201, """{"id":8,"room_id":1,"room_name":"寝室","name":"","created_at":"t"}""")
+        assertEquals(ApiResult.Ok(Unit), api.register(1, "34970112332", ""))
+        val body = JSONObject(requests.single().substringAfter("/api/devices "))
+        assertEquals("34970112332", body.getString("manual_code"))
+        assertFalse(body.has("qr_payload"))
+    }
+
     @Test fun mapsRegistrationFailures() {
         val cases = listOf(
             Triple(409, "duplicate_qr_payload", ApiError.DUPLICATE_QR),
             Triple(404, "room_not_found", ApiError.ROOM_NOT_FOUND),
             Triple(400, "invalid_qr_payload", ApiError.INVALID_QR),
+            Triple(400, "invalid_manual_code", ApiError.INVALID_MANUAL),
             Triple(400, "invalid_device_name", ApiError.INVALID_NAME),
             Triple(500, "internal", ApiError.SERVER),
             Triple(502, "", ApiError.SERVER),

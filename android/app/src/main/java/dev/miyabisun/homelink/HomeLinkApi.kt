@@ -9,7 +9,7 @@ import java.net.URL
 
 data class Room(val id: Long, val name: String)
 
-enum class ApiError { UNREACHABLE, DUPLICATE_QR, ROOM_NOT_FOUND, DUPLICATE_ROOM, INVALID_QR, INVALID_NAME, SERVER }
+enum class ApiError { UNREACHABLE, DUPLICATE_QR, ROOM_NOT_FOUND, DUPLICATE_ROOM, INVALID_QR, INVALID_MANUAL, INVALID_NAME, SERVER }
 
 sealed interface ApiResult<out T> {
     data class Ok<T>(val value: T) : ApiResult<T>
@@ -20,6 +20,7 @@ sealed interface ApiResult<out T> {
 interface HomeLinkApi {
     fun rooms(): ApiResult<List<Room>>
     fun createRoom(name: String): ApiResult<Room>
+    /** `payload` is a QR payload (`MT:`) or the digits of a manual pairing code. */
     fun register(roomId: Long, payload: String, name: String): ApiResult<Unit>
 }
 
@@ -35,7 +36,8 @@ class HttpHomeLinkApi(baseUrl: String) : HomeLinkApi {
         call("POST", "/api/rooms", JSONObject().put("name", name)) { room(JSONObject(it)) }
 
     override fun register(roomId: Long, payload: String, name: String): ApiResult<Unit> {
-        val body = JSONObject().put("room_id", roomId).put("qr_payload", payload).put("name", name)
+        val field = if (payload.startsWith("MT:")) "qr_payload" else "manual_code"
+        val body = JSONObject().put("room_id", roomId).put(field, payload).put("name", name)
         return call("POST", "/api/devices", body) { }
     }
 
@@ -78,6 +80,7 @@ class HttpHomeLinkApi(baseUrl: String) : HomeLinkApi {
             "room_not_found" -> ApiError.ROOM_NOT_FOUND
             "duplicate_room_name" -> ApiError.DUPLICATE_ROOM
             "invalid_qr_payload" -> ApiError.INVALID_QR
+            "invalid_manual_code" -> ApiError.INVALID_MANUAL
             "invalid_room_name", "invalid_device_name" -> ApiError.INVALID_NAME
             else -> ApiError.SERVER
         }

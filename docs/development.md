@@ -27,7 +27,8 @@ cargo test --locked
 ```
 
 `tests/api.rs` はメモリ上のSQLiteでAPIの要求と応答を検証します。
-`src/qr.rs` はMatterのQRコード（Base38）の検証と、そのテストを持ちます。
+`src/onboarding.rs` はMatterのQRコード（Base38）と手動ペアリングコード（Verhoeff）の検証、
+同じ機器かを判定するキーの取り出しと、そのテストを持ちます。
 
 コンテナは次のように作成し、確認できます。
 

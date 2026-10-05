@@ -17,6 +17,7 @@ import android.view.Gravity
 import android.view.View
 import android.view.WindowInsets
 import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputMethodManager
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
@@ -43,11 +44,17 @@ class MainActivity : Activity() {
     private lateinit var worker: ExecutorService
     private var loadingRooms = false
     private var addingRoom = false
+    private var enteringCode = false
+    private var formattingCode = false
 
     private lateinit var content: LinearLayout
     private lateinit var qrState: TextView
     private lateinit var qrMessage: TextView
     private lateinit var scanButton: Button
+    private lateinit var manualButton: Button
+    private lateinit var manualPanel: LinearLayout
+    private lateinit var manualField: EditText
+    private lateinit var manualMessage: TextView
     private lateinit var roomSpinner: Spinner
     private lateinit var roomAdapter: ArrayAdapter<String>
     private lateinit var roomState: TextView
@@ -73,8 +80,11 @@ class MainActivity : Activity() {
             form.roomId = state.getLong("roomId", -1).takeIf { it >= 0 }
             form.name = state.getString("name").orEmpty()
             addingRoom = state.getBoolean("addingRoom")
+            enteringCode = state.getBoolean("enteringCode")
         }
         build()
+        manualField.setText(savedInstanceState?.getString("manualCode").orEmpty())
+        manualField.setSelection(manualField.length())
         newRoomName.setText(savedInstanceState?.getString("newRoom").orEmpty())
         nameField.setText(form.name)
         loadRooms()
@@ -86,6 +96,8 @@ class MainActivity : Activity() {
         outState.putString("name", form.name)
         outState.putBoolean("addingRoom", addingRoom)
         outState.putString("newRoom", newRoomName.text.toString())
+        outState.putBoolean("enteringCode", enteringCode)
+        outState.putString("manualCode", manualField.text.toString())
         super.onSaveInstanceState(outState)
     }
 
@@ -116,12 +128,50 @@ class MainActivity : Activity() {
         scanner.scan { result ->
             if (isDestroyed) return@scan
             when (result) {
-                is ScanResult.Read -> form.scanned(result.value)
+                is ScanResult.Read -> {
+                    form.scanned(result.value)
+                    if (form.status == null) closeManual()
+                }
                 ScanResult.Cancelled -> Unit
                 ScanResult.Failed -> form.status = Status.ScanFailed
             }
             render()
         }
+    }
+
+    private fun openManual() {
+        enteringCode = true
+        form.status = null
+        render()
+        manualField.requestFocus()
+        getSystemService(InputMethodManager::class.java).showSoftInput(manualField, 0)
+    }
+
+    private fun closeManual() {
+        enteringCode = false
+        form.manualError = null
+        manualField.setText("")
+        getSystemService(InputMethodManager::class.java).hideSoftInputFromWindow(manualField.windowToken, 0)
+    }
+
+    /** Shows the digits grouped 4-3-4 and takes the code as soon as it is complete and valid. */
+    private fun manualChanged(text: Editable) {
+        if (formattingCode) return
+        val shown = ManualCode.format(ManualCode.digits(text.toString()))
+        if (text.toString() != shown) {
+            val before = ManualCode.digits(text.substring(0, manualField.selectionEnd.coerceIn(0, text.length))).length
+            formattingCode = true
+            text.replace(0, text.length, shown)
+            formattingCode = false
+            manualField.setSelection(ManualCode.cursor(shown, before))
+        }
+        if (form.typed(shown)) closeManual()
+        render()
+    }
+
+    private fun submitManual() {
+        if (form.submitted(manualField.text.toString())) closeManual()
+        render()
     }
 
     private fun createRoom() {
@@ -173,10 +223,29 @@ class MainActivity : Activity() {
         label(content, "機器を登録", 28, bold = true)
 
         val qr = panel()
-        label(qr, "QRコード", 18, bold = true)
+        label(qr, "機器のコード", 18, bold = true)
         qrState = label(qr, "", 16)
         qrMessage = message(qr)
         scanButton = button(qr, "", icon = R.drawable.ic_qr) { scan() }
+        manualButton = button(qr, "", icon = R.drawable.ic_keypad) { openManual() }
+        manualPanel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        qr.addView(manualPanel, LinearLayout.LayoutParams(-1, -2))
+        label(manualPanel, "機器に印字された11桁の数字", 14, muted = true)
+        manualField = field(manualPanel, "11桁の数字", EditorInfo.IME_ACTION_DONE) { submitManual() }
+        // The phone keypad shows digits and, unlike the number class, keeps the grouping spaces.
+        manualField.inputType = InputType.TYPE_CLASS_PHONE
+        manualField.importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
+        manualField.hint = "0000 000 0000"
+        manualField.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+            override fun afterTextChanged(s: Editable) = manualChanged(s)
+        })
+        manualMessage = message(manualPanel)
+        button(manualPanel, "やめる") {
+            closeManual()
+            render()
+        }
 
         val room = panel()
         label(room, "部屋", 18, bold = true)
@@ -250,13 +319,27 @@ class MainActivity : Activity() {
 
     private fun render() {
         val payload = form.payload
-        qrState.text = if (payload == null) "まだ読み取っていません" else "読み取り済み：${preview(payload)}"
+        val scannedQr = payload?.startsWith("MT:") == true
+        qrState.text = when {
+            payload == null -> "まだ読み取っていません"
+            scannedQr -> "読み取り済み：${preview(payload)}"
+            else -> "入力済み：${preview(payload)}"
+        }
         qrState.setTextColor(getColor(if (payload == null) R.color.muted else R.color.text))
-        scanButton.text = if (payload == null) "QRを読み取る" else "読み取り直す"
+        scanButton.text = if (scannedQr) "読み取り直す" else "QRを読み取る"
+        manualButton.text = if (payload != null && !scannedQr) "数字を入力し直す" else "数字で入力"
+        manualButton.visibility = if (enteringCode) View.GONE else View.VISIBLE
+        manualPanel.visibility = if (enteringCode) View.VISIBLE else View.GONE
         show(qrMessage, when (form.status) {
-            Status.NotMatter -> "MatterのQRコードではありません。電球に印刷されたQRコードを読み取ってください"
+            Status.NotMatter -> "MatterのQRコードではありません。QRコードが無い機器は「数字で入力」を使ってください"
             Status.ScanFailed -> "QRコードを読み取れませんでした。もう一度お試しください"
             else -> null
+        })
+        val typed = ManualCode.digits(manualField.text.toString()).length
+        show(manualMessage, when (form.manualError) {
+            ManualError.LENGTH -> "11桁の数字を入力してください（あと${ManualCode.LENGTH - typed}桁）"
+            ManualError.CHECK_DIGIT -> "数字が正しくありません。機器に印字された数字と見比べてください"
+            null -> null
         })
 
         val names = form.rooms.map { it.name }
@@ -290,9 +373,10 @@ class MainActivity : Activity() {
             is Status.Failed -> when (status.error) {
                 ApiError.UNREACHABLE -> "home-link（${Uri.parse(BuildConfig.HOME_LINK_URL).authority}）に接続できません。" +
                     "Tailscaleの接続を確認してください"
-                ApiError.DUPLICATE_QR -> "このQRコードの機器は登録済みです"
+                ApiError.DUPLICATE_QR -> "この機器は登録済みです"
                 ApiError.ROOM_NOT_FOUND -> "選んだ部屋が見つかりません。部屋を選び直してください"
                 ApiError.INVALID_QR -> "MatterのQRコードとして読み取れませんでした。読み取り直してください"
+                ApiError.INVALID_MANUAL -> "この数字はMatterの機器のコードとして使えません。数字を入力し直してください"
                 ApiError.INVALID_NAME -> "名前は${MAX_NAME}文字以内で入力してください"
                 ApiError.SERVER -> "home-linkでエラーが発生しました。時間をおいてお試しください"
                 ApiError.DUPLICATE_ROOM -> null
@@ -317,8 +401,9 @@ class MainActivity : Activity() {
         registerButton.text = if (form.busy) "登録中…" else "登録"
     }
 
-    /** Shows only the start of the code: the payload carries the setup passcode. */
-    private fun preview(payload: String) = payload.take(8) + "…"
+    /** Shows only the start of the code: both forms carry the setup passcode. */
+    private fun preview(payload: String) =
+        if (payload.startsWith("MT:")) payload.take(8) + "…" else payload.take(4) + " …"
 
     private fun show(view: TextView, text: String?, failure: Boolean = true) {
         view.text = text.orEmpty()

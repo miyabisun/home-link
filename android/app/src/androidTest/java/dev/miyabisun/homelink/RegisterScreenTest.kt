@@ -3,6 +3,7 @@ package dev.miyabisun.homelink
 import android.os.ParcelFileDescriptor
 import android.view.View
 import android.view.ViewGroup
+import android.view.inputmethod.EditorInfo
 import android.widget.Button
 import android.widget.EditText
 import android.widget.ScrollView
@@ -104,7 +105,7 @@ class RegisterScreenTest {
 
             api.failure = ApiError.DUPLICATE_QR
             screen.onActivity { button(it, "登録").performClick() }
-            eventually(screen) { hasLabel(it, "このQRコードの機器は登録済みです") }
+            eventually(screen) { hasLabel(it, "この機器は登録済みです") }
             assertInputsKept(screen)
             capture(screen, "duplicate")
 
@@ -133,7 +134,7 @@ class RegisterScreenTest {
             scanner.next = ScanResult.Read("https://example.com/")
             screen.onActivity { activity ->
                 button(activity, "読み取り直す").performClick()
-                assertTrue(hasLabel(activity, "MatterのQRコードではありません。電球に印刷されたQRコードを読み取ってください"))
+                assertTrue(hasLabel(activity, "MatterのQRコードではありません。QRコードが無い機器は「数字で入力」を使ってください"))
                 assertTrue(hasLabel(activity, "読み取り済み：MT:Y.K90…"))
             }
             capture(screen, "not-matter")
@@ -142,6 +143,75 @@ class RegisterScreenTest {
             screen.onActivity { button(it, "登録").performClick() }
             eventually(screen) { hasLabel(it, "居間に「天井灯」を登録しました") }
             assertEquals(Registration(2, qr, "天井灯"), api.registrations.last())
+        }
+    }
+
+    @Test fun manualCodeIsTypedCheckedAndRegistered() {
+        api.rooms += Room(1, "寝室")
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        ActivityScenario.launch(MainActivity::class.java).use { screen ->
+            eventually(screen) { views(it).filterIsInstance<Spinner>().single().selectedItem == "寝室" }
+            screen.onActivity { button(it, "数字で入力").performClick() }
+            eventually(screen) { field(it, "11桁の数字").hasFocus() }
+            instrumentation.waitForIdleSync()
+            instrumentation.sendStringSync("3497011")
+            eventually(screen) { field(it, "11桁の数字").text.toString() == "3497 011" }
+            capture(screen, "manual-typing")
+
+            screen.recreate()
+            eventually(screen) { field(it, "11桁の数字").isShown }
+            screen.onActivity { activity ->
+                assertEquals("3497 011", field(activity, "11桁の数字").text.toString())
+                field(activity, "11桁の数字").onEditorAction(EditorInfo.IME_ACTION_DONE)
+                assertTrue(hasLabel(activity, "11桁の数字を入力してください（あと4桁）"))
+                assertFalse(button(activity, "登録").isEnabled)
+            }
+            capture(screen, "manual-length")
+
+            screen.onActivity { field(it, "11桁の数字").requestFocus() }
+            instrumentation.waitForIdleSync()
+            instrumentation.sendStringSync("2331")
+            eventually(screen) { hasLabel(it, "数字が正しくありません。機器に印字された数字と見比べてください") }
+            screen.onActivity { activity ->
+                assertEquals("3497 011 2331", field(activity, "11桁の数字").text.toString())
+                assertFalse(button(activity, "登録").isEnabled)
+            }
+            capture(screen, "manual-check-digit")
+
+            screen.onActivity { activity ->
+                field(activity, "11桁の数字").setText("3497-011-233")
+                assertEquals("3497 011 233", field(activity, "11桁の数字").text.toString())
+                assertFalse(hasLabel(activity, "数字が正しくありません。機器に印字された数字と見比べてください"))
+                field(activity, "11桁の数字").requestFocus()
+                field(activity, "11桁の数字").setSelection(12)
+            }
+            instrumentation.waitForIdleSync()
+            instrumentation.sendStringSync("2")
+            eventually(screen) { hasLabel(it, "入力済み：3497 …") }
+            screen.onActivity { activity ->
+                assertFalse(field(activity, "11桁の数字").isShown)
+                assertTrue(button(activity, "数字を入力し直す").isShown)
+                assertFalse(views(activity).filterIsInstance<TextView>().any { "2332" in it.text })
+                field(activity, "機器名（任意）").setText("電球")
+            }
+            capture(screen, "manual-ready")
+            screen.onActivity { button(it, "登録").performClick() }
+            eventually(screen) { hasLabel(it, "寝室に「電球」を登録しました") }
+            assertEquals(Registration(1, "34970112332", "電球"), api.registrations.single())
+            screen.onActivity { activity ->
+                assertTrue(hasLabel(activity, "まだ読み取っていません"))
+                assertTrue(button(activity, "数字で入力").isShown)
+            }
+            capture(screen, "manual-registered")
+
+            api.failure = ApiError.DUPLICATE_QR
+            screen.onActivity { activity ->
+                button(activity, "数字で入力").performClick()
+                field(activity, "11桁の数字").setText("34970112332")
+                button(activity, "登録").performClick()
+            }
+            eventually(screen) { hasLabel(it, "この機器は登録済みです") }
+            screen.onActivity { assertTrue(hasLabel(it, "入力済み：3497 …")) }
         }
     }
 

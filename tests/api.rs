@@ -7,6 +7,10 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 const QR: &str = "MT:Y.K9042C00KA0648G00";
+// The same device as `QR` (passcode 20202021, discriminator 3840).
+const MANUAL: &str = "34970112332";
+// Another device: passcode 20202022.
+const OTHER_QR: &str = "MT:Y.K9042C000O0648G00";
 
 fn app() -> Router {
     home_link::app(home_link::open_db(":memory:").unwrap())
@@ -143,7 +147,7 @@ async fn devices_register_with_optional_name_and_hide_payload_in_list() {
     assert_eq!(unnamed["room_name"], "寝室");
     assert!(unnamed.get("qr_payload").is_none());
 
-    let second = "MT:Y.K9042C00KA0648G00*Y.K9042C00KA0648G00";
+    let second = format!("{OTHER_QR}*{}", &OTHER_QR[3..]);
     let (status, named) = call(
         &app,
         "POST",
@@ -204,4 +208,85 @@ async fn device_registration_rejects_invalid_input_and_duplicates() {
 
     let (status, _) = post(json!({ "qr_payload": QR })).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn devices_register_with_a_manual_pairing_code_and_hide_it_in_list() {
+    let app = app();
+    let room = create_room(&app, "寝室").await;
+    let body = json!({ "room_id": room, "manual_code": " 3497-011 2332 ", "name": "電球" });
+    let (status, created) = call(&app, "POST", "/api/devices", Some(body)).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["name"], "電球");
+    assert!(created.get("manual_code").is_none());
+
+    let (_, devices) = call(&app, "GET", "/api/devices", None).await;
+    assert_eq!(devices.as_array().unwrap().len(), 1);
+    assert!(!devices.to_string().contains("3497"));
+
+    let uri = format!("/api/devices/{}", created["id"]);
+    let (status, detail) = call(&app, "GET", &uri, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail["manual_code"], MANUAL);
+    assert!(detail.get("qr_payload").is_none());
+}
+
+#[tokio::test]
+async fn qr_and_manual_codes_of_one_device_are_duplicates() {
+    let app = app();
+    let room = create_room(&app, "寝室").await;
+    let post = |body: Value| {
+        let app = app.clone();
+        async move { call(&app, "POST", "/api/devices", Some(body)).await }
+    };
+
+    let (status, manual) = post(json!({ "room_id": room, "manual_code": MANUAL })).await;
+    assert_eq!(status, StatusCode::CREATED);
+    for body in [
+        json!({ "room_id": room, "manual_code": "3497 011 2332" }),
+        json!({ "room_id": room, "qr_payload": QR }),
+        json!({ "room_id": room, "qr_payload": format!("{OTHER_QR}*{}", &QR[3..]) }),
+    ] {
+        let (status, error) = post(body.clone()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(error["error"], "duplicate_qr_payload");
+    }
+
+    let uri = format!("/api/devices/{}", manual["id"]);
+    call(&app, "DELETE", &uri, None).await;
+    let (status, _) = post(json!({ "room_id": room, "qr_payload": QR })).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = post(json!({ "room_id": room, "manual_code": MANUAL })).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _) = post(json!({ "room_id": room, "qr_payload": OTHER_QR })).await;
+    assert_eq!(status, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn device_registration_needs_exactly_one_valid_code() {
+    let app = app();
+    let room = create_room(&app, "寝室").await;
+    let post = |body: Value| {
+        let app = app.clone();
+        async move { call(&app, "POST", "/api/devices", Some(body)).await }
+    };
+
+    let (status, error) = post(json!({ "room_id": room, "manual_code": "34970112331" })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error["error"], "invalid_manual_code");
+    assert!(!error.to_string().contains("3497"));
+
+    // A manual code is not accepted as a QR payload.
+    let (status, error) = post(json!({ "room_id": room, "qr_payload": MANUAL })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error["error"], "invalid_qr_payload");
+
+    for body in [
+        json!({ "room_id": room }),
+        json!({ "room_id": room, "qr_payload": QR, "manual_code": MANUAL }),
+    ] {
+        let (status, error) = post(body.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(error["error"], "missing_setup_code");
+    }
 }
