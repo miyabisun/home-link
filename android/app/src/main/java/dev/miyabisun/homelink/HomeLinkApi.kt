@@ -9,7 +9,8 @@ import java.net.URL
 
 data class Room(val id: Long, val name: String)
 
-enum class ApiError { UNREACHABLE, DUPLICATE_QR, ROOM_NOT_FOUND, DUPLICATE_ROOM, INVALID_QR, INVALID_MANUAL, INVALID_NAME, SERVER }
+enum class ApiError { UNREACHABLE, DUPLICATE_QR, ROOM_NOT_FOUND, DUPLICATE_ROOM, INVALID_QR, INVALID_MANUAL, INVALID_NAME,
+    MATTER_UNREACHABLE, MATTER_NOT_CONFIGURED, SERVER }
 
 sealed interface ApiResult<out T> {
     data class Ok<T>(val value: T) : ApiResult<T>
@@ -22,6 +23,8 @@ interface HomeLinkApi {
     fun createRoom(name: String): ApiResult<Room>
     /** `payload` is a QR payload (`MT:`) or the digits of a manual pairing code. */
     fun register(roomId: Long, payload: String, name: String): ApiResult<Unit>
+    /** Switches every light matterjs-server serves on or off. */
+    fun switchLights(on: Boolean): ApiResult<LightsResult>
 }
 
 class HttpHomeLinkApi(baseUrl: String) : HomeLinkApi {
@@ -41,6 +44,19 @@ class HttpHomeLinkApi(baseUrl: String) : HomeLinkApi {
         return call("POST", "/api/devices", body) { }
     }
 
+    override fun switchLights(on: Boolean): ApiResult<LightsResult> =
+        call("POST", if (on) "/api/lights/on" else "/api/lights/off", null) { body ->
+            val json = JSONObject(body)
+            val missing = json.getJSONArray("missing_devices")
+            LightsResult(
+                json.getInt("switched"), json.getInt("no_response"), json.getInt("failed"),
+                (0 until missing.length()).map { index ->
+                    val device = missing.getJSONObject(index)
+                    device.getString("name").ifEmpty { device.getString("room_name") + "の機器" }
+                },
+            )
+        }
+
     private fun room(json: JSONObject) = Room(json.getLong("id"), json.getString("name"))
 
     private fun <T> call(method: String, path: String, body: JSONObject?, parse: (String) -> T): ApiResult<T> {
@@ -48,7 +64,8 @@ class HttpHomeLinkApi(baseUrl: String) : HomeLinkApi {
             (URL(base + path).openConnection() as HttpURLConnection).apply {
                 requestMethod = method
                 connectTimeout = 5_000
-                readTimeout = 10_000
+                // Switching lights waits up to 10 s for every light's answer.
+                readTimeout = 20_000
                 setRequestProperty("accept", "application/json")
                 if (body != null) {
                     doOutput = true
@@ -82,6 +99,8 @@ class HttpHomeLinkApi(baseUrl: String) : HomeLinkApi {
             "invalid_qr_payload" -> ApiError.INVALID_QR
             "invalid_manual_code" -> ApiError.INVALID_MANUAL
             "invalid_room_name", "invalid_device_name" -> ApiError.INVALID_NAME
+            "matter_server_unreachable" -> ApiError.MATTER_UNREACHABLE
+            "matter_server_not_configured" -> ApiError.MATTER_NOT_CONFIGURED
             else -> ApiError.SERVER
         }
     }

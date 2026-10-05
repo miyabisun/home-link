@@ -1,3 +1,7 @@
 <resources>
     <string name="app_name">home-link</string>
+    <string name="lights_on">照明オン</string>
+    <string name="lights_off">照明オフ</string>
+    <string name="widget_name">照明のオン・オフ</string>
+    <string name="widget_description">家の照明を全部オン・全部オフにします</string>
 </resources>

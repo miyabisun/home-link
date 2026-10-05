@@ -1,6 +1,7 @@
 # home-link
 
 住まいの機器を、部屋と名前で記録するサービスです。
+家じゅうの照明を、Androidのボタン1つで全部オン・全部オフにできます。
 電球などに印刷されたMatterのQRコードをAndroidアプリで読み取り、部屋と名前を付けて登録します。
 QRコードが無い機器は、印字された11桁の数字（Matterの手動ペアリングコード）を入力して登録します。
 登録した内容は、自宅サーバーで動くhome-linkのAPIがSQLiteに保存します。
@@ -9,7 +10,8 @@ Matterのcontroller（[matterjs-server](https://github.com/matter-js/matterjs-se
 台帳の機器が今どのnodeにいるかを識別子から引き直します。
 
 構成は、Rust（axum）のAPIサーバーと、Kotlinで作ったAndroidアプリです。
-Matterの機器登録（commissioning）と照明の操作は、現在のhome-linkにはありません。
+照明の操作は、matterjs-serverに登録済みの照明を全部オン・全部オフにするものだけです。
+照明ごと・部屋ごとの操作と、Matterの機器登録（commissioning）は、現在のhome-linkにはありません。
 
 ## 公開範囲と認証
 
@@ -38,7 +40,7 @@ curl http://127.0.0.1:5011/healthz
 | `PORT` | `3000` | 待ち受けるTCPポート。1〜65535の10進数で、不正な値では起動しません。 |
 | `DATABASE_PATH` | `home-link.db`（コンテナでは `/data/home-link.db`） | SQLiteデータベースのファイル。無ければ作成します。 |
 | `LOG_LEVEL` | `info` | `off`・`error`・`warn`・`info`・`debug`・`trace` のいずれか。 |
-| `MATTER_SERVER_URL` | なし | matterjs-serverのWebSocket API（例: `ws://192.168.1.100:5580/ws`）。未設定なら状態APIは503を返します。 |
+| `MATTER_SERVER_URL` | なし | matterjs-serverのWebSocket API（例: `ws://192.168.1.100:5580/ws`）。未設定なら状態APIと照明APIは503を返します。 |
 
 ## Androidアプリ
 
@@ -51,6 +53,15 @@ QRの読み取りにはGoogle Playサービスのコードスキャナーを使�
 `home-link-vX.Y.Z.apk` をダウンロードし、端末で開いてインストールします。
 APKは開発用のdebug署名です。PCからADBで導入する方法と、ファイルの検証方法は
 [開発ガイド](docs/development.md#adbでのインストール)を参照してください。
+
+### 照明を全部オン・全部オフにする
+
+アプリの上部にある「照明オン」「照明オフ」を押すと、matterjs-serverに登録された照明を全部切り替えます。
+結果は切り替えた台数と、応答のなかった照明・失敗した照明・台帳にあるのに見つからない機器の台数で示します。
+1台でも切り替えられなかった照明があれば、失敗の色で表示します。
+
+「ホーム画面にボタンを置く」を押すと、同じ2つのボタンのウィジェットをホーム画面へ置けます。
+ウィジェットはボタンの下に、直前の結果を短く表示します。
 
 ### 機器を登録する
 
@@ -79,6 +90,9 @@ APKは開発用のdebug署名です。PCからADBで導入する方法と、フ�
 | `GET /api/devices/{id}` | 機器1台。登録したコードの全文 `qr_payload` または `manual_code` を含みます | 404 `device_not_found` |
 | `DELETE /api/devices/{id}` | 機器の削除 | 404 `device_not_found` |
 | `GET /api/status` | 台帳の機器ごとに、matterjs-serverで見えるか（`visible`）と今の `node_id`・`endpoint` | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
+| `GET /api/lights` | 照明ごとの今の状態（`on`・`off`・`no_response`）と、その件数 | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
+| `POST /api/lights/on` | 全部の照明をオンにし、照明ごとの結果（`switched`・`no_response`・`failed`）と件数を返します | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
+| `POST /api/lights/off` | 全部の照明をオフにします。応答は `on` と同じ形です | 同上 |
 | `GET /api/health` | 稼働確認と版（`{"status":"ok","version":"0.1.4"}`） | |
 | `GET /healthz` | 稼働確認（`ok`） | |
 
@@ -99,6 +113,14 @@ VendorNameとSerialNumberです。Aqara Hub M3配下のT2ではZigbeeのIEEEア�
 node IDとendpointはmatterjs-serverが振る番号なので台帳には保存しません。
 `visible: false` の機器は、matterjs-serverに見えないか識別子が無い機器で、matterjs-serverへの登録し直しが必要です。
 
+照明APIは、要求のたびにmatterjs-serverの全nodeを読み、照明の種類（On/Off・Dimmable・Color Temperature・Extended Colorの各Light）を持ち、
+On/Offの属性があるendpointを照明として扱います。Aqara Hub M3などのブリッジ配下の照明も、endpointごとに1台と数えます。
+nodeが使えない照明と、ブリッジが届かないと報告している照明には命令を送らず、`no_response` とします。
+命令を受け付けた照明だけを `switched` に数え、エラーが返った照明は `failed`、10秒以内に応答の無かった照明は `no_response` です。
+途中で接続が切れた場合は、つなぎ直して全部の照明へ送り直します（オン・オフは状態に依らない指定なので、二重に届いても結果は同じです）。
+照明の `name` は台帳の機器名で、台帳に無い照明は製品名です。台帳の機器のうちmatterjs-serverに見えないものは `missing_devices` に並び、
+`missing` に数えます。状態の `GET /api/lights` は、matterjs-serverが最後に読んだOn/Offの値を返します。
+
 ```sh
 curl -X POST http://homeserver:5011/api/rooms -H 'content-type: application/json' -d '{"name":"寝室"}'
 # {"id":1,"name":"寝室","device_count":0}
@@ -117,6 +139,15 @@ curl -X POST http://homeserver:5011/api/devices -H 'content-type: application/js
 
 curl http://homeserver:5011/api/status
 # {"devices":[{"endpoint":null,"id":1,"name":"天井灯","node_id":null,"room_name":"寝室","visible":false},{"endpoint":0,"id":2,"name":"読書灯","node_id":5,"room_name":"寝室","visible":true}],"version":"0.1.4"}
+
+curl -X POST http://homeserver:5011/api/lights/off
+# {"action":"off","switched":10,"no_response":1,"failed":0,"missing":1,
+#  "lights":[{"node_id":1,"endpoint":2,"name":"Aqara LED Bulb T2","room_name":null,"result":"no_response"},
+#            {"node_id":5,"endpoint":1,"name":"読書灯","room_name":"寝室","result":"switched"},…],
+#  "missing_devices":[{"id":1,"name":"天井灯","room_name":"寝室"}]}
+
+curl http://homeserver:5011/api/lights
+# {"on":0,"off":10,"no_response":1,"missing":1,"lights":[{"node_id":5,"endpoint":1,"name":"読書灯","room_name":"寝室","state":"off"},…],"missing_devices":[…]}
 
 curl -X DELETE http://homeserver:5011/api/rooms/1
 # {"error":"room_has_devices","message":"この部屋には機器が1台登録されています。先に機器を削除してください"}

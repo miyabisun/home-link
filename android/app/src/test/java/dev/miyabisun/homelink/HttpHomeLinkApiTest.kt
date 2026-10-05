@@ -76,10 +76,32 @@ class HttpHomeLinkApiTest {
         }
     }
 
+    @Test fun switchesLightsAndCountsEachResult() {
+        respond("/api/lights/on", 200, """{"action":"on","switched":7,"no_response":2,"failed":1,"missing":2,
+            "lights":[],"missing_devices":[{"id":3,"name":"台所","room_name":"居間"},{"id":4,"name":"","room_name":"寝室"}]}""")
+        assertEquals(ApiResult.Ok(LightsResult(7, 2, 1, listOf("台所", "寝室の機器"))), api.switchLights(true))
+        assertEquals("POST /api/lights/on", requests.single())
+        respond("/api/lights/off", 200, """{"action":"off","switched":3,"no_response":0,"failed":0,"missing":0,"lights":[],"missing_devices":[]}""")
+        assertEquals(ApiResult.Ok(LightsResult(3, 0, 0, emptyList())), api.switchLights(false))
+    }
+
+    @Test fun mapsLightFailures() {
+        val cases = listOf(
+            Triple(502, "matter_server_unreachable", ApiError.MATTER_UNREACHABLE),
+            Triple(503, "matter_server_not_configured", ApiError.MATTER_NOT_CONFIGURED),
+            Triple(500, "internal", ApiError.SERVER),
+        )
+        for ((status, code, expected) in cases) {
+            respond("/api/lights/off", status, """{"error":"$code"}""")
+            assertEquals("$status $code", ApiResult.Failed(expected), api.switchLights(false))
+        }
+    }
+
     @Test fun reportsAnUnreachableServer() {
         val port = ServerSocket(0).use { it.localPort }
         val offline = HttpHomeLinkApi("http://127.0.0.1:$port")
         assertEquals(ApiResult.Failed(ApiError.UNREACHABLE), offline.rooms())
         assertEquals(ApiResult.Failed(ApiError.UNREACHABLE), offline.register(1, "MT:x", ""))
+        assertEquals(ApiResult.Failed(ApiError.UNREACHABLE), offline.switchLights(true))
     }
 }

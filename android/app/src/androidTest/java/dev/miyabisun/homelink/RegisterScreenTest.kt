@@ -1,5 +1,7 @@
 package dev.miyabisun.homelink
 
+import android.appwidget.AppWidgetManager
+import android.content.ComponentName
 import android.os.ParcelFileDescriptor
 import android.view.View
 import android.view.ViewGroup
@@ -23,6 +25,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.FileInputStream
 import java.util.Collections
+import java.util.concurrent.CountDownLatch
 
 @RunWith(AndroidJUnit4::class)
 class RegisterScreenTest {
@@ -259,6 +262,50 @@ class RegisterScreenTest {
         }
     }
 
+    @Test fun switchAllLightsAndShowTheResult() {
+        ActivityScenario.launch(MainActivity::class.java).use { screen ->
+            eventually(screen) { hasLabel(it, "部屋がありません。「部屋を追加」から作成してください") }
+            screen.onActivity { activity ->
+                // Offered until a widget is placed, when the launcher can pin one.
+                val manager = AppWidgetManager.getInstance(activity)
+                val placed = manager.getAppWidgetIds(ComponentName(activity, LightsWidget::class.java)).isNotEmpty()
+                assertEquals(manager.isRequestPinAppWidgetSupported && !placed,
+                    views(activity).any { it is Button && it.isShown && it.text == "ホーム画面にボタンを置く" })
+            }
+            capture(screen, "lights")
+
+            val gate = CountDownLatch(1)
+            api.gate = gate
+            api.lights = ApiResult.Ok(LightsResult(11, 0, 0, emptyList()))
+            screen.onActivity { button(it, "照明オン").performClick() }
+            eventually(screen) { hasLabel(it, "照明をオンにしています…") }
+            screen.onActivity { activity ->
+                assertFalse(button(activity, "照明オン").isEnabled)
+                assertFalse(button(activity, "照明オフ").isEnabled)
+            }
+            capture(screen, "lights-busy")
+            gate.countDown()
+            eventually(screen) { hasLabel(it, "照明を11台オンにしました") }
+            screen.onActivity { assertTrue(button(it, "照明オフ").isEnabled) }
+            assertEquals(listOf(true), api.switches)
+            capture(screen, "lights-on")
+
+            api.lights = ApiResult.Ok(LightsResult(8, 2, 1, listOf("キッチン側の天井灯（リビング・南の窓寄り）", "通路")))
+            screen.onActivity { button(it, "照明オフ").performClick() }
+            val partial = "照明を8台オフにしました。応答なし2台・失敗1台・見つからない2台（キッチン側の天井灯（リビング・南の窓寄り）、通路）"
+            eventually(screen) { hasLabel(it, partial) }
+            assertEquals(listOf(true, false), api.switches)
+            capture(screen, "lights-partial")
+            screen.recreate()
+            eventually(screen) { hasLabel(it, partial) }
+
+            api.lights = ApiResult.Failed(ApiError.UNREACHABLE)
+            screen.onActivity { button(it, "照明オン").performClick() }
+            eventually(screen) { hasLabel(it, "home-link（homeserver:5011）に接続できません。Tailscaleの接続を確認してください") }
+            capture(screen, "lights-unreachable")
+        }
+    }
+
     private fun assertInputsKept(screen: ActivityScenario<MainActivity>) = screen.onActivity { activity ->
         assertTrue(hasLabel(activity, "読み取り済み：MT:Y.K90…"))
         assertEquals("天井灯", field(activity, "機器名（任意）").text.toString())
@@ -349,6 +396,9 @@ private class FakeApi : HomeLinkApi {
     val registrations: MutableList<Registration> = Collections.synchronizedList(mutableListOf())
     @Volatile var failure: ApiError? = null
     @Volatile var roomsFailure: ApiError? = null
+    @Volatile var lights: ApiResult<LightsResult> = ApiResult.Ok(LightsResult(0, 0, 0, emptyList()))
+    @Volatile var gate: CountDownLatch? = null
+    val switches: MutableList<Boolean> = Collections.synchronizedList(mutableListOf())
 
     override fun rooms(): ApiResult<List<Room>> =
         roomsFailure?.let { ApiResult.Failed(it) } ?: ApiResult.Ok(rooms.toList())
@@ -362,6 +412,12 @@ private class FakeApi : HomeLinkApi {
         failure?.let { return ApiResult.Failed(it) }
         registrations += Registration(roomId, payload, name)
         return ApiResult.Ok(Unit)
+    }
+
+    override fun switchLights(on: Boolean): ApiResult<LightsResult> {
+        gate?.await()
+        switches += on
+        return lights
     }
 }
 

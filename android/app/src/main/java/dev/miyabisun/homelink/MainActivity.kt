@@ -1,6 +1,8 @@
 package dev.miyabisun.homelink
 
 import android.app.Activity
+import android.appwidget.AppWidgetManager
+import android.content.ComponentName
 import android.content.res.ColorStateList
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -42,12 +44,22 @@ class MainActivity : Activity() {
     private lateinit var api: HomeLinkApi
     private lateinit var scanner: QrScanner
     private lateinit var worker: ExecutorService
+    private lateinit var lightsWorker: ExecutorService
+    /** The light switch in flight: true for on, false for off. */
+    private var switching: Boolean? = null
+    private var lightsResult: LightsMessage? = null
+    /** Offer to place the widget while the launcher can pin one and none is placed. */
+    private var canPinWidget = false
     private var loadingRooms = false
     private var addingRoom = false
     private var enteringCode = false
     private var formattingCode = false
 
     private lateinit var content: LinearLayout
+    private lateinit var lightsOnButton: Button
+    private lateinit var lightsOffButton: Button
+    private lateinit var lightsRow: ResultRow
+    private lateinit var pinButton: Button
     private lateinit var qrState: TextView
     private lateinit var qrMessage: TextView
     private lateinit var scanButton: Button
@@ -64,9 +76,7 @@ class MainActivity : Activity() {
     private lateinit var newRoomName: EditText
     private lateinit var createRoomButton: Button
     private lateinit var nameField: EditText
-    private lateinit var resultPanel: LinearLayout
-    private lateinit var resultIcon: ImageView
-    private lateinit var resultText: TextView
+    private lateinit var resultRow: ResultRow
     private lateinit var reconnectButton: Button
     private lateinit var registerButton: Button
 
@@ -75,12 +85,15 @@ class MainActivity : Activity() {
         api = apiFactory?.invoke() ?: HttpHomeLinkApi(BuildConfig.HOME_LINK_URL)
         scanner = scannerFactory?.invoke(this) ?: GmsQrScanner(this)
         worker = Executors.newSingleThreadExecutor()
+        // Switching lights can wait seconds for every bulb; registration does not queue behind it.
+        lightsWorker = Executors.newSingleThreadExecutor()
         savedInstanceState?.let { state ->
             form.payload = state.getString("payload")
             form.roomId = state.getLong("roomId", -1).takeIf { it >= 0 }
             form.name = state.getString("name").orEmpty()
             addingRoom = state.getBoolean("addingRoom")
             enteringCode = state.getBoolean("enteringCode")
+            lightsResult = state.getString("lightsText")?.let { LightsMessage(it, state.getBoolean("lightsFailed")) }
         }
         build()
         manualField.setText(savedInstanceState?.getString("manualCode").orEmpty())
@@ -98,17 +111,33 @@ class MainActivity : Activity() {
         outState.putString("newRoom", newRoomName.text.toString())
         outState.putBoolean("enteringCode", enteringCode)
         outState.putString("manualCode", manualField.text.toString())
+        lightsResult?.let {
+            outState.putString("lightsText", it.text)
+            outState.putBoolean("lightsFailed", it.failed)
+        }
         super.onSaveInstanceState(outState)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // A widget may have been placed meanwhile.
+        val manager = AppWidgetManager.getInstance(this)
+        canPinWidget = manager.isRequestPinAppWidgetSupported &&
+            manager.getAppWidgetIds(ComponentName(this, LightsWidget::class.java)).isEmpty()
+        render()
     }
 
     override fun onDestroy() {
         worker.shutdownNow()
+        lightsWorker.shutdownNow()
         super.onDestroy()
     }
 
     /** Runs a blocking API call off the main thread and drops results for a destroyed screen. */
-    private fun <T> background(call: () -> T, done: (T) -> Unit) {
-        worker.execute {
+    private fun <T> background(call: () -> T, done: (T) -> Unit) = background(worker, call, done)
+
+    private fun <T> background(executor: ExecutorService, call: () -> T, done: (T) -> Unit) {
+        executor.execute {
             val result = call()
             runOnUiThread { if (!isDestroyed) done(result) }
         }
@@ -122,6 +151,23 @@ class MainActivity : Activity() {
             form.rooms(result)
             render()
         }
+    }
+
+    private fun switchLights(on: Boolean) {
+        switching = on
+        lightsResult = null
+        render()
+        val host = Uri.parse(BuildConfig.HOME_LINK_URL).authority.orEmpty()
+        background(lightsWorker, { api.switchLights(on) }) { result ->
+            switching = null
+            lightsResult = lightsMessage(on, result, host, names = true)
+            render()
+            LightsWidget.show(this, lightsMessage(on, result, host, names = false))
+        }
+    }
+
+    private fun pinWidget() {
+        AppWidgetManager.getInstance(this).requestPinAppWidget(ComponentName(this, LightsWidget::class.java), null, null)
     }
 
     private fun scan() {
@@ -220,7 +266,18 @@ class MainActivity : Activity() {
         scroll.addView(content)
         setContentView(scroll)
 
-        label(content, "機器を登録", 28, bold = true)
+        label(content, "照明", 28, bold = true)
+        val lights = panel()
+        val lightActions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        lights.addView(lightActions, LinearLayout.LayoutParams(-1, -2))
+        lightsOnButton = button(lightActions, "照明オン", icon = R.drawable.ic_light_on, weight = true) { switchLights(true) }
+        lightsOffButton = button(lightActions, "照明オフ", icon = R.drawable.ic_light_off, weight = true) { switchLights(false) }
+        lightsRow = ResultRow(lights, dp(8))
+        pinButton = button(lights, "ホーム画面にボタンを置く", icon = R.drawable.ic_widget) { pinWidget() }
+
+        label(content, "機器を登録", 28, bold = true).apply {
+            (layoutParams as LinearLayout.LayoutParams).topMargin = dp(24)
+        }
 
         val qr = panel()
         label(qr, "機器のコード", 18, bold = true)
@@ -298,26 +355,23 @@ class MainActivity : Activity() {
         nameField.hint = "空欄でも登録できます"
         nameField.addTextChangedListener(changed { form.name = it })
 
-        resultPanel = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(12), dp(8), dp(12), dp(8))
-            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
-        }
-        content.addView(resultPanel, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(16) })
-        resultIcon = ImageView(this).apply { importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO }
-        resultPanel.addView(resultIcon, LinearLayout.LayoutParams(dp(24), dp(24)).apply { marginEnd = dp(8) })
-        resultText = TextView(this).apply {
-            textSize = 16f
-            setTextColor(getColor(R.color.text))
-        }
-        resultPanel.addView(resultText, LinearLayout.LayoutParams(0, -2, 1f))
+        resultRow = ResultRow(content, dp(16))
         reconnectButton = button(content, "再接続") { loadRooms() }
         registerButton = button(content, "登録", primary = true) { register() }
         render()
     }
 
     private fun render() {
+        val busy = switching != null
+        lightsOnButton.isEnabled = !busy
+        lightsOffButton.isEnabled = !busy
+        when (switching) {
+            true -> lightsRow.show("照明をオンにしています…", failed = false, R.drawable.ic_light_on)
+            false -> lightsRow.show("照明をオフにしています…", failed = false, R.drawable.ic_light_off)
+            null -> lightsRow.show(lightsResult?.text, lightsResult?.failed == true)
+        }
+        pinButton.visibility = if (canPinWidget) View.VISIBLE else View.GONE
+
         val payload = form.payload
         val scannedQr = payload?.startsWith("MT:") == true
         qrState.text = when {
@@ -378,27 +432,54 @@ class MainActivity : Activity() {
                 ApiError.INVALID_QR -> "MatterのQRコードとして読み取れませんでした。読み取り直してください"
                 ApiError.INVALID_MANUAL -> "この数字はMatterの機器のコードとして使えません。数字を入力し直してください"
                 ApiError.INVALID_NAME -> "名前は${MAX_NAME}文字以内で入力してください"
-                ApiError.SERVER -> "home-linkでエラーが発生しました。時間をおいてお試しください"
+                ApiError.SERVER, ApiError.MATTER_UNREACHABLE, ApiError.MATTER_NOT_CONFIGURED ->
+                    "home-linkでエラーが発生しました。時間をおいてお試しください"
                 ApiError.DUPLICATE_ROOM -> null
             }
             else -> null
         }
-        resultPanel.visibility = if (result == null) View.GONE else View.VISIBLE
-        if (result != null) {
-            val failed = status is Status.Failed
-            resultText.text = result
-            resultIcon.setImageResource(if (failed) R.drawable.ic_error else R.drawable.ic_success)
-            resultPanel.background = GradientDrawable().apply {
-                setColor(getColor(if (failed) R.color.danger_subtle else R.color.surface))
-                cornerRadius = dp(8).toFloat()
-                setStroke(dp(1), getColor(if (failed) R.color.danger else R.color.border))
-            }
-        }
+        resultRow.show(result, status is Status.Failed)
         reconnectButton.visibility =
             if ((form.roomsFailed || status == Status.Failed(ApiError.UNREACHABLE)) && !loadingRooms) View.VISIBLE
             else View.GONE
         registerButton.isEnabled = form.canRegister()
         registerButton.text = if (form.busy) "登録中…" else "登録"
+    }
+
+    /** A result line: an icon and text on a surface that turns to the failure colors. */
+    private inner class ResultRow(parent: LinearLayout, top: Int) {
+        private val panel = LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+            parent.addView(this, LinearLayout.LayoutParams(-1, -2).apply { topMargin = top })
+        }
+        private val icon = ImageView(this@MainActivity).apply {
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            panel.addView(this, LinearLayout.LayoutParams(dp(24), dp(24)).apply { marginEnd = dp(8) })
+        }
+        private val text = TextView(this@MainActivity).apply {
+            textSize = 16f
+            setTextColor(getColor(R.color.text))
+            panel.addView(this, LinearLayout.LayoutParams(0, -2, 1f))
+        }
+
+        fun show(message: String?, failed: Boolean, progress: Int = 0) {
+            panel.visibility = if (message == null) View.GONE else View.VISIBLE
+            if (message == null) return
+            text.text = message
+            icon.setImageResource(when {
+                progress != 0 -> progress
+                failed -> R.drawable.ic_error
+                else -> R.drawable.ic_success
+            })
+            panel.background = GradientDrawable().apply {
+                setColor(getColor(if (failed) R.color.danger_subtle else R.color.surface))
+                cornerRadius = dp(8).toFloat()
+                setStroke(dp(1), getColor(if (failed) R.color.danger else R.color.border))
+            }
+        }
     }
 
     /** Shows only the start of the code: both forms carry the setup passcode. */

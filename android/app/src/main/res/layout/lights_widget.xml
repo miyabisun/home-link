@@ -1,0 +1,18 @@
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@android:id/background" android:layout_width="match_parent"
+    android:layout_height="match_parent" android:orientation="vertical" android:gravity="center"
+    android:background="@drawable/widget_background" android:padding="8dp">
+    <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:orientation="horizontal">
+        <Button android:id="@+id/light_on" style="@style/WidgetButton"
+            android:layout_marginEnd="8dp" android:text="@string/lights_on"
+            android:drawableStart="@drawable/ic_light_on" />
+        <Button android:id="@+id/light_off" style="@style/WidgetButton"
+            android:text="@string/lights_off" android:drawableStart="@drawable/ic_light_off" />
+    </LinearLayout>
+    <TextView android:id="@+id/status" android:layout_width="match_parent"
+        android:layout_height="wrap_content" android:layout_marginTop="4dp"
+        android:drawablePadding="4dp" android:gravity="center_vertical" android:visibility="gone"
+        android:textColor="@color/text" android:textSize="14sp" android:maxLines="3"
+        android:ellipsize="end" android:accessibilityLiveRegion="polite" />
+</LinearLayout>

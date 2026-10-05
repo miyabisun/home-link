@@ -30,7 +30,10 @@ cargo test --locked
 `src/onboarding.rs` はMatterのQRコード（Base38）と手動ペアリングコード（Verhoeff）の検証、
 同じ機器かを判定するキーの取り出しと、そのテストを持ちます。
 `src/matter.rs` はmatterjs-serverのWebSocket APIから全nodeを読み、識別子からnodeとendpointを引きます。
-状態APIのテストは、`tests/api.rs` の中で同じ応答を返すWebSocketサーバーを立てて検証します。
+照明の選び方（Descriptorのdevice typeとOn/Off、ブリッジ配下の展開、届くかどうか）も同じファイルで単体テストします。
+状態APIと照明APIのテストは、`tests/api.rs` の中でmatterjs-serverと同じ形で `get_nodes` と `device_command` に応答する
+WebSocketサーバーを立て、全部オン・全部オフ、エラーや無応答の照明、接続断からの再接続を検証します。
+無応答の照明のテストは、応答を待つ10秒の期限まで待ちます。
 
 コンテナは次のように作成し、確認できます。
 
@@ -66,6 +69,17 @@ JVMテストは、JDKの一時HTTPサーバーを相手にAPIクライアント�
 
 instrumentationテストは、APIとQRスキャナーをfakeに置き換え、実際の画面部品を操作します。
 部屋の作成・選択・登録・成功表示と、登録済み・部屋なし・接続不可・Matter以外のQR・画面の再生成を扱います。
+照明のボタンは、送信中・全部成功・一部の照明が残った場合・接続不可の表示と、画面の再生成での結果の保持を扱います。
+ホーム画面のウィジェットは、ランチャーへの配置を伴うため、このテストには含みません。
+エミュレータで、本物のAPIサーバーとmatterjs-server互換のmockを相手に、ウィジェットを配置して押して確かめます。
+アプリは `homeserver` だけに平文HTTPを許可しているため、エミュレータのHTTPプロキシをAPIサーバーへ向けると、
+既定の接続先のままのAPKで試せます（APIサーバーはプロキシ形式の要求もそのまま処理します）。
+
+```sh
+adb -s emulator-5554 shell settings put global http_proxy 10.0.2.2:PORT
+# 確認後
+adb -s emulator-5554 shell settings delete global http_proxy
+```
 fakeの成功は、実際のカメラでの読み取りや、homeserverへの接続を証明しません。
 
 ```sh
