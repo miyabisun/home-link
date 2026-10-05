@@ -86,6 +86,9 @@ pub fn app(db: Connection, matter_url: Option<String>) -> Router {
         .route("/devices", get(list_devices).post(create_device))
         .route("/devices/{id}", get(get_device).delete(delete_device))
         .route("/status", get(status))
+        .route("/lights", get(light_states))
+        .route("/lights/on", axum::routing::post(lights_on))
+        .route("/lights/off", axum::routing::post(lights_off))
         .fallback(not_found)
         // ponytail: one connection behind a global lock; a pool if writes ever contend.
         .with_state(Arc::new(AppState {
@@ -514,6 +517,26 @@ async fn delete_device(State(db): State<Db>, Path(id): Path<i64>) -> ApiResult<S
     Ok(StatusCode::NO_CONTENT)
 }
 
+fn matter_url(state: &AppState) -> ApiResult<&str> {
+    state.matter_url.as_deref().ok_or_else(|| {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "matter_server_not_configured",
+            "matterjs-serverの接続先（MATTER_SERVER_URL）が設定されていません".into(),
+        )
+    })
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn matter_unreachable(error: String) -> ApiError {
+    tracing::warn!(%error, "matterjs-server unreachable");
+    ApiError(
+        StatusCode::BAD_GATEWAY,
+        "matter_server_unreachable",
+        "matterjs-serverから機器を読めませんでした".into(),
+    )
+}
+
 /// A ledger device and where matterjs-server currently serves it.
 #[derive(Serialize)]
 struct DeviceStatus {
@@ -530,21 +553,9 @@ struct DeviceStatus {
 /// registering again.
 // ponytail: reads every node per request; cache with subscriptions if polled often.
 async fn status(State(state): State<Db>) -> ApiResult<Json<serde_json::Value>> {
-    let url = state.matter_url.as_deref().ok_or_else(|| {
-        ApiError(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "matter_server_not_configured",
-            "matterjs-serverの接続先（MATTER_SERVER_URL）が設定されていません".into(),
-        )
-    })?;
-    let nodes = matter::fetch_nodes(url).await.map_err(|error| {
-        tracing::warn!(%error, "matterjs-server unreachable");
-        ApiError(
-            StatusCode::BAD_GATEWAY,
-            "matter_server_unreachable",
-            "matterjs-serverから機器を読めませんでした".into(),
-        )
-    })?;
+    let nodes = matter::fetch_nodes(matter_url(&state)?)
+        .await
+        .map_err(matter_unreachable)?;
     let db = state.db.lock().unwrap();
     let mut statement = db.prepare(&format!("{DEVICE_SELECT} ORDER BY devices.id"))?;
     let devices = statement
@@ -569,5 +580,159 @@ async fn status(State(state): State<Db>) -> ApiResult<Json<serde_json::Value>> {
     Ok(Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "devices": devices,
+    })))
+}
+
+/// A ledger device matterjs-server does not serve.
+#[derive(Serialize)]
+struct MissingDevice {
+    id: i64,
+    name: String,
+    room_name: String,
+}
+
+/// A light's ledger name (else its product name) and room.
+type LightName = (Option<String>, Option<String>);
+
+/// Names `lights` from the ledger and lists the ledger devices `nodes` lack.
+/// A device located on endpoint 0 names the lights of its node that are not
+/// behind a bridge; a bridged device names the light on its own endpoint.
+fn match_ledger(
+    db: &Connection,
+    nodes: &[serde_json::Value],
+    lights: &[matter::Light],
+) -> rusqlite::Result<(Vec<LightName>, Vec<MissingDevice>)> {
+    let mut statement = db.prepare(&format!("{DEVICE_SELECT} ORDER BY devices.id"))?;
+    let devices = statement
+        .query_map([], |row| device_row(row, false))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut names = vec![(None, None); lights.len()];
+    let mut missing = Vec::new();
+    for device in devices {
+        let place = device
+            .vendor
+            .as_deref()
+            .zip(device.serial_number.as_deref())
+            .and_then(|(vendor, serial)| matter::locate(nodes, vendor, serial));
+        let Some((node, endpoint)) = place else {
+            missing.push(MissingDevice {
+                id: device.id,
+                name: device.name,
+                room_name: device.room_name,
+            });
+            continue;
+        };
+        for (light, name) in lights.iter().zip(&mut names) {
+            let names_it = light.node_id == node
+                && if light.bridged {
+                    light.endpoint == endpoint
+                } else {
+                    endpoint == 0
+                };
+            if names_it && !device.name.is_empty() {
+                *name = (Some(device.name.clone()), Some(device.room_name.clone()));
+            }
+        }
+    }
+    let names = names
+        .into_iter()
+        .zip(lights)
+        .map(|((name, room), light)| (name.or_else(|| light.product.clone()), room))
+        .collect();
+    Ok((names, missing))
+}
+
+/// Each light with its ledger name (else its product name) and room, and `field`'s value.
+fn light_entries(
+    lights: &[matter::Light],
+    names: Vec<LightName>,
+    values: &[&str],
+    field: &str,
+) -> Vec<serde_json::Value> {
+    lights
+        .iter()
+        .zip(names)
+        .zip(values)
+        .map(|((light, (name, room_name)), value)| {
+            json!({
+                "node_id": light.node_id,
+                "endpoint": light.endpoint,
+                "name": name,
+                "room_name": room_name,
+                field: value,
+            })
+        })
+        .collect()
+}
+
+fn count(values: &[&str], value: &str) -> usize {
+    values.iter().filter(|v| **v == value).count()
+}
+
+/// Counts the lights on, off and not responding, as matterjs-server last read them,
+/// and the ledger devices it does not serve.
+// ponytail: reads every node per request; cache with subscriptions if polled often.
+async fn light_states(State(state): State<Db>) -> ApiResult<Json<serde_json::Value>> {
+    let nodes = matter::fetch_nodes(matter_url(&state)?)
+        .await
+        .map_err(matter_unreachable)?;
+    let lights = matter::lights(&nodes);
+    let states: Vec<&str> = lights
+        .iter()
+        .map(|light| match (light.reachable, light.on) {
+            (true, Some(true)) => "on",
+            (true, Some(false)) => "off",
+            _ => "no_response",
+        })
+        .collect();
+    let (names, missing) = match_ledger(&state.db.lock().unwrap(), &nodes, &lights)?;
+    Ok(Json(json!({
+        "on": count(&states, "on"),
+        "off": count(&states, "off"),
+        "no_response": count(&states, "no_response"),
+        "missing": missing.len(),
+        "lights": light_entries(&lights, names, &states, "state"),
+        "missing_devices": missing,
+    })))
+}
+
+async fn lights_on(state: State<Db>) -> ApiResult<Json<serde_json::Value>> {
+    switch_lights(state, true).await
+}
+
+async fn lights_off(state: State<Db>) -> ApiResult<Json<serde_json::Value>> {
+    switch_lights(state, false).await
+}
+
+/// Switches every light matterjs-server serves and reports each light's result.
+/// Only a light whose command was accepted counts as switched.
+async fn switch_lights(State(state): State<Db>, on: bool) -> ApiResult<Json<serde_json::Value>> {
+    let (nodes, results) = matter::switch(matter_url(&state)?, on)
+        .await
+        .map_err(matter_unreachable)?;
+    let (lights, outcomes): (Vec<_>, Vec<_>) = results.into_iter().unzip();
+    let outcomes: Vec<&str> = outcomes
+        .into_iter()
+        .map(|outcome| match outcome {
+            matter::Outcome::Switched => "switched",
+            matter::Outcome::NoResponse => "no_response",
+            matter::Outcome::Failed => "failed",
+        })
+        .collect();
+    let (names, missing) = match_ledger(&state.db.lock().unwrap(), &nodes, &lights)?;
+    tracing::info!(
+        on,
+        switched = count(&outcomes, "switched"),
+        lights = lights.len(),
+        "lights switched"
+    );
+    Ok(Json(json!({
+        "action": if on { "on" } else { "off" },
+        "switched": count(&outcomes, "switched"),
+        "no_response": count(&outcomes, "no_response"),
+        "failed": count(&outcomes, "failed"),
+        "missing": missing.len(),
+        "lights": light_entries(&lights, names, &outcomes, "result"),
+        "missing_devices": missing,
     })))
 }

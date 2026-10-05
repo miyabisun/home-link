@@ -1,4 +1,7 @@
-use std::net::SocketAddr;
+use std::{
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
 
 use axum::{
     Router,
@@ -522,4 +525,305 @@ async fn status_reports_an_unset_or_unreachable_matter_server() {
     let (status, error) = call(&app, "GET", "/api/status", None).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert_eq!(error["error"], "matter_server_unreachable");
+}
+
+/// How the fake matterjs-server answers `device_command`.
+#[derive(Clone, Default)]
+struct Fake {
+    /// `(node_id, endpoint)` answered with an error.
+    failing: Vec<(u64, u64)>,
+    /// `(node_id, endpoint)` never answered.
+    silent: Vec<(u64, u64)>,
+    /// Close the first connection when its first command arrives.
+    drop_first: bool,
+}
+
+/// Serves `get_nodes` and On/Off `device_command` the way matterjs-server does,
+/// applying each command to the served On/Off attribute and recording it.
+async fn fake_light_server(
+    nodes: Value,
+    fake: Fake,
+) -> (SocketAddr, Arc<Mutex<Vec<Value>>>, Arc<Mutex<usize>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let connections = Arc::new(Mutex::new(0));
+    let nodes = Arc::new(Mutex::new(nodes));
+    let (seen, count) = (commands.clone(), connections.clone());
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let first = {
+                let mut count = count.lock().unwrap();
+                *count += 1;
+                *count == 1
+            };
+            let info = json!({ "fabric_id": 1, "schema_version": 13 });
+            ws.send(Message::text(info.to_string())).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let command: Value = serde_json::from_str(&text).unwrap();
+                let id = command["message_id"].clone();
+                let reply = match command["command"].as_str().unwrap() {
+                    "get_nodes" => json!({ "message_id": id, "result": *nodes.lock().unwrap() }),
+                    "device_command" => {
+                        seen.lock().unwrap().push(command["args"].clone());
+                        if fake.drop_first && first {
+                            break;
+                        }
+                        let args = &command["args"];
+                        let target = (
+                            args["node_id"].as_u64().unwrap(),
+                            args["endpoint_id"].as_u64().unwrap(),
+                        );
+                        if fake.silent.contains(&target) {
+                            continue;
+                        }
+                        if fake.failing.contains(&target) {
+                            json!({ "message_id": id, "error_code": 0, "details": "failed" })
+                        } else {
+                            let on = args["command_name"] == "On";
+                            for node in nodes.lock().unwrap().as_array_mut().unwrap() {
+                                if node["node_id"] == target.0 {
+                                    node["attributes"][format!("{}/6/0", target.1)] = json!(on);
+                                }
+                            }
+                            json!({ "message_id": id, "result": null })
+                        }
+                    }
+                    other => panic!("unexpected command {other}"),
+                };
+                ws.send(Message::text(reply.to_string())).await.unwrap();
+            }
+        }
+    });
+    (addr, commands, connections)
+}
+
+/// A bridge with an unreachable and a reachable bulb, a Wi-Fi bulb, an
+/// unavailable node and a plug, as matterjs-server serves them.
+fn home_nodes() -> Value {
+    json!([
+        { "node_id": 1, "available": true, "attributes": {
+            "0/40/1": "Aqara", "0/40/15": "hub", "0/40/3": "Aqara Hub M3",
+            "2/29/0": [{ "0": 19, "1": 2 }, { "0": 268, "1": 4 }], "2/6/0": false,
+            "2/57/1": "Aqara", "2/57/15": "t2-a", "2/57/3": "Aqara LED Bulb T2", "2/57/17": false,
+            "3/29/0": [{ "0": 19, "1": 2 }, { "0": 268, "1": 4 }], "3/6/0": false,
+            "3/57/1": "Aqara", "3/57/15": "t2-b", "3/57/3": "Aqara LED Bulb T2", "3/57/17": true,
+        }},
+        { "node_id": 5, "available": true, "attributes": {
+            "0/40/1": "Tapo", "0/40/15": TAPO, "0/40/3": "Smart Multicolor Bulb",
+            "1/29/0": [{ "0": 269, "1": 1 }], "1/6/0": false,
+        }},
+        { "node_id": 16, "available": false, "attributes": {
+            "0/40/1": "Uascent", "0/40/15": "beam", "0/40/3": "Smart Bulb",
+            "1/29/0": [{ "0": 269, "1": 1 }], "1/6/0": true,
+        }},
+        { "node_id": 20, "available": true, "attributes": {
+            "1/29/0": [{ "0": 266, "1": 1 }], "1/6/0": false,
+        }},
+    ])
+}
+
+async fn light_app(addr: SocketAddr) -> Router {
+    let app = home_link::app(
+        home_link::open_db(":memory:").unwrap(),
+        Some(format!("ws://{addr}/ws")),
+    );
+    let room = create_room(&app, "寝室").await;
+    for body in [
+        json!({ "room_id": room, "vendor": "Tapo", "serial_number": TAPO, "name": "読書灯" }),
+        json!({ "room_id": room, "vendor": "Aqara", "serial_number": "t2-b", "name": "台所" }),
+        json!({ "room_id": room, "vendor": "Tapo", "serial_number": "gone", "name": "消えた灯" }),
+    ] {
+        assert_eq!(
+            call(&app, "POST", "/api/devices", Some(body)).await.0,
+            StatusCode::CREATED
+        );
+    }
+    app
+}
+
+fn results(body: &Value, field: &str) -> Vec<(Value, Value, Value, Value)> {
+    body["lights"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| {
+            (
+                l["node_id"].clone(),
+                l["endpoint"].clone(),
+                l["name"].clone(),
+                l[field].clone(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn all_lights_switch_on_and_off_and_report_each_result() {
+    let (addr, commands, _) = fake_light_server(home_nodes(), Fake::default()).await;
+    let app = light_app(addr).await;
+
+    let (status, body) = call(&app, "POST", "/api/lights/on", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        (
+            &body["action"],
+            &body["switched"],
+            &body["no_response"],
+            &body["failed"],
+            &body["missing"]
+        ),
+        (&json!("on"), &json!(2), &json!(2), &json!(0), &json!(1))
+    );
+    assert_eq!(
+        results(&body, "result"),
+        [
+            (
+                json!(1),
+                json!(2),
+                json!("Aqara LED Bulb T2"),
+                json!("no_response")
+            ),
+            (json!(1), json!(3), json!("台所"), json!("switched")),
+            (json!(5), json!(1), json!("読書灯"), json!("switched")),
+            (
+                json!(16),
+                json!(1),
+                json!("Smart Bulb"),
+                json!("no_response")
+            ),
+        ]
+    );
+    assert_eq!(
+        body["missing_devices"],
+        json!([{ "id": 3, "name": "消えた灯", "room_name": "寝室" }])
+    );
+    let sent: Vec<_> = commands
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            (
+                c["node_id"].clone(),
+                c["endpoint_id"].clone(),
+                c["cluster_id"].clone(),
+                c["command_name"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        sent,
+        [
+            (json!(1), json!(3), json!(6), json!("On")),
+            (json!(5), json!(1), json!(6), json!("On"))
+        ]
+    );
+
+    let (status, body) = call(&app, "GET", "/api/lights", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        (
+            &body["on"],
+            &body["off"],
+            &body["no_response"],
+            &body["missing"]
+        ),
+        (&json!(2), &json!(0), &json!(2), &json!(1))
+    );
+    assert_eq!(
+        results(&body, "state"),
+        [
+            (
+                json!(1),
+                json!(2),
+                json!("Aqara LED Bulb T2"),
+                json!("no_response")
+            ),
+            (json!(1), json!(3), json!("台所"), json!("on")),
+            (json!(5), json!(1), json!("読書灯"), json!("on")),
+            (
+                json!(16),
+                json!(1),
+                json!("Smart Bulb"),
+                json!("no_response")
+            ),
+        ]
+    );
+
+    let (_, body) = call(&app, "POST", "/api/lights/off", None).await;
+    assert_eq!(
+        (&body["action"], &body["switched"]),
+        (&json!("off"), &json!(2))
+    );
+    let (_, body) = call(&app, "GET", "/api/lights", None).await;
+    assert_eq!((&body["on"], &body["off"]), (&json!(0), &json!(2)));
+}
+
+#[tokio::test]
+async fn lights_that_fail_or_never_answer_are_not_counted_as_switched() {
+    let fake = Fake {
+        failing: vec![(5, 1)],
+        silent: vec![(1, 3)],
+        ..Fake::default()
+    };
+    let (addr, _, _) = fake_light_server(home_nodes(), fake).await;
+    let app = light_app(addr).await;
+
+    let (status, body) = call(&app, "POST", "/api/lights/off", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        (&body["switched"], &body["no_response"], &body["failed"]),
+        (&json!(0), &json!(3), &json!(1))
+    );
+    assert_eq!(body["lights"][1]["result"], "no_response");
+    assert_eq!(body["lights"][2]["result"], "failed");
+}
+
+#[tokio::test]
+async fn switching_reconnects_when_the_connection_drops() {
+    let fake = Fake {
+        drop_first: true,
+        ..Fake::default()
+    };
+    let (addr, commands, connections) = fake_light_server(home_nodes(), fake).await;
+    let app = light_app(addr).await;
+
+    let (status, body) = call(&app, "POST", "/api/lights/on", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        (&body["switched"], &body["no_response"]),
+        (&json!(2), &json!(2))
+    );
+    assert_eq!(*connections.lock().unwrap(), 2);
+    // On is absolute, so the light commanded before the drop is commanded again.
+    assert_eq!(commands.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn lights_report_an_unset_or_unreachable_matter_server() {
+    for (method, uri) in [
+        ("GET", "/api/lights"),
+        ("POST", "/api/lights/on"),
+        ("POST", "/api/lights/off"),
+    ] {
+        let (status, error) = call(&app(), method, uri, None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error["error"], "matter_server_not_configured");
+    }
+    let closed = TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let app = home_link::app(
+        home_link::open_db(":memory:").unwrap(),
+        Some(format!("ws://{closed}/ws")),
+    );
+    for (method, uri) in [("GET", "/api/lights"), ("POST", "/api/lights/on")] {
+        let (status, error) = call(&app, method, uri, None).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(error["error"], "matter_server_unreachable");
+    }
 }
