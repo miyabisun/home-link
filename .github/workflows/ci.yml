@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check Rust formatting
+        run: cargo fmt --check
+
+      - name: Lint Rust
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test Rust
+        run: cargo test --locked
+
+      - name: Build smoke-test binary
+        run: cargo build --locked
+
+      - name: Smoke-test the API from an isolated directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary_dir=$(mktemp -d)
+          cp target/debug/home-link "$binary_dir/"
+          cd "$binary_dir"
+          PORT=3100 DATABASE_PATH=smoke.db ./home-link &
+          server_pid=$!
+          trap 'kill -TERM "$server_pid" 2>/dev/null || true; rm -rf "$binary_dir"' EXIT
+
+          for attempt in {1..20}; do
+            if curl --fail --silent --show-error http://127.0.0.1:3100/healthz >/dev/null; then
+              break
+            fi
+            if [[ "$attempt" == 20 ]]; then
+              exit 1
+            fi
+            sleep 0.25
+          done
+
+          test "$(curl --fail --silent http://127.0.0.1:3100/healthz)" = "ok"
+          test "$(curl --fail --silent http://127.0.0.1:3100/api/health)" = '{"status":"ok"}'
+          test "$(curl --fail --silent -X POST -H 'content-type: application/json' -d '{"name":"smoke"}' http://127.0.0.1:3100/api/rooms)" = '{"id":1,"name":"smoke","device_count":0}'
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:3100/api/missing)" = "404"
+
+          kill -TERM "$server_pid"
+          wait "$server_pid"
+          rm -rf "$binary_dir"
+          trap - EXIT
+
+  container:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build container image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

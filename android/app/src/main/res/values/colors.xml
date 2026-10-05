@@ -1,0 +1,12 @@
+<resources>
+    <color name="background">#faf6ef</color>
+    <color name="surface">#fffdf8</color>
+    <color name="text">#3a2f28</color>
+    <color name="muted">#6f6257</color>
+    <color name="border">#e3d9c9</color>
+    <color name="accent">#9a6a00</color>
+    <color name="on_accent">#fffdf8</color>
+    <color name="danger">#9c2b1d</color>
+    <color name="danger_subtle">#f9e9e4</color>
+    <bool name="light_bars">true</bool>
+</resources>

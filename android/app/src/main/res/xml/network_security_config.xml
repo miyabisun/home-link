@@ -1,0 +1,6 @@
+<network-security-config>
+    <!-- home-link is reached over the tailnet (WireGuard-encrypted) by its MagicDNS name. -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">homeserver</domain>
+    </domain-config>
+</network-security-config>

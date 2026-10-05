@@ -1,0 +1,9 @@
+.git
+.github
+target
+*.log
+.env
+.env.*
+README.md
+android
+*.db*
