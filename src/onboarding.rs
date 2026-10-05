@@ -89,7 +89,7 @@ const VERHOEFF_P: [[u8; 10]; 8] = [
     [1, 5, 7, 6, 2, 8, 3, 0, 9, 4],
     [5, 8, 0, 3, 7, 9, 6, 1, 4, 2],
     [8, 9, 1, 6, 0, 4, 3, 5, 2, 7],
-    [9, 4, 5, 8, 1, 2, 7, 6, 3, 0],
+    [9, 4, 5, 3, 1, 2, 6, 8, 7, 0],
     [4, 2, 8, 6, 5, 7, 3, 9, 0, 1],
     [2, 7, 9, 3, 8, 0, 6, 4, 1, 5],
     [7, 0, 4, 6, 9, 1, 3, 2, 5, 8],
@@ -201,6 +201,33 @@ mod tests {
         ] {
             assert_eq!(normalize_manual(code), None, "accepted {code:?}");
         }
+    }
+
+    /// Codes that commissioned real devices; their sharing windows have expired.
+    const EXPIRED_SHARED_CODES: [&str; 3] = ["10482735974", "04691737344", "00726849676"];
+
+    #[test]
+    fn manual_codes_accept_real_codes_and_reject_any_single_digit_change() {
+        for code in EXPIRED_SHARED_CODES {
+            assert_eq!(normalize_manual(code).as_deref(), Some(code));
+            for i in 0..code.len() {
+                for d in b'0'..=b'9' {
+                    let mut changed = code.as_bytes().to_vec();
+                    if changed[i] == d {
+                        continue;
+                    }
+                    changed[i] = d;
+                    let changed = String::from_utf8(changed).unwrap();
+                    assert!(!verhoeff_ok(&changed), "accepted {changed}");
+                }
+            }
+        }
+        // The fields matter.js decodes from the first code.
+        let key = SetupKey {
+            passcode: 58_938_075,
+            short_discriminator: 4,
+        };
+        assert_eq!(keys(EXPIRED_SHARED_CODES[0]), Some(vec![key]));
     }
 
     #[test]

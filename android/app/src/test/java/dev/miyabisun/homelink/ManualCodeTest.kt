@@ -29,6 +29,18 @@ class ManualCodeTest {
         assertFalse(ManualCode.isValid("3497011233"))
     }
 
+    @Test fun acceptsRealCodesAndRejectsAnySingleDigitChange() {
+        // Codes that commissioned real devices; their sharing windows have expired.
+        for (code in listOf("10482735974", "04691737344", "00726849676")) {
+            assertTrue(code, ManualCode.isValid(code))
+            for (i in code.indices) for (d in '0'..'9') {
+                if (code[i] == d) continue
+                val changed = code.replaceRange(i, i + 1, d.toString())
+                assertFalse(changed, ManualCode.isValid(changed))
+            }
+        }
+    }
+
     @Test fun placesTheCursorAfterTheSameNumberOfDigits() {
         assertEquals(0, ManualCode.cursor("3497 011 2", 0))
         assertEquals(4, ManualCode.cursor("3497 011 2", 4))
