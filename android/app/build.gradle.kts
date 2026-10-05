@@ -7,12 +7,12 @@ android {
         applicationId = "dev.miyabisun.homelink"
         minSdk = 37
         targetSdk = 37
-        versionCode = 2
-        versionName = "0.1.1"
+        versionCode = 3
+        versionName = "0.1.2"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         // The tailnet URL of the home-link API. Cleartext is permitted only for
         // the host in res/xml/network_security_config.xml.
-        val url = (findProperty("homeLinkUrl") as String?) ?: "http://homeserver:5009"
+        val url = (findProperty("homeLinkUrl") as String?) ?: "http://homeserver:5011"
         buildConfigField("String", "HOME_LINK_URL", "\"$url\"")
     }
     buildFeatures { buildConfig = true }

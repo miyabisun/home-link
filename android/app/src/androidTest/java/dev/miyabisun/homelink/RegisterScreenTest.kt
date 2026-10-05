@@ -110,7 +110,7 @@ class RegisterScreenTest {
 
             api.failure = ApiError.UNREACHABLE
             screen.onActivity { button(it, "登録").performClick() }
-            eventually(screen) { hasLabel(it, "home-link（homeserver:5009）に接続できません。Tailscaleの接続を確認してください") }
+            eventually(screen) { hasLabel(it, "home-link（homeserver:5011）に接続できません。Tailscaleの接続を確認してください") }
             assertInputsKept(screen)
             capture(screen, "unreachable")
             screen.onActivity { button(it, "再接続").performClick() }

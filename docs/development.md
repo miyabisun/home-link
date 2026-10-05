@@ -53,7 +53,7 @@ cd android
 
 APKは `android/app/build/outputs/apk/debug/app-debug.apk` に出力します。
 package IDは `dev.miyabisun.homelink` です。
-接続先は既定で `http://homeserver:5009` です。別のURLでビルドするには `-PhomeLinkUrl=http://…` を付けます。
+接続先は既定で `http://homeserver:5011` です。別のURLでビルドするには `-PhomeLinkUrl=http://…` を付けます。
 平文HTTPを許可するホストは `app/src/main/res/xml/network_security_config.xml` に書いています。
 ホスト名を変える場合は、このファイルも合わせて変更してください。
 

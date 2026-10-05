@@ -21,8 +21,8 @@ MatterのQRコードには機器のsetup passcodeが含まれます。
 データベースはコンテナ内の `/data` に置かれるので、ボリュームを割り当てます。
 
 ```sh
-docker run -d --name home-link -p 5009:3000 -v home-link-data:/data ghcr.io/miyabisun/home-link:latest
-curl http://127.0.0.1:5009/healthz
+docker run -d --name home-link -p 5011:3000 -v home-link-data:/data ghcr.io/miyabisun/home-link:latest
+curl http://127.0.0.1:5011/healthz
 ```
 
 `ok` が返れば起動しています。
@@ -38,7 +38,7 @@ curl http://127.0.0.1:5009/healthz
 ## Androidアプリ
 
 Android 17以降の端末と、Tailscaleへの接続が必要です。
-アプリは `http://homeserver:5009` へ接続します。
+アプリは `http://homeserver:5011` へ接続します。
 `homeserver` はtailnetのMagicDNS名なので、Tailscaleが有効なら家の外からも使えます。
 QRの読み取りにはGoogle Playサービスのコードスキャナーを使うため、カメラの権限は求めません。
 
@@ -77,14 +77,14 @@ APKは開発用のdebug署名です。PCからADBで導入する方法と、フ�
 QRコードは `MT:` で始まるMatterのセットアップコードとして検証し、前後の空白は除いて保存します。
 
 ```sh
-curl -X POST http://homeserver:5009/api/rooms -H 'content-type: application/json' -d '{"name":"寝室"}'
+curl -X POST http://homeserver:5011/api/rooms -H 'content-type: application/json' -d '{"name":"寝室"}'
 # {"id":1,"name":"寝室","device_count":0}
 
-curl -X POST http://homeserver:5009/api/devices -H 'content-type: application/json' \
+curl -X POST http://homeserver:5011/api/devices -H 'content-type: application/json' \
   -d '{"room_id":1,"qr_payload":"MT:Y.K9042C00KA0648G00","name":"天井灯"}'
 # {"id":1,"room_id":1,"room_name":"寝室","name":"天井灯","created_at":"2026-10-05T09:46:07Z"}
 
-curl -X DELETE http://homeserver:5009/api/rooms/1
+curl -X DELETE http://homeserver:5011/api/rooms/1
 # {"error":"room_has_devices","message":"この部屋には機器が1台登録されています。先に機器を削除してください"}
 ```
 
