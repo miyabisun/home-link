@@ -29,6 +29,8 @@ cargo test --locked
 `tests/api.rs` はメモリ上のSQLiteでAPIの要求と応答を検証します。
 `src/onboarding.rs` はMatterのQRコード（Base38）と手動ペアリングコード（Verhoeff）の検証、
 同じ機器かを判定するキーの取り出しと、そのテストを持ちます。
+`src/matter.rs` はmatterjs-serverのWebSocket APIから全nodeを読み、識別子からnodeとendpointを引きます。
+状態APIのテストは、`tests/api.rs` の中で同じ応答を返すWebSocketサーバーを立てて検証します。
 
 コンテナは次のように作成し、確認できます。
 

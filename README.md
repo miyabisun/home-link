@@ -4,6 +4,9 @@
 電球などに印刷されたMatterのQRコードをAndroidアプリで読み取り、部屋と名前を付けて登録します。
 QRコードが無い機器は、印字された11桁の数字（Matterの手動ペアリングコード）を入力して登録します。
 登録した内容は、自宅サーバーで動くhome-linkのAPIがSQLiteに保存します。
+機器自身の識別子（ベンダー名とシリアル番号、Wi-Fi機器はMACアドレス）も保存でき、
+Matterのcontroller（[matterjs-server](https://github.com/matter-js/matterjs-server)）を作り直しても、
+台帳の機器が今どのnodeにいるかを識別子から引き直します。
 
 構成は、Rust（axum）のAPIサーバーと、Kotlinで作ったAndroidアプリです。
 Matterの機器登録（commissioning）と照明の操作は、現在のhome-linkにはありません。
@@ -35,6 +38,7 @@ curl http://127.0.0.1:5011/healthz
 | `PORT` | `3000` | 待ち受けるTCPポート。1〜65535の10進数で、不正な値では起動しません。 |
 | `DATABASE_PATH` | `home-link.db`（コンテナでは `/data/home-link.db`） | SQLiteデータベースのファイル。無ければ作成します。 |
 | `LOG_LEVEL` | `info` | `off`・`error`・`warn`・`info`・`debug`・`trace` のいずれか。 |
+| `MATTER_SERVER_URL` | なし | matterjs-serverのWebSocket API（例: `ws://192.168.1.100:5580/ws`）。未設定なら状態APIは503を返します。 |
 
 ## Androidアプリ
 
@@ -71,17 +75,29 @@ APKは開発用のdebug署名です。PCからADBで導入する方法と、フ�
 | `PATCH /api/rooms/{id}` | 部屋の名前の変更。本文は作成と同じ | 404 `room_not_found`、409 `duplicate_room_name` |
 | `DELETE /api/rooms/{id}` | 部屋の削除。機器が残っている部屋は削除しません | 404 `room_not_found`、409 `room_has_devices` |
 | `GET /api/devices` | 機器の一覧。コードは含みません | |
-| `POST /api/devices` | 機器の登録 | 400 `invalid_qr_payload`・`invalid_manual_code`・`missing_setup_code`・`invalid_device_name`、404 `room_not_found`、409 `duplicate_qr_payload` |
+| `POST /api/devices` | 機器の登録 | 400 `invalid_qr_payload`・`invalid_manual_code`・`missing_setup_code`・`invalid_identifier`・`invalid_mac`・`invalid_device_name`、404 `room_not_found`、409 `duplicate_qr_payload`・`duplicate_identifier` |
 | `GET /api/devices/{id}` | 機器1台。登録したコードの全文 `qr_payload` または `manual_code` を含みます | 404 `device_not_found` |
 | `DELETE /api/devices/{id}` | 機器の削除 | 404 `device_not_found` |
-| `GET /api/health`、`GET /healthz` | 稼働確認 | |
+| `GET /api/status` | 台帳の機器ごとに、matterjs-serverで見えるか（`visible`）と今の `node_id`・`endpoint` | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
+| `GET /api/health` | 稼働確認と版（`{"status":"ok","version":"0.1.4"}`） | |
+| `GET /healthz` | 稼働確認（`ok`） | |
 
 部屋の名前は前後の空白を除いて1〜100文字、機器名は0〜100文字です。
-機器の登録では、QRコード `qr_payload` と手動ペアリングコード `manual_code` のどちらか一方を送ります。
+機器の登録では、QRコード `qr_payload` と手動ペアリングコード `manual_code` のどちらか一方、
+または機器の識別子 `vendor` と `serial_number` の組を送ります。コードと識別子は両方送っても構いません。
 QRコードは `MT:` で始まるMatterのセットアップコードとして検証し、前後の空白は除いて保存します。
 手動ペアリングコードは空白とハイフンを除いた11桁の数字にして、チェック数字とsetup passcodeを検証して保存します。
 QRコードと手動ペアリングコードは、setup passcodeとdiscriminatorの上位4ビットが一致すれば同じ機器として扱い、
 二重登録を `duplicate_qr_payload` で拒否します。
+
+識別子は、matterjs-serverが機器から読んだBasic Information（ブリッジ配下の機器はBridged Device Basic Information）の
+VendorNameとSerialNumberです。Aqara Hub M3配下のT2ではZigbeeのIEEEアドレス、TapoではWi-FiのMACがSerialNumberになります。
+`vendor` と `serial_number` は両方を前後の空白を除いて1〜100文字で送り、`mac` は任意で16進数12桁（`:` と `-` は除きます）を送ります。
+同じ `vendor` と `serial_number` の組、または同じ `mac` の二重登録は `duplicate_identifier` で拒否します。
+
+`GET /api/status` は、そのたびにmatterjs-serverの全nodeを読み、識別子から機器の今の `node_id` と `endpoint` を引きます。
+node IDとendpointはmatterjs-serverが振る番号なので台帳には保存しません。
+`visible: false` の機器は、matterjs-serverに見えないか識別子が無い機器で、matterjs-serverへの登録し直しが必要です。
 
 ```sh
 curl -X POST http://homeserver:5011/api/rooms -H 'content-type: application/json' -d '{"name":"寝室"}'
@@ -94,6 +110,13 @@ curl -X POST http://homeserver:5011/api/devices -H 'content-type: application/js
 curl -X POST http://homeserver:5011/api/devices -H 'content-type: application/json' \
   -d '{"room_id":1,"manual_code":"3497 011 2332","name":"天井灯"}'
 # {"error":"duplicate_qr_payload","message":"この機器は登録済みです"}
+
+curl -X POST http://homeserver:5011/api/devices -H 'content-type: application/json' \
+  -d '{"room_id":1,"vendor":"Tapo","serial_number":"CCBABDE0C244","mac":"CC:BA:BD:E0:C2:44","name":"読書灯"}'
+# {"id":2,"room_id":1,"room_name":"寝室","name":"読書灯","vendor":"Tapo","serial_number":"CCBABDE0C244","mac":"CCBABDE0C244","created_at":"2026-10-05T12:30:00Z"}
+
+curl http://homeserver:5011/api/status
+# {"devices":[{"endpoint":null,"id":1,"name":"天井灯","node_id":null,"room_name":"寝室","visible":false},{"endpoint":0,"id":2,"name":"読書灯","node_id":5,"room_name":"寝室","visible":true}],"version":"0.1.4"}
 
 curl -X DELETE http://homeserver:5011/api/rooms/1
 # {"error":"room_has_devices","message":"この部屋には機器が1台登録されています。先に機器を削除してください"}

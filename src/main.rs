@@ -18,7 +18,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let listener = TcpListener::bind(bind_addr).await?;
     info!(%bind_addr, "server listening");
 
-    axum::serve(listener, home_link::app(db))
+    let matter_url = std::env::var("MATTER_SERVER_URL")
+        .ok()
+        .filter(|url| !url.is_empty());
+    info!(
+        matter_url = matter_url.as_deref().unwrap_or("unset"),
+        "matterjs-server"
+    );
+
+    axum::serve(listener, home_link::app(db, matter_url))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 

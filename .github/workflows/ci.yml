@@ -57,7 +57,9 @@ jobs:
           done
 
           test "$(curl --fail --silent http://127.0.0.1:3100/healthz)" = "ok"
-          test "$(curl --fail --silent http://127.0.0.1:3100/api/health)" = '{"status":"ok"}'
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$GITHUB_WORKSPACE/Cargo.toml")
+          test "$(curl --fail --silent http://127.0.0.1:3100/api/health)" = "{\"status\":\"ok\",\"version\":\"$version\"}"
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:3100/api/status)" = "503"
           test "$(curl --fail --silent -X POST -H 'content-type: application/json' -d '{"name":"smoke"}' http://127.0.0.1:3100/api/rooms)" = '{"id":1,"name":"smoke","device_count":0}'
           test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:3100/api/missing)" = "404"
 

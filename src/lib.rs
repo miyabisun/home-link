@@ -1,3 +1,4 @@
+pub mod matter;
 pub mod onboarding;
 
 use std::sync::{Arc, Mutex};
@@ -16,9 +17,6 @@ use tower_http::trace::TraceLayer;
 
 const MAX_NAME_CHARS: usize = 100;
 const MAX_QR_CHARS: usize = 512;
-
-// ponytail: one connection behind a global lock; a pool if writes ever contend.
-type Db = Arc<Mutex<Connection>>;
 
 /// Opens (or creates) the `SQLite` database and applies the schema.
 ///
@@ -41,10 +39,43 @@ pub fn open_db(path: &str) -> rusqlite::Result<Connection> {
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
         );",
     )?;
+    let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 1 {
+        // Version 1 makes the setup code optional and adds the device's own identifiers.
+        db.execute_batch(
+            "BEGIN;
+            CREATE TABLE devices_v1 (
+                id INTEGER PRIMARY KEY,
+                room_id INTEGER NOT NULL REFERENCES rooms(id) ON DELETE RESTRICT,
+                qr_payload TEXT UNIQUE,
+                vendor TEXT,
+                serial_number TEXT,
+                mac TEXT UNIQUE,
+                name TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                UNIQUE (vendor, serial_number),
+                CHECK (qr_payload IS NOT NULL OR serial_number IS NOT NULL)
+            );
+            INSERT INTO devices_v1 (id, room_id, qr_payload, name, created_at)
+                SELECT id, room_id, qr_payload, name, created_at FROM devices;
+            DROP TABLE devices;
+            ALTER TABLE devices_v1 RENAME TO devices;
+            PRAGMA user_version = 1;
+            COMMIT;",
+        )?;
+    }
     Ok(db)
 }
 
-pub fn app(db: Connection) -> Router {
+struct AppState {
+    db: Mutex<Connection>,
+    matter_url: Option<String>,
+}
+
+type Db = Arc<AppState>;
+
+/// Builds the router; `matter_url` is the matterjs-server WebSocket API used by the status API.
+pub fn app(db: Connection, matter_url: Option<String>) -> Router {
     let api = Router::new()
         .route("/health", get(health))
         .route("/rooms", get(list_rooms).post(create_room))
@@ -54,8 +85,13 @@ pub fn app(db: Connection) -> Router {
         )
         .route("/devices", get(list_devices).post(create_device))
         .route("/devices/{id}", get(get_device).delete(delete_device))
+        .route("/status", get(status))
         .fallback(not_found)
-        .with_state(Arc::new(Mutex::new(db)));
+        // ponytail: one connection behind a global lock; a pool if writes ever contend.
+        .with_state(Arc::new(AppState {
+            db: Mutex::new(db),
+            matter_url,
+        }));
 
     Router::new()
         .route("/healthz", get(healthz))
@@ -108,7 +144,7 @@ async fn healthz() -> &'static str {
 }
 
 async fn health() -> Json<serde_json::Value> {
-    Json(json!({ "status": "ok" }))
+    Json(json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }))
 }
 
 async fn not_found() -> ApiError {
@@ -166,7 +202,7 @@ fn duplicate_room_name() -> ApiError {
 }
 
 async fn list_rooms(State(db): State<Db>) -> ApiResult<Json<Vec<Room>>> {
-    let db = db.lock().unwrap();
+    let db = db.db.lock().unwrap();
     let mut statement = db.prepare(
         "SELECT id, name, (SELECT count(*) FROM devices WHERE room_id = rooms.id)
          FROM rooms ORDER BY id",
@@ -188,7 +224,7 @@ async fn create_room(
     Json(input): Json<RoomInput>,
 ) -> ApiResult<(StatusCode, Json<Room>)> {
     let name = valid_room_name(&input)?;
-    let db = db.lock().unwrap();
+    let db = db.db.lock().unwrap();
     match db.execute("INSERT INTO rooms (name) VALUES (?1)", [&name]) {
         Err(error) if is_unique_violation(&error) => Err(duplicate_room_name()),
         result => {
@@ -205,7 +241,7 @@ async fn rename_room(
     Json(input): Json<RoomInput>,
 ) -> ApiResult<Json<Room>> {
     let name = valid_room_name(&input)?;
-    let db = db.lock().unwrap();
+    let db = db.db.lock().unwrap();
     match db.execute(
         "UPDATE rooms SET name = ?1 WHERE id = ?2",
         params![name, id],
@@ -219,7 +255,7 @@ async fn rename_room(
 }
 
 async fn delete_room(State(db): State<Db>, Path(id): Path<i64>) -> ApiResult<StatusCode> {
-    let db = db.lock().unwrap();
+    let db = db.db.lock().unwrap();
     let room = find_room(&db, id)?.ok_or_else(room_not_found)?;
     if room.device_count > 0 {
         return Err(ApiError(
@@ -243,6 +279,9 @@ struct Device {
     room_id: i64,
     room_name: String,
     name: String,
+    vendor: Option<String>,
+    serial_number: Option<String>,
+    mac: Option<String>,
     created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     qr_payload: Option<String>,
@@ -250,18 +289,22 @@ struct Device {
     manual_code: Option<String>,
 }
 
-/// A device to register with exactly one of its QR payload or manual pairing code.
+/// A device to register with at most one of its QR payload or manual pairing code,
+/// and its own identifiers; a code or the vendor and serial number is required.
 #[derive(Deserialize)]
 struct DeviceInput {
     room_id: i64,
     qr_payload: Option<String>,
     manual_code: Option<String>,
+    vendor: Option<String>,
+    serial_number: Option<String>,
+    mac: Option<String>,
     #[serde(default)]
     name: String,
 }
 
 const DEVICE_SELECT: &str = "SELECT devices.id, room_id, rooms.name, devices.name, created_at,
-    qr_payload FROM devices JOIN rooms ON rooms.id = room_id";
+    qr_payload, vendor, serial_number, mac FROM devices JOIN rooms ON rooms.id = room_id";
 
 /// The `qr_payload` column stores either form; a QR payload starts with `MT:`.
 fn device_row(row: &rusqlite::Row, with_payload: bool) -> rusqlite::Result<Device> {
@@ -275,6 +318,9 @@ fn device_row(row: &rusqlite::Row, with_payload: bool) -> rusqlite::Result<Devic
         room_id: row.get(1)?,
         room_name: row.get(2)?,
         name: row.get(3)?,
+        vendor: row.get(6)?,
+        serial_number: row.get(7)?,
+        mac: row.get(8)?,
         created_at: row.get(4)?,
         qr_payload,
         manual_code,
@@ -298,7 +344,7 @@ fn find_device(db: &Connection, id: i64, with_payload: bool) -> ApiResult<Device
 }
 
 async fn list_devices(State(db): State<Db>) -> ApiResult<Json<Vec<Device>>> {
-    let db = db.lock().unwrap();
+    let db = db.db.lock().unwrap();
     let mut statement = db.prepare(&format!("{DEVICE_SELECT} ORDER BY devices.id"))?;
     let devices = statement
         .query_map([], |row| device_row(row, false))?
@@ -307,16 +353,25 @@ async fn list_devices(State(db): State<Db>) -> ApiResult<Json<Vec<Device>>> {
 }
 
 async fn get_device(State(db): State<Db>, Path(id): Path<i64>) -> ApiResult<Json<Device>> {
-    Ok(Json(find_device(&db.lock().unwrap(), id, true)?))
+    Ok(Json(find_device(&db.db.lock().unwrap(), id, true)?))
 }
 
-/// Validates the one setup code of `input` and returns the form to store.
-fn setup_code(input: &DeviceInput) -> ApiResult<String> {
+fn missing_setup_code() -> ApiError {
+    ApiError(
+        StatusCode::BAD_REQUEST,
+        "missing_setup_code",
+        "QRコードか手動ペアリングコードのどちらか一方、または機器の識別子（vendorとserial_number）を送ってください".into(),
+    )
+}
+
+/// Validates the optional setup code of `input` and returns the form to store.
+fn setup_code(input: &DeviceInput) -> ApiResult<Option<String>> {
     match (&input.qr_payload, &input.manual_code) {
+        (None, None) => Ok(None),
         (Some(payload), None) => {
             let payload = payload.trim();
             (payload.len() <= MAX_QR_CHARS && onboarding::is_valid(payload))
-                .then(|| payload.to_owned())
+                .then(|| Some(payload.to_owned()))
                 .ok_or_else(|| {
                     ApiError(
                         StatusCode::BAD_REQUEST,
@@ -325,19 +380,57 @@ fn setup_code(input: &DeviceInput) -> ApiResult<String> {
                     )
                 })
         }
-        (None, Some(code)) => onboarding::normalize_manual(code.trim()).ok_or_else(|| {
-            ApiError(
-                StatusCode::BAD_REQUEST,
-                "invalid_manual_code",
-                "Matterの手動ペアリングコード（11桁の数字）として正しくありません".into(),
-            )
-        }),
-        _ => Err(ApiError(
-            StatusCode::BAD_REQUEST,
-            "missing_setup_code",
-            "QRコードか手動ペアリングコードのどちらか一方を送ってください".into(),
-        )),
+        (None, Some(code)) => onboarding::normalize_manual(code.trim())
+            .map(Some)
+            .ok_or_else(|| {
+                ApiError(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_manual_code",
+                    "Matterの手動ペアリングコード（11桁の数字）として正しくありません".into(),
+                )
+            }),
+        (Some(_), Some(_)) => Err(missing_setup_code()),
     }
+}
+
+/// The device's own identifiers: `(vendor, serial_number)` and a Wi-Fi MAC.
+type Identifiers = (Option<(String, String)>, Option<String>);
+
+/// Validates the vendor and serial number (both or neither) and normalizes the MAC
+/// to 12 upper-case hex digits.
+fn identifiers(input: &DeviceInput) -> ApiResult<Identifiers> {
+    let invalid = || {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_identifier",
+            format!("vendorとserial_numberは両方を1〜{MAX_NAME_CHARS}文字で送ってください"),
+        )
+    };
+    let serial = match (&input.vendor, &input.serial_number) {
+        (None, None) => None,
+        (Some(vendor), Some(serial)) => Some((
+            clean_name(vendor, false).ok_or_else(invalid)?,
+            clean_name(serial, false).ok_or_else(invalid)?,
+        )),
+        _ => return Err(invalid()),
+    };
+    let mac = input
+        .mac
+        .as_deref()
+        .map(|mac| {
+            let hex: String = mac.chars().filter(|c| !matches!(c, ':' | '-')).collect();
+            (hex.len() == 12 && hex.chars().all(|c| c.is_ascii_hexdigit()))
+                .then(|| hex.to_ascii_uppercase())
+                .ok_or_else(|| {
+                    ApiError(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_mac",
+                        "MACアドレスは16進数12桁で送ってください".into(),
+                    )
+                })
+        })
+        .transpose()?;
+    Ok((serial, mac))
 }
 
 fn duplicate_device() -> ApiError {
@@ -354,10 +447,11 @@ fn is_registered(db: &Connection, code: &str) -> rusqlite::Result<bool> {
     let new = onboarding::keys(code).unwrap_or_default();
     let mut statement = db.prepare("SELECT qr_payload FROM devices")?;
     let stored = statement
-        .query_map([], |row| row.get::<_, String>(0))?
+        .query_map([], |row| row.get::<_, Option<String>>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(stored
         .iter()
+        .flatten()
         .flat_map(|code| onboarding::keys(code).unwrap_or_default())
         .any(|key| new.contains(&key)))
 }
@@ -367,6 +461,10 @@ async fn create_device(
     Json(input): Json<DeviceInput>,
 ) -> ApiResult<(StatusCode, Json<Device>)> {
     let code = setup_code(&input)?;
+    let (serial, mac) = identifiers(&input)?;
+    if code.is_none() && serial.is_none() {
+        return Err(missing_setup_code());
+    }
     let name = clean_name(&input.name, true).ok_or_else(|| {
         ApiError(
             StatusCode::BAD_REQUEST,
@@ -374,14 +472,31 @@ async fn create_device(
             format!("機器名は{MAX_NAME_CHARS}文字以内で入力してください"),
         )
     })?;
-    let db = db.lock().unwrap();
+    let db = db.db.lock().unwrap();
     find_room(&db, input.room_id)?.ok_or_else(room_not_found)?;
-    if is_registered(&db, &code)? {
+    if let Some(code) = &code
+        && is_registered(&db, code)?
+    {
         return Err(duplicate_device());
     }
+    let (vendor, serial_number) = serial.unzip();
+    let taken: bool = db.query_row(
+        "SELECT EXISTS (SELECT 1 FROM devices
+            WHERE (vendor = ?1 AND serial_number = ?2) OR mac = ?3)",
+        params![vendor, serial_number, mac],
+        |row| row.get(0),
+    )?;
+    if taken {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "duplicate_identifier",
+            "同じ識別子の機器が登録済みです".into(),
+        ));
+    }
     match db.execute(
-        "INSERT INTO devices (room_id, qr_payload, name) VALUES (?1, ?2, ?3)",
-        params![input.room_id, code, name],
+        "INSERT INTO devices (room_id, qr_payload, vendor, serial_number, mac, name)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![input.room_id, code, vendor, serial_number, mac, name],
     ) {
         Err(error) if is_unique_violation(&error) => Err(duplicate_device()),
         result => {
@@ -393,8 +508,66 @@ async fn create_device(
 }
 
 async fn delete_device(State(db): State<Db>, Path(id): Path<i64>) -> ApiResult<StatusCode> {
-    let db = db.lock().unwrap();
+    let db = db.db.lock().unwrap();
     find_device(&db, id, false)?;
     db.execute("DELETE FROM devices WHERE id = ?1", [id])?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// A ledger device and where matterjs-server currently serves it.
+#[derive(Serialize)]
+struct DeviceStatus {
+    id: i64,
+    room_name: String,
+    name: String,
+    visible: bool,
+    node_id: Option<u64>,
+    endpoint: Option<u16>,
+}
+
+/// Locates every ledger device on matterjs-server by its vendor and serial number.
+/// Devices it does not serve, or without identifiers, are not visible and need
+/// registering again.
+// ponytail: reads every node per request; cache with subscriptions if polled often.
+async fn status(State(state): State<Db>) -> ApiResult<Json<serde_json::Value>> {
+    let url = state.matter_url.as_deref().ok_or_else(|| {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "matter_server_not_configured",
+            "matterjs-serverの接続先（MATTER_SERVER_URL）が設定されていません".into(),
+        )
+    })?;
+    let nodes = matter::fetch_nodes(url).await.map_err(|error| {
+        tracing::warn!(%error, "matterjs-server unreachable");
+        ApiError(
+            StatusCode::BAD_GATEWAY,
+            "matter_server_unreachable",
+            "matterjs-serverから機器を読めませんでした".into(),
+        )
+    })?;
+    let db = state.db.lock().unwrap();
+    let mut statement = db.prepare(&format!("{DEVICE_SELECT} ORDER BY devices.id"))?;
+    let devices = statement
+        .query_map([], |row| device_row(row, false))?
+        .map(|device| {
+            let device = device?;
+            let place = device
+                .vendor
+                .as_deref()
+                .zip(device.serial_number.as_deref())
+                .and_then(|(vendor, serial)| matter::locate(&nodes, vendor, serial));
+            Ok(DeviceStatus {
+                id: device.id,
+                room_name: device.room_name,
+                name: device.name,
+                visible: place.is_some(),
+                node_id: place.map(|(node, _)| node),
+                endpoint: place.map(|(_, endpoint)| endpoint),
+            })
+        })
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(Json(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "devices": devices,
+    })))
 }
