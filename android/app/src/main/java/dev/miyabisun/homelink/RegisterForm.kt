@@ -14,6 +14,7 @@ class RegisterForm {
     var rooms: List<Room> = emptyList()
     var name = ""
     var busy = false
+    var roomsFailed = false
     var status: Status? = null
 
     fun canRegister() = payload != null && roomId != null && !busy
@@ -34,8 +35,14 @@ class RegisterForm {
             is ApiResult.Ok -> {
                 rooms = result.value
                 if (rooms.none { it.id == roomId }) roomId = rooms.firstOrNull()?.id
+                // A successful load proves the server is reachable again.
+                if (status == Status.Failed(ApiError.UNREACHABLE)) status = null
+                roomsFailed = false
             }
-            is ApiResult.Failed -> status = Status.Failed(result.error)
+            is ApiResult.Failed -> {
+                roomsFailed = true
+                status = Status.Failed(result.error)
+            }
         }
     }
 

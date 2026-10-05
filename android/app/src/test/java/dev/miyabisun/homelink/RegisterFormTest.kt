@@ -53,6 +53,23 @@ class RegisterFormTest {
         assertEquals(Status.Failed(ApiError.UNREACHABLE), form.status)
     }
 
+    @Test fun aRoomLoadFailureOutlivesLaterMessages() {
+        val form = RegisterForm()
+        form.rooms(ApiResult.Failed(ApiError.UNREACHABLE))
+        assertTrue(form.roomsFailed)
+        form.status = Status.ScanFailed
+        form.scanned(qr)
+        assertTrue(form.roomsFailed)
+        form.rooms(ApiResult.Failed(ApiError.UNREACHABLE))
+        form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
+        assertFalse(form.roomsFailed)
+        assertNull(form.status)
+
+        form.status = Status.Failed(ApiError.DUPLICATE_QR)
+        form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
+        assertEquals(Status.Failed(ApiError.DUPLICATE_QR), form.status)
+    }
+
     @Test fun createdRoomsAreAddedAndSelected() {
         val form = RegisterForm()
         form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))

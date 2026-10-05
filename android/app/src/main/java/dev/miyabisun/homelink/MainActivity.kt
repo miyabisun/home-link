@@ -107,7 +107,6 @@ class MainActivity : Activity() {
         render()
         background({ api.rooms() }) { result ->
             loadingRooms = false
-            if (result is ApiResult.Ok && form.status == Status.Failed(ApiError.UNREACHABLE)) form.status = null
             form.rooms(result)
             render()
         }
@@ -270,7 +269,7 @@ class MainActivity : Activity() {
         roomSpinner.visibility = if (names.isEmpty()) View.GONE else View.VISIBLE
         roomState.text = when {
             loadingRooms && names.isEmpty() -> "部屋を読み込み中…"
-            names.isEmpty() && form.status == Status.Failed(ApiError.UNREACHABLE) -> "部屋を読み込めませんでした"
+            names.isEmpty() && form.roomsFailed -> "部屋を読み込めませんでした"
             names.isEmpty() -> "部屋がありません。「部屋を追加」から作成してください"
             else -> ""
         }
@@ -312,7 +311,8 @@ class MainActivity : Activity() {
             }
         }
         reconnectButton.visibility =
-            if (status == Status.Failed(ApiError.UNREACHABLE) && !loadingRooms) View.VISIBLE else View.GONE
+            if ((form.roomsFailed || status == Status.Failed(ApiError.UNREACHABLE)) && !loadingRooms) View.VISIBLE
+            else View.GONE
         registerButton.isEnabled = form.canRegister()
         registerButton.text = if (form.busy) "登録中…" else "登録"
     }

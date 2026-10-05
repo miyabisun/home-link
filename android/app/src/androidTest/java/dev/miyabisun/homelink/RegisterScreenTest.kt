@@ -149,6 +149,13 @@ class RegisterScreenTest {
         api.roomsFailure = ApiError.UNREACHABLE
         ActivityScenario.launch(MainActivity::class.java).use { screen ->
             eventually(screen) { hasLabel(it, "部屋を読み込めませんでした") }
+            scanner.next = ScanResult.Failed
+            screen.onActivity { activity ->
+                button(activity, "QRを読み取る").performClick()
+                assertTrue(hasLabel(activity, "QRコードを読み取れませんでした。もう一度お試しください"))
+                assertTrue(hasLabel(activity, "部屋を読み込めませんでした"))
+                assertTrue(button(activity, "再接続").isShown)
+            }
             capture(screen, "offline")
             api.roomsFailure = null
             api.rooms += Room(1, "寝室")
