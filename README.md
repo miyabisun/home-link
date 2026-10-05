@@ -88,12 +88,13 @@ APKは開発用のdebug署名です。PCからADBで導入する方法と、フ�
 | `GET /api/devices` | 機器の一覧。コードは含みません | |
 | `POST /api/devices` | 機器の登録 | 400 `invalid_qr_payload`・`invalid_manual_code`・`missing_setup_code`・`invalid_identifier`・`invalid_mac`・`invalid_device_name`、404 `room_not_found`、409 `duplicate_qr_payload`・`duplicate_identifier` |
 | `GET /api/devices/{id}` | 機器1台。登録したコードの全文 `qr_payload` または `manual_code` を含みます | 404 `device_not_found` |
+| `PATCH /api/devices/{id}` | 自動調整の色温度の下限の変更。本文は `{"min_kelvin": 4000}`、`null` で下限なし | 400 `invalid_min_kelvin`、404 `device_not_found` |
 | `DELETE /api/devices/{id}` | 機器の削除 | 404 `device_not_found` |
 | `GET /api/status` | 台帳の機器ごとに、matterjs-serverで見えるか（`visible`）と今の `node_id`・`endpoint` | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `GET /api/lights` | 照明ごとの今の状態（`on`・`off`・`no_response`）と、その件数 | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `POST /api/lights/on` | 全部の照明をオンにし、照明ごとの結果（`switched`・`no_response`・`failed`）と件数を返します | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `POST /api/lights/off` | 全部の照明をオフにします。応答は `on` と同じ形です | 同上 |
-| `GET /api/lights/schedule` | 明るさと色温度の自動調整の設定（`settings`）、最後に押された全部オン・全部オフ（`intent`）、直近の調整の記録（`runs`、新しい順に48回分） | |
+| `GET /api/lights/schedule` | 明るさと色温度の自動調整の設定（`settings`）、照明ごとの色温度の下限（`floors`）、最後に押された全部オン・全部オフ（`intent`）、直近の調整の記録（`runs`、新しい順に144回分） | |
 | `PUT /api/lights/schedule` | 自動調整の設定のうち、送った項目だけを変更します。応答は `GET` と同じ形です | 400 `invalid_schedule` |
 | `GET /api/health` | 稼働確認と版（`{"status":"ok","version":"0.1.4"}`） | |
 | `GET /healthz` | 稼働確認（`ok`） | |
@@ -125,20 +126,29 @@ nodeが使えない照明と、ブリッジが届かないと報告している�
 
 ### 明るさと色温度の自動調整
 
-有効にすると、毎時0分に、点いている照明の明るさと色温度をその時刻の値へ合わせます。既定では無効です。
+有効にすると、10分ごと（毎時0分・10分・…）に、点いている照明の明るさと色温度をその時刻の値へ合わせます。既定では無効です。
+明るさの割合はLevel Controlの254を100%とします（80%は203、40%は102）。
 
-- 22時から5時までは `night_level` の明るさ・`warm_kelvin` の色温度にします。
-- 5時以降は、日の出から2時間かけて `day_level` の明るさ・`cool_kelvin` の色温度へ近づけます。
-- 日の入りの2時間前から日の入りまでに `warm_kelvin` へ戻し、22時まではその色で `day_level` の明るさを保ちます。
+| 時間帯 | 明るさ | 色温度 |
+| --- | --- | --- |
+| 朝: 日の出（5時より前なら5時）→ `morning_end_minute` | `night_level` → `day_level` へ線形に上げる | `warm_kelvin` → `cool_kelvin` へ線形に上げる |
+| 昼: `morning_end_minute` → 日の入り | `day_level` | `cool_kelvin` |
+| 夕: 日の入り → 22時 | `day_level` → `night_level` へ線形に下げる | `cool_kelvin` → `warm_kelvin` へ線形に下げる |
+| 夜: 22時 → 翌朝の開始 | `night_level` | `warm_kelvin` |
+
 - 日の出・日の入りは `latitude`・`longitude` とAsia/Tokyoの時刻で計算します。既定は東京（新宿）です。
+- 台帳の機器に色温度の下限（`min_kelvin`、`PATCH /api/devices/{id}`）があれば、その照明へはそれより低い色温度を送りません。
 - 色温度と明るさは、照明ごとに報告された範囲へ収めます。色温度に対応しない照明へは色温度を、調光しない照明へは明るさを送りません。
+- 1回の変化は30秒（`transitionTime` 300）かけて移します。
+- 前回送った値と同じ値は送りません。送った値はメモリだけに持ち、再起動後は改めて送ります。
 
 | 設定 | 既定値 | 内容 |
 | --- | --- | --- |
 | `enabled` | `false` | 自動調整を行うか |
 | `latitude`・`longitude` | `35.6895`・`139.6917` | 日の出・日の入りを計算する地点 |
-| `day_level`・`night_level` | `254`・`40` | 日中と22時〜5時の明るさ（1〜254） |
-| `warm_kelvin`・`cool_kelvin` | `2700`・`5000` | 夜・夕方と日中の色温度（K）。`warm_kelvin` は `cool_kelvin` 以下 |
+| `morning_end_minute` | `600`（10:00） | 朝の上昇が昼の値に達する時刻（0時からの分、301〜1319） |
+| `day_level`・`night_level` | `203`・`102` | 昼と夜の明るさ（1〜254） |
+| `warm_kelvin`・`cool_kelvin` | `3000`・`5000` | 夜と昼の色温度（K）。`warm_kelvin` は `cool_kelvin` 以下 |
 
 点灯を伴う書き込みはしません。
 
@@ -151,21 +161,24 @@ nodeが使えない照明と、ブリッジが届かないと報告している�
   押された操作と時刻は保存し、再起動しても保ちます。照明ごとのオン・オフは保存せず、毎回matterjs-serverから読みます。
 - 有効なときに「全部オン」を押すと、点けた後にその時刻の値へ合わせます。
 
-`runs` は調整ごとに、時刻（`at`）、きっかけ（`trigger`: `hourly` または `lights_on`）、目標値（`level`・`kelvin`）、
+`runs` は調整ごとに、時刻（`at`）、きっかけ（`trigger`: `scheduled` または `lights_on`）、目標値（`level`・`kelvin`）、
 日の出・日の入り、送った命令の数（`commands`）、照明ごとの判断（`decision`）を持ちます。
 判断は、送った `sent`、全部オフ中の `all_off`、無効の `disabled`、消えていた `off`、届かない `no_response`、
-エラーが返った `failed`、調光にも色温度にも対応しない `unsupported` です。
+エラーが返った `failed`、調光にも色温度にも対応しない `unsupported`、前回と同じ値の `unchanged` です。
+`sent` の照明の `level`・`mireds` は、前回から変わって送った値だけを持ちます。
 記録はメモリだけに持ち、再起動で消えます。
 
 ```sh
 curl -X PUT http://homeserver:5011/api/lights/schedule -H 'content-type: application/json' -d '{"enabled":true}'
-# {"settings":{"enabled":true,"latitude":35.6895,"longitude":139.6917,"day_level":254,"night_level":40,"warm_kelvin":2700,"cool_kelvin":5000},
-#  "intent":{"action":"on","at":"2026-10-05T21:10:00+09:00"},"runs":[…]}
+# {"settings":{"enabled":true,"latitude":35.6895,"longitude":139.6917,"morning_end_minute":600,"day_level":203,"night_level":102,"warm_kelvin":3000,"cool_kelvin":5000},
+#  "floors":[{"id":3,"name":"Tapo 1","room_name":"リビング","min_kelvin":4000},…],"intent":{"action":"on","at":"2026-10-05T21:10:00+09:00"},"runs":[…]}
 
 curl http://homeserver:5011/api/lights/schedule
-# {…,"runs":[{"at":"2026-10-05T23:00:00+09:00","trigger":"hourly","sunrise":"05:39","sunset":"17:23","level":40,"kelvin":2700,"commands":2,
-#   "lights":[{"node_id":1,"endpoint":3,"name":"キッチン","room_name":"リビング","decision":"sent","level":40,"mireds":370},
+# {…,"runs":[{"at":"2026-10-05T23:00:00+09:00","trigger":"scheduled","sunrise":"05:39","sunset":"17:23","level":102,"kelvin":3000,"commands":2,
+#   "lights":[{"node_id":1,"endpoint":3,"name":"キッチン","room_name":"リビング","decision":"sent","level":102,"mireds":333},
 #             {"node_id":5,"endpoint":1,"name":"読書灯","room_name":"寝室","decision":"off"},…]},…]}
+
+curl -X PATCH http://homeserver:5011/api/devices/3 -H 'content-type: application/json' -d '{"min_kelvin":4000}'
 ```
 
 ### 例

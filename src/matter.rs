@@ -280,8 +280,10 @@ pub struct Tuned {
 
 const TUNE_TIMEOUT: Duration = Duration::from_mins(1);
 const REPLY_TIMEOUT: Duration = Duration::from_secs(3);
+/// Each change fades over 30 s (tenths of a second) so a step every ten minutes goes unnoticed.
+const TRANSITION: u16 = 300;
 
-/// Reads every light, asks `plan` what to send each, reads the On/Off of each
+/// Reads every light, asks `plan` what to send each given the nodes read, reads the On/Off of each
 /// light to write to again, and sends the level and colour temperature only to
 /// lights read as on. Commands never carry `ExecuteIfOff`, so a light switched
 /// off in between ignores them and stays off.
@@ -291,7 +293,7 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(3);
 /// adjustment overruns.
 pub async fn tune(
     url: &str,
-    plan: impl Fn(&Light) -> Result<Target, Skip>,
+    plan: impl Fn(&[Value], &Light) -> Result<Target, Skip>,
 ) -> Result<Tuned, String> {
     tokio::time::timeout(TUNE_TIMEOUT, async {
         let mut ws = connect(url).await?;
@@ -305,7 +307,7 @@ pub async fn tune(
 
 async fn tune_all(
     ws: &mut Socket,
-    plan: impl Fn(&Light) -> Result<Target, Skip>,
+    plan: impl Fn(&[Value], &Light) -> Result<Target, Skip>,
 ) -> Result<Tuned, Dropped> {
     let nodes = get_nodes(ws).await?;
     let mut tuned = Tuned {
@@ -314,7 +316,7 @@ async fn tune_all(
         nodes: Vec::new(),
     };
     for light in lights(&nodes) {
-        let decision = match plan(&light) {
+        let decision = match plan(&nodes, &light) {
             Err(skip) => Decision::Skipped(skip),
             Ok(target) => tune_one(ws, &light, target, &mut tuned.commands).await?,
         };
@@ -350,14 +352,14 @@ async fn tune_one(
         (
             8,
             "MoveToLevel",
-            json!({ "level": level, "transitionTime": 0, "optionsMask": 0, "optionsOverride": 0 }),
+            json!({ "level": level, "transitionTime": TRANSITION, "optionsMask": 0, "optionsOverride": 0 }),
         )
     });
     let mireds = target.mireds.map(|mireds| {
         (
             768,
             "MoveToColorTemperature",
-            json!({ "colorTemperatureMireds": mireds, "transitionTime": 0, "optionsMask": 0, "optionsOverride": 0 }),
+            json!({ "colorTemperatureMireds": mireds, "transitionTime": TRANSITION, "optionsMask": 0, "optionsOverride": 0 }),
         )
     });
     for (cluster, command, payload) in level.into_iter().chain(mireds) {

@@ -28,7 +28,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let home = home_link::Home::new(db, matter_url.clone());
     if matter_url.is_some() {
-        tokio::spawn(home.clone().hourly());
+        tokio::spawn(home.clone().every_ten_minutes());
     }
 
     axum::serve(listener, home.router())

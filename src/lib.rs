@@ -3,7 +3,7 @@ pub mod onboarding;
 pub mod schedule;
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -76,6 +76,15 @@ pub fn open_db(path: &str) -> rusqlite::Result<Connection> {
             COMMIT;",
         )?;
     }
+    if version < 2 {
+        // Version 2 adds each light's lowest colour temperature for the schedule.
+        db.execute_batch(
+            "BEGIN;
+            ALTER TABLE devices ADD COLUMN min_kelvin INTEGER;
+            PRAGMA user_version = 2;
+            COMMIT;",
+        )?;
+    }
     Ok(db)
 }
 
@@ -84,18 +93,21 @@ struct AppState {
     matter_url: Option<String>,
     /// The latest adjustments, newest first; kept in memory only.
     runs: Mutex<VecDeque<serde_json::Value>>,
+    /// What the schedule last sent each light, by node and endpoint; kept in memory only.
+    sent: Mutex<HashMap<(u64, u16), schedule::Target>>,
 }
 
 type Db = Arc<AppState>;
 
-const RUNS_KEPT: usize = 48;
+/// A day of runs every ten minutes.
+const RUNS_KEPT: usize = 144;
 
 /// Builds the router; `matter_url` is the matterjs-server WebSocket API used by the status API.
 pub fn app(db: Connection, matter_url: Option<String>) -> Router {
     Home::new(db, matter_url).router()
 }
 
-/// The API and the hourly light adjustment over one ledger.
+/// The API and the light adjustment every ten minutes over one ledger.
 #[derive(Clone)]
 pub struct Home(Db);
 
@@ -106,6 +118,7 @@ impl Home {
             db: Mutex::new(db),
             matter_url,
             runs: Mutex::new(VecDeque::new()),
+            sent: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -118,12 +131,12 @@ impl Home {
         adjust(&self.0, unix, trigger).await;
     }
 
-    /// Adjusts the lights at the top of every hour, forever.
-    pub async fn hourly(self) {
+    /// Adjusts the lights every ten minutes on the clock, forever.
+    pub async fn every_ten_minutes(self) {
         loop {
-            let wait = 3600 - now().rem_euclid(3600);
+            let wait = 600 - now().rem_euclid(600);
             tokio::time::sleep(Duration::from_secs(wait.unsigned_abs())).await;
-            self.adjust(now(), "hourly").await;
+            self.adjust(now(), "scheduled").await;
         }
     }
 }
@@ -143,7 +156,10 @@ fn router(state: Db) -> Router {
             axum::routing::patch(rename_room).delete(delete_room),
         )
         .route("/devices", get(list_devices).post(create_device))
-        .route("/devices/{id}", get(get_device).delete(delete_device))
+        .route(
+            "/devices/{id}",
+            get(get_device).patch(update_device).delete(delete_device),
+        )
         .route("/status", get(status))
         .route("/lights", get(light_states))
         .route("/lights/on", axum::routing::post(lights_on))
@@ -342,6 +358,8 @@ struct Device {
     vendor: Option<String>,
     serial_number: Option<String>,
     mac: Option<String>,
+    /// The schedule never sends this light a colour temperature below this.
+    min_kelvin: Option<u16>,
     created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     qr_payload: Option<String>,
@@ -364,7 +382,7 @@ struct DeviceInput {
 }
 
 const DEVICE_SELECT: &str = "SELECT devices.id, room_id, rooms.name, devices.name, created_at,
-    qr_payload, vendor, serial_number, mac FROM devices JOIN rooms ON rooms.id = room_id";
+    qr_payload, vendor, serial_number, mac, min_kelvin FROM devices JOIN rooms ON rooms.id = room_id";
 
 /// The `qr_payload` column stores either form; a QR payload starts with `MT:`.
 fn device_row(row: &rusqlite::Row, with_payload: bool) -> rusqlite::Result<Device> {
@@ -381,6 +399,7 @@ fn device_row(row: &rusqlite::Row, with_payload: bool) -> rusqlite::Result<Devic
         vendor: row.get(6)?,
         serial_number: row.get(7)?,
         mac: row.get(8)?,
+        min_kelvin: row.get(9)?,
         created_at: row.get(4)?,
         qr_payload,
         manual_code,
@@ -567,6 +586,37 @@ async fn create_device(
     }
 }
 
+/// A ledger change to a device; `min_kelvin` null removes the floor.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeviceUpdate {
+    min_kelvin: Option<u16>,
+}
+
+async fn update_device(
+    State(db): State<Db>,
+    Path(id): Path<i64>,
+    Json(input): Json<DeviceUpdate>,
+) -> ApiResult<Json<Device>> {
+    if input
+        .min_kelvin
+        .is_some_and(|k| !(1000..=10000).contains(&k))
+    {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_min_kelvin",
+            "min_kelvinは1000〜10000Kか、nullで指定してください".into(),
+        ));
+    }
+    let db = db.db.lock().unwrap();
+    find_device(&db, id, false)?;
+    db.execute(
+        "UPDATE devices SET min_kelvin = ?1 WHERE id = ?2",
+        params![input.min_kelvin, id],
+    )?;
+    Ok(Json(find_device(&db, id, false)?))
+}
+
 async fn delete_device(State(db): State<Db>, Path(id): Path<i64>) -> ApiResult<StatusCode> {
     let db = db.db.lock().unwrap();
     find_device(&db, id, false)?;
@@ -619,11 +669,7 @@ async fn status(State(state): State<Db>) -> ApiResult<Json<serde_json::Value>> {
         .query_map([], |row| device_row(row, false))?
         .map(|device| {
             let device = device?;
-            let place = device
-                .vendor
-                .as_deref()
-                .zip(device.serial_number.as_deref())
-                .and_then(|(vendor, serial)| matter::locate(&nodes, vendor, serial));
+            let place = place(&device, &nodes);
             Ok(DeviceStatus {
                 id: device.id,
                 room_name: device.room_name,
@@ -651,52 +697,67 @@ struct MissingDevice {
 /// A light's ledger name (else its product name) and room.
 type LightName = (Option<String>, Option<String>);
 
-/// Names `lights` from the ledger and lists the ledger devices `nodes` lack.
-/// A device located on endpoint 0 names the lights of its node that are not
-/// behind a bridge; a bridged device names the light on its own endpoint.
-fn match_ledger(
-    db: &Connection,
-    nodes: &[serde_json::Value],
-    lights: &[matter::Light],
-) -> rusqlite::Result<(Vec<LightName>, Vec<MissingDevice>)> {
+fn ledger(db: &Connection) -> rusqlite::Result<Vec<Device>> {
     let mut statement = db.prepare(&format!("{DEVICE_SELECT} ORDER BY devices.id"))?;
-    let devices = statement
+    statement
         .query_map([], |row| device_row(row, false))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut names = vec![(None, None); lights.len()];
-    let mut missing = Vec::new();
-    for device in devices {
-        let place = device
-            .vendor
-            .as_deref()
-            .zip(device.serial_number.as_deref())
-            .and_then(|(vendor, serial)| matter::locate(nodes, vendor, serial));
-        let Some((node, endpoint)) = place else {
-            missing.push(MissingDevice {
-                id: device.id,
-                name: device.name,
-                room_name: device.room_name,
-            });
-            continue;
-        };
-        for (light, name) in lights.iter().zip(&mut names) {
-            let names_it = light.node_id == node
+        .collect()
+}
+
+fn place(device: &Device, nodes: &[serde_json::Value]) -> Option<(u64, u16)> {
+    device
+        .vendor
+        .as_deref()
+        .zip(device.serial_number.as_deref())
+        .and_then(|(vendor, serial)| matter::locate(nodes, vendor, serial))
+}
+
+/// The ledger devices that are `light`, latest first: a device located on
+/// endpoint 0 is the lights of its node that are not behind a bridge; a bridged
+/// device the light on its own endpoint.
+fn devices_of<'a>(
+    devices: &'a [Device],
+    nodes: &'a [serde_json::Value],
+    light: &'a matter::Light,
+) -> impl Iterator<Item = &'a Device> {
+    devices.iter().rev().filter(move |device| {
+        place(device, nodes).is_some_and(|(node, endpoint)| {
+            light.node_id == node
                 && if light.bridged {
                     light.endpoint == endpoint
                 } else {
                     endpoint == 0
-                };
-            if names_it && !device.name.is_empty() {
-                *name = (Some(device.name.clone()), Some(device.room_name.clone()));
-            }
-        }
-    }
-    let names = names
-        .into_iter()
-        .zip(lights)
-        .map(|((name, room), light)| (name.or_else(|| light.product.clone()), room))
+                }
+        })
+    })
+}
+
+/// Names `lights` from the ledger and lists the ledger devices `nodes` lack.
+fn match_ledger(
+    devices: &[Device],
+    nodes: &[serde_json::Value],
+    lights: &[matter::Light],
+) -> (Vec<LightName>, Vec<MissingDevice>) {
+    let names = lights
+        .iter()
+        .map(|light| {
+            devices_of(devices, nodes, light)
+                .find(|device| !device.name.is_empty())
+                .map_or((light.product.clone(), None), |device| {
+                    (Some(device.name.clone()), Some(device.room_name.clone()))
+                })
+        })
         .collect();
-    Ok((names, missing))
+    let missing = devices
+        .iter()
+        .filter(|device| place(device, nodes).is_none())
+        .map(|device| MissingDevice {
+            id: device.id,
+            name: device.name.clone(),
+            room_name: device.room_name.clone(),
+        })
+        .collect();
+    (names, missing)
 }
 
 /// Each light with its ledger name (else its product name) and room, and `field`'s value.
@@ -742,7 +803,7 @@ async fn light_states(State(state): State<Db>) -> ApiResult<Json<serde_json::Val
             _ => "no_response",
         })
         .collect();
-    let (names, missing) = match_ledger(&state.db.lock().unwrap(), &nodes, &lights)?;
+    let (names, missing) = match_ledger(&ledger(&state.db.lock().unwrap())?, &nodes, &lights);
     Ok(Json(json!({
         "on": count(&states, "on"),
         "off": count(&states, "off"),
@@ -753,7 +814,7 @@ async fn light_states(State(state): State<Db>) -> ApiResult<Json<serde_json::Val
     })))
 }
 
-/// Switches every light on and, when the schedule is on, brings them to the hour's values.
+/// Switches every light on and, when the schedule is on, brings them to the current values.
 async fn lights_on(State(state): State<Db>) -> ApiResult<Json<serde_json::Value>> {
     let response = switch_lights(&state, true).await?;
     if load::<schedule::Settings>(&state.db.lock().unwrap(), SCHEDULE)?.enabled {
@@ -786,7 +847,7 @@ async fn switch_lights(state: &AppState, on: bool) -> ApiResult<Json<serde_json:
             matter::Outcome::Failed => "failed",
         })
         .collect();
-    let (names, missing) = match_ledger(&state.db.lock().unwrap(), &nodes, &lights)?;
+    let (names, missing) = match_ledger(&ledger(&state.db.lock().unwrap())?, &nodes, &lights);
     tracing::info!(
         on,
         switched = count(&outcomes, "switched"),
@@ -834,29 +895,33 @@ fn store<T: Serialize>(db: &Connection, key: &str, value: &T) -> rusqlite::Resul
     Ok(())
 }
 
-/// Adjusts every light that is on to the values for `unix` and records the run:
-/// nothing is written while "all off" is in force or the schedule is disabled.
+/// Adjusts every light that is on to the values for `unix`, raised to its
+/// ledger floor, and records the run: nothing is written while "all off" is in
+/// force or the schedule is disabled, nor what was already sent.
 async fn adjust(state: &AppState, unix: i64, trigger: &'static str) {
     let loaded = {
         let db = state.db.lock().unwrap();
         load::<schedule::Settings>(&db, SCHEDULE)
-            .and_then(|settings| Ok((settings, load::<Option<Intent>>(&db, INTENT)?)))
+            .and_then(|settings| Ok((settings, load::<Option<Intent>>(&db, INTENT)?, ledger(&db)?)))
     };
     let (day, minute) = schedule::local(unix);
     let mut run = json!({ "at": schedule::timestamp(unix), "trigger": trigger, "commands": 0 });
     let result = match (&loaded, &state.matter_url) {
         (Err(error), _) => Err(error.to_string()),
         (_, None) => Err("MATTER_SERVER_URL is not set".into()),
-        (Ok((settings, intent)), Some(url)) => {
+        (Ok((settings, intent, devices)), Some(url)) => {
             let sun = schedule::sun_times(day, settings.latitude, settings.longitude);
-            let (level, kelvin) = schedule::target(minute, sun, settings);
+            let goal = schedule::target(minute, sun, settings);
             let all_off = intent.as_ref().is_some_and(|i| i.action == "off");
             run["sunrise"] = json!(schedule::clock(sun.0));
             run["sunset"] = json!(schedule::clock(sun.1));
-            run["level"] = json!(level);
-            run["kelvin"] = json!(kelvin);
-            matter::tune(url, |light| {
-                schedule::plan(light, all_off, settings, level, kelvin)
+            run["level"] = json!(goal.0);
+            run["kelvin"] = json!(goal.1);
+            let sent = state.sent.lock().unwrap().clone();
+            matter::tune(url, |nodes, light| {
+                let floor = devices_of(devices, nodes, light).find_map(|d| d.min_kelvin);
+                let last = sent.get(&(light.node_id, light.endpoint)).copied();
+                schedule::plan(light, all_off, settings, goal, floor, last)
             })
             .await
         }
@@ -864,8 +929,9 @@ async fn adjust(state: &AppState, unix: i64, trigger: &'static str) {
     match result {
         Ok(tuned) => {
             let lights: Vec<_> = tuned.lights.iter().map(|(l, _)| l.clone()).collect();
-            let names = match_ledger(&state.db.lock().unwrap(), &tuned.nodes, &lights)
-                .map_or_else(|_| vec![(None, None); lights.len()], |(names, _)| names);
+            let devices = loaded.map(|(_, _, devices)| devices).unwrap_or_default();
+            let (names, _) = match_ledger(&devices, &tuned.nodes, &lights);
+            let mut memory = state.sent.lock().unwrap();
             let entries: Vec<_> = tuned
                 .lights
                 .iter()
@@ -883,6 +949,11 @@ async fn adjust(state: &AppState, unix: i64, trigger: &'static str) {
                         matter::Decision::NoResponse => json!("no_response"),
                         matter::Decision::Failed => json!("failed"),
                         matter::Decision::Sent(target) => {
+                            let last = memory
+                                .entry((light.node_id, light.endpoint))
+                                .or_insert(*target);
+                            last.level = target.level.or(last.level);
+                            last.mireds = target.mireds.or(last.mireds);
                             entry["level"] = json!(target.level);
                             entry["mireds"] = json!(target.mireds);
                             json!("sent")
@@ -907,19 +978,44 @@ async fn adjust(state: &AppState, unix: i64, trigger: &'static str) {
     runs.truncate(RUNS_KEPT);
 }
 
-/// The schedule's settings, the user's last "all on"/"all off" and the latest runs.
+/// The ledger devices with a colour temperature floor.
+#[derive(Serialize)]
+struct Floor {
+    id: i64,
+    name: String,
+    room_name: String,
+    min_kelvin: u16,
+}
+
+/// The schedule's settings, the ledger's colour temperature floors, the user's
+/// last "all on"/"all off" and the latest runs.
 async fn get_schedule(State(state): State<Db>) -> ApiResult<Json<serde_json::Value>> {
-    let (settings, intent) = {
+    let (settings, intent, floors) = {
         let db = state.db.lock().unwrap();
+        let floors: Vec<_> = ledger(&db)?
+            .into_iter()
+            .filter_map(|device| {
+                Some(Floor {
+                    min_kelvin: device.min_kelvin?,
+                    id: device.id,
+                    name: device.name,
+                    room_name: device.room_name,
+                })
+            })
+            .collect();
         (
             load::<schedule::Settings>(&db, SCHEDULE)?,
             load::<Option<Intent>>(&db, INTENT)?,
+            floors,
         )
     };
     let runs: Vec<_> = state.runs.lock().unwrap().iter().cloned().collect();
-    Ok(Json(
-        json!({ "settings": settings, "intent": intent, "runs": runs }),
-    ))
+    Ok(Json(json!({
+        "settings": settings,
+        "floors": floors,
+        "intent": intent,
+        "runs": runs,
+    })))
 }
 
 /// Merges the given fields into the schedule's settings.

@@ -1,4 +1,4 @@
-//! The hourly brightness and colour temperature of lights that are on.
+//! The brightness and colour temperature of lights that are on, every ten minutes.
 
 use serde::{Deserialize, Serialize};
 
@@ -6,11 +6,9 @@ use crate::matter::Light;
 
 /// Asia/Tokyo keeps UTC+9 all year.
 const JST: i64 = 9 * 3600;
-/// Dim from 22:00 until 05:00.
+/// The evening reaches the night's values at 22:00; the morning starts at sunrise, 05:00 at the earliest.
 const NIGHT_FROM: u32 = 22 * 60;
-const NIGHT_UNTIL: u32 = 5 * 60;
-/// Brighten and cool over this long after sunrise, warm over this long before sunset.
-const RAMP: f64 = 120.0;
+const MORNING_FROM: u32 = 5 * 60;
 
 /// The adjustable values; off until the user turns it on.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -20,23 +18,27 @@ pub struct Settings {
     /// Where sunrise and sunset are computed; Tokyo (Shinjuku) unless the user gives a city.
     pub latitude: f64,
     pub longitude: f64,
-    /// `CurrentLevel` by day and from 22:00 to 05:00, 1–254.
+    /// When the morning reaches the day's values, in minutes after midnight.
+    pub morning_end_minute: u32,
+    /// `CurrentLevel` by day and at night, 1–254.
     pub day_level: u8,
     pub night_level: u8,
-    /// Warm white at night and in the evening, cool white by day.
+    /// Warm white at night, cool white by day.
     pub warm_kelvin: u16,
     pub cool_kelvin: u16,
 }
 
 impl Default for Settings {
+    /// 80% and 40% of 254, 5000 K and 3000 K, the morning ending at 10:00.
     fn default() -> Self {
         Self {
             enabled: false,
             latitude: 35.6895,
             longitude: 139.6917,
-            day_level: 254,
-            night_level: 40,
-            warm_kelvin: 2700,
+            morning_end_minute: 10 * 60,
+            day_level: 203,
+            night_level: 102,
+            warm_kelvin: 3000,
             cool_kelvin: 5000,
         }
     }
@@ -55,6 +57,8 @@ impl Settings {
             || self.warm_kelvin > self.cool_kelvin
         {
             Some("色温度は1000〜10000Kで、warm_kelvinをcool_kelvin以下にしてください")
+        } else if !(MORNING_FROM + 1..NIGHT_FROM).contains(&self.morning_end_minute) {
+            Some("morning_end_minuteは301〜1319（05:01〜21:59）で指定してください")
         } else {
             None
         }
@@ -143,29 +147,35 @@ pub fn sun_times(day_of_year: u32, latitude: f64, longitude: f64) -> (u32, u32) 
 }
 
 /// The level and colour temperature in kelvin for `minute` of the day, given
-/// `sun` as sunrise and sunset minutes.
+/// `sun` as sunrise and sunset minutes: the night's values rise linearly from
+/// the morning's start to the day's by the morning end, and fall back from
+/// sunset to 22:00.
 // The values are rounded and clamped into range before the casts.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 #[must_use]
 pub fn target(minute: u32, sun: (u32, u32), settings: &Settings) -> (u8, u16) {
-    if !(NIGHT_UNTIL..NIGHT_FROM).contains(&minute) {
-        return (settings.night_level, settings.warm_kelvin);
-    }
-    let (minute, sunrise, sunset) = (f64::from(minute), f64::from(sun.0), f64::from(sun.1));
-    let rise = ((minute - sunrise) / RAMP).clamp(0.0, 1.0);
-    let set = ((sunset - minute) / RAMP).clamp(0.0, 1.0);
-    let lerp = |from: f64, to: f64, f: f64| (from + (to - from) * f).round();
-    let level = lerp(
-        f64::from(settings.night_level),
-        f64::from(settings.day_level),
-        rise,
-    );
-    let kelvin = lerp(
-        f64::from(settings.warm_kelvin),
-        f64::from(settings.cool_kelvin),
-        rise.min(set),
-    );
-    (level as u8, kelvin as u16)
+    let start = sun.0.max(MORNING_FROM);
+    let between = |from: u32, to: u32| f64::from(minute - from) / f64::from(to - from);
+    let day = if minute >= NIGHT_FROM || minute < start {
+        0.0
+    } else if minute < settings.morning_end_minute {
+        between(start, settings.morning_end_minute)
+    } else if minute < sun.1 {
+        1.0
+    } else {
+        1.0 - between(sun.1, NIGHT_FROM)
+    };
+    let lerp = |night: f64, by_day: f64| (night + (by_day - night) * day).round();
+    (
+        lerp(
+            f64::from(settings.night_level),
+            f64::from(settings.day_level),
+        ) as u8,
+        lerp(
+            f64::from(settings.warm_kelvin),
+            f64::from(settings.cool_kelvin),
+        ) as u16,
+    )
 }
 
 /// What to send one light; `None` where it does not support the control.
@@ -175,11 +185,12 @@ pub struct Target {
     pub mireds: Option<u16>,
 }
 
-/// Fits `level` and `kelvin` into the ranges `light` reports.
+/// Fits `level` and `kelvin`, raised to the light's `floor`, into the ranges `light` reports.
 // The values are rounded and clamped into range before the casts.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 #[must_use]
-pub fn fit(level: u8, kelvin: u16, light: &Light) -> Target {
+pub fn fit(level: u8, kelvin: u16, floor: Option<u16>, light: &Light) -> Target {
+    let kelvin = kelvin.max(floor.unwrap_or(0));
     Target {
         level: light
             .levels
@@ -201,9 +212,12 @@ pub enum Skip {
     NoResponse,
     /// Supports neither level nor colour temperature.
     Unsupported,
+    /// Already sent these values.
+    Unchanged,
 }
 
-/// What to send `light`, before its On/Off is read again, or why to send nothing.
+/// What to send `light` for the `goal` level and kelvin, before its On/Off is
+/// read again: only the values that differ from `last` sent, or why to send nothing.
 ///
 /// # Errors
 /// The reason the light is left alone.
@@ -211,10 +225,19 @@ pub fn plan(
     light: &Light,
     all_off: bool,
     settings: &Settings,
-    level: u8,
-    kelvin: u16,
+    goal: (u8, u16),
+    floor: Option<u16>,
+    last: Option<Target>,
 ) -> Result<Target, Skip> {
-    let target = fit(level, kelvin, light);
+    let target = fit(goal.0, goal.1, floor, light);
+    let last = last.unwrap_or(Target {
+        level: None,
+        mireds: None,
+    });
+    let changed = Target {
+        level: target.level.filter(|v| last.level != Some(*v)),
+        mireds: target.mireds.filter(|v| last.mireds != Some(*v)),
+    };
     if all_off {
         Err(Skip::AllOff)
     } else if !settings.enabled {
@@ -223,8 +246,10 @@ pub fn plan(
         Err(Skip::NoResponse)
     } else if target.level.is_none() && target.mireds.is_none() {
         Err(Skip::Unsupported)
+    } else if changed.level.is_none() && changed.mireds.is_none() {
+        Err(Skip::Unchanged)
     } else {
-        Ok(target)
+        Ok(changed)
     }
 }
 
@@ -278,37 +303,75 @@ mod tests {
         assert!(rise < set);
     }
 
+    fn day() -> Settings {
+        Settings::default()
+    }
+
     #[test]
-    fn night_from_22_to_5_is_dim_and_warm() {
-        let s = Settings::default();
+    fn defaults_are_80_and_40_percent_of_254_and_5000_to_3000_kelvin() {
+        let s = day();
+        assert_eq!((s.day_level, s.night_level), (203, 102));
+        assert_eq!((s.cool_kelvin, s.warm_kelvin), (5000, 3000));
+        assert_eq!(s.morning_end_minute, at(10, 0));
+    }
+
+    #[test]
+    fn night_from_22_until_the_morning_starts_is_dim_and_warm() {
+        let s = day();
         let sun = (at(5, 39), at(17, 24));
-        assert_eq!(target(at(22, 0), sun, &s), (40, 2700));
-        assert_eq!(target(at(2, 0), sun, &s), (40, 2700));
-        assert_eq!(target(at(4, 59), sun, &s), (40, 2700));
-        // The evening before 22:00 keeps the day's level, warm.
-        assert_eq!(target(at(21, 59), sun, &s), (254, 2700));
+        assert_eq!(target(at(22, 0), sun, &s), (102, 3000));
+        assert_eq!(target(at(2, 0), sun, &s), (102, 3000));
+        assert_eq!(target(at(5, 38), sun, &s), (102, 3000));
+        // The evening reaches the night's values at 22:00.
+        assert_eq!(target(at(21, 59), sun, &s).0, 102);
     }
 
     #[test]
-    fn mornings_brighten_and_cool_from_sunrise() {
-        let s = Settings::default();
+    fn mornings_rise_linearly_from_sunrise_to_the_morning_end() {
+        let s = day();
         let sun = (at(6, 0), at(17, 0));
-        // 05:00 is before sunrise: still the night's values.
-        assert_eq!(target(at(5, 0), sun, &s), (40, 2700));
-        assert_eq!(target(at(6, 0), sun, &s), (40, 2700));
-        assert_eq!(target(at(7, 0), sun, &s), (147, 3850));
-        assert_eq!(target(at(8, 0), sun, &s), (254, 5000));
-        assert_eq!(target(at(12, 0), sun, &s), (254, 5000));
+        assert_eq!(target(at(5, 59), sun, &s), (102, 3000));
+        assert_eq!(target(at(6, 0), sun, &s), (102, 3000));
+        // Halfway from 06:00 to 10:00.
+        assert_eq!(target(at(8, 0), sun, &s), (153, 4000));
+        assert_eq!(target(at(10, 0), sun, &s), (203, 5000));
+        assert_eq!(target(at(12, 0), sun, &s), (203, 5000));
+        assert_eq!(target(at(16, 59), sun, &s), (203, 5000));
     }
 
     #[test]
-    fn evenings_warm_toward_sunset() {
-        let s = Settings::default();
+    fn mornings_start_at_5_when_the_sun_rises_earlier() {
+        let s = day();
+        let sun = (at(4, 25), at(19, 0));
+        assert_eq!(target(at(4, 30), sun, &s), (102, 3000));
+        assert_eq!(target(at(5, 0), sun, &s), (102, 3000));
+        // A fifth of 05:00 to 10:00.
+        assert_eq!(target(at(6, 0), sun, &s), (122, 3400));
+    }
+
+    #[test]
+    fn evenings_fall_linearly_from_sunset_to_22() {
+        let s = day();
+        let sun = (at(6, 0), at(18, 0));
+        assert_eq!(target(at(18, 0), sun, &s), (203, 5000));
+        // Halfway from 18:00 to 22:00.
+        assert_eq!(target(at(20, 0), sun, &s), (153, 4000));
+        assert_eq!(target(at(21, 0), sun, &s), (127, 3500));
+        assert_eq!(target(at(22, 0), sun, &s), (102, 3000));
+    }
+
+    #[test]
+    fn the_morning_end_is_a_setting() {
+        let s = Settings {
+            morning_end_minute: at(8, 0),
+            ..day()
+        };
         let sun = (at(6, 0), at(17, 0));
-        assert_eq!(target(at(15, 0), sun, &s), (254, 5000));
-        assert_eq!(target(at(16, 0), sun, &s), (254, 3850));
-        assert_eq!(target(at(17, 0), sun, &s), (254, 2700));
-        assert_eq!(target(at(19, 0), sun, &s), (254, 2700));
+        assert_eq!(target(at(7, 0), sun, &s), (153, 4000));
+        assert_eq!(target(at(8, 0), sun, &s), (203, 5000));
+        // A sunrise after the morning end jumps to the day's values.
+        assert_eq!(target(at(9, 0), (at(9, 30), at(17, 0)), &s), (102, 3000));
+        assert_eq!(target(at(9, 30), (at(9, 30), at(17, 0)), &s), (203, 5000));
     }
 
     fn bulb(levels: Option<(u8, u8)>, mireds: Option<(u16, u16)>) -> Light {
@@ -329,20 +392,26 @@ mod tests {
         // T2: 153–370 mired. 2700 K is 370; 2000 K clamps to it, 10000 K to 153.
         let t2 = bulb(Some((1, 254)), Some((153, 370)));
         assert_eq!(
-            fit(40, 2700, &t2),
+            fit(40, 2700, None, &t2),
             Target {
                 level: Some(40),
                 mireds: Some(370)
             }
         );
-        assert_eq!(fit(40, 2000, &t2).mireds, Some(370));
-        assert_eq!(fit(40, 10000, &t2).mireds, Some(153));
+        assert_eq!(fit(40, 2000, None, &t2).mireds, Some(370));
+        assert_eq!(fit(40, 10000, None, &t2).mireds, Some(153));
         // Tapo reports MinLevel 0: level 1 is the lowest sent.
-        assert_eq!(fit(0, 5000, &bulb(Some((0, 254)), None)).level, Some(1));
-        assert_eq!(fit(254, 5000, &bulb(Some((1, 200)), None)).level, Some(200));
+        assert_eq!(
+            fit(0, 5000, None, &bulb(Some((0, 254)), None)).level,
+            Some(1)
+        );
+        assert_eq!(
+            fit(254, 5000, None, &bulb(Some((1, 200)), None)).level,
+            Some(200)
+        );
         // A light without the control gets no value for it.
         assert_eq!(
-            fit(40, 5000, &bulb(None, None)),
+            fit(40, 5000, None, &bulb(None, None)),
             Target {
                 level: None,
                 mireds: None
@@ -351,20 +420,33 @@ mod tests {
     }
 
     #[test]
-    fn all_off_and_disabled_leave_every_light_alone() {
-        let on = Settings {
+    fn a_lights_floor_raises_its_colour_temperature() {
+        let tapo = bulb(Some((0, 254)), Some((153, 400)));
+        // 3000 K is 333 mired; a 4000 K floor sends 250.
+        assert_eq!(fit(102, 3000, Some(4000), &tapo).mireds, Some(250));
+        assert_eq!(fit(102, 5000, Some(4000), &tapo).mireds, Some(200));
+        assert_eq!(fit(102, 3000, None, &tapo).mireds, Some(333));
+    }
+
+    fn on() -> Settings {
+        Settings {
             enabled: true,
             ..Settings::default()
-        };
+        }
+    }
+
+    #[test]
+    fn all_off_and_disabled_leave_every_light_alone() {
         let t2 = bulb(Some((1, 254)), Some((153, 370)));
-        assert_eq!(plan(&t2, true, &on, 40, 2700), Err(Skip::AllOff));
+        let night = (102, 3000);
+        assert_eq!(plan(&t2, true, &on(), night, None, None), Err(Skip::AllOff));
         // "All off" wins over disabled, so the status shows why nothing was sent.
         assert_eq!(
-            plan(&t2, true, &Settings::default(), 40, 2700),
+            plan(&t2, true, &Settings::default(), night, None, None),
             Err(Skip::AllOff)
         );
         assert_eq!(
-            plan(&t2, false, &Settings::default(), 40, 2700),
+            plan(&t2, false, &Settings::default(), night, None, None),
             Err(Skip::Disabled)
         );
         let unreachable = Light {
@@ -372,19 +454,55 @@ mod tests {
             ..t2.clone()
         };
         assert_eq!(
-            plan(&unreachable, false, &on, 40, 2700),
+            plan(&unreachable, false, &on(), night, None, None),
             Err(Skip::NoResponse)
         );
         assert_eq!(
-            plan(&bulb(None, None), false, &on, 40, 2700),
+            plan(&bulb(None, None), false, &on(), night, None, None),
             Err(Skip::Unsupported)
         );
         assert_eq!(
-            plan(&t2, false, &on, 40, 2700),
+            plan(&t2, false, &on(), night, None, None),
             Ok(Target {
-                level: Some(40),
-                mireds: Some(370)
+                level: Some(102),
+                mireds: Some(333)
             })
+        );
+    }
+
+    #[test]
+    fn only_values_that_changed_since_the_last_send_are_sent() {
+        let t2 = bulb(Some((1, 254)), Some((153, 370)));
+        let sent = Target {
+            level: Some(102),
+            mireds: Some(333),
+        };
+        assert_eq!(
+            plan(&t2, false, &on(), (102, 3000), None, Some(sent)),
+            Err(Skip::Unchanged)
+        );
+        assert_eq!(
+            plan(&t2, false, &on(), (105, 3000), None, Some(sent)),
+            Ok(Target {
+                level: Some(105),
+                mireds: None
+            })
+        );
+        assert_eq!(
+            plan(&t2, false, &on(), (102, 3100), None, Some(sent)),
+            Ok(Target {
+                level: None,
+                mireds: Some(323)
+            })
+        );
+        // The floor counts: 3000 K and 3100 K both send 4000 K.
+        let floored = Target {
+            level: Some(102),
+            mireds: Some(250),
+        };
+        assert_eq!(
+            plan(&t2, false, &on(), (102, 3100), Some(4000), Some(floored)),
+            Err(Skip::Unchanged)
         );
     }
 
@@ -406,6 +524,14 @@ mod tests {
             },
             Settings {
                 warm_kelvin: 6000,
+                ..Settings::default()
+            },
+            Settings {
+                morning_end_minute: 5 * 60,
+                ..Settings::default()
+            },
+            Settings {
+                morning_end_minute: 22 * 60,
                 ..Settings::default()
             },
         ] {

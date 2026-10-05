@@ -405,14 +405,14 @@ fn opening_a_ledger_from_the_code_only_schema_keeps_its_devices() {
 
     for round in 0..2 {
         let db = home_link::open_db(path.to_str().unwrap()).unwrap();
-        let row: (String, String, Option<String>) = db
+        let row: (String, String, Option<String>, Option<u16>) = db
             .query_row(
-                "SELECT qr_payload, name, serial_number FROM devices WHERE id = 1",
+                "SELECT qr_payload, name, serial_number, min_kelvin FROM devices WHERE id = 1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        assert_eq!(row, ("34970112332".into(), "電球".into(), None));
+        assert_eq!(row, ("34970112332".into(), "電球".into(), None, None));
         db.execute(
             "INSERT INTO devices (room_id, vendor, serial_number) VALUES (1, 'Tapo', ?1)",
             [format!("S{round}")],
@@ -888,7 +888,7 @@ fn tuning_nodes() -> Value {
     ])
 }
 
-/// 2026-10-05 23:00 in Tokyo: night, level 40 and 2700 K (370 mired).
+/// 2026-10-05 23:00 in Tokyo: night, level 102 and 3000 K (333 mired).
 const NIGHT: i64 = 1_791_208_800;
 
 /// `(node_id, endpoint, cluster_id, command_name, payload)` of every command but On/Off.
@@ -952,15 +952,15 @@ async fn enable(app: &Router) {
 }
 
 fn level(level: u64) -> Value {
-    json!({ "level": level, "transitionTime": 0, "optionsMask": 0, "optionsOverride": 0 })
+    json!({ "level": level, "transitionTime": 300, "optionsMask": 0, "optionsOverride": 0 })
 }
 
 fn mireds(mireds: u64) -> Value {
-    json!({ "colorTemperatureMireds": mireds, "transitionTime": 0, "optionsMask": 0, "optionsOverride": 0 })
+    json!({ "colorTemperatureMireds": mireds, "transitionTime": 300, "optionsMask": 0, "optionsOverride": 0 })
 }
 
 #[tokio::test]
-async fn hourly_adjustment_writes_only_to_lights_read_as_on() {
+async fn scheduled_adjustment_writes_only_to_lights_read_as_on() {
     let fake = Fake {
         // Served as on, but the bulb itself answers off: it was switched off since.
         read_off: vec![(5, 1)],
@@ -974,7 +974,7 @@ async fn hourly_adjustment_writes_only_to_lights_read_as_on() {
     let app = home.router();
     enable(&app).await;
 
-    home.adjust(NIGHT, "hourly").await;
+    home.adjust(NIGHT, "scheduled").await;
 
     // The On/Off of every reachable light that can dim or change colour is read again.
     assert_eq!(
@@ -994,14 +994,14 @@ async fn hourly_adjustment_writes_only_to_lights_read_as_on() {
                 json!(3),
                 json!(8),
                 json!("MoveToLevel"),
-                level(40)
+                level(102)
             ),
             (
                 json!(1),
                 json!(3),
                 json!(768),
                 json!("MoveToColorTemperature"),
-                mireds(370)
+                mireds(333)
             ),
         ]
     );
@@ -1017,8 +1017,8 @@ async fn hourly_adjustment_writes_only_to_lights_read_as_on() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let run = &body["runs"][0];
     assert_eq!(run["at"], "2026-10-05T23:00:00+09:00");
-    assert_eq!(run["trigger"], "hourly");
-    assert_eq!((&run["level"], &run["kelvin"]), (&json!(40), &json!(2700)));
+    assert_eq!(run["trigger"], "scheduled");
+    assert_eq!((&run["level"], &run["kelvin"]), (&json!(102), &json!(3000)));
     assert_eq!(run["commands"], 2);
     assert_eq!(
         decisions(run),
@@ -1034,7 +1034,93 @@ async fn hourly_adjustment_writes_only_to_lights_read_as_on() {
     assert_eq!(run["lights"][1]["name"], "Aqara LED Bulb T2");
     assert_eq!(
         (&run["lights"][1]["level"], &run["lights"][1]["mireds"]),
-        (&json!(40), &json!(370))
+        (&json!(102), &json!(333))
+    );
+
+    // Ten minutes later the night's values are unchanged: the T2 is neither read
+    // nor written; the lights read as off are read again in case they came on.
+    commands.lock().unwrap().clear();
+    home.adjust(NIGHT + 600, "scheduled").await;
+    assert_eq!(tunings(&commands), []);
+    assert_eq!(
+        reads(&commands),
+        [(json!(5), json!(["1/6/0"])), (json!(6), json!(["1/6/0"]))]
+    );
+    let (_, body) = call(&app, "GET", "/api/lights/schedule", None).await;
+    assert_eq!(body["runs"][0]["lights"][1]["decision"], "unchanged");
+    assert_eq!(body["runs"][0]["commands"], 0);
+}
+
+#[tokio::test]
+async fn a_ledger_floor_keeps_a_light_at_or_above_its_colour_temperature() {
+    let (addr, commands, _) = fake_light_server(tuning_nodes(), Fake::default()).await;
+    let home = home_link::Home::new(
+        home_link::open_db(":memory:").unwrap(),
+        Some(format!("ws://{addr}/ws")),
+    );
+    let app = home.router();
+    enable(&app).await;
+    let room = create_room(&app, "リビング").await;
+    let (_, tapo) = call(
+        &app,
+        "POST",
+        "/api/devices",
+        Some(json!({ "room_id": room, "vendor": "Tapo", "serial_number": TAPO, "name": "寝室前" })),
+    )
+    .await;
+    let uri = format!("/api/devices/{}", tapo["id"]);
+    for bad in [
+        json!({ "min_kelvin": 999 }),
+        json!({ "min_kelvin": 10001 }),
+        json!({ "min": 4000 }),
+    ] {
+        let (status, _) = call(&app, "PATCH", &uri, Some(bad.clone())).await;
+        assert!(status.is_client_error(), "{bad}");
+    }
+    let (status, device) = call(&app, "PATCH", &uri, Some(json!({ "min_kelvin": 4000 }))).await;
+    assert_eq!(status, StatusCode::OK, "{device}");
+    assert_eq!(device["min_kelvin"], 4000);
+    let (status, _) = call(
+        &app,
+        "PATCH",
+        "/api/devices/999",
+        Some(json!({ "min_kelvin": 4000 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    home.adjust(NIGHT, "scheduled").await;
+
+    // The Tapo gets 4000 K (250 mired) at night, the T2 without a floor 3000 K.
+    let mireds_sent: Vec<_> = tunings(&commands)
+        .into_iter()
+        .filter(|(_, _, cluster, _, _)| cluster == 768)
+        .map(|(node, _, _, _, payload)| (node, payload["colorTemperatureMireds"].clone()))
+        .collect();
+    assert_eq!(
+        mireds_sent,
+        [(json!(1), json!(333)), (json!(5), json!(250))]
+    );
+    let (_, body) = call(&app, "GET", "/api/lights/schedule", None).await;
+    assert_eq!(
+        body["floors"],
+        json!([{ "id": tapo["id"], "name": "寝室前", "room_name": "リビング", "min_kelvin": 4000 }])
+    );
+
+    // Removing the floor sends the Tapo 3000 K again.
+    let (_, device) = call(&app, "PATCH", &uri, Some(json!({ "min_kelvin": null }))).await;
+    assert_eq!(device["min_kelvin"], Value::Null);
+    commands.lock().unwrap().clear();
+    home.adjust(NIGHT + 600, "scheduled").await;
+    assert_eq!(
+        tunings(&commands),
+        [(
+            json!(5),
+            json!(1),
+            json!(768),
+            json!("MoveToColorTemperature"),
+            mireds(333)
+        )]
     );
 }
 
@@ -1045,7 +1131,7 @@ async fn adjustment_is_off_until_the_user_enables_it() {
         home_link::open_db(":memory:").unwrap(),
         Some(format!("ws://{addr}/ws")),
     );
-    home.adjust(NIGHT, "hourly").await;
+    home.adjust(NIGHT, "scheduled").await;
     let (_, body) = call(&home.router(), "GET", "/api/lights/schedule", None).await;
     assert_eq!(body["settings"]["enabled"], false);
     assert_eq!(body["runs"][0]["commands"], 0);
@@ -1074,7 +1160,7 @@ async fn all_off_stops_adjustment_until_all_on_across_restarts() {
         enable(&app).await;
         let (status, _) = call(&app, "POST", "/api/lights/off", None).await;
         assert_eq!(status, StatusCode::OK);
-        home.adjust(NIGHT, "hourly").await;
+        home.adjust(NIGHT, "scheduled").await;
     }
     // Lights on again by other means (1/3 and 5/1) are left alone too.
     assert_eq!(tunings(&commands), []);
@@ -1083,18 +1169,21 @@ async fn all_off_stops_adjustment_until_all_on_across_restarts() {
     // A restart keeps "all off".
     let home = home_link::Home::new(home_link::open_db(db_path).unwrap(), url);
     let app = home.router();
-    home.adjust(NIGHT + 3600, "hourly").await;
+    // Every ten-minute run through the night and the next day sends nothing.
+    for step in 1..=24 * 6 {
+        home.adjust(NIGHT + 600 * step, "scheduled").await;
+    }
     assert_eq!(tunings(&commands), []);
     assert_eq!(reads(&commands), []);
     let (_, body) = call(&app, "GET", "/api/lights/schedule", None).await;
     assert_eq!(body["intent"]["action"], "off");
     assert_eq!(body["settings"]["enabled"], true);
     let run = &body["runs"][0];
-    assert_eq!(run["at"], "2026-10-06T00:00:00+09:00");
+    assert_eq!(run["at"], "2026-10-06T23:00:00+09:00");
     assert_eq!(run["commands"], 0);
     assert!(decisions(run).iter().all(|(_, _, d)| d == "all_off"));
 
-    // "All on" lights them at the hour's values and resumes the adjustment.
+    // "All on" lights them at the current values and resumes the adjustment.
     commands.lock().unwrap().clear();
     let (status, _) = call(&app, "POST", "/api/lights/on", None).await;
     assert_eq!(status, StatusCode::OK);
@@ -1127,7 +1216,8 @@ async fn schedule_settings_merge_and_are_validated() {
     assert_eq!(
         body["settings"],
         json!({ "enabled": false, "latitude": 35.6895, "longitude": 139.6917,
-                "day_level": 254, "night_level": 40, "warm_kelvin": 2700, "cool_kelvin": 5000 })
+                "morning_end_minute": 600, "day_level": 203, "night_level": 102,
+                "warm_kelvin": 3000, "cool_kelvin": 5000 })
     );
     assert_eq!(body["intent"], Value::Null);
     assert_eq!(body["runs"], json!([]));
@@ -1141,12 +1231,13 @@ async fn schedule_settings_merge_and_are_validated() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["settings"]["night_level"], 20);
-    assert_eq!(body["settings"]["day_level"], 254);
+    assert_eq!(body["settings"]["day_level"], 203);
 
     for bad in [
         json!({ "night_level": 0 }),
         json!({ "warm_kelvin": 6000 }),
         json!({ "latitude": 91 }),
+        json!({ "morning_end_minute": 1320 }),
         json!({ "enable": true }),
         json!({ "enabled": "yes" }),
         json!([]),
