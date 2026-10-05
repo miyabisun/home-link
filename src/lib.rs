@@ -1,7 +1,12 @@
 pub mod matter;
 pub mod onboarding;
+pub mod schedule;
 
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use axum::{
     Json, Router,
@@ -11,7 +16,7 @@ use axum::{
     routing::get,
 };
 use rusqlite::{Connection, ErrorCode, OptionalExtension, params};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
 use tower_http::trace::TraceLayer;
 
@@ -37,6 +42,13 @@ pub fn open_db(path: &str) -> rusqlite::Result<Connection> {
             qr_payload TEXT NOT NULL UNIQUE,
             name TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+        );",
+    )?;
+    // The user's last "all on"/"all off" and the light schedule, as JSON by key.
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
         );",
     )?;
     let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -70,12 +82,59 @@ pub fn open_db(path: &str) -> rusqlite::Result<Connection> {
 struct AppState {
     db: Mutex<Connection>,
     matter_url: Option<String>,
+    /// The latest adjustments, newest first; kept in memory only.
+    runs: Mutex<VecDeque<serde_json::Value>>,
 }
 
 type Db = Arc<AppState>;
 
+const RUNS_KEPT: usize = 48;
+
 /// Builds the router; `matter_url` is the matterjs-server WebSocket API used by the status API.
 pub fn app(db: Connection, matter_url: Option<String>) -> Router {
+    Home::new(db, matter_url).router()
+}
+
+/// The API and the hourly light adjustment over one ledger.
+#[derive(Clone)]
+pub struct Home(Db);
+
+impl Home {
+    #[must_use]
+    pub fn new(db: Connection, matter_url: Option<String>) -> Self {
+        Self(Arc::new(AppState {
+            db: Mutex::new(db),
+            matter_url,
+            runs: Mutex::new(VecDeque::new()),
+        }))
+    }
+
+    pub fn router(&self) -> Router {
+        router(self.0.clone())
+    }
+
+    /// Adjusts the lights that are on for `unix` seconds and records the run.
+    pub async fn adjust(&self, unix: i64, trigger: &'static str) {
+        adjust(&self.0, unix, trigger).await;
+    }
+
+    /// Adjusts the lights at the top of every hour, forever.
+    pub async fn hourly(self) {
+        loop {
+            let wait = 3600 - now().rem_euclid(3600);
+            tokio::time::sleep(Duration::from_secs(wait.unsigned_abs())).await;
+            self.adjust(now(), "hourly").await;
+        }
+    }
+}
+
+fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0))
+}
+
+fn router(state: Db) -> Router {
     let api = Router::new()
         .route("/health", get(health))
         .route("/rooms", get(list_rooms).post(create_room))
@@ -89,12 +148,10 @@ pub fn app(db: Connection, matter_url: Option<String>) -> Router {
         .route("/lights", get(light_states))
         .route("/lights/on", axum::routing::post(lights_on))
         .route("/lights/off", axum::routing::post(lights_off))
+        .route("/lights/schedule", get(get_schedule).put(update_schedule))
         .fallback(not_found)
         // ponytail: one connection behind a global lock; a pool if writes ever contend.
-        .with_state(Arc::new(AppState {
-            db: Mutex::new(db),
-            matter_url,
-        }));
+        .with_state(state);
 
     Router::new()
         .route("/healthz", get(healthz))
@@ -696,20 +753,30 @@ async fn light_states(State(state): State<Db>) -> ApiResult<Json<serde_json::Val
     })))
 }
 
-async fn lights_on(state: State<Db>) -> ApiResult<Json<serde_json::Value>> {
-    switch_lights(state, true).await
+/// Switches every light on and, when the schedule is on, brings them to the hour's values.
+async fn lights_on(State(state): State<Db>) -> ApiResult<Json<serde_json::Value>> {
+    let response = switch_lights(&state, true).await?;
+    if load::<schedule::Settings>(&state.db.lock().unwrap(), SCHEDULE)?.enabled {
+        adjust(&state, now(), "lights_on").await;
+    }
+    Ok(response)
 }
 
-async fn lights_off(state: State<Db>) -> ApiResult<Json<serde_json::Value>> {
-    switch_lights(state, false).await
+async fn lights_off(State(state): State<Db>) -> ApiResult<Json<serde_json::Value>> {
+    switch_lights(&state, false).await
 }
 
-/// Switches every light matterjs-server serves and reports each light's result.
+/// Records "all on" or "all off" as the user's intent, switches every light
+/// matterjs-server serves and reports each light's result.
 /// Only a light whose command was accepted counts as switched.
-async fn switch_lights(State(state): State<Db>, on: bool) -> ApiResult<Json<serde_json::Value>> {
-    let (nodes, results) = matter::switch(matter_url(&state)?, on)
-        .await
-        .map_err(matter_unreachable)?;
+async fn switch_lights(state: &AppState, on: bool) -> ApiResult<Json<serde_json::Value>> {
+    let url = matter_url(state)?;
+    let intent = Intent {
+        action: if on { "on" } else { "off" }.into(),
+        at: schedule::timestamp(now()),
+    };
+    store(&state.db.lock().unwrap(), INTENT, &intent)?;
+    let (nodes, results) = matter::switch(url, on).await.map_err(matter_unreachable)?;
     let (lights, outcomes): (Vec<_>, Vec<_>) = results.into_iter().unzip();
     let outcomes: Vec<&str> = outcomes
         .into_iter()
@@ -735,4 +802,147 @@ async fn switch_lights(State(state): State<Db>, on: bool) -> ApiResult<Json<serd
         "lights": light_entries(&lights, names, &outcomes, "result"),
         "missing_devices": missing,
     })))
+}
+
+const INTENT: &str = "lights_intent";
+const SCHEDULE: &str = "light_schedule";
+
+/// The last "all on" or "all off" pressed: the only light state kept across restarts.
+#[derive(Serialize, Deserialize)]
+struct Intent {
+    action: String,
+    at: String,
+}
+
+fn load<T: DeserializeOwned + Default>(db: &Connection, key: &str) -> rusqlite::Result<T> {
+    let value: Option<String> = db
+        .query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    Ok(value
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default())
+}
+
+fn store<T: Serialize>(db: &Connection, key: &str, value: &T) -> rusqlite::Result<()> {
+    db.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2)
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        params![key, serde_json::to_string(value).unwrap_or_default()],
+    )?;
+    Ok(())
+}
+
+/// Adjusts every light that is on to the values for `unix` and records the run:
+/// nothing is written while "all off" is in force or the schedule is disabled.
+async fn adjust(state: &AppState, unix: i64, trigger: &'static str) {
+    let loaded = {
+        let db = state.db.lock().unwrap();
+        load::<schedule::Settings>(&db, SCHEDULE)
+            .and_then(|settings| Ok((settings, load::<Option<Intent>>(&db, INTENT)?)))
+    };
+    let (day, minute) = schedule::local(unix);
+    let mut run = json!({ "at": schedule::timestamp(unix), "trigger": trigger, "commands": 0 });
+    let result = match (&loaded, &state.matter_url) {
+        (Err(error), _) => Err(error.to_string()),
+        (_, None) => Err("MATTER_SERVER_URL is not set".into()),
+        (Ok((settings, intent)), Some(url)) => {
+            let sun = schedule::sun_times(day, settings.latitude, settings.longitude);
+            let (level, kelvin) = schedule::target(minute, sun, settings);
+            let all_off = intent.as_ref().is_some_and(|i| i.action == "off");
+            run["sunrise"] = json!(schedule::clock(sun.0));
+            run["sunset"] = json!(schedule::clock(sun.1));
+            run["level"] = json!(level);
+            run["kelvin"] = json!(kelvin);
+            matter::tune(url, |light| {
+                schedule::plan(light, all_off, settings, level, kelvin)
+            })
+            .await
+        }
+    };
+    match result {
+        Ok(tuned) => {
+            let lights: Vec<_> = tuned.lights.iter().map(|(l, _)| l.clone()).collect();
+            let names = match_ledger(&state.db.lock().unwrap(), &tuned.nodes, &lights)
+                .map_or_else(|_| vec![(None, None); lights.len()], |(names, _)| names);
+            let entries: Vec<_> = tuned
+                .lights
+                .iter()
+                .zip(names)
+                .map(|((light, decision), (name, room_name))| {
+                    let mut entry = json!({
+                        "node_id": light.node_id,
+                        "endpoint": light.endpoint,
+                        "name": name,
+                        "room_name": room_name,
+                    });
+                    entry["decision"] = match decision {
+                        matter::Decision::Skipped(skip) => json!(skip),
+                        matter::Decision::Off => json!("off"),
+                        matter::Decision::NoResponse => json!("no_response"),
+                        matter::Decision::Failed => json!("failed"),
+                        matter::Decision::Sent(target) => {
+                            entry["level"] = json!(target.level);
+                            entry["mireds"] = json!(target.mireds);
+                            json!("sent")
+                        }
+                    };
+                    entry
+                })
+                .collect();
+            let sent = entries.iter().filter(|e| e["decision"] == "sent").count();
+            tracing::info!(trigger, commands = tuned.commands, sent, "lights adjusted");
+            run["commands"] = json!(tuned.commands);
+            run["lights"] = json!(entries);
+        }
+        Err(error) => {
+            tracing::warn!(trigger, %error, "light adjustment failed");
+            run["error"] = json!(error);
+            run["lights"] = json!([]);
+        }
+    }
+    let mut runs = state.runs.lock().unwrap();
+    runs.push_front(run);
+    runs.truncate(RUNS_KEPT);
+}
+
+/// The schedule's settings, the user's last "all on"/"all off" and the latest runs.
+async fn get_schedule(State(state): State<Db>) -> ApiResult<Json<serde_json::Value>> {
+    let (settings, intent) = {
+        let db = state.db.lock().unwrap();
+        (
+            load::<schedule::Settings>(&db, SCHEDULE)?,
+            load::<Option<Intent>>(&db, INTENT)?,
+        )
+    };
+    let runs: Vec<_> = state.runs.lock().unwrap().iter().cloned().collect();
+    Ok(Json(
+        json!({ "settings": settings, "intent": intent, "runs": runs }),
+    ))
+}
+
+/// Merges the given fields into the schedule's settings.
+async fn update_schedule(
+    State(state): State<Db>,
+    Json(input): Json<serde_json::Value>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let invalid = |message: String| ApiError(StatusCode::BAD_REQUEST, "invalid_schedule", message);
+    {
+        let db = state.db.lock().unwrap();
+        let mut settings = json!(load::<schedule::Settings>(&db, SCHEDULE)?);
+        let fields = input
+            .as_object()
+            .ok_or_else(|| invalid("設定はJSONのオブジェクトで送ってください".into()))?;
+        for (key, value) in fields {
+            settings[key] = value.clone();
+        }
+        let settings: schedule::Settings =
+            serde_json::from_value(settings).map_err(|e| invalid(e.to_string()))?;
+        if let Some(message) = settings.invalid() {
+            return Err(invalid(message.into()));
+        }
+        store(&db, SCHEDULE, &settings)?;
+    }
+    get_schedule(State(state)).await
 }

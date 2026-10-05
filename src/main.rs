@@ -26,7 +26,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "matterjs-server"
     );
 
-    axum::serve(listener, home_link::app(db, matter_url))
+    let home = home_link::Home::new(db, matter_url.clone());
+    if matter_url.is_some() {
+        tokio::spawn(home.clone().hourly());
+    }
+
+    axum::serve(listener, home.router())
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 

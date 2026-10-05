@@ -536,6 +536,10 @@ struct Fake {
     silent: Vec<(u64, u64)>,
     /// Close the first connection when its first command arrives.
     drop_first: bool,
+    /// `(node_id, endpoint)` read as off although `get_nodes` serves it on.
+    read_off: Vec<(u64, u64)>,
+    /// Off is accepted but the lights stay on, as if switched on again by other means.
+    ignore_off: bool,
 }
 
 /// Serves `get_nodes` and On/Off `device_command` the way matterjs-server does,
@@ -566,6 +570,26 @@ async fn fake_light_server(
                 let id = command["message_id"].clone();
                 let reply = match command["command"].as_str().unwrap() {
                     "get_nodes" => json!({ "message_id": id, "result": *nodes.lock().unwrap() }),
+                    "read_attribute" => {
+                        seen.lock().unwrap().push(command.clone());
+                        let args = &command["args"];
+                        let node_id = args["node_id"].as_u64().unwrap();
+                        let path = args["attribute_path"][0].as_str().unwrap().to_owned();
+                        let endpoint: u64 = path.split('/').next().unwrap().parse().unwrap();
+                        let value = if fake.read_off.contains(&(node_id, endpoint)) {
+                            json!(false)
+                        } else {
+                            nodes
+                                .lock()
+                                .unwrap()
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .find(|n| n["node_id"] == node_id)
+                                .map_or(Value::Null, |n| n["attributes"][&path].clone())
+                        };
+                        json!({ "message_id": id, "result": { path: value } })
+                    }
                     "device_command" => {
                         seen.lock().unwrap().push(command["args"].clone());
                         if fake.drop_first && first {
@@ -582,10 +606,14 @@ async fn fake_light_server(
                         if fake.failing.contains(&target) {
                             json!({ "message_id": id, "error_code": 0, "details": "failed" })
                         } else {
-                            let on = args["command_name"] == "On";
-                            for node in nodes.lock().unwrap().as_array_mut().unwrap() {
-                                if node["node_id"] == target.0 {
-                                    node["attributes"][format!("{}/6/0", target.1)] = json!(on);
+                            if args["cluster_id"] == 6
+                                && !(fake.ignore_off && args["command_name"] == "Off")
+                            {
+                                let on = args["command_name"] == "On";
+                                for node in nodes.lock().unwrap().as_array_mut().unwrap() {
+                                    if node["node_id"] == target.0 {
+                                        node["attributes"][format!("{}/6/0", target.1)] = json!(on);
+                                    }
                                 }
                             }
                             json!({ "message_id": id, "result": null })
@@ -826,4 +854,307 @@ async fn lights_report_an_unset_or_unreachable_matter_server() {
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(error["error"], "matter_server_unreachable");
     }
+}
+
+/// A T2 behind a bridge that is on, another unreachable, a Tapo that is on, one
+/// that is off, an unavailable BEAMTEC, and a plain On/Off light, with the
+/// level and colour temperature ranges matterjs-server serves.
+fn tuning_nodes() -> Value {
+    json!([
+        { "node_id": 1, "available": true, "attributes": {
+            "2/29/0": [{ "0": 268, "1": 4 }], "2/6/0": false, "2/8/0": 100,
+            "2/768/65532": 16, "2/57/3": "Aqara LED Bulb T2", "2/57/17": false,
+            "3/29/0": [{ "0": 268, "1": 4 }], "3/6/0": true, "3/8/0": 100, "3/8/2": 1, "3/8/3": 254,
+            "3/768/65532": 16, "3/768/16395": 153, "3/768/16396": 370,
+            "3/57/1": "Aqara", "3/57/15": "t2-b", "3/57/3": "Aqara LED Bulb T2", "3/57/17": true,
+        }},
+        { "node_id": 5, "available": true, "attributes": {
+            "0/40/1": "Tapo", "0/40/15": TAPO, "0/40/3": "Smart Multicolor Bulb",
+            "1/29/0": [{ "0": 269, "1": 1 }], "1/6/0": true, "1/8/0": 100, "1/8/2": 0,
+            "1/768/65532": 25, "1/768/16395": 153, "1/768/16396": 400,
+        }},
+        { "node_id": 6, "available": true, "attributes": {
+            "0/40/3": "Smart Multicolor Bulb",
+            "1/29/0": [{ "0": 269, "1": 1 }], "1/6/0": false, "1/8/0": 100,
+            "1/768/65532": 25, "1/768/16395": 153, "1/768/16396": 400,
+        }},
+        { "node_id": 16, "available": false, "attributes": {
+            "0/40/3": "Smart Bulb", "1/29/0": [{ "0": 269, "1": 1 }], "1/6/0": true,
+            "1/8/0": 100, "1/768/65532": 16, "1/768/16395": 142, "1/768/16396": 454,
+        }},
+        { "node_id": 30, "available": true, "attributes": {
+            "1/29/0": [{ "0": 256, "1": 1 }], "1/6/0": true,
+        }},
+    ])
+}
+
+/// 2026-10-05 23:00 in Tokyo: night, level 40 and 2700 K (370 mired).
+const NIGHT: i64 = 1_791_208_800;
+
+/// `(node_id, endpoint, cluster_id, command_name, payload)` of every command but On/Off.
+fn tunings(commands: &Arc<Mutex<Vec<Value>>>) -> Vec<(Value, Value, Value, Value, Value)> {
+    commands
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c["cluster_id"].is_u64() && c["cluster_id"] != 6)
+        .map(|c| {
+            (
+                c["node_id"].clone(),
+                c["endpoint_id"].clone(),
+                c["cluster_id"].clone(),
+                c["command_name"].clone(),
+                c["payload"].clone(),
+            )
+        })
+        .collect()
+}
+
+fn reads(commands: &Arc<Mutex<Vec<Value>>>) -> Vec<(Value, Value)> {
+    commands
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c["command"] == "read_attribute")
+        .map(|c| {
+            (
+                c["args"]["node_id"].clone(),
+                c["args"]["attribute_path"].clone(),
+            )
+        })
+        .collect()
+}
+
+fn decisions(run: &Value) -> Vec<(Value, Value, Value)> {
+    run["lights"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| {
+            (
+                l["node_id"].clone(),
+                l["endpoint"].clone(),
+                l["decision"].clone(),
+            )
+        })
+        .collect()
+}
+
+async fn enable(app: &Router) {
+    let (status, body) = call(
+        app,
+        "PUT",
+        "/api/lights/schedule",
+        Some(json!({ "enabled": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+fn level(level: u64) -> Value {
+    json!({ "level": level, "transitionTime": 0, "optionsMask": 0, "optionsOverride": 0 })
+}
+
+fn mireds(mireds: u64) -> Value {
+    json!({ "colorTemperatureMireds": mireds, "transitionTime": 0, "optionsMask": 0, "optionsOverride": 0 })
+}
+
+#[tokio::test]
+async fn hourly_adjustment_writes_only_to_lights_read_as_on() {
+    let fake = Fake {
+        // Served as on, but the bulb itself answers off: it was switched off since.
+        read_off: vec![(5, 1)],
+        ..Fake::default()
+    };
+    let (addr, commands, _) = fake_light_server(tuning_nodes(), fake).await;
+    let home = home_link::Home::new(
+        home_link::open_db(":memory:").unwrap(),
+        Some(format!("ws://{addr}/ws")),
+    );
+    let app = home.router();
+    enable(&app).await;
+
+    home.adjust(NIGHT, "hourly").await;
+
+    // The On/Off of every reachable light that can dim or change colour is read again.
+    assert_eq!(
+        reads(&commands),
+        [
+            (json!(1), json!(["3/6/0"])),
+            (json!(5), json!(["1/6/0"])),
+            (json!(6), json!(["1/6/0"])),
+        ]
+    );
+    // Only the T2 read as on gets the night's values, without ExecuteIfOff.
+    assert_eq!(
+        tunings(&commands),
+        [
+            (
+                json!(1),
+                json!(3),
+                json!(8),
+                json!("MoveToLevel"),
+                level(40)
+            ),
+            (
+                json!(1),
+                json!(3),
+                json!(768),
+                json!("MoveToColorTemperature"),
+                mireds(370)
+            ),
+        ]
+    );
+    assert!(
+        commands
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|c| c["cluster_id"] != 6)
+    );
+
+    let (status, body) = call(&app, "GET", "/api/lights/schedule", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let run = &body["runs"][0];
+    assert_eq!(run["at"], "2026-10-05T23:00:00+09:00");
+    assert_eq!(run["trigger"], "hourly");
+    assert_eq!((&run["level"], &run["kelvin"]), (&json!(40), &json!(2700)));
+    assert_eq!(run["commands"], 2);
+    assert_eq!(
+        decisions(run),
+        [
+            (json!(1), json!(2), json!("no_response")),
+            (json!(1), json!(3), json!("sent")),
+            (json!(5), json!(1), json!("off")),
+            (json!(6), json!(1), json!("off")),
+            (json!(16), json!(1), json!("no_response")),
+            (json!(30), json!(1), json!("unsupported")),
+        ]
+    );
+    assert_eq!(run["lights"][1]["name"], "Aqara LED Bulb T2");
+    assert_eq!(
+        (&run["lights"][1]["level"], &run["lights"][1]["mireds"]),
+        (&json!(40), &json!(370))
+    );
+}
+
+#[tokio::test]
+async fn adjustment_is_off_until_the_user_enables_it() {
+    let (addr, commands, _) = fake_light_server(tuning_nodes(), Fake::default()).await;
+    let home = home_link::Home::new(
+        home_link::open_db(":memory:").unwrap(),
+        Some(format!("ws://{addr}/ws")),
+    );
+    home.adjust(NIGHT, "hourly").await;
+    let (_, body) = call(&home.router(), "GET", "/api/lights/schedule", None).await;
+    assert_eq!(body["settings"]["enabled"], false);
+    assert_eq!(body["runs"][0]["commands"], 0);
+    assert!(
+        decisions(&body["runs"][0])
+            .iter()
+            .all(|(_, _, d)| d == "disabled")
+    );
+    assert!(commands.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn all_off_stops_adjustment_until_all_on_across_restarts() {
+    let fake = Fake {
+        ignore_off: true,
+        ..Fake::default()
+    };
+    let (addr, commands, _) = fake_light_server(tuning_nodes(), fake).await;
+    let url = Some(format!("ws://{addr}/ws"));
+    let path = std::env::temp_dir().join(format!("home-link-intent-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let db_path = path.to_str().unwrap();
+    {
+        let home = home_link::Home::new(home_link::open_db(db_path).unwrap(), url.clone());
+        let app = home.router();
+        enable(&app).await;
+        let (status, _) = call(&app, "POST", "/api/lights/off", None).await;
+        assert_eq!(status, StatusCode::OK);
+        home.adjust(NIGHT, "hourly").await;
+    }
+    // Lights on again by other means (1/3 and 5/1) are left alone too.
+    assert_eq!(tunings(&commands), []);
+    assert_eq!(reads(&commands), []);
+
+    // A restart keeps "all off".
+    let home = home_link::Home::new(home_link::open_db(db_path).unwrap(), url);
+    let app = home.router();
+    home.adjust(NIGHT + 3600, "hourly").await;
+    assert_eq!(tunings(&commands), []);
+    assert_eq!(reads(&commands), []);
+    let (_, body) = call(&app, "GET", "/api/lights/schedule", None).await;
+    assert_eq!(body["intent"]["action"], "off");
+    assert_eq!(body["settings"]["enabled"], true);
+    let run = &body["runs"][0];
+    assert_eq!(run["at"], "2026-10-06T00:00:00+09:00");
+    assert_eq!(run["commands"], 0);
+    assert!(decisions(run).iter().all(|(_, _, d)| d == "all_off"));
+
+    // "All on" lights them at the hour's values and resumes the adjustment.
+    commands.lock().unwrap().clear();
+    let (status, _) = call(&app, "POST", "/api/lights/on", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = call(&app, "GET", "/api/lights/schedule", None).await;
+    assert_eq!(body["intent"]["action"], "on");
+    assert_eq!(body["runs"][0]["trigger"], "lights_on");
+    let tuned: Vec<_> = tunings(&commands)
+        .into_iter()
+        .map(|(node, endpoint, cluster, _, _)| (node, endpoint, cluster))
+        .collect();
+    assert_eq!(
+        tuned,
+        [
+            (json!(1), json!(3), json!(8)),
+            (json!(1), json!(3), json!(768)),
+            (json!(5), json!(1), json!(8)),
+            (json!(5), json!(1), json!(768)),
+            (json!(6), json!(1), json!(8)),
+            (json!(6), json!(1), json!(768)),
+        ]
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn schedule_settings_merge_and_are_validated() {
+    let app = app();
+    let (status, body) = call(&app, "GET", "/api/lights/schedule", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["settings"],
+        json!({ "enabled": false, "latitude": 35.6895, "longitude": 139.6917,
+                "day_level": 254, "night_level": 40, "warm_kelvin": 2700, "cool_kelvin": 5000 })
+    );
+    assert_eq!(body["intent"], Value::Null);
+    assert_eq!(body["runs"], json!([]));
+
+    let (status, body) = call(
+        &app,
+        "PUT",
+        "/api/lights/schedule",
+        Some(json!({ "night_level": 20, "latitude": 34.69, "longitude": 135.50 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["settings"]["night_level"], 20);
+    assert_eq!(body["settings"]["day_level"], 254);
+
+    for bad in [
+        json!({ "night_level": 0 }),
+        json!({ "warm_kelvin": 6000 }),
+        json!({ "latitude": 91 }),
+        json!({ "enable": true }),
+        json!({ "enabled": "yes" }),
+        json!([]),
+    ] {
+        let (status, error) = call(&app, "PUT", "/api/lights/schedule", Some(bad.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+        assert_eq!(error["error"], "invalid_schedule", "{bad}");
+    }
+    let (_, body) = call(&app, "GET", "/api/lights/schedule", None).await;
+    assert_eq!(body["settings"]["night_level"], 20);
 }

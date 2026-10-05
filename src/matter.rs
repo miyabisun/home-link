@@ -5,6 +5,8 @@ use serde_json::{Value, json};
 use tokio::time::Instant;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
+use crate::schedule::{Skip, Target};
+
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Basic Information (0x0028) on a node, Bridged Device Basic Information
@@ -47,6 +49,11 @@ pub struct Light {
     /// The On/Off attribute as matterjs-server last read it.
     pub on: Option<bool>,
     pub product: Option<String>,
+    /// Min and max `CurrentLevel` when the light dims (Level Control).
+    pub levels: Option<(u8, u8)>,
+    /// Physical min and max colour temperature in mireds when the light
+    /// supports it (Color Control with the `ColorTemperature` feature).
+    pub mireds: Option<(u16, u16)>,
 }
 
 /// Lists every endpoint, including those behind bridges, whose Descriptor
@@ -87,6 +94,23 @@ pub fn lights(nodes: &[Value]) -> Vec<Light> {
             } else {
                 "0/40/3".to_owned()
             };
+            let attribute = |path: String| attributes.get(&path).and_then(Value::as_u64);
+            let levels = attributes
+                .contains_key(&format!("{endpoint}/8/0"))
+                .then(|| {
+                    let min = attribute(format!("{endpoint}/8/2")).unwrap_or(1);
+                    let max = attribute(format!("{endpoint}/8/3")).unwrap_or(254);
+                    (narrow(min, 1), narrow(max, 254))
+                });
+            let mireds = attribute(format!("{endpoint}/768/65532"))
+                .is_some_and(|features| features & COLOR_TEMPERATURE != 0)
+                .then(|| {
+                    attribute(format!("{endpoint}/768/16395"))
+                        .zip(attribute(format!("{endpoint}/768/16396")))
+                        .map_or((153, 370), |(min, max)| {
+                            (narrow(min, 153), narrow(max, 370))
+                        })
+                });
             lights.push(Light {
                 node_id,
                 endpoint,
@@ -97,11 +121,20 @@ pub fn lights(nodes: &[Value]) -> Vec<Light> {
                     .get(&product)
                     .and_then(Value::as_str)
                     .map(str::to_owned),
+                levels,
+                mireds,
             });
         }
     }
     lights.sort_by_key(|light| (light.node_id, light.endpoint));
     lights
+}
+
+/// Color Control `FeatureMap` bit for colour temperature.
+const COLOR_TEMPERATURE: u64 = 0x10;
+
+fn narrow<T: TryFrom<u64>>(value: u64, fallback: T) -> T {
+    T::try_from(value).unwrap_or(fallback)
 }
 
 type Socket =
@@ -224,6 +257,152 @@ async fn switch_once(
     Ok((nodes, results))
 }
 
+/// What became of one light in an adjustment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decision {
+    /// Left alone before its On/Off was read.
+    Skipped(Skip),
+    /// Read as off just before writing: nothing sent.
+    Off,
+    /// No answer to the read or to a command in time.
+    NoResponse,
+    /// matterjs-server answered a command with an error.
+    Failed,
+    Sent(Target),
+}
+
+/// An adjustment: the nodes read, each light's decision and the commands sent.
+pub struct Tuned {
+    pub nodes: Vec<Value>,
+    pub lights: Vec<(Light, Decision)>,
+    pub commands: usize,
+}
+
+const TUNE_TIMEOUT: Duration = Duration::from_mins(1);
+const REPLY_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Reads every light, asks `plan` what to send each, reads the On/Off of each
+/// light to write to again, and sends the level and colour temperature only to
+/// lights read as on. Commands never carry `ExecuteIfOff`, so a light switched
+/// off in between ignores them and stays off.
+///
+/// # Errors
+/// Fails when the server cannot be reached, drops the connection or the whole
+/// adjustment overruns.
+pub async fn tune(
+    url: &str,
+    plan: impl Fn(&Light) -> Result<Target, Skip>,
+) -> Result<Tuned, String> {
+    tokio::time::timeout(TUNE_TIMEOUT, async {
+        let mut ws = connect(url).await?;
+        let result = tune_all(&mut ws, plan).await.map_err(|e| e.0);
+        let _ = ws.close(None).await;
+        result
+    })
+    .await
+    .map_err(|_| "timed out".to_owned())?
+}
+
+async fn tune_all(
+    ws: &mut Socket,
+    plan: impl Fn(&Light) -> Result<Target, Skip>,
+) -> Result<Tuned, Dropped> {
+    let nodes = get_nodes(ws).await?;
+    let mut tuned = Tuned {
+        lights: Vec::new(),
+        commands: 0,
+        nodes: Vec::new(),
+    };
+    for light in lights(&nodes) {
+        let decision = match plan(&light) {
+            Err(skip) => Decision::Skipped(skip),
+            Ok(target) => tune_one(ws, &light, target, &mut tuned.commands).await?,
+        };
+        tuned.lights.push((light, decision));
+    }
+    tuned.nodes = nodes;
+    Ok(tuned)
+}
+
+async fn tune_one(
+    ws: &mut Socket,
+    light: &Light,
+    target: Target,
+    commands: &mut usize,
+) -> Result<Decision, Dropped> {
+    let path = format!("{}/6/0", light.endpoint);
+    let read = json!({
+        "command": "read_attribute",
+        "args": { "node_id": light.node_id, "attribute_path": [path] },
+    });
+    match request(ws, read).await? {
+        None => return Ok(Decision::NoResponse),
+        Some(reply) if reply["result"][&path] != true => {
+            return Ok(if reply.get("error_code").is_some() {
+                Decision::NoResponse
+            } else {
+                Decision::Off
+            });
+        }
+        Some(_) => {}
+    }
+    let level = target.level.map(|level| {
+        (
+            8,
+            "MoveToLevel",
+            json!({ "level": level, "transitionTime": 0, "optionsMask": 0, "optionsOverride": 0 }),
+        )
+    });
+    let mireds = target.mireds.map(|mireds| {
+        (
+            768,
+            "MoveToColorTemperature",
+            json!({ "colorTemperatureMireds": mireds, "transitionTime": 0, "optionsMask": 0, "optionsOverride": 0 }),
+        )
+    });
+    for (cluster, command, payload) in level.into_iter().chain(mireds) {
+        *commands += 1;
+        let command = json!({
+            "command": "device_command",
+            "args": {
+                "node_id": light.node_id,
+                "endpoint_id": light.endpoint,
+                "cluster_id": cluster,
+                "command_name": command,
+                "payload": payload,
+            },
+        });
+        match request(ws, command).await? {
+            None => return Ok(Decision::NoResponse),
+            Some(reply) if reply.get("error_code").is_some() => return Ok(Decision::Failed),
+            Some(_) => {}
+        }
+    }
+    Ok(Decision::Sent(target))
+}
+
+/// Sends `request` under a fresh message id and waits for its reply; `None`
+/// when none arrives in time. Late replies to earlier requests are skipped.
+async fn request(ws: &mut Socket, mut request: Value) -> Result<Option<Value>, Dropped> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = format!(
+        "tune-{}",
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    request["message_id"] = json!(id);
+    send(ws, &request).await?;
+    let deadline = Instant::now() + REPLY_TIMEOUT;
+    loop {
+        let Ok(reply) = tokio::time::timeout_at(deadline, receive(ws)).await else {
+            return Ok(None);
+        };
+        let reply = reply?;
+        if reply["message_id"] == id.as_str() {
+            return Ok(Some(reply));
+        }
+    }
+}
+
 async fn connect(url: &str) -> Result<Socket, String> {
     let (ws, _) = connect_async(url).await.map_err(|e| e.to_string())?;
     Ok(ws)
@@ -326,6 +505,8 @@ mod tests {
             reachable,
             on,
             product: Some("Bulb".into()),
+            levels: None,
+            mireds: None,
         }
     }
 
@@ -372,6 +553,26 @@ mod tests {
             json!({ "node_id": 4, "attributes": { "1/6/0": true }}),
         ];
         assert_eq!(lights(&nodes), []);
+        // Level and colour temperature ranges as the light reports them, else the usual ones.
+        let tunable = vec![json!({ "node_id": 7, "attributes": {
+            "1/29/0": [{ "0": 269, "1": 1 }], "1/6/0": true,
+            "1/8/0": 9, "1/8/2": 0, "1/768/65532": 25, "1/768/16395": 142, "1/768/16396": 454,
+            "2/29/0": [{ "0": 268, "1": 1 }], "2/6/0": true, "2/8/0": 9, "2/768/65532": 16,
+            // Hue and saturation only: no colour temperature.
+            "3/29/0": [{ "0": 269, "1": 1 }], "3/6/0": true, "3/768/65532": 1,
+        }})];
+        let ranges: Vec<_> = lights(&tunable)
+            .into_iter()
+            .map(|l| (l.levels, l.mireds))
+            .collect();
+        assert_eq!(
+            ranges,
+            [
+                (Some((0, 254)), Some((142, 454))),
+                (Some((1, 254)), Some((153, 370))),
+                (None, None),
+            ]
+        );
         // Dimmable lights count; a missing state stays unknown and the product name optional.
         let dimmable = vec![json!({ "node_id": 6, "attributes": {
             "1/29/0": [{ "0": 257, "1": 1 }], "1/6/0": null,

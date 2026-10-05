@@ -93,6 +93,8 @@ APKは開発用のdebug署名です。PCからADBで導入する方法と、フ�
 | `GET /api/lights` | 照明ごとの今の状態（`on`・`off`・`no_response`）と、その件数 | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `POST /api/lights/on` | 全部の照明をオンにし、照明ごとの結果（`switched`・`no_response`・`failed`）と件数を返します | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `POST /api/lights/off` | 全部の照明をオフにします。応答は `on` と同じ形です | 同上 |
+| `GET /api/lights/schedule` | 明るさと色温度の自動調整の設定（`settings`）、最後に押された全部オン・全部オフ（`intent`）、直近の調整の記録（`runs`、新しい順に48回分） | |
+| `PUT /api/lights/schedule` | 自動調整の設定のうち、送った項目だけを変更します。応答は `GET` と同じ形です | 400 `invalid_schedule` |
 | `GET /api/health` | 稼働確認と版（`{"status":"ok","version":"0.1.4"}`） | |
 | `GET /healthz` | 稼働確認（`ok`） | |
 
@@ -120,6 +122,53 @@ nodeが使えない照明と、ブリッジが届かないと報告している�
 途中で接続が切れた場合は、つなぎ直して全部の照明へ送り直します（オン・オフは状態に依らない指定なので、二重に届いても結果は同じです）。
 照明の `name` は台帳の機器名で、台帳に無い照明は製品名です。台帳の機器のうちmatterjs-serverに見えないものは `missing_devices` に並び、
 `missing` に数えます。状態の `GET /api/lights` は、matterjs-serverが最後に読んだOn/Offの値を返します。
+
+### 明るさと色温度の自動調整
+
+有効にすると、毎時0分に、点いている照明の明るさと色温度をその時刻の値へ合わせます。既定では無効です。
+
+- 22時から5時までは `night_level` の明るさ・`warm_kelvin` の色温度にします。
+- 5時以降は、日の出から2時間かけて `day_level` の明るさ・`cool_kelvin` の色温度へ近づけます。
+- 日の入りの2時間前から日の入りまでに `warm_kelvin` へ戻し、22時まではその色で `day_level` の明るさを保ちます。
+- 日の出・日の入りは `latitude`・`longitude` とAsia/Tokyoの時刻で計算します。既定は東京（新宿）です。
+- 色温度と明るさは、照明ごとに報告された範囲へ収めます。色温度に対応しない照明へは色温度を、調光しない照明へは明るさを送りません。
+
+| 設定 | 既定値 | 内容 |
+| --- | --- | --- |
+| `enabled` | `false` | 自動調整を行うか |
+| `latitude`・`longitude` | `35.6895`・`139.6917` | 日の出・日の入りを計算する地点 |
+| `day_level`・`night_level` | `254`・`40` | 日中と22時〜5時の明るさ（1〜254） |
+| `warm_kelvin`・`cool_kelvin` | `2700`・`5000` | 夜・夕方と日中の色温度（K）。`warm_kelvin` は `cool_kelvin` 以下 |
+
+点灯を伴う書き込みはしません。
+
+- 調整のたびに、送る直前に各照明のOn/Offを照明から読み直し、点いている照明にだけ送ります。
+- 消えている照明、届かない照明には何も送りません。
+- 命令はLevel Controlの `MoveToLevel` とColor Controlの `MoveToColorTemperature` で、`ExecuteIfOff` を立てません。
+  読んだ後に消された照明は、命令を無視して消えたままです。
+- 「全部オフ」（`POST /api/lights/off`）が押されると、次に「全部オン」が押されるまで、
+  ほかの手段で点けられた照明も含めて何も送りません。
+  押された操作と時刻は保存し、再起動しても保ちます。照明ごとのオン・オフは保存せず、毎回matterjs-serverから読みます。
+- 有効なときに「全部オン」を押すと、点けた後にその時刻の値へ合わせます。
+
+`runs` は調整ごとに、時刻（`at`）、きっかけ（`trigger`: `hourly` または `lights_on`）、目標値（`level`・`kelvin`）、
+日の出・日の入り、送った命令の数（`commands`）、照明ごとの判断（`decision`）を持ちます。
+判断は、送った `sent`、全部オフ中の `all_off`、無効の `disabled`、消えていた `off`、届かない `no_response`、
+エラーが返った `failed`、調光にも色温度にも対応しない `unsupported` です。
+記録はメモリだけに持ち、再起動で消えます。
+
+```sh
+curl -X PUT http://homeserver:5011/api/lights/schedule -H 'content-type: application/json' -d '{"enabled":true}'
+# {"settings":{"enabled":true,"latitude":35.6895,"longitude":139.6917,"day_level":254,"night_level":40,"warm_kelvin":2700,"cool_kelvin":5000},
+#  "intent":{"action":"on","at":"2026-10-05T21:10:00+09:00"},"runs":[…]}
+
+curl http://homeserver:5011/api/lights/schedule
+# {…,"runs":[{"at":"2026-10-05T23:00:00+09:00","trigger":"hourly","sunrise":"05:39","sunset":"17:23","level":40,"kelvin":2700,"commands":2,
+#   "lights":[{"node_id":1,"endpoint":3,"name":"キッチン","room_name":"リビング","decision":"sent","level":40,"mireds":370},
+#             {"node_id":5,"endpoint":1,"name":"読書灯","room_name":"寝室","decision":"off"},…]},…]}
+```
+
+### 例
 
 ```sh
 curl -X POST http://homeserver:5011/api/rooms -H 'content-type: application/json' -d '{"name":"寝室"}'
