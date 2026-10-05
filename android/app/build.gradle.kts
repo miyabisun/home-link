@@ -7,8 +7,8 @@ android {
         applicationId = "dev.miyabisun.homelink"
         minSdk = 37
         targetSdk = 37
-        versionCode = 4
-        versionName = "0.1.3"
+        versionCode = 5
+        versionName = "0.1.5"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         // The tailnet URL of the home-link API. Cleartext is permitted only for
         // the host in res/xml/network_security_config.xml.
