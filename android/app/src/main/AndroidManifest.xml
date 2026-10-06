@@ -4,6 +4,8 @@
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
         android:usesPermissionFlags="neverForLocation" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <!-- Android 17 blocks LAN connections, including to the BLE proxy, without it. -->
+    <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
     <application android:label="@string/app_name" android:icon="@drawable/ic_home_link"
         android:theme="@style/AppTheme" android:allowBackup="false"

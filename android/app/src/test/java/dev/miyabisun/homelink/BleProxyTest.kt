@@ -147,6 +147,8 @@ class BleProxyTest {
         mock.enqueue(MockResponse().withWebSocketUpgrade(silent))
         val waiting = BleProxy(mock.url("/ble").toString().replace("http", "ws"), FakeBle(), OkHttpClient()) {}
         assertEquals(ProxyOpen.UNREACHABLE, waiting.open(300))
+        // The registration closes its link again after a failed open.
+        waiting.close()
 
         val closed = MockWebServer().apply { start(); shutdown() }
         val nobody = BleProxy(closed.url("/ble").toString().replace("http", "ws"), FakeBle(), OkHttpClient()) {}

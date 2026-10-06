@@ -51,7 +51,8 @@ class MainActivity : Activity() {
         private const val REQUEST_BLUETOOTH = 1
         private const val REQUEST_ENABLE = 2
         private val BLUETOOTH_PERMISSIONS =
-            arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
+            arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT,
+                Manifest.permission.ACCESS_LOCAL_NETWORK)
     }
 
     private val form = RegisterForm()

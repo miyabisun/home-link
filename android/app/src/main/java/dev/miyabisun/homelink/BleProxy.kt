@@ -96,8 +96,9 @@ class BleProxy(
         return ProxyOpen.OK
     }
 
-    /** Closes the WebSocket and releases every BLE connection. */
-    fun close() {
+    /** Closes the WebSocket and releases every BLE connection; later calls do nothing. */
+    @Synchronized fun close() {
+        if (worker.isShutdown) return
         socket?.close(1000, null)
         worker.execute { ble.close() }
         worker.shutdown()
@@ -139,16 +140,18 @@ class BleProxy(
         }
 
         private fun ended() {
-            if (!worker.isShutdown) worker.execute { ble.close() }
+            submit { ble.close() }
         }
     }
 
     /** Runs BLE work on the single worker so operations never overlap. */
-    private fun run(work: () -> Unit) {
-        if (worker.isShutdown) return
-        worker.execute {
-            try { work() } catch (_: BleException) { /* a binary write has no reply to carry it */ }
-        }
+    private fun run(work: () -> Unit) = submit {
+        try { work() } catch (_: BleException) { /* a binary write has no reply to carry it */ }
+    }
+
+    /** Queues [work] unless [close] already stopped the worker; shares its lock so the check holds. */
+    @Synchronized private fun submit(work: () -> Unit) {
+        if (!worker.isShutdown) worker.execute(work)
     }
 
     private fun respond(message: JSONObject): JSONObject {
