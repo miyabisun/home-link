@@ -1,6 +1,5 @@
 package dev.miyabisun.homelink
 
-import android.Manifest
 import android.app.Activity
 import android.appwidget.AppWidgetManager
 import android.bluetooth.BluetoothAdapter
@@ -15,6 +14,7 @@ import android.graphics.drawable.LayerDrawable
 import android.graphics.drawable.RippleDrawable
 import android.graphics.drawable.StateListDrawable
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.text.Editable
 import android.text.InputFilter
@@ -50,9 +50,7 @@ class MainActivity : Activity() {
         private const val MAX_NAME = 100
         private const val REQUEST_BLUETOOTH = 1
         private const val REQUEST_ENABLE = 2
-        private val BLUETOOTH_PERMISSIONS =
-            arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT,
-                Manifest.permission.ACCESS_LOCAL_NETWORK)
+        private val BLUETOOTH_PERMISSIONS = bluetoothPermissions(Build.VERSION.SDK_INT)
     }
 
     private val form = RegisterForm()

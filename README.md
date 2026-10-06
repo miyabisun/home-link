@@ -46,7 +46,7 @@ curl http://127.0.0.1:5011/healthz
 
 ## Androidアプリ
 
-Android 17以降の端末と、Tailscaleへの接続が必要です。
+Android 16以降の端末と、Tailscaleへの接続が必要です。
 アプリは `http://homeserver:5011` へ接続します。
 `homeserver` はtailnetのMagicDNS名なので、Tailscaleが有効なら家の外からも使えます。
 QRの読み取りにはGoogle Playサービスのコードスキャナーを使うため、カメラの権限は求めません。

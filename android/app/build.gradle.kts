@@ -5,7 +5,7 @@ android {
     compileSdk = 37
     defaultConfig {
         applicationId = "dev.miyabisun.homelink"
-        minSdk = 37
+        minSdk = 36
         targetSdk = 37
         versionCode = 11
         versionName = "0.1.11"

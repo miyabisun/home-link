@@ -105,6 +105,9 @@ avdmanager create avd -n home-link-api37 -k 'system-images;android-37.0;google_a
 "$ANDROID_HOME/emulator/emulator" -avd home-link-api37
 ```
 
+アプリはAndroid 16（API 36）以降に対応します。Android 16でも同じテストを実行するには、
+`system-images;android-36;google_apis;x86_64` で `home-link-api36` を作って起動します。
+
 エミュレータの起動後、別のターミナルの `android/` で実行します。`emulator-5554` は `adb devices` で確認した識別子に置き換えます。
 
 ```sh

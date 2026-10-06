@@ -1,5 +1,6 @@
 package dev.miyabisun.homelink
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
@@ -23,6 +24,16 @@ import java.util.concurrent.ExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicInteger
+
+/**
+ * The runtime permissions the proxy needs on [sdk]. Android 17 also blocks LAN connections,
+ * including to the BLE proxy, without ACCESS_LOCAL_NETWORK; Android 16 lacks it and would deny it.
+ */
+@SuppressLint("InlinedApi") // Only asked for when sdk is 37 or above.
+fun bluetoothPermissions(sdk: Int): Array<String> {
+    val bluetooth = arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
+    return if (sdk >= 37) bluetooth + Manifest.permission.ACCESS_LOCAL_NETWORK else bluetooth
+}
 
 /** The real proxy: [BleProxy] over the phone's BLE, to matterjs-server at [url]. */
 class ProxyLink(private val context: Context, private val url: String) : BleLink {
