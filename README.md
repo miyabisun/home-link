@@ -4,6 +4,7 @@
 家じゅうの照明を、Androidのボタン1つで全部オン・全部オフにできます。
 電球などに印刷されたMatterのQRコードをAndroidアプリで読み取り、部屋と名前を付けて登録します。
 QRコードが無い機器は、印字された11桁の数字（Matterの手動ペアリングコード）を入力して登録します。
+新しいWi-Fi電球は、電話のBluetoothで直接つなぎ、家のWi-Fiとmatterjs-serverへ入れてから台帳に登録できます。
 登録した内容は、自宅サーバーで動くhome-linkのAPIがSQLiteに保存します。
 機器自身の識別子（ベンダー名とシリアル番号、Wi-Fi機器はMACアドレス）も保存でき、
 Matterのcontroller（[matterjs-server](https://github.com/matter-js/matterjs-server)）を作り直しても、
@@ -11,7 +12,8 @@ Matterのcontroller（[matterjs-server](https://github.com/matter-js/matterjs-se
 
 構成は、Rust（axum）のAPIサーバーと、Kotlinで作ったAndroidアプリです。
 照明の操作は、matterjs-serverに登録済みの照明を全部オン・全部オフにするものだけです。
-照明ごと・部屋ごとの操作と、Matterの機器登録（commissioning）は、現在のhome-linkにはありません。
+照明ごと・部屋ごとの操作は、現在のhome-linkにはありません。
+Matterの機器登録（commissioning）はmatterjs-serverが行い、home-linkのアプリは電話のBluetoothを貸すだけです。
 
 ## 公開範囲と認証
 
@@ -40,7 +42,7 @@ curl http://127.0.0.1:5011/healthz
 | `PORT` | `3000` | 待ち受けるTCPポート。1〜65535の10進数で、不正な値では起動しません。 |
 | `DATABASE_PATH` | `home-link.db`（コンテナでは `/data/home-link.db`） | SQLiteデータベースのファイル。無ければ作成します。 |
 | `LOG_LEVEL` | `info` | `off`・`error`・`warn`・`info`・`debug`・`trace` のいずれか。 |
-| `MATTER_SERVER_URL` | なし | matterjs-serverのWebSocket API（例: `ws://192.168.1.100:5580/ws`）。未設定なら状態APIと照明APIは503を返します。 |
+| `MATTER_SERVER_URL` | なし | matterjs-serverのWebSocket API（例: `ws://192.168.1.100:5580/ws`）。未設定なら状態API・照明API・機器のBluetooth登録は503を返します。 |
 
 ## Androidアプリ
 
@@ -63,9 +65,35 @@ APKは開発用のdebug署名です。PCからADBで導入する方法と、フ�
 「ホーム画面にボタンを置く」を押すと、同じ2つのボタンのウィジェットをホーム画面へ置けます。
 ウィジェットはボタンの下に、直前の結果を短く表示します。
 
-### 機器を登録する
+### Wi-Fi電球をBluetoothでつなぐ
 
-1. アプリを開き、「QRを読み取る」で機器のQRコードを読み取ります。
+新品や初期化した、ペアリング待ちのMatter over Wi-Fiの電球（Tapo、BEAMTECなど）を、Aqara Homeを使わずに登録できます。
+前のルーター向けに設定されて今つながらない電球も、初期化すれば同じ手順で今のWi-Fiへ入れられます。
+Matter over ThreadやZigbeeの電球（Aqara T2など）は対象外です。Thread網の資格情報やZigbeeの親機がHub M3にあるためです。
+これらはAqara Homeで追加してから、下の「記録だけ」で登録してください。
+
+電話がBluetoothでmatterjs-serverの[BLE Proxy](https://github.com/matter-js/matterjs-server/blob/main/docs/ble-proxy-protocol.md)
+（`ws://192.168.1.100:5580/ble`）の中継を務め、Matterの手順（暗号化、Wi-Fi情報の送付、fabricへの参加）はmatterjs-serverが行います。
+そのため、登録するときは電話を家のWi-Fiにつなぎ、電球の近くに置きます。
+matterjs-serverはBluetoothを有効にして（BLE Proxyを受け付けて）起動しておく必要があります。
+
+1. 「つなぎ方」で「新しいWi-Fi電球をBluetoothでつなぐ」を選びます（既定）。
+2. 初回だけ「電球に渡すWi-Fi」に家のWi-FiのSSIDとパスワードを入力して保存します。
+   パスワードはこの電話の中だけに、Android Keystoreの鍵で暗号化して保存します。
+   登録のたびにhome-link経由でmatterjs-serverへ渡し、home-linkのデータベースやログには残しません。
+3. 電球をペアリング待ちにします。BEAMTECは電源のオフ・オンを5回くり返します。ほかはメーカーの手順に従います。
+4. QRコードを読み取るか数字を入力し、部屋と名前（任意）を決めて「登録」を押します。
+   初回は「付近のデバイス」の許可を求めます。Bluetoothがオフならオンにするよう求めます。
+
+登録中は、電球を探している・接続している・コードとWi-Fiの設定を送っている・電球がWi-Fiにつながるのを待っている、の段階を表示します。
+電球が見つからない、コードが違う、Wi-Fiにつながらない、時間切れ、matterjs-serverに接続できない、はそれぞれ理由と次にすることを表示し、入力は残ります。
+台帳に同じ機器（同じ識別子かコード）がある場合は新しく登録せず、既存の登録を示します。
+
+### 機器を登録する（記録だけ）
+
+すでにmatterjs-serverにつながっている機器は、「つなぎ方」で「記録だけ」を選んで台帳にだけ登録します。
+
+1. 「QRを読み取る」で機器のQRコードを読み取ります。
    QRコードが無い機器は「数字で入力」を押し、機器に印字された11桁の数字を入力します。
    11桁そろうと確定し、数字の誤りはその場で表示します。
 2. 部屋を選びます。部屋が無ければ「部屋を追加」で作成します。
@@ -90,6 +118,7 @@ APKは開発用のdebug署名です。PCからADBで導入する方法と、フ�
 | `GET /api/devices/{id}` | 機器1台。登録したコードの全文 `qr_payload` または `manual_code` を含みます | 404 `device_not_found` |
 | `PATCH /api/devices/{id}` | 自動調整の色温度の下限の変更。本文は `{"min_kelvin": 4000}`、`null` で下限なし | 400 `invalid_min_kelvin`、404 `device_not_found` |
 | `DELETE /api/devices/{id}` | 機器の削除 | 404 `device_not_found` |
+| `POST /api/commission` | 機器をmatterjs-serverへBluetoothで登録（commissioning）し、台帳に登録 | 400 `missing_setup_code`・`invalid_qr_payload`・`invalid_manual_code`・`invalid_wifi`・`invalid_device_name`、404 `room_not_found`、422 `device_not_found`・`wrong_code`・`wifi_failed`・`commission_failed`、504 `commission_timeout`、502 `matter_server_unreachable`、503 `matter_server_not_configured`・`bluetooth_unavailable` |
 | `GET /api/status` | 台帳の機器ごとに、matterjs-serverで見えるか（`visible`）と今の `node_id`・`endpoint` | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `GET /api/lights` | 照明ごとの今の状態（`on`・`off`・`no_response`）と、その件数 | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `POST /api/lights/on` | 全部の照明をオンにし、照明ごとの結果（`switched`・`no_response`・`failed`）と件数を返します | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
@@ -111,6 +140,17 @@ QRコードと手動ペアリングコードは、setup passcodeとdiscriminator
 VendorNameとSerialNumberです。Aqara Hub M3配下のT2ではZigbeeのIEEEアドレス、TapoではWi-FiのMACがSerialNumberになります。
 `vendor` と `serial_number` は両方を前後の空白を除いて1〜100文字で送り、`mac` は任意で16進数12桁（`:` と `-` は除きます）を送ります。
 同じ `vendor` と `serial_number` の組、または同じ `mac` の二重登録は `duplicate_identifier` で拒否します。
+
+`POST /api/commission` は、本文の `room_id`、`qr_payload` か `manual_code` のどちらか一方、`name`（任意）、
+`wifi_ssid`（1〜32バイト）、`wifi_password`（1〜64文字）を受け取ります。
+matterjs-serverへ `set_wifi_credentials` でWi-Fi情報を渡し、`commission_with_code`（`network_only: false`）でBluetooth経由の登録を行います。
+Bluetoothの中継は、要求の前からmatterjs-serverの `/ble` に接続している電話などのBLE Proxyが務めます。
+登録できたら、新しいnodeのBasic InformationのVendorNameとSerialNumber、General DiagnosticsのWi-Fiインターフェースの
+MACアドレスを読み、コードとともに台帳へ登録して201を返します。
+同じ識別子かコードの機器が台帳にあれば新しく登録せず、その機器に欠けていた識別子を補って200で返します（`registered: false`）。
+1回の登録は5分で打ち切ります。Wi-Fiのパスワードはmatterjs-serverへ渡すだけで、データベース・ログ・応答には含めません。
+`device_not_found` はペアリング待ちの機器がBluetoothで見つからない、`wrong_code` は見つかったがコードを受け付けない、
+`wifi_failed` は機器がWi-Fiにつながらない、`commission_failed` はそれ以外（matterjs-serverの説明を `message` に含みます）です。
 
 `GET /api/status` は、そのたびにmatterjs-serverの全nodeを読み、識別子から機器の今の `node_id` と `endpoint` を引きます。
 node IDとendpointはmatterjs-serverが振る番号なので台帳には保存しません。
@@ -198,6 +238,12 @@ curl -X POST http://homeserver:5011/api/devices -H 'content-type: application/js
 curl -X POST http://homeserver:5011/api/devices -H 'content-type: application/json' \
   -d '{"room_id":1,"vendor":"Tapo","serial_number":"CCBABDE0C244","mac":"CC:BA:BD:E0:C2:44","name":"読書灯"}'
 # {"id":2,"room_id":1,"room_name":"寝室","name":"読書灯","vendor":"Tapo","serial_number":"CCBABDE0C244","mac":"CCBABDE0C244","created_at":"2026-10-05T12:30:00Z"}
+
+curl -X POST http://homeserver:5011/api/commission -H 'content-type: application/json' \
+  -d '{"room_id":2,"qr_payload":"MT:Y.K9042C00KA0648G00","name":"押入れ1","wifi_ssid":"home-2g","wifi_password":"…"}'
+# 201 {"node_id":17,"registered":true,"device":{"id":9,"room_id":2,"room_name":"押入れ","name":"押入れ1","vendor":"Tapo",
+#      "serial_number":"CCBABDE0C244","mac":"CCBABDE0C244","min_kelvin":null,"created_at":"2026-10-06T03:30:00Z"}}
+# 422 {"error":"wifi_failed","message":"機器がWi-Fi「home-2g」に接続できませんでした"}
 
 curl http://homeserver:5011/api/status
 # {"devices":[{"endpoint":null,"id":1,"name":"天井灯","node_id":null,"room_name":"寝室","visible":false},{"endpoint":0,"id":2,"name":"読書灯","node_id":5,"room_name":"寝室","visible":true}],"version":"0.1.4"}

@@ -1,8 +1,13 @@
 package dev.miyabisun.homelink
 
+import android.Manifest
 import android.app.Activity
 import android.appwidget.AppWidgetManager
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothManager
 import android.content.ComponentName
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -26,6 +31,8 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.RadioButton
+import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
@@ -37,12 +44,20 @@ class MainActivity : Activity() {
         // Instrumentation supplies fakes here; there is no user-facing mock mode.
         internal var apiFactory: (() -> HomeLinkApi)? = null
         internal var scannerFactory: ((Activity) -> QrScanner)? = null
+        /** A fake link also skips the Bluetooth permission and power checks. */
+        internal var linkFactory: ((Activity) -> BleLink)? = null
+        internal var wifiStoreFactory: ((Activity) -> WifiStore)? = null
         private const val MAX_NAME = 100
+        private const val REQUEST_BLUETOOTH = 1
+        private const val REQUEST_ENABLE = 2
+        private val BLUETOOTH_PERMISSIONS =
+            arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
     }
 
     private val form = RegisterForm()
     private lateinit var api: HomeLinkApi
     private lateinit var scanner: QrScanner
+    private lateinit var wifiStore: WifiStore
     private lateinit var worker: ExecutorService
     private lateinit var lightsWorker: ExecutorService
     /** The light switch in flight: true for on, false for off. */
@@ -54,8 +69,21 @@ class MainActivity : Activity() {
     private var addingRoom = false
     private var enteringCode = false
     private var formattingCode = false
+    private var editingWifi = false
 
     private lateinit var content: LinearLayout
+    private lateinit var bluetoothChoice: RadioButton
+    private lateinit var recordChoice: RadioButton
+    private lateinit var bluetoothGuide: LinearLayout
+    private lateinit var wifiPanel: LinearLayout
+    private lateinit var wifiState: TextView
+    private lateinit var wifiEditButton: Button
+    private lateinit var wifiEditor: LinearLayout
+    private lateinit var wifiSsid: EditText
+    private lateinit var wifiPassword: EditText
+    private lateinit var wifiMessage: TextView
+    private lateinit var wifiCancelButton: Button
+    private lateinit var wifiSaveButton: Button
     private lateinit var lightsOnButton: Button
     private lateinit var lightsOffButton: Button
     private lateinit var lightsRow: ResultRow
@@ -84,6 +112,8 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         api = apiFactory?.invoke() ?: HttpHomeLinkApi(BuildConfig.HOME_LINK_URL)
         scanner = scannerFactory?.invoke(this) ?: GmsQrScanner(this)
+        wifiStore = wifiStoreFactory?.invoke(this) ?: KeystoreWifiStore(this)
+        form.wifi = wifiStore.load()
         worker = Executors.newSingleThreadExecutor()
         // Switching lights can wait seconds for every bulb; registration does not queue behind it.
         lightsWorker = Executors.newSingleThreadExecutor()
@@ -93,6 +123,8 @@ class MainActivity : Activity() {
             form.name = state.getString("name").orEmpty()
             addingRoom = state.getBoolean("addingRoom")
             enteringCode = state.getBoolean("enteringCode")
+            form.bluetooth = state.getBoolean("bluetooth", true)
+            editingWifi = state.getBoolean("editingWifi")
             lightsResult = state.getString("lightsText")?.let { LightsMessage(it, state.getBoolean("lightsFailed")) }
         }
         build()
@@ -100,6 +132,12 @@ class MainActivity : Activity() {
         manualField.setSelection(manualField.length())
         newRoomName.setText(savedInstanceState?.getString("newRoom").orEmpty())
         nameField.setText(form.name)
+        wifiSsid.setText(savedInstanceState?.getString("wifiSsid") ?: form.wifi?.ssid.orEmpty())
+        // A registration started before the screen was recreated carries on.
+        form.busy = CommissionSession.running
+        form.stage = CommissionSession.stage
+        CommissionSession.follow { sessionChanged() }
+        sessionChanged()
         loadRooms()
     }
 
@@ -111,6 +149,10 @@ class MainActivity : Activity() {
         outState.putString("newRoom", newRoomName.text.toString())
         outState.putBoolean("enteringCode", enteringCode)
         outState.putString("manualCode", manualField.text.toString())
+        outState.putBoolean("bluetooth", form.bluetooth)
+        outState.putBoolean("editingWifi", editingWifi)
+        // The password is never put in the saved state.
+        outState.putString("wifiSsid", wifiSsid.text.toString())
         lightsResult?.let {
             outState.putString("lightsText", it.text)
             outState.putBoolean("lightsFailed", it.failed)
@@ -128,6 +170,7 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        CommissionSession.follow(null)
         worker.shutdownNow()
         lightsWorker.shutdownNow()
         super.onDestroy()
@@ -234,7 +277,94 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun saveWifi() {
+        val network = WifiNetwork(wifiSsid.text.toString(), wifiPassword.text.toString())
+        // SSIDs are up to 32 bytes; WPA passphrases up to 64 characters.
+        if (network.ssid.toByteArray().size !in 1..32 || network.password.length !in 1..64) {
+            show(wifiMessage, "Wi-Fiの名前（32バイトまで）とパスワード（64文字まで）を入力してください")
+            return
+        }
+        wifiStore.save(network)
+        form.wifi = network
+        editingWifi = false
+        wifiPassword.setText("")
+        wifiMessage.visibility = View.GONE
+        if (form.status == Status.Failed(ApiError.INVALID_WIFI) || form.status == Status.Failed(ApiError.WIFI_FAILED)) {
+            form.status = null
+        }
+        getSystemService(InputMethodManager::class.java).hideSoftInputFromWindow(wifiPassword.windowToken, 0)
+        render()
+    }
+
+    /** Checks the Bluetooth permissions and power, asking for them, then starts the registration. */
+    private fun commission() {
+        if (linkFactory == null) {
+            if (BLUETOOTH_PERMISSIONS.any { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }) {
+                requestPermissions(BLUETOOTH_PERMISSIONS, REQUEST_BLUETOOTH)
+                return
+            }
+            val adapter = getSystemService(BluetoothManager::class.java)?.adapter
+            if (adapter == null) {
+                form.bleFailed(BleProblem.BLUETOOTH_OFF)
+                render()
+                return
+            }
+            if (!adapter.isEnabled) {
+                @Suppress("DEPRECATION") // The result is needed to carry on; there is no other API for this prompt.
+                startActivityForResult(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE), REQUEST_ENABLE)
+                return
+            }
+        }
+        val payload = form.payload ?: return
+        val roomId = form.roomId ?: return
+        val wifi = form.wifi ?: return
+        val name = form.name.trim()
+        form.busy = true
+        form.status = null
+        val link = linkFactory?.invoke(this) ?: ProxyLink(applicationContext, BuildConfig.BLE_PROXY_URL)
+        CommissionSession.start(link) { api.commission(roomId, payload, name, wifi) }
+        form.stage = CommissionSession.stage
+        render()
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != REQUEST_BLUETOOTH) return
+        if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) commission()
+        else {
+            form.bleFailed(BleProblem.PERMISSION)
+            render()
+        }
+    }
+
+    @Deprecated("Pairs with startActivityForResult for the Bluetooth prompt")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        @Suppress("DEPRECATION")
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQUEST_ENABLE) return
+        if (resultCode == RESULT_OK) commission()
+        else {
+            form.bleFailed(BleProblem.BLUETOOTH_OFF)
+            render()
+        }
+    }
+
+    private fun sessionChanged() {
+        form.stage = CommissionSession.stage
+        when (val outcome = CommissionSession.take()) {
+            is Outcome.Done -> {
+                form.commissioned(outcome.result)
+                if (outcome.result is ApiResult.Ok) nameField.setText("")
+                if (outcome.result == ApiResult.Failed(ApiError.ROOM_NOT_FOUND)) loadRooms()
+            }
+            is Outcome.Failed -> form.bleFailed(outcome.problem)
+            null -> Unit
+        }
+        render()
+    }
+
     private fun register() {
+        if (form.bluetooth) return commission()
         val payload = form.payload ?: return
         val roomId = form.roomId ?: return
         form.busy = true
@@ -278,6 +408,49 @@ class MainActivity : Activity() {
         label(content, "機器を登録", 28, bold = true).apply {
             (layoutParams as LinearLayout.LayoutParams).topMargin = dp(24)
         }
+
+        val mode = panel()
+        label(mode, "つなぎ方", 18, bold = true)
+        val choices = RadioGroup(this).apply { orientation = RadioGroup.VERTICAL }
+        mode.addView(choices, LinearLayout.LayoutParams(-1, -2))
+        bluetoothChoice = choice(choices, "新しいWi-Fi電球をBluetoothでつなぐ") { form.bluetooth = true }
+        recordChoice = choice(choices, "記録だけ（つながっている機器）") { form.bluetooth = false }
+        bluetoothGuide = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        mode.addView(bluetoothGuide, LinearLayout.LayoutParams(-1, -2))
+        label(bluetoothGuide, "電球をペアリング待ちにし、電話を近づけて登録します。" +
+            "BEAMTECは電源のオフ・オンを5回くり返します。ほかはメーカーの手順に従ってください。", 14, muted = true)
+        label(bluetoothGuide, "ThreadやZigbeeの電球（Aqara T2など）はこの方法でつなげません。" +
+            "Aqara Homeで追加してから「記録だけ」で登録してください。", 14, muted = true)
+
+        wifiPanel = panel()
+        label(wifiPanel, "電球に渡すWi-Fi", 18, bold = true)
+        wifiState = label(wifiPanel, "", 16)
+        wifiEditButton = button(wifiPanel, "変更") {
+            editingWifi = true
+            render()
+            wifiPassword.requestFocus()
+        }
+        wifiEditor = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        wifiPanel.addView(wifiEditor, LinearLayout.LayoutParams(-1, -2))
+        label(wifiEditor, "Wi-Fiの名前（SSID）", 14, muted = true)
+        wifiSsid = field(wifiEditor, "Wi-Fiの名前（SSID）", EditorInfo.IME_ACTION_NEXT) { wifiPassword.requestFocus() }
+        wifiSsid.addTextChangedListener(changed { render() })
+        label(wifiEditor, "パスワード", 14, muted = true)
+        wifiPassword = field(wifiEditor, "Wi-Fiのパスワード", EditorInfo.IME_ACTION_DONE) { saveWifi() }
+        wifiPassword.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        wifiPassword.addTextChangedListener(changed { render() })
+        label(wifiEditor, "この電話の中だけに暗号化して保存し、登録のたびにmatterjs-serverへ渡します。", 14, muted = true)
+        wifiMessage = message(wifiEditor)
+        val wifiActions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        wifiEditor.addView(wifiActions, LinearLayout.LayoutParams(-1, -2))
+        wifiCancelButton = button(wifiActions, "やめる", weight = true) {
+            editingWifi = false
+            wifiSsid.setText(form.wifi?.ssid.orEmpty())
+            wifiPassword.setText("")
+            wifiMessage.visibility = View.GONE
+            render()
+        }
+        wifiSaveButton = button(wifiActions, "保存", weight = true) { saveWifi() }
 
         val qr = panel()
         label(qr, "機器のコード", 18, bold = true)
@@ -372,6 +545,22 @@ class MainActivity : Activity() {
         }
         pinButton.visibility = if (canPinWidget) View.VISIBLE else View.GONE
 
+        bluetoothChoice.isChecked = form.bluetooth
+        recordChoice.isChecked = !form.bluetooth
+        bluetoothChoice.isEnabled = !form.busy
+        recordChoice.isEnabled = !form.busy
+        bluetoothGuide.visibility = if (form.bluetooth) View.VISIBLE else View.GONE
+        wifiPanel.visibility = if (form.bluetooth) View.VISIBLE else View.GONE
+        val wifi = form.wifi
+        val editing = editingWifi || wifi == null
+        wifiState.text = if (wifi == null) "まだ設定していません" else "「${wifi.ssid}」を渡します"
+        wifiState.setTextColor(getColor(if (wifi == null) R.color.muted else R.color.text))
+        wifiEditButton.visibility = if (editing) View.GONE else View.VISIBLE
+        wifiEditButton.isEnabled = !form.busy
+        wifiEditor.visibility = if (editing) View.VISIBLE else View.GONE
+        wifiCancelButton.visibility = if (wifi == null) View.GONE else View.VISIBLE
+        wifiSaveButton.isEnabled = wifiSsid.text.isNotEmpty() && wifiPassword.text.isNotEmpty()
+
         val payload = form.payload
         val scannedQr = payload?.startsWith("MT:") == true
         qrState.text = when {
@@ -421,7 +610,24 @@ class MainActivity : Activity() {
         newRoomPanel.visibility = if (addingRoom) View.VISIBLE else View.GONE
         createRoomButton.isEnabled = newRoomName.text.isNotBlank()
 
+        val ssid = form.wifi?.ssid.orEmpty()
         val result = when (status) {
+            is Status.Commissioned -> with(status.device) {
+                when {
+                    !registered -> "Wi-Fiにつなぎました。台帳の" +
+                        (if (name.isEmpty()) "${room}の機器" else "「$name」（$room）") + "として登録済みです"
+                    name.isEmpty() -> "${room}に機器をつなぎ、登録しました"
+                    else -> "${room}に「$name」をつなぎ、登録しました"
+                }
+            }
+            is Status.BleFailed -> when (status.problem) {
+                BleProblem.PERMISSION -> "Bluetoothで電球を探すには「付近のデバイス」の許可が必要です。" +
+                    "許可してから「登録」を押し直してください"
+                BleProblem.BLUETOOTH_OFF -> "Bluetoothがオフです。オンにしてから「登録」を押し直してください"
+                BleProblem.PROXY_UNREACHABLE -> "matterjs-server（${Uri.parse(BuildConfig.BLE_PROXY_URL).authority}）に" +
+                    "接続できません。家のWi-Fiにつないでから、もう一度お試しください"
+                BleProblem.PROXY_VERSION -> "matterjs-serverのBluetooth中継の版が合いません。アプリを更新してください"
+            }
             is Status.Registered -> if (status.name.isEmpty()) "${status.room}に機器を登録しました"
                 else "${status.room}に「${status.name}」を登録しました"
             is Status.Failed -> when (status.error) {
@@ -435,15 +641,49 @@ class MainActivity : Activity() {
                 ApiError.SERVER, ApiError.MATTER_UNREACHABLE, ApiError.MATTER_NOT_CONFIGURED ->
                     "home-linkでエラーが発生しました。時間をおいてお試しください"
                 ApiError.DUPLICATE_ROOM -> null
+                ApiError.DEVICE_NOT_FOUND -> "電球が見つかりませんでした。電球をペアリング待ちにし、" +
+                    "電話を近づけてから「登録」を押し直してください"
+                ApiError.WRONG_CODE -> "電球がコードを受け付けませんでした。電球のコードを読み取り直すか、入力し直してください"
+                ApiError.WIFI_FAILED -> "電球がWi-Fi「$ssid」につながりませんでした。Wi-Fiの名前とパスワードを確かめてください。" +
+                    "2.4GHzにしか対応しない電球もあります"
+                ApiError.COMMISSION_TIMEOUT -> "時間内に登録が終わりませんでした。電球をペアリング待ちにし直して、もう一度お試しください"
+                ApiError.COMMISSION_FAILED -> "電球を登録できませんでした。電球を初期化してから、もう一度お試しください"
+                ApiError.BLUETOOTH_UNAVAILABLE -> "matterjs-serverでBluetoothの中継が有効になっていません。サーバーの設定を確かめてください"
+                ApiError.INVALID_WIFI -> "Wi-Fiの名前かパスワードが長すぎます。「変更」から入力し直してください"
             }
             else -> null
         }
-        resultRow.show(result, status is Status.Failed)
+        val stage = form.stage
+        if (form.busy && stage != null) resultRow.show(stageText(stage), failed = false, R.drawable.ic_bluetooth)
+        else resultRow.show(result, status is Status.Failed || status is Status.BleFailed)
         reconnectButton.visibility =
             if ((form.roomsFailed || status == Status.Failed(ApiError.UNREACHABLE)) && !loadingRooms) View.VISIBLE
             else View.GONE
         registerButton.isEnabled = form.canRegister()
         registerButton.text = if (form.busy) "登録中…" else "登録"
+    }
+
+    private fun stageText(stage: Stage) = when (stage) {
+        Stage.PREPARING -> "matterjs-serverに接続しています…"
+        Stage.SEARCHING -> "電球を探しています…"
+        Stage.CONNECTING -> "電球に接続しています…"
+        Stage.SENDING -> "電球にコードとWi-Fiの設定を送っています…"
+        Stage.JOINING -> "電球がWi-Fiにつながるのを待っています…"
+    }
+
+    private fun choice(group: RadioGroup, value: String, select: () -> Unit): RadioButton = RadioButton(this).apply {
+        text = value
+        textSize = 16f
+        minHeight = dp(48)
+        setTextColor(ColorStateList(arrayOf(intArrayOf(-android.R.attr.state_enabled), intArrayOf()),
+            intArrayOf(getColor(R.color.muted), getColor(R.color.text))))
+        buttonTintList = ColorStateList.valueOf(getColor(R.color.accent))
+        setOnClickListener {
+            select()
+            form.status = null
+            render()
+        }
+        group.addView(this, RadioGroup.LayoutParams(-1, -2))
     }
 
     /** A result line: an icon and text on a surface that turns to the failure colors. */

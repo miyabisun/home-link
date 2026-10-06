@@ -1,5 +1,10 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Lending the phone's BLE to matterjs-server while registering a new device. -->
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
     <application android:label="@string/app_name" android:icon="@drawable/ic_home_link"
         android:theme="@style/AppTheme" android:allowBackup="false"
         android:dataExtractionRules="@xml/data_extraction_rules"

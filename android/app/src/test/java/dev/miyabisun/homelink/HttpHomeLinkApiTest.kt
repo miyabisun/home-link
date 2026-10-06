@@ -76,6 +76,47 @@ class HttpHomeLinkApiTest {
         }
     }
 
+    @Test fun commissionsWithTheWifiAndReadsTheLedgerEntry() {
+        respond("/api/commission", 201, """{"node_id":17,"registered":true,"device":{"id":9,"room_id":2,
+            "room_name":"押入れ","name":"押入れ1","vendor":"Tapo","serial_number":"CCBABDE0C244","mac":"CCBABDE0C244",
+            "min_kelvin":null,"created_at":"t"}}""")
+        val wifi = WifiNetwork("home-2g", "pass word")
+        assertEquals(ApiResult.Ok(Commissioned(true, "押入れ", "押入れ1")),
+            api.commission(2, "MT:Y.K9042C00KA0648G00", "押入れ1", wifi))
+        val body = JSONObject(requests.single().substringAfter("/api/commission "))
+        assertEquals(2L, body.getLong("room_id"))
+        assertEquals("MT:Y.K9042C00KA0648G00", body.getString("qr_payload"))
+        assertEquals("押入れ1", body.getString("name"))
+        assertEquals("home-2g", body.getString("wifi_ssid"))
+        assertEquals("pass word", body.getString("wifi_password"))
+
+        // A device the ledger already holds keeps its own room and name.
+        respond("/api/commission", 200, """{"node_id":17,"registered":false,"device":{"id":3,"room_id":1,
+            "room_name":"寝室","name":"読書灯","created_at":"t"}}""")
+        assertEquals(ApiResult.Ok(Commissioned(false, "寝室", "読書灯")), api.commission(2, "34970112332", "", wifi))
+        assertEquals("34970112332", JSONObject(requests.last().substringAfter("/api/commission ")).getString("manual_code"))
+    }
+
+    @Test fun mapsCommissioningFailures() {
+        val cases = listOf(
+            Triple(422, "device_not_found", ApiError.DEVICE_NOT_FOUND),
+            Triple(422, "wrong_code", ApiError.WRONG_CODE),
+            Triple(422, "wifi_failed", ApiError.WIFI_FAILED),
+            Triple(504, "commission_timeout", ApiError.COMMISSION_TIMEOUT),
+            Triple(422, "commission_failed", ApiError.COMMISSION_FAILED),
+            Triple(503, "bluetooth_unavailable", ApiError.BLUETOOTH_UNAVAILABLE),
+            Triple(400, "invalid_wifi", ApiError.INVALID_WIFI),
+            Triple(400, "invalid_qr_payload", ApiError.INVALID_QR),
+            Triple(404, "room_not_found", ApiError.ROOM_NOT_FOUND),
+            Triple(502, "matter_server_unreachable", ApiError.MATTER_UNREACHABLE),
+        )
+        for ((status, code, expected) in cases) {
+            respond("/api/commission", status, """{"error":"$code","message":"m"}""")
+            assertEquals("$status $code", ApiResult.Failed(expected),
+                api.commission(1, "MT:x", "", WifiNetwork("s", "p")))
+        }
+    }
+
     @Test fun switchesLightsAndCountsEachResult() {
         respond("/api/lights/on", 200, """{"action":"on","switched":7,"no_response":2,"failed":1,"missing":2,
             "lights":[],"missing_devices":[{"id":3,"name":"台所","room_name":"居間"},{"id":4,"name":"","room_name":"寝室"}]}""")
@@ -103,5 +144,6 @@ class HttpHomeLinkApiTest {
         assertEquals(ApiResult.Failed(ApiError.UNREACHABLE), offline.rooms())
         assertEquals(ApiResult.Failed(ApiError.UNREACHABLE), offline.register(1, "MT:x", ""))
         assertEquals(ApiResult.Failed(ApiError.UNREACHABLE), offline.switchLights(true))
+        assertEquals(ApiResult.Failed(ApiError.UNREACHABLE), offline.commission(1, "MT:x", "", WifiNetwork("s", "p")))
     }
 }

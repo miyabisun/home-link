@@ -34,6 +34,11 @@ cargo test --locked
 状態APIと照明APIのテストは、`tests/api.rs` の中でmatterjs-serverと同じ形で `get_nodes` と `device_command` に応答する
 WebSocketサーバーを立て、全部オン・全部オフ、エラーや無応答の照明、接続断からの再接続を検証します。
 無応答の照明のテストは、応答を待つ10秒の期限まで待ちます。
+`src/commission.rs` はmatterjs-serverへWi-Fi情報を渡して `commission_with_code` で機器を登録する処理と、
+失敗の文言（matter.jsの例外の文）を見つからない・コード違い・Wi-Fi・時間切れに分ける処理、
+登録した機器のBasic InformationとWi-FiのMACアドレスの取り出しと、それらの単体テストを持ちます。
+機器登録APIのテストは、`tests/api.rs` の中で `set_wifi_credentials`・`commission_with_code`・`read_attribute` に応答するmockを立て、
+成功・各失敗・時間切れ・台帳の重複・入力の検証と、データベースのファイルと応答にWi-Fiのパスワードが残らないことを検証します。
 `src/schedule.rs` は自動調整の目標値（日の出・日の入り、朝・昼・夕・夜の境界と線形の補間、照明ごとの下限と範囲への丸め）と、
 照明ごとに送るか・送らない理由（前回と同じ値を含む）を決める純粋な処理と、そのテストを持ちます。
 自動調整のテストは、同じmockに `read_attribute` と明るさ・色温度の命令を受けさせ、点いている照明だけに書き込むこと、
@@ -64,15 +69,23 @@ cd android
 APKは `android/app/build/outputs/apk/debug/app-debug.apk` に出力します。
 package IDは `dev.miyabisun.homelink` です。
 接続先は既定で `http://homeserver:5011` です。別のURLでビルドするには `-PhomeLinkUrl=http://…` を付けます。
+Bluetoothで機器を登録するときのmatterjs-serverのBLE Proxyは既定で `ws://192.168.1.100:5580/ble` で、`-PbleProxyUrl=ws://…` で変えられます。
 平文HTTPを許可するホストは `app/src/main/res/xml/network_security_config.xml` に書いています。
 ホスト名を変える場合は、このファイルも合わせて変更してください。
 
 JVMテストは、JDKの一時HTTPサーバーを相手にAPIクライアントを検証します。入力の状態の扱いも単体で検証します。
+`BleProxyTest` は、OkHttpのMockWebServerでmatterjs-serverの `/ble` を、fakeでBLEの層を置き換え、
+BLE Proxy Protocol v1のhello、各命令とその失敗、`device_discovered` などのevent、binary frame（`WRITE_DATA` と `NOTIFICATION`）を検証します。
+pingへのpongはOkHttpが自動で返します（実サーバーへ75秒接続して切られないことを確認済み）。
+実際のBluetoothを使う `AndroidBle` と、Keystoreに保存するWi-Fi情報は、エミュレータと実機で確かめます。
 
 ### 画面の検証
 
 instrumentationテストは、APIとQRスキャナーをfakeに置き換え、実際の画面部品を操作します。
 部屋の作成・選択・登録・成功表示と、登録済み・部屋なし・接続不可・Matter以外のQR・画面の再生成を扱います。
+Bluetoothでの登録は、BLEの中継をfakeに置き換え、Wi-Fiの設定、段階の表示、画面の再生成をまたいだ進行、成功、
+各失敗（電球が見つからない・コード違い・Wi-Fi・時間切れ・matterjs-serverに接続できないなど）での入力の保持を扱います。
+Keystoreに暗号化して保存したWi-Fi情報を読み戻せること、平文で残らないことも同じテストで確かめます。
 照明のボタンは、送信中・全部成功・一部の照明が残った場合・接続不可の表示と、画面の再生成での結果の保持を扱います。
 ホーム画面のウィジェットは、ランチャーへの配置を伴うため、このテストには含みません。
 エミュレータで、本物のAPIサーバーとmatterjs-server互換のmockを相手に、ウィジェットを配置して押して確かめます。

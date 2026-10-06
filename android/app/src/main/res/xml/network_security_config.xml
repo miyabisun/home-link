@@ -3,4 +3,8 @@
     <domain-config cleartextTrafficPermitted="true">
         <domain includeSubdomains="false">homeserver</domain>
     </domain-config>
+    <!-- matterjs-server's BLE proxy on the home LAN; registration happens at home, next to the device. -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">192.168.1.100</domain>
+    </domain-config>
 </network-security-config>

@@ -10,7 +10,14 @@ import java.net.URL
 data class Room(val id: Long, val name: String)
 
 enum class ApiError { UNREACHABLE, DUPLICATE_QR, ROOM_NOT_FOUND, DUPLICATE_ROOM, INVALID_QR, INVALID_MANUAL, INVALID_NAME,
-    MATTER_UNREACHABLE, MATTER_NOT_CONFIGURED, SERVER }
+    MATTER_UNREACHABLE, MATTER_NOT_CONFIGURED, SERVER,
+    DEVICE_NOT_FOUND, WRONG_CODE, WIFI_FAILED, COMMISSION_TIMEOUT, COMMISSION_FAILED, BLUETOOTH_UNAVAILABLE, INVALID_WIFI }
+
+/** The Wi-Fi network handed to a new device. */
+data class WifiNetwork(val ssid: String, val password: String)
+
+/** A commissioned device's ledger entry: new, or the one the ledger already held. */
+data class Commissioned(val registered: Boolean, val room: String, val name: String)
 
 sealed interface ApiResult<out T> {
     data class Ok<T>(val value: T) : ApiResult<T>
@@ -25,6 +32,11 @@ interface HomeLinkApi {
     fun register(roomId: Long, payload: String, name: String): ApiResult<Unit>
     /** Switches every light matterjs-server serves on or off. */
     fun switchLights(on: Boolean): ApiResult<LightsResult>
+    /**
+     * Has matterjs-server commission the device behind `payload` over the BLE proxy
+     * this phone holds open, onto `wifi`, and records it. Takes up to minutes.
+     */
+    fun commission(roomId: Long, payload: String, name: String, wifi: WifiNetwork): ApiResult<Commissioned>
 }
 
 class HttpHomeLinkApi(baseUrl: String) : HomeLinkApi {
@@ -39,9 +51,22 @@ class HttpHomeLinkApi(baseUrl: String) : HomeLinkApi {
         call("POST", "/api/rooms", JSONObject().put("name", name)) { room(JSONObject(it)) }
 
     override fun register(roomId: Long, payload: String, name: String): ApiResult<Unit> {
+        return call("POST", "/api/devices", device(roomId, payload, name)) { }
+    }
+
+    override fun commission(roomId: Long, payload: String, name: String, wifi: WifiNetwork): ApiResult<Commissioned> {
+        val body = device(roomId, payload, name).put("wifi_ssid", wifi.ssid).put("wifi_password", wifi.password)
+        // matterjs-server may take minutes: Bluetooth discovery, PASE, Wi-Fi join and CASE.
+        return call("POST", "/api/commission", body, readTimeout = 360_000) {
+            val json = JSONObject(it)
+            val device = json.getJSONObject("device")
+            Commissioned(json.getBoolean("registered"), device.getString("room_name"), device.getString("name"))
+        }
+    }
+
+    private fun device(roomId: Long, payload: String, name: String): JSONObject {
         val field = if (payload.startsWith("MT:")) "qr_payload" else "manual_code"
-        val body = JSONObject().put("room_id", roomId).put(field, payload).put("name", name)
-        return call("POST", "/api/devices", body) { }
+        return JSONObject().put("room_id", roomId).put(field, payload).put("name", name)
     }
 
     override fun switchLights(on: Boolean): ApiResult<LightsResult> =
@@ -59,13 +84,14 @@ class HttpHomeLinkApi(baseUrl: String) : HomeLinkApi {
 
     private fun room(json: JSONObject) = Room(json.getLong("id"), json.getString("name"))
 
-    private fun <T> call(method: String, path: String, body: JSONObject?, parse: (String) -> T): ApiResult<T> {
+    private fun <T> call(method: String, path: String, body: JSONObject?, readTimeout: Int = 20_000,
+                         parse: (String) -> T): ApiResult<T> {
         val connection = try {
             (URL(base + path).openConnection() as HttpURLConnection).apply {
                 requestMethod = method
                 connectTimeout = 5_000
                 // Switching lights waits up to 10 s for every light's answer.
-                readTimeout = 20_000
+                this.readTimeout = readTimeout
                 setRequestProperty("accept", "application/json")
                 if (body != null) {
                     doOutput = true
@@ -101,6 +127,13 @@ class HttpHomeLinkApi(baseUrl: String) : HomeLinkApi {
             "invalid_room_name", "invalid_device_name" -> ApiError.INVALID_NAME
             "matter_server_unreachable" -> ApiError.MATTER_UNREACHABLE
             "matter_server_not_configured" -> ApiError.MATTER_NOT_CONFIGURED
+            "device_not_found" -> ApiError.DEVICE_NOT_FOUND
+            "wrong_code" -> ApiError.WRONG_CODE
+            "wifi_failed" -> ApiError.WIFI_FAILED
+            "commission_timeout" -> ApiError.COMMISSION_TIMEOUT
+            "commission_failed" -> ApiError.COMMISSION_FAILED
+            "bluetooth_unavailable" -> ApiError.BLUETOOTH_UNAVAILABLE
+            "invalid_wifi" -> ApiError.INVALID_WIFI
             else -> ApiError.SERVER
         }
     }

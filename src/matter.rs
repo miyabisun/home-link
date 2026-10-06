@@ -137,7 +137,7 @@ fn narrow<T: TryFrom<u64>>(value: u64, fallback: T) -> T {
     T::try_from(value).unwrap_or(fallback)
 }
 
-type Socket =
+pub(crate) type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Reads every node from the matterjs-server WebSocket API at `url`.
@@ -202,7 +202,7 @@ pub async fn switch(url: &str, on: bool) -> Result<(Vec<Value>, Vec<(Light, Outc
 const RECONNECT_DELAY: Duration = Duration::from_millis(500);
 
 /// The connection ended or failed before the expected replies arrived.
-struct Dropped(String);
+pub(crate) struct Dropped(pub(crate) String);
 
 async fn switch_once(
     ws: &mut Socket,
@@ -405,19 +405,19 @@ async fn request(ws: &mut Socket, mut request: Value) -> Result<Option<Value>, D
     }
 }
 
-async fn connect(url: &str) -> Result<Socket, String> {
+pub(crate) async fn connect(url: &str) -> Result<Socket, String> {
     let (ws, _) = connect_async(url).await.map_err(|e| e.to_string())?;
     Ok(ws)
 }
 
-async fn send(ws: &mut Socket, request: &Value) -> Result<(), Dropped> {
+pub(crate) async fn send(ws: &mut Socket, request: &Value) -> Result<(), Dropped> {
     ws.send(Message::text(request.to_string()))
         .await
         .map_err(|e| Dropped(e.to_string()))
 }
 
 /// The next reply or event; JSON that does not parse is a protocol failure.
-async fn receive(ws: &mut Socket) -> Result<Value, Dropped> {
+pub(crate) async fn receive(ws: &mut Socket) -> Result<Value, Dropped> {
     while let Some(message) = ws.next().await {
         if let Message::Text(text) = message.map_err(|e| Dropped(e.to_string()))? {
             return serde_json::from_str(&text).map_err(|e| Dropped(e.to_string()));

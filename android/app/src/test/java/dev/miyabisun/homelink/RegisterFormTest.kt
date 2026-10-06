@@ -10,7 +10,7 @@ class RegisterFormTest {
     private val qr = "MT:Y.K9042C00KA0648G00"
 
     @Test fun registrationNeedsAScannedCodeAndARoom() {
-        val form = RegisterForm()
+        val form = RegisterForm().apply { bluetooth = false }
         assertFalse(form.canRegister())
         form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
         assertEquals(1L, form.roomId)
@@ -111,7 +111,7 @@ class RegisterFormTest {
     }
 
     @Test fun aValidManualCodeIsAcceptedOnceAllDigitsAreTyped() {
-        val form = RegisterForm()
+        val form = RegisterForm().apply { bluetooth = false }
         form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
         form.scanned(qr)
         assertFalse(form.typed("3497 011 233"))
@@ -137,5 +137,55 @@ class RegisterFormTest {
         assertEquals(ManualError.CHECK_DIGIT, form.manualError)
         assertTrue(form.submitted("3497 011 2332"))
         assertNull(form.manualError)
+    }
+
+    @Test fun bluetoothRegistrationAlsoNeedsTheWifiToHandOver() {
+        val form = RegisterForm()
+        assertTrue(form.bluetooth)
+        form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
+        form.scanned(qr)
+        assertFalse(form.canRegister())
+        form.wifi = WifiNetwork("home-2g", "secret")
+        assertTrue(form.canRegister())
+        form.bluetooth = false
+        form.wifi = null
+        assertTrue(form.canRegister())
+    }
+
+    @Test fun commissioningClearsTheCodeAndNameOnlyOnSuccess() {
+        val form = RegisterForm()
+        form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
+        form.scanned(qr)
+        form.name = "押入れ1"
+        form.busy = true
+        form.stage = Stage.SENDING
+        form.commissioned(ApiResult.Failed(ApiError.WIFI_FAILED))
+        assertEquals(Status.Failed(ApiError.WIFI_FAILED), form.status)
+        assertEquals(qr, form.payload)
+        assertEquals("押入れ1", form.name)
+        assertFalse(form.busy)
+        assertNull(form.stage)
+
+        form.busy = true
+        form.bleFailed(BleProblem.BLUETOOTH_OFF)
+        assertEquals(Status.BleFailed(BleProblem.BLUETOOTH_OFF), form.status)
+        assertEquals(qr, form.payload)
+        assertFalse(form.busy)
+
+        form.commissioned(ApiResult.Ok(Commissioned(true, "寝室", "押入れ1")))
+        assertEquals(Status.Commissioned(Commissioned(true, "寝室", "押入れ1")), form.status)
+        assertNull(form.payload)
+        assertEquals("", form.name)
+        assertEquals(1L, form.roomId)
+    }
+
+    @Test fun proxyCommandsMarkTheStages() {
+        assertEquals(Stage.SEARCHING, Stage.of("start_scan"))
+        assertEquals(Stage.CONNECTING, Stage.of("connect"))
+        assertEquals(Stage.SENDING, Stage.of("write_and_subscribe"))
+        assertEquals(Stage.JOINING, Stage.of("disconnect"))
+        for (other in listOf("stop_scan", "discover_services", "read_characteristic", "request_mtu")) {
+            assertNull(other, Stage.of(other))
+        }
     }
 }

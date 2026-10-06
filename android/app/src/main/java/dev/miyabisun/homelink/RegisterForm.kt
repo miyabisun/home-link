@@ -6,6 +6,28 @@ sealed interface Status {
     data class RoomAdded(val room: String) : Status
     data class Registered(val room: String, val name: String) : Status
     data class Failed(val error: ApiError) : Status
+    data class Commissioned(val device: dev.miyabisun.homelink.Commissioned) : Status
+    data class BleFailed(val problem: BleProblem) : Status
+}
+
+/** Why the phone could not lend its Bluetooth to matterjs-server. */
+enum class BleProblem { PERMISSION, BLUETOOTH_OFF, PROXY_UNREACHABLE, PROXY_VERSION }
+
+/** How far a Bluetooth registration got, as the proxy commands show it. */
+enum class Stage {
+    PREPARING, SEARCHING, CONNECTING, SENDING, JOINING;
+
+    companion object {
+        fun of(command: String): Stage? = when (command) {
+            "start_scan" -> SEARCHING
+            "connect" -> CONNECTING
+            // The BTP handshake opens the channel for PASE and the Wi-Fi credentials.
+            "write_and_subscribe" -> SENDING
+            // Bluetooth is done; the device joins Wi-Fi and matterjs-server reaches it there.
+            "disconnect" -> JOINING
+            else -> null
+        }
+    }
 }
 
 enum class ManualError { LENGTH, CHECK_DIGIT }
@@ -20,8 +42,13 @@ class RegisterForm {
     var busy = false
     var roomsFailed = false
     var status: Status? = null
+    /** Commission the device over Bluetooth rather than only record it. */
+    var bluetooth = true
+    /** The saved network to hand over; required for Bluetooth. */
+    var wifi: WifiNetwork? = null
+    var stage: Stage? = null
 
-    fun canRegister() = payload != null && roomId != null && !busy
+    fun canRegister() = payload != null && roomId != null && !busy && (!bluetooth || wifi != null)
 
     /** Accepts a scanned code; anything but a Matter payload leaves the previous code. */
     fun scanned(value: String) {
@@ -100,5 +127,23 @@ class RegisterForm {
             }
             is ApiResult.Failed -> Status.Failed(result.error)
         }
+    }
+
+    fun commissioned(result: ApiResult<Commissioned>) {
+        busy = false
+        stage = null
+        status = when (result) {
+            is ApiResult.Ok -> Status.Commissioned(result.value).also {
+                payload = null
+                name = ""
+            }
+            is ApiResult.Failed -> Status.Failed(result.error)
+        }
+    }
+
+    fun bleFailed(problem: BleProblem) {
+        busy = false
+        stage = null
+        status = Status.BleFailed(problem)
     }
 }

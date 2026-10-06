@@ -8,6 +8,7 @@ import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
 import android.widget.Button
 import android.widget.EditText
+import android.widget.RadioButton
 import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
@@ -26,25 +27,40 @@ import org.junit.runner.RunWith
 import java.io.FileInputStream
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
 
 @RunWith(AndroidJUnit4::class)
 class RegisterScreenTest {
     private val qr = "MT:Y.K9042C00KA0648G00"
     private val api = FakeApi()
     private val scanner = FakeScanner()
+    private val link = FakeLink()
+    private val wifi = MemoryWifiStore()
 
     @Before fun install() {
         MainActivity.apiFactory = { api }
         MainActivity.scannerFactory = { scanner }
+        MainActivity.linkFactory = { link }
+        MainActivity.wifiStoreFactory = { wifi }
     }
 
     @After fun uninstall() {
         MainActivity.apiFactory = null
         MainActivity.scannerFactory = null
+        MainActivity.linkFactory = null
+        MainActivity.wifiStoreFactory = null
+    }
+
+    /** The ledger-only registration the earlier tests exercise. */
+    private fun recordOnly(screen: ActivityScenario<MainActivity>) = screen.onActivity { activity ->
+        views(activity).filterIsInstance<RadioButton>().first { it.text == "記録だけ（つながっている機器）" }.performClick()
+        assertFalse(hasLabel(activity, "電球に渡すWi-Fi"))
     }
 
     @Test fun createSelectAndRegister() {
         ActivityScenario.launch(MainActivity::class.java).use { screen ->
+            recordOnly(screen)
             eventually(screen) { hasLabel(it, "部屋がありません。「部屋を追加」から作成してください") }
             screen.onActivity { assertFalse(button(it, "登録").isEnabled) }
             capture(screen, "empty")
@@ -99,6 +115,7 @@ class RegisterScreenTest {
     @Test fun failuresKeepTheInputs() {
         api.rooms += Room(1, "寝室")
         ActivityScenario.launch(MainActivity::class.java).use { screen ->
+            recordOnly(screen)
             eventually(screen) { views(it).filterIsInstance<Spinner>().single().selectedItem == "寝室" }
             scanner.next = ScanResult.Read(qr)
             screen.onActivity { activity ->
@@ -153,6 +170,7 @@ class RegisterScreenTest {
         api.rooms += Room(1, "寝室")
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         ActivityScenario.launch(MainActivity::class.java).use { screen ->
+            recordOnly(screen)
             eventually(screen) { views(it).filterIsInstance<Spinner>().single().selectedItem == "寝室" }
             screen.onActivity { button(it, "数字で入力").performClick() }
             eventually(screen) { field(it, "11桁の数字").hasFocus() }
@@ -221,6 +239,7 @@ class RegisterScreenTest {
     @Test fun unreachableServerOnLaunchOffersReconnect() {
         api.roomsFailure = ApiError.UNREACHABLE
         ActivityScenario.launch(MainActivity::class.java).use { screen ->
+            recordOnly(screen)
             eventually(screen) { hasLabel(it, "部屋を読み込めませんでした") }
             scanner.next = ScanResult.Failed
             screen.onActivity { activity ->
@@ -243,6 +262,7 @@ class RegisterScreenTest {
     @Test fun recreationKeepsTheEnteredValues() {
         api.rooms += listOf(Room(1, "寝室"), Room(2, "居間"))
         ActivityScenario.launch(MainActivity::class.java).use { screen ->
+            recordOnly(screen)
             eventually(screen) { views(it).filterIsInstance<Spinner>().single().count == 2 }
             scanner.next = ScanResult.Read(qr)
             screen.onActivity { views(it).filterIsInstance<Spinner>().single().setSelection(1) }
@@ -306,12 +326,145 @@ class RegisterScreenTest {
         }
     }
 
-    private fun assertInputsKept(screen: ActivityScenario<MainActivity>) = screen.onActivity { activity ->
-        assertTrue(hasLabel(activity, "読み取り済み：MT:Y.K90…"))
-        assertEquals("天井灯", field(activity, "機器名（任意）").text.toString())
-        assertEquals("寝室", views(activity).filterIsInstance<Spinner>().single().selectedItem)
-        assertTrue(button(activity, "登録").isEnabled)
+
+    @Test fun commissionOverBluetoothShowsEachStage() {
+        api.rooms += Room(1, "押入れ")
+        ActivityScenario.launch(MainActivity::class.java).use { screen ->
+            eventually(screen) { views(it).filterIsInstance<Spinner>().single().selectedItem == "押入れ" }
+            scanner.next = ScanResult.Read(qr)
+            screen.onActivity { activity ->
+                assertTrue(views(activity).filterIsInstance<RadioButton>().first { it.text.startsWith("新しいWi-Fi電球") }.isChecked)
+                assertTrue(hasLabel(activity, "まだ設定していません"))
+                button(activity, "QRを読み取る").performClick()
+                field(activity, "機器名（任意）").setText("押入れ1")
+                // No Wi-Fi to hand over yet.
+                assertFalse(button(activity, "登録").isEnabled)
+                field(activity, "Wi-Fiの名前（SSID）").setText("home-2g")
+                field(activity, "Wi-Fiのパスワード").setText("x".repeat(65))
+                button(activity, "保存").performClick()
+                assertTrue(hasLabel(activity, "Wi-Fiの名前（32バイトまで）とパスワード（64文字まで）を入力してください"))
+                field(activity, "Wi-Fiのパスワード").setText("kakushi")
+            }
+            capture(screen, "bt-wifi")
+            screen.onActivity { activity ->
+                button(activity, "保存").performClick()
+                assertTrue(hasLabel(activity, "「home-2g」を渡します"))
+                assertFalse(field(activity, "Wi-Fiのパスワード").isShown)
+                assertTrue(button(activity, "登録").isEnabled)
+            }
+            assertEquals(WifiNetwork("home-2g", "kakushi"), wifi.saved)
+            capture(screen, "bt-ready")
+
+            link.script = listOf("start_scan", "stop_scan", "connect", "discover_services", "write_and_subscribe", "disconnect")
+            val gate = CountDownLatch(1)
+            api.gate = gate
+            api.commissioned = ApiResult.Ok(Commissioned(true, "押入れ", "押入れ1"))
+            screen.onActivity { button(it, "登録").performClick() }
+            for ((text, name) in listOf("電球を探しています…" to "bt-searching", "電球に接続しています…" to "bt-connecting",
+                    "電球にコードとWi-Fiの設定を送っています…" to "bt-sending")) {
+                eventually(screen) { hasLabel(it, text) }
+                screen.onActivity { activity ->
+                    assertFalse(button(activity, "登録中…").isEnabled)
+                    assertFalse(views(activity).filterIsInstance<RadioButton>().any { it.isEnabled })
+                }
+                capture(screen, name)
+                if (name == "bt-sending") {
+                    // A recreated screen follows the same registration.
+                    screen.recreate()
+                    eventually(screen) { hasLabel(it, text) }
+                }
+                link.step()
+                link.step()
+            }
+            eventually(screen) { hasLabel(it, "電球がWi-Fiにつながるのを待っています…") }
+            capture(screen, "bt-joining")
+            link.step()
+            gate.countDown()
+            eventually(screen) { hasLabel(it, "押入れに「押入れ1」をつなぎ、登録しました") }
+            assertEquals(listOf(Commissioning(1, qr, "押入れ1", WifiNetwork("home-2g", "kakushi"))), api.commissionings)
+            assertTrue(link.closed)
+            screen.onActivity { activity ->
+                assertTrue(hasLabel(activity, "まだ読み取っていません"))
+                assertEquals("", field(activity, "機器名（任意）").text.toString())
+                assertFalse(button(activity, "登録").isEnabled)
+            }
+            capture(screen, "bt-registered")
+        }
     }
+
+    @Test fun commissioningFailuresSayWhatToDoAndKeepTheInputs() {
+        api.rooms += Room(1, "押入れ")
+        wifi.saved = WifiNetwork("home-2g", "kakushi")
+        ActivityScenario.launch(MainActivity::class.java).use { screen ->
+            eventually(screen) { views(it).filterIsInstance<Spinner>().single().selectedItem == "押入れ" }
+            scanner.next = ScanResult.Read(qr)
+            screen.onActivity { activity ->
+                assertTrue(hasLabel(activity, "「home-2g」を渡します"))
+                button(activity, "QRを読み取る").performClick()
+                field(activity, "機器名（任意）").setText("押入れ1")
+            }
+            val cases = listOf(
+                ApiError.DEVICE_NOT_FOUND to "電球が見つかりませんでした。電球をペアリング待ちにし、電話を近づけてから「登録」を押し直してください",
+                ApiError.WRONG_CODE to "電球がコードを受け付けませんでした。電球のコードを読み取り直すか、入力し直してください",
+                ApiError.WIFI_FAILED to "電球がWi-Fi「home-2g」につながりませんでした。Wi-Fiの名前とパスワードを確かめてください。2.4GHzにしか対応しない電球もあります",
+                ApiError.COMMISSION_TIMEOUT to "時間内に登録が終わりませんでした。電球をペアリング待ちにし直して、もう一度お試しください",
+                ApiError.COMMISSION_FAILED to "電球を登録できませんでした。電球を初期化してから、もう一度お試しください",
+                ApiError.BLUETOOTH_UNAVAILABLE to "matterjs-serverでBluetoothの中継が有効になっていません。サーバーの設定を確かめてください",
+            )
+            for ((error, text) in cases) {
+                api.commissioned = ApiResult.Failed(error)
+                screen.onActivity { button(it, "登録").performClick() }
+                eventually(screen) { hasLabel(it, text) }
+                assertInputsKept(screen, "押入れ1", "押入れ")
+                if (error == ApiError.DEVICE_NOT_FOUND || error == ApiError.WIFI_FAILED) capture(screen, "bt-${error.name.lowercase()}")
+            }
+
+            link.opens = ProxyOpen.UNREACHABLE
+            screen.onActivity { button(it, "登録").performClick() }
+            eventually(screen) {
+                hasLabel(it, "matterjs-server（192.168.1.100:5580）に接続できません。家のWi-Fiにつないでから、もう一度お試しください")
+            }
+            assertInputsKept(screen, "押入れ1", "押入れ")
+            capture(screen, "bt-proxy-unreachable")
+
+            // A device the ledger already holds keeps its entry.
+            link.opens = ProxyOpen.OK
+            api.commissioned = ApiResult.Ok(Commissioned(false, "寝室", "読書灯"))
+            screen.onActivity { button(it, "登録").performClick() }
+            eventually(screen) { hasLabel(it, "Wi-Fiにつなぎました。台帳の「読書灯」（寝室）として登録済みです") }
+            capture(screen, "bt-already")
+            // An unreachable proxy never reaches the API.
+            assertEquals(7, api.commissionings.size)
+
+            // Changing the Wi-Fi asks for the password again.
+            screen.onActivity { activity ->
+                button(activity, "変更").performClick()
+                assertEquals("home-2g", field(activity, "Wi-Fiの名前（SSID）").text.toString())
+                assertEquals("", field(activity, "Wi-Fiのパスワード").text.toString())
+                assertFalse(button(activity, "保存").isEnabled)
+                button(activity, "やめる").performClick()
+                assertTrue(hasLabel(activity, "「home-2g」を渡します"))
+            }
+        }
+    }
+
+    @Test fun theWifiPasswordIsKeptEncryptedInTheKeystore() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val store = KeystoreWifiStore(context)
+        store.save(WifiNetwork("home-2g", "kakushi-pass"))
+        assertEquals(WifiNetwork("home-2g", "kakushi-pass"), KeystoreWifiStore(context).load())
+        val prefs = context.getSharedPreferences("wifi", android.content.Context.MODE_PRIVATE).all.values.joinToString()
+        assertFalse("kakushi-pass" in prefs || "home-2g" in prefs)
+        context.getSharedPreferences("wifi", android.content.Context.MODE_PRIVATE).edit().clear().commit()
+    }
+
+    private fun assertInputsKept(screen: ActivityScenario<MainActivity>, name: String = "天井灯", room: String = "寝室") =
+        screen.onActivity { activity ->
+            assertTrue(hasLabel(activity, "読み取り済み：MT:Y.K90…"))
+            assertEquals(name, field(activity, "機器名（任意）").text.toString())
+            assertEquals(room, views(activity).filterIsInstance<Spinner>().single().selectedItem)
+            assertTrue(button(activity, "登録").isEnabled)
+        }
 
     private fun eventually(screen: ActivityScenario<MainActivity>, condition: (MainActivity) -> Boolean) {
         val deadline = System.currentTimeMillis() + 5_000
@@ -390,6 +543,7 @@ class RegisterScreenTest {
 }
 
 private data class Registration(val roomId: Long, val payload: String, val name: String)
+private data class Commissioning(val roomId: Long, val payload: String, val name: String, val wifi: WifiNetwork)
 
 private class FakeApi : HomeLinkApi {
     val rooms: MutableList<Room> = Collections.synchronizedList(mutableListOf())
@@ -419,6 +573,43 @@ private class FakeApi : HomeLinkApi {
         switches += on
         return lights
     }
+
+    val commissionings: MutableList<Commissioning> = Collections.synchronizedList(mutableListOf())
+    @Volatile var commissioned: ApiResult<Commissioned> = ApiResult.Failed(ApiError.SERVER)
+
+    override fun commission(roomId: Long, payload: String, name: String, wifi: WifiNetwork): ApiResult<Commissioned> {
+        gate?.await()
+        commissionings += Commissioning(roomId, payload, name, wifi)
+        return commissioned
+    }
+}
+
+/** Plays proxy commands one [step] at a time, as matterjs-server would send them. */
+private class FakeLink : BleLink {
+    @Volatile var script: List<String> = emptyList()
+    @Volatile var opens = ProxyOpen.OK
+    @Volatile var closed = false
+    private val steps = Semaphore(0)
+
+    fun step() = steps.release()
+
+    override fun open(onCommand: (String) -> Unit): ProxyOpen {
+        closed = false
+        for (command in script) {
+            onCommand(command)
+            if (!steps.tryAcquire(10, TimeUnit.SECONDS)) error("test did not step past $command")
+        }
+        script = emptyList()
+        return opens
+    }
+
+    override fun close() { closed = true }
+}
+
+private class MemoryWifiStore : WifiStore {
+    @Volatile var saved: WifiNetwork? = null
+    override fun load() = saved
+    override fun save(network: WifiNetwork) { saved = network }
 }
 
 private class FakeScanner : QrScanner {

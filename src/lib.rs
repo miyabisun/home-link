@@ -1,3 +1,4 @@
+pub mod commission;
 pub mod matter;
 pub mod onboarding;
 pub mod schedule;
@@ -95,7 +96,11 @@ struct AppState {
     runs: Mutex<VecDeque<serde_json::Value>>,
     /// What the schedule last sent each light, by node and endpoint; kept in memory only.
     sent: Mutex<HashMap<(u64, u16), schedule::Target>>,
+    /// How long one commissioning may take, Bluetooth discovery to Wi-Fi join.
+    commission_timeout: Duration,
 }
+
+const COMMISSION_TIMEOUT: Duration = Duration::from_mins(5);
 
 type Db = Arc<AppState>;
 
@@ -119,7 +124,20 @@ impl Home {
             matter_url,
             runs: Mutex::new(VecDeque::new()),
             sent: Mutex::new(HashMap::new()),
+            commission_timeout: COMMISSION_TIMEOUT,
         }))
+    }
+
+    /// Replaces the five-minute limit on one commissioning.
+    ///
+    /// # Panics
+    /// Panics once the router or a clone shares this `Home`.
+    #[must_use]
+    pub fn with_commission_timeout(mut self, timeout: Duration) -> Self {
+        Arc::get_mut(&mut self.0)
+            .expect("set before the Home is shared")
+            .commission_timeout = timeout;
+        self
     }
 
     pub fn router(&self) -> Router {
@@ -160,6 +178,7 @@ fn router(state: Db) -> Router {
             "/devices/{id}",
             get(get_device).patch(update_device).delete(delete_device),
         )
+        .route("/commission", axum::routing::post(commission))
         .route("/status", get(status))
         .route("/lights", get(light_states))
         .route("/lights/on", axum::routing::post(lights_on))
@@ -443,9 +462,12 @@ fn missing_setup_code() -> ApiError {
     )
 }
 
-/// Validates the optional setup code of `input` and returns the form to store.
-fn setup_code(input: &DeviceInput) -> ApiResult<Option<String>> {
-    match (&input.qr_payload, &input.manual_code) {
+/// Validates the optional QR payload or manual pairing code and returns the form to store.
+fn setup_code(
+    qr_payload: Option<&String>,
+    manual_code: Option<&String>,
+) -> ApiResult<Option<String>> {
+    match (qr_payload, manual_code) {
         (None, None) => Ok(None),
         (Some(payload), None) => {
             let payload = payload.trim();
@@ -512,6 +534,16 @@ fn identifiers(input: &DeviceInput) -> ApiResult<Identifiers> {
     Ok((serial, mac))
 }
 
+fn device_name(name: &str) -> ApiResult<String> {
+    clean_name(name, true).ok_or_else(|| {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_device_name",
+            format!("機器名は{MAX_NAME_CHARS}文字以内で入力してください"),
+        )
+    })
+}
+
 fn duplicate_device() -> ApiError {
     ApiError(
         StatusCode::CONFLICT,
@@ -520,37 +552,39 @@ fn duplicate_device() -> ApiError {
     )
 }
 
-/// Whether a stored device shares a passcode and short discriminator with `code`.
-// ponytail: scans every device per insert; a key column if the ledger outgrows a home.
 fn is_registered(db: &Connection, code: &str) -> rusqlite::Result<bool> {
+    Ok(registered_id(db, code)?.is_some())
+}
+
+/// The stored device sharing a passcode and short discriminator with `code`.
+// ponytail: scans every device per insert; a key column if the ledger outgrows a home.
+fn registered_id(db: &Connection, code: &str) -> rusqlite::Result<Option<i64>> {
     let new = onboarding::keys(code).unwrap_or_default();
-    let mut statement = db.prepare("SELECT qr_payload FROM devices")?;
+    let mut statement = db.prepare("SELECT id, qr_payload FROM devices ORDER BY id")?;
     let stored = statement
-        .query_map([], |row| row.get::<_, Option<String>>(0))?
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(stored
-        .iter()
-        .flatten()
-        .flat_map(|code| onboarding::keys(code).unwrap_or_default())
-        .any(|key| new.contains(&key)))
+    Ok(stored.into_iter().find_map(|(id, code)| {
+        onboarding::keys(code.as_deref()?)
+            .unwrap_or_default()
+            .iter()
+            .any(|key| new.contains(key))
+            .then_some(id)
+    }))
 }
 
 async fn create_device(
     State(db): State<Db>,
     Json(input): Json<DeviceInput>,
 ) -> ApiResult<(StatusCode, Json<Device>)> {
-    let code = setup_code(&input)?;
+    let code = setup_code(input.qr_payload.as_ref(), input.manual_code.as_ref())?;
     let (serial, mac) = identifiers(&input)?;
     if code.is_none() && serial.is_none() {
         return Err(missing_setup_code());
     }
-    let name = clean_name(&input.name, true).ok_or_else(|| {
-        ApiError(
-            StatusCode::BAD_REQUEST,
-            "invalid_device_name",
-            format!("機器名は{MAX_NAME_CHARS}文字以内で入力してください"),
-        )
-    })?;
+    let name = device_name(&input.name)?;
     let db = db.db.lock().unwrap();
     find_room(&db, input.room_id)?.ok_or_else(room_not_found)?;
     if let Some(code) = &code
@@ -622,6 +656,154 @@ async fn delete_device(State(db): State<Db>, Path(id): Path<i64>) -> ApiResult<S
     find_device(&db, id, false)?;
     db.execute("DELETE FROM devices WHERE id = ?1", [id])?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// A new device to commission over the phone's Bluetooth and record. The Wi-Fi
+/// password is handed to matterjs-server and kept nowhere else.
+#[derive(Deserialize)]
+struct CommissionInput {
+    room_id: i64,
+    qr_payload: Option<String>,
+    manual_code: Option<String>,
+    #[serde(default)]
+    name: String,
+    wifi_ssid: String,
+    wifi_password: String,
+}
+
+/// Has matterjs-server commission the device over the BLE proxy the phone holds
+/// open, onto the given Wi-Fi, then records it: a device already in the ledger
+/// (by identifiers, else by code) keeps its entry and gains missing identifiers.
+async fn commission(
+    State(state): State<Db>,
+    Json(input): Json<CommissionInput>,
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    let code =
+        setup_code(input.qr_payload.as_ref(), input.manual_code.as_ref())?.ok_or_else(|| {
+            ApiError(
+                StatusCode::BAD_REQUEST,
+                "missing_setup_code",
+                "QRコードか手動ペアリングコードのどちらか一方を送ってください".into(),
+            )
+        })?;
+    // SSIDs are up to 32 bytes; WPA passphrases 8–63 characters or 64 hex digits.
+    if !(1..=32).contains(&input.wifi_ssid.len()) || !(1..=64).contains(&input.wifi_password.len())
+    {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_wifi",
+            "Wi-Fiの名前（32バイト以内）とパスワード（64文字以内）を送ってください".into(),
+        ));
+    }
+    let name = device_name(&input.name)?;
+    find_room(&state.db.lock().unwrap(), input.room_id)?.ok_or_else(room_not_found)?;
+    let url = matter_url(&state)?;
+    let commissioned = commission::commission(
+        url,
+        &code,
+        &input.wifi_ssid,
+        &input.wifi_password,
+        state.commission_timeout,
+    )
+    .await
+    .map_err(|error| match error {
+        commission::Error::Unreachable(error) => matter_unreachable(error),
+        commission::Error::Failed(failure) => commission_failed(failure, &input.wifi_ssid),
+    })?;
+    let db = state.db.lock().unwrap();
+    let (registered, device) = record(&db, input.room_id, &name, &code, &commissioned)?;
+    tracing::info!(
+        node_id = commissioned.node_id,
+        registered,
+        device = device.id,
+        "device commissioned"
+    );
+    Ok((
+        if registered {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+        Json(json!({
+            "node_id": commissioned.node_id,
+            "registered": registered,
+            "device": device,
+        })),
+    ))
+}
+
+fn commission_failed(failure: commission::Failure, ssid: &str) -> ApiError {
+    use commission::Failure;
+    tracing::warn!(?failure, "commissioning failed");
+    let (status, code, message) = match failure {
+        Failure::NotFound => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "device_not_found",
+            "ペアリング待ちの機器がBluetoothで見つかりませんでした".to_owned(),
+        ),
+        Failure::WrongCode => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "wrong_code",
+            "機器がコードを受け付けませんでした".to_owned(),
+        ),
+        Failure::Wifi => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "wifi_failed",
+            format!("機器がWi-Fi「{ssid}」に接続できませんでした"),
+        ),
+        Failure::Timeout => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "commission_timeout",
+            "時間内に登録が終わりませんでした".to_owned(),
+        ),
+        Failure::BluetoothDisabled => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "bluetooth_unavailable",
+            "matterjs-serverでBluetoothが有効になっていません".to_owned(),
+        ),
+        Failure::Other(details) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "commission_failed",
+            format!("登録できませんでした: {details}"),
+        ),
+    };
+    ApiError(status, code, message)
+}
+
+/// Records a commissioned device; `false` with the existing entry when the
+/// ledger already holds it.
+fn record(
+    db: &Connection,
+    room_id: i64,
+    name: &str,
+    code: &str,
+    commissioned: &commission::Commissioned,
+) -> ApiResult<(bool, Device)> {
+    let (vendor, serial) = commissioned.identity.clone().unzip();
+    let mac = &commissioned.mac;
+    let by_identifier: Option<i64> = db
+        .query_row(
+            "SELECT id FROM devices WHERE (vendor = ?1 AND serial_number = ?2) OR mac = ?3
+             ORDER BY id LIMIT 1",
+            params![vendor, serial, mac],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(id) = by_identifier.or(registered_id(db, code)?) {
+        db.execute(
+            "UPDATE devices SET vendor = coalesce(vendor, ?1),
+                serial_number = coalesce(serial_number, ?2), mac = coalesce(mac, ?3)
+             WHERE id = ?4",
+            params![vendor, serial, mac, id],
+        )?;
+        return Ok((false, find_device(db, id, false)?));
+    }
+    db.execute(
+        "INSERT INTO devices (room_id, qr_payload, vendor, serial_number, mac, name)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![room_id, code, vendor, serial, mac, name],
+    )?;
+    Ok((true, find_device(db, db.last_insert_rowid(), false)?))
 }
 
 fn matter_url(state: &AppState) -> ApiResult<&str> {
