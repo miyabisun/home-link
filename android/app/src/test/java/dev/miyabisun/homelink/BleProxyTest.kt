@@ -225,6 +225,27 @@ class BleProxyTest {
         assertTrue(server.closed.await(5, TimeUnit.SECONDS))
     }
 
+    @Test fun reportsEachDeviceOnceAScanWhenDuplicatesAreNotAllowed() {
+        val server = handshake()
+        open(server)
+        val a = Advertisement("AA:BB:CC:DD:EE:FF", null, -61, true, emptyMap(), listOf("FFF6"))
+        val end = a.copy(address = "11:22:33:44:55:66")
+        /** Starts a scan, advertises [a] twice, and returns the addresses reported up to [end]. */
+        fun scan(args: JSONObject): List<String> {
+            assertTrue(server.command("start_scan", args).getBoolean("success"))
+            listOf(a, a, end).forEach { ble.events.discovered(it) }
+            val reported = mutableListOf<String>()
+            do reported += server.next().getJSONObject("data").getString("address") while (reported.last() != end.address)
+            return reported.dropLast(1)
+        }
+        val fff6 = JSONArray(listOf("fff6"))
+
+        assertEquals(listOf(a.address), scan(args("service_uuids" to fff6, "allow_duplicates" to false)))
+        assertEquals(listOf(a.address), scan(args("service_uuids" to fff6, "allow_duplicates" to false)))
+        assertEquals(listOf(a.address, a.address), scan(args("service_uuids" to fff6)))
+        assertEquals(listOf(a.address, a.address), scan(args("service_uuids" to fff6, "allow_duplicates" to true)))
+    }
+
     @Test fun reportsBleFailuresAndUnexpectedEvents() {
         val server = handshake()
         open(server)

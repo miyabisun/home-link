@@ -84,6 +84,8 @@ class BleProxy(
     /** Per connection handle: the target of `WRITE_DATA` and the source of binary notifications. */
     private val writeTarget = ConcurrentHashMap<Int, String>()
     private val notifySource = ConcurrentHashMap<Int, String>()
+    /** Addresses this scan already reported, or null when `allow_duplicates` asks for every advertisement. */
+    @Volatile private var reported: MutableSet<String>? = null
 
     /** Connects and completes the handshake within [timeoutMs]. */
     fun open(timeoutMs: Long): ProxyOpen {
@@ -175,7 +177,10 @@ class BleProxy(
         val result = JSONObject()
         val handle by lazy { args.getInt("connection_handle") }
         when (command) {
-            "start_scan" -> ble.startScan(args.optJSONArray("service_uuids").strings())
+            "start_scan" -> {
+                reported = if (args.optBoolean("allow_duplicates", true)) null else ConcurrentHashMap.newKeySet()
+                ble.startScan(args.optJSONArray("service_uuids").strings())
+            }
             "stop_scan" -> ble.stopScan()
             "connect" -> ble.connect(args.getString("address"), args.optLong("timeout", 30_000)).let {
                 result.put("connection_handle", it.handle).put("mtu", it.mtu)
@@ -220,6 +225,7 @@ class BleProxy(
 
     private inner class Events : BleEvents {
         override fun discovered(advertisement: Advertisement) {
+            if (reported?.add(advertisement.address) == false) return
             val data = JSONObject()
                 .put("address", advertisement.address)
                 .put("rssi", advertisement.rssi)
