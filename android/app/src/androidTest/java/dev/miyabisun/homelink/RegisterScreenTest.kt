@@ -544,6 +544,168 @@ class RegisterScreenTest {
         }
     }
 
+    private val threadTab = "Threadの電球\n（T2など）"
+
+    private fun tab(activity: MainActivity, text: String) =
+        views(activity).filterIsInstance<RadioButton>().first { it.text == text }
+
+    @Test fun tabsSplitWifiAndThreadBulbs() {
+        api.rooms += Room(1, "寝室")
+        wifi.saved = SavedWifi().added(WifiNetwork("home-2g", "kakushi"))
+        api.thread = ApiResult.Ok(true)
+        ActivityScenario.launch(MainActivity::class.java).use { screen ->
+            eventually(screen) { spinner(it, "部屋").selectedItem == "寝室" }
+            screen.onActivity { activity ->
+                assertTrue(tab(activity, "Wi-Fiの電球").isChecked)
+                assertFalse(tab(activity, threadTab).isChecked)
+                // The underlines line up although the Thread tab takes two lines.
+                assertEquals(tab(activity, "Wi-Fiの電球").height, tab(activity, threadTab).height)
+                assertTrue(spinner(activity, "電球に渡すWi-Fi").isShown)
+                assertFalse(hasLabel(activity, "Thread網"))
+                assertTrue(tab(activity, "新しいWi-Fi電球をBluetoothでつなぐ").isChecked)
+            }
+            assertEquals(0, api.threadChecks)
+            capture(screen, "tab-wifi")
+
+            screen.onActivity { tab(it, threadTab).performClick() }
+            eventually(screen) { hasLabel(it, "準備できています。電球にはmatterjs-serverが持つThread網の設定を渡します") }
+            screen.onActivity { activity ->
+                assertTrue(tab(activity, threadTab).isChecked)
+                assertFalse(tab(activity, "Wi-Fiの電球").isChecked)
+                // No Wi-Fi to choose: Thread bulbs take the network matterjs-server holds.
+                assertFalse(hasLabel(activity, "電球に渡すWi-Fi"))
+                assertFalse(spinner(activity, "電球に渡すWi-Fi").isShown)
+                assertTrue(hasLabel(activity, "Thread網"))
+                assertTrue(tab(activity, "新しいThread電球をBluetoothでつなぐ").isChecked)
+                assertTrue(views(activity).filterIsInstance<TextView>().any { it.isShown && "電源のオフ・オンを1秒間隔で10回" in it.text })
+                assertFalse(views(activity).filterIsInstance<TextView>().any { it.isShown && "BEAMTEC" in it.text })
+            }
+            capture(screen, "tab-thread")
+
+            // The chosen tab survives a recreated screen, and switching back restores the Wi-Fi flow.
+            screen.recreate()
+            eventually(screen) { tab(it, threadTab).isChecked && hasLabel(it, "Thread網") }
+            screen.onActivity { tab(it, "Wi-Fiの電球").performClick() }
+            screen.onActivity { activity ->
+                assertEquals("home-2g", spinner(activity, "電球に渡すWi-Fi").selectedItem)
+                assertTrue(spinner(activity, "電球に渡すWi-Fi").isShown)
+                assertFalse(hasLabel(activity, "Thread網"))
+            }
+
+            // Recording only works from either tab and needs no network.
+            screen.onActivity { activity ->
+                tab(activity, threadTab).performClick()
+                tab(activity, "記録だけ（つながっている機器）").performClick()
+                assertFalse(hasLabel(activity, "Thread網"))
+                assertFalse(hasLabel(activity, "電球に渡すWi-Fi"))
+            }
+        }
+    }
+
+    @Test fun threadBulbsCommissionWithoutWifi() {
+        api.rooms += Room(1, "寝室")
+        api.thread = ApiResult.Ok(true)
+        ActivityScenario.launch(MainActivity::class.java).use { screen ->
+            eventually(screen) { spinner(it, "部屋").selectedItem == "寝室" }
+            screen.onActivity { tab(it, threadTab).performClick() }
+            eventually(screen) { hasLabel(it, "準備できています。電球にはmatterjs-serverが持つThread網の設定を渡します") }
+            scanner.next = ScanResult.Read(qr)
+            screen.onActivity { activity ->
+                button(activity, "QRを読み取る").performClick()
+                field(activity, "機器名（任意）").setText("寝室T2")
+                // Nothing saved for Wi-Fi, yet Thread can register.
+                assertTrue(button(activity, "登録").isEnabled)
+            }
+            capture(screen, "thread-ready")
+
+            link.script = listOf("start_scan", "connect", "write_and_subscribe", "disconnect")
+            val gate = CountDownLatch(1)
+            api.gate = gate
+            api.commissioned = ApiResult.Ok(Commissioned(true, "寝室", "寝室T2"))
+            screen.onActivity { button(it, "登録").performClick() }
+            for ((text, name) in listOf("電球を探しています…" to null, "電球に接続しています…" to null,
+                    "電球にコードとThread網の設定を送っています…" to "thread-sending",
+                    "電球がThread網につながるのを待っています…" to "thread-joining")) {
+                eventually(screen) { hasLabel(it, text) }
+                screen.onActivity { activity ->
+                    assertFalse(views(activity).filterIsInstance<RadioButton>().any { it.isEnabled })
+                }
+                name?.let { capture(screen, it) }
+                link.step()
+            }
+            gate.countDown()
+            eventually(screen) { hasLabel(it, "寝室に「寝室T2」をつなぎ、登録しました") }
+            assertEquals(listOf(Commissioning(1, qr, "寝室T2", null)), api.commissionings)
+            capture(screen, "thread-registered")
+
+            // A device already in the ledger says it joined Thread.
+            api.gate = null
+            api.commissioned = ApiResult.Ok(Commissioned(false, "寝室", "読書灯"))
+            screen.onActivity { activity ->
+                button(activity, "QRを読み取る").performClick()
+                button(activity, "登録").performClick()
+            }
+            eventually(screen) { hasLabel(it, "Thread網につなぎました。台帳の「読書灯」（寝室）として登録済みです") }
+        }
+    }
+
+    @Test fun threadRegistrationWaitsForTheThreadNetwork() {
+        api.rooms += Room(1, "寝室")
+        api.thread = ApiResult.Ok(false)
+        ActivityScenario.launch(MainActivity::class.java).use { screen ->
+            eventually(screen) { spinner(it, "部屋").selectedItem == "寝室" }
+            scanner.next = ScanResult.Read(qr)
+            screen.onActivity { activity ->
+                tab(activity, threadTab).performClick()
+                button(activity, "QRを読み取る").performClick()
+                field(activity, "機器名（任意）").setText("寝室T2")
+            }
+            val notReady = "Thread網が未準備です。homeserverでThread網（OTBR）を用意するまで、Threadの電球は登録できません"
+            eventually(screen) { hasLabel(it, notReady) }
+            screen.onActivity { activity ->
+                assertFalse(button(activity, "登録").isEnabled)
+                assertTrue(button(activity, "もう一度確かめる").isShown)
+            }
+            capture(screen, "thread-not-ready")
+
+            api.thread = ApiResult.Failed(ApiError.UNREACHABLE)
+            screen.onActivity { button(it, "もう一度確かめる").performClick() }
+            eventually(screen) {
+                hasLabel(it, "Thread網の状態を確かめられませんでした。home-linkにつながるか確かめてから、もう一度確かめてください")
+            }
+            screen.onActivity { assertFalse(button(it, "登録").isEnabled) }
+            capture(screen, "thread-check-failed")
+
+            // Once matterjs-server holds the network, registering opens without other changes.
+            api.thread = ApiResult.Ok(true)
+            screen.onActivity { button(it, "もう一度確かめる").performClick() }
+            eventually(screen) { button(it, "登録").isEnabled }
+            screen.onActivity { assertFalse(views(it).filterIsInstance<Button>().any { b -> b.isShown && b.text == "もう一度確かめる" }) }
+
+            // home-link refusing it marks the network not ready again and keeps the inputs.
+            api.commissioned = ApiResult.Failed(ApiError.THREAD_NOT_READY)
+            screen.onActivity { button(it, "登録").performClick() }
+            eventually(screen) { hasLabel(it, "Thread網が未準備です。homeserverでThread網を用意してから登録してください") }
+            screen.onActivity { activity ->
+                assertTrue(hasLabel(activity, notReady))
+                assertFalse(button(activity, "登録").isEnabled)
+                assertTrue(hasLabel(activity, "読み取り済み：MT:Y.K90…"))
+                assertEquals("寝室T2", field(activity, "機器名（任意）").text.toString())
+            }
+            capture(screen, "thread-refused")
+
+            api.thread = ApiResult.Ok(true)
+            api.commissioned = ApiResult.Failed(ApiError.THREAD_FAILED)
+            screen.onActivity { button(it, "もう一度確かめる").performClick() }
+            eventually(screen) { button(it, "登録").isEnabled }
+            screen.onActivity { button(it, "登録").performClick() }
+            eventually(screen) {
+                hasLabel(it, "電球がThread網につながりませんでした。Thread網（OTBR）が動いているか確かめてから、もう一度お試しください")
+            }
+            assertInputsKept(screen, "寝室T2", "寝室")
+        }
+    }
+
     @Test fun theWifiPasswordIsKeptEncryptedInTheKeystore() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val store = KeystoreWifiStore(context)
@@ -642,7 +804,7 @@ class RegisterScreenTest {
 }
 
 private data class Registration(val roomId: Long, val payload: String, val name: String)
-private data class Commissioning(val roomId: Long, val payload: String, val name: String, val wifi: WifiNetwork)
+private data class Commissioning(val roomId: Long, val payload: String, val name: String, val wifi: WifiNetwork?)
 
 private class FakeApi : HomeLinkApi {
     val rooms: MutableList<Room> = Collections.synchronizedList(mutableListOf())
@@ -676,10 +838,18 @@ private class FakeApi : HomeLinkApi {
     val commissionings: MutableList<Commissioning> = Collections.synchronizedList(mutableListOf())
     @Volatile var commissioned: ApiResult<Commissioned> = ApiResult.Failed(ApiError.SERVER)
 
-    override fun commission(roomId: Long, payload: String, name: String, wifi: WifiNetwork): ApiResult<Commissioned> {
+    override fun commission(roomId: Long, payload: String, name: String, wifi: WifiNetwork?): ApiResult<Commissioned> {
         gate?.await()
         commissionings += Commissioning(roomId, payload, name, wifi)
         return commissioned
+    }
+
+    @Volatile var thread: ApiResult<Boolean> = ApiResult.Ok(false)
+    @Volatile var threadChecks = 0
+
+    override fun threadReady(): ApiResult<Boolean> {
+        threadChecks++
+        return thread
     }
 }
 

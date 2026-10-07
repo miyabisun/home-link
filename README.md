@@ -4,7 +4,7 @@
 家じゅうの照明を、Androidのボタン1つで全部オン・全部オフにできます。
 電球などに印刷されたMatterのQRコードをAndroidアプリで読み取り、部屋と名前を付けて登録します。
 QRコードが無い機器は、印字された11桁の数字（Matterの手動ペアリングコード）を入力して登録します。
-新しいWi-Fi電球は、電話のBluetoothで直接つなぎ、家のWi-Fiとmatterjs-serverへ入れてから台帳に登録できます。
+新しいWi-Fi電球とThread電球（Aqara T2など）は、電話のBluetoothで直接つなぎ、家のWi-FiかThread網とmatterjs-serverへ入れてから台帳に登録できます。
 登録した内容は、自宅サーバーで動くhome-linkのAPIがSQLiteに保存します。
 機器自身の識別子（ベンダー名とシリアル番号、Wi-Fi機器はMACアドレス）も保存でき、
 Matterのcontroller（[matterjs-server](https://github.com/matter-js/matterjs-server)）を作り直しても、
@@ -72,8 +72,9 @@ APKは開発用のdebug署名です。PCからADBで導入する方法と、フ�
 
 新品や初期化した、ペアリング待ちのMatter over Wi-Fiの電球（Tapo、BEAMTECなど）を、Aqara Homeを使わずに登録できます。
 前のルーター向けに設定されて今つながらない電球も、初期化すれば同じ手順で今のWi-Fiへ入れられます。
-Matter over ThreadやZigbeeの電球（Aqara T2など）は対象外です。Thread網の資格情報やZigbeeの親機がHub M3にあるためです。
-これらはAqara Homeで追加してから、下の「記録だけ」で登録してください。
+Matter over Threadの電球（Aqara T2など）は、下の「Thread電球をBluetoothでつなぐ」で登録します。
+Zigbeeの電球は対象外です（親機が要るため）。Aqara Homeで追加してから、下の「記録だけ」で登録してください。
+登録の画面は「Wi-Fiの電球」と「Threadの電球（T2など）」のタブに分かれています。この節はWi-Fiのタブの手順です。
 
 電話がBluetoothでmatterjs-serverの[BLE Proxy](https://github.com/matter-js/matterjs-server/blob/main/docs/ble-proxy-protocol.md)
 （`ws://192.168.1.100:5580/ble`）の中継を務め、Matterの手順（暗号化、Wi-Fi情報の送付、fabricへの参加）はmatterjs-serverが行います。
@@ -97,9 +98,22 @@ matterjs-serverはBluetoothを有効にして（BLE Proxyを受け付けて）�
 電球が見つからない、コードが違う、Wi-Fiにつながらない、時間切れ、matterjs-serverに接続できない、はそれぞれ理由と次にすることを表示し、入力は残ります。
 台帳に同じ機器（同じ識別子かコード）がある場合は新しく登録せず、既存の登録を示します。
 
+### Thread電球をBluetoothでつなぐ
+
+Thread電球はWi-Fiの無線を持たないため、Bluetoothで渡すのはWi-Fiではなく、自前のThread網の資格情報（dataset）です。
+datasetはmatterjs-serverに `set_thread_dataset` で登録したものを使い、アプリやhome-linkには持ちません。
+Thread網（OpenThread Border Router）が無いうちは、Threadのタブに「Thread網が未準備です」と表示され、登録できません。
+matterjs-serverにdatasetが入ると、アプリを変えずに登録できるようになります（「もう一度確かめる」で表示を更新します）。
+
+1. 「Threadの電球（T2など）」のタブを選びます。「つなぎ方」は「新しいThread電球をBluetoothでつなぐ」（既定）のままにします。
+2. 電球をペアリング待ちにします。Aqara T2は電源のオフ・オンを1秒間隔で10回くり返すと初期化されます（初期はThreadで動きます）。
+3. QRコードを読み取るか数字を入力し、部屋と名前（任意）を決めて「登録」を押します。Wi-Fiは選びません。
+
+段階の表示、失敗の表示、台帳に同じ機器がある場合の扱いはWi-Fi電球と同じです。電球がThread網に参加できない場合はその旨を表示します。
+
 ### 機器を登録する（記録だけ）
 
-すでにmatterjs-serverにつながっている機器は、「つなぎ方」で「記録だけ」を選んで台帳にだけ登録します。
+すでにmatterjs-serverにつながっている機器は、どちらのタブでも「つなぎ方」で「記録だけ」を選んで台帳にだけ登録します。
 
 1. 「QRを読み取る」で機器のQRコードを読み取ります。
    QRコードが無い機器は「数字で入力」を押し、機器に印字された11桁の数字を入力します。
@@ -126,7 +140,8 @@ matterjs-serverはBluetoothを有効にして（BLE Proxyを受け付けて）�
 | `GET /api/devices/{id}` | 機器1台。登録したコードの全文 `qr_payload` または `manual_code` を含みます | 404 `device_not_found` |
 | `PATCH /api/devices/{id}` | 自動調整の色温度の下限の変更。本文は `{"min_kelvin": 4000}`、`null` で下限なし | 400 `invalid_min_kelvin`、404 `device_not_found` |
 | `DELETE /api/devices/{id}` | 機器の削除 | 404 `device_not_found` |
-| `POST /api/commission` | 機器をmatterjs-serverへBluetoothで登録（commissioning）し、台帳に登録 | 400 `missing_setup_code`・`invalid_qr_payload`・`invalid_manual_code`・`invalid_wifi`・`invalid_device_name`、404 `room_not_found`、422 `device_not_found`・`wrong_code`・`wifi_failed`・`commission_failed`、504 `commission_timeout`、502 `matter_server_unreachable`、503 `matter_server_not_configured`・`bluetooth_unavailable` |
+| `POST /api/commission` | 機器をmatterjs-serverへBluetoothで登録（commissioning）し、台帳に登録 | 400 `missing_setup_code`・`invalid_qr_payload`・`invalid_manual_code`・`invalid_network`・`invalid_wifi`・`invalid_device_name`、404 `room_not_found`、422 `device_not_found`・`wrong_code`・`wifi_failed`・`thread_failed`・`commission_failed`、504 `commission_timeout`、502 `matter_server_unreachable`、503 `matter_server_not_configured`・`bluetooth_unavailable`・`thread_not_ready` |
+| `GET /api/thread` | Thread電球を登録できるか（matterjs-serverがThread網のdatasetを持つか）を `{"ready": true}` で返します | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `GET /api/status` | 台帳の機器ごとに、matterjs-serverで見えるか（`visible`）と今の `node_id`・`endpoint` | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `GET /api/lights` | 照明ごとの今の状態（`on`・`off`・`no_response`）と、その件数 | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `POST /api/lights/on` | 全部の照明をオンにし、照明ごとの結果（`switched`・`no_response`・`failed`）と件数を返します | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
@@ -150,15 +165,17 @@ VendorNameとSerialNumberです。Aqara Hub M3配下のT2ではZigbeeのIEEEア�
 同じ `vendor` と `serial_number` の組、または同じ `mac` の二重登録は `duplicate_identifier` で拒否します。
 
 `POST /api/commission` は、本文の `room_id`、`qr_payload` か `manual_code` のどちらか一方、`name`（任意）、
-`wifi_ssid`（1〜32バイト）、`wifi_password`（1〜64文字）を受け取ります。
-matterjs-serverへ `set_wifi_credentials` でWi-Fi情報を渡し、`commission_with_code`（`network_only: false`）でBluetooth経由の登録を行います。
+`network`（`wifi` か `thread`、既定は `wifi`）を受け取ります。`wifi` では `wifi_ssid`（1〜32バイト）と `wifi_password`（1〜64文字）も受け取り、
+matterjs-serverへ `set_wifi_credentials` でWi-Fi情報を渡してから、`commission_with_code`（`network_only: false`）でBluetooth経由の登録を行います。
+`thread` ではWi-Fi情報を渡さず、matterjs-serverが持つThread網のdatasetで登録します。
+matterjs-serverの `server_info` の `thread_credentials_set` がtrueでなければ、登録を始めずに `thread_not_ready` を返します。
 Bluetoothの中継は、要求の前からmatterjs-serverの `/ble` に接続している電話などのBLE Proxyが務めます。
-登録できたら、新しいnodeのBasic InformationのVendorNameとSerialNumber、General DiagnosticsのWi-Fiインターフェースの
+登録できたら、新しいnodeのBasic InformationのVendorNameとSerialNumber、Wi-Fi機器はGeneral DiagnosticsのWi-Fiインターフェースの
 MACアドレスを読み、コードとともに台帳へ登録して201を返します。
 同じ識別子かコードの機器が台帳にあれば新しく登録せず、その機器に欠けていた識別子を補って200で返します（`registered: false`）。
 1回の登録は5分で打ち切ります。Wi-Fiのパスワードはmatterjs-serverへ渡すだけで、データベース・ログ・応答には含めません。
 `device_not_found` はペアリング待ちの機器がBluetoothで見つからない、`wrong_code` は見つかったがコードを受け付けない、
-`wifi_failed` は機器がWi-Fiにつながらない、`commission_failed` はそれ以外（matterjs-serverの説明を `message` に含みます）です。
+`wifi_failed` は機器がWi-Fiにつながらない、`thread_failed` は機器がThread網に参加できない、`commission_failed` はそれ以外（matterjs-serverの説明を `message` に含みます）です。
 
 `GET /api/status` は、そのたびにmatterjs-serverの全nodeを読み、識別子から機器の今の `node_id` と `endpoint` を引きます。
 node IDとendpointはmatterjs-serverが振る番号なので台帳には保存しません。

@@ -44,11 +44,22 @@ class RegisterForm {
     var status: Status? = null
     /** Commission the device over Bluetooth rather than only record it. */
     var bluetooth = true
-    /** The saved network to hand over; required for Bluetooth. */
+    /** The saved network to hand over; required for Bluetooth onto Wi-Fi. */
     var wifi: WifiNetwork? = null
+    /** The Thread tab: the device joins the Thread network matterjs-server holds, not Wi-Fi. */
+    var thread = false
+    /** Whether matterjs-server holds the Thread network; null until checked or when the check failed. */
+    var threadReady: Boolean? = null
+    var threadFailed = false
     var stage: Stage? = null
 
-    fun canRegister() = payload != null && roomId != null && !busy && (!bluetooth || wifi != null)
+    fun canRegister() = payload != null && roomId != null && !busy &&
+        (!bluetooth || if (thread) threadReady == true else wifi != null)
+
+    fun threadChecked(result: ApiResult<Boolean>) {
+        threadReady = (result as? ApiResult.Ok)?.value
+        threadFailed = result is ApiResult.Failed
+    }
 
     /** Accepts a scanned code; anything but a Matter payload leaves the previous code. */
     fun scanned(value: String) {
@@ -137,7 +148,9 @@ class RegisterForm {
                 payload = null
                 name = ""
             }
-            is ApiResult.Failed -> Status.Failed(result.error)
+            is ApiResult.Failed -> Status.Failed(result.error).also {
+                if (result.error == ApiError.THREAD_NOT_READY) threadReady = false
+            }
         }
     }
 

@@ -11,7 +11,8 @@ data class Room(val id: Long, val name: String)
 
 enum class ApiError { UNREACHABLE, DUPLICATE_QR, ROOM_NOT_FOUND, DUPLICATE_ROOM, INVALID_QR, INVALID_MANUAL, INVALID_NAME,
     MATTER_UNREACHABLE, MATTER_NOT_CONFIGURED, SERVER,
-    DEVICE_NOT_FOUND, WRONG_CODE, WIFI_FAILED, COMMISSION_TIMEOUT, COMMISSION_FAILED, BLUETOOTH_UNAVAILABLE, INVALID_WIFI }
+    DEVICE_NOT_FOUND, WRONG_CODE, WIFI_FAILED, COMMISSION_TIMEOUT, COMMISSION_FAILED, BLUETOOTH_UNAVAILABLE, INVALID_WIFI,
+    THREAD_NOT_READY, THREAD_FAILED }
 
 /** The Wi-Fi network handed to a new device. */
 data class WifiNetwork(val ssid: String, val password: String)
@@ -34,9 +35,12 @@ interface HomeLinkApi {
     fun switchLights(on: Boolean): ApiResult<LightsResult>
     /**
      * Has matterjs-server commission the device behind `payload` over the BLE proxy
-     * this phone holds open, onto `wifi`, and records it. Takes up to minutes.
+     * this phone holds open, onto `wifi` or, when null, onto Thread, and records it.
+     * Takes up to minutes.
      */
-    fun commission(roomId: Long, payload: String, name: String, wifi: WifiNetwork): ApiResult<Commissioned>
+    fun commission(roomId: Long, payload: String, name: String, wifi: WifiNetwork?): ApiResult<Commissioned>
+    /** Whether matterjs-server holds the Thread network's credentials to commission Thread devices. */
+    fun threadReady(): ApiResult<Boolean>
 }
 
 class HttpHomeLinkApi(baseUrl: String) : HomeLinkApi {
@@ -54,8 +58,10 @@ class HttpHomeLinkApi(baseUrl: String) : HomeLinkApi {
         return call("POST", "/api/devices", device(roomId, payload, name)) { }
     }
 
-    override fun commission(roomId: Long, payload: String, name: String, wifi: WifiNetwork): ApiResult<Commissioned> {
-        val body = device(roomId, payload, name).put("wifi_ssid", wifi.ssid).put("wifi_password", wifi.password)
+    override fun commission(roomId: Long, payload: String, name: String, wifi: WifiNetwork?): ApiResult<Commissioned> {
+        val body = device(roomId, payload, name)
+        if (wifi == null) body.put("network", "thread")
+        else body.put("network", "wifi").put("wifi_ssid", wifi.ssid).put("wifi_password", wifi.password)
         // matterjs-server may take minutes: Bluetooth discovery, PASE, Wi-Fi join and CASE.
         return call("POST", "/api/commission", body, readTimeout = 360_000) {
             val json = JSONObject(it)
@@ -63,6 +69,9 @@ class HttpHomeLinkApi(baseUrl: String) : HomeLinkApi {
             Commissioned(json.getBoolean("registered"), device.getString("room_name"), device.getString("name"))
         }
     }
+
+    override fun threadReady(): ApiResult<Boolean> =
+        call("GET", "/api/thread", null) { JSONObject(it).getBoolean("ready") }
 
     private fun device(roomId: Long, payload: String, name: String): JSONObject {
         val field = if (payload.startsWith("MT:")) "qr_payload" else "manual_code"
@@ -134,6 +143,8 @@ class HttpHomeLinkApi(baseUrl: String) : HomeLinkApi {
             "commission_failed" -> ApiError.COMMISSION_FAILED
             "bluetooth_unavailable" -> ApiError.BLUETOOTH_UNAVAILABLE
             "invalid_wifi" -> ApiError.INVALID_WIFI
+            "thread_not_ready" -> ApiError.THREAD_NOT_READY
+            "thread_failed" -> ApiError.THREAD_FAILED
             else -> ApiError.SERVER
         }
     }

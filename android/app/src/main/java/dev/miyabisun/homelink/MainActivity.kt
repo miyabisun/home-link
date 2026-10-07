@@ -82,11 +82,19 @@ class MainActivity : Activity() {
     private var enteringCode = false
     private var formattingCode = false
     private var addingWifi = false
+    private var checkingThread = false
 
     private lateinit var content: LinearLayout
+    private lateinit var wifiTab: RadioButton
+    private lateinit var threadTab: RadioButton
     private lateinit var bluetoothChoice: RadioButton
     private lateinit var recordChoice: RadioButton
     private lateinit var bluetoothGuide: LinearLayout
+    private lateinit var wifiGuide: TextView
+    private lateinit var threadGuide: TextView
+    private lateinit var threadPanel: LinearLayout
+    private lateinit var threadState: TextView
+    private lateinit var threadCheckButton: Button
     private lateinit var wifiPanel: LinearLayout
     private lateinit var wifiState: TextView
     private lateinit var wifiSpinner: Spinner
@@ -144,6 +152,7 @@ class MainActivity : Activity() {
             addingRoom = state.getBoolean("addingRoom")
             enteringCode = state.getBoolean("enteringCode")
             form.bluetooth = state.getBoolean("bluetooth", true)
+            form.thread = state.getBoolean("thread")
             addingWifi = state.getBoolean("addingWifi")
             locationDenied = state.getBoolean("locationDenied")
             lightsResult = state.getString("lightsText")?.let { LightsMessage(it, state.getBoolean("lightsFailed")) }
@@ -161,6 +170,7 @@ class MainActivity : Activity() {
         CommissionSession.follow { sessionChanged() }
         sessionChanged()
         loadRooms()
+        if (form.thread) checkThread()
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -172,6 +182,7 @@ class MainActivity : Activity() {
         outState.putBoolean("enteringCode", enteringCode)
         outState.putString("manualCode", manualField.text.toString())
         outState.putBoolean("bluetooth", form.bluetooth)
+        outState.putBoolean("thread", form.thread)
         outState.putBoolean("addingWifi", addingWifi)
         outState.putBoolean("locationDenied", locationDenied)
         // The password is never put in the saved state.
@@ -217,6 +228,25 @@ class MainActivity : Activity() {
             form.rooms(result)
             render()
         }
+    }
+
+    /** Asks home-link whether matterjs-server holds the Thread network to hand to Thread bulbs. */
+    private fun checkThread() {
+        checkingThread = true
+        render()
+        background({ api.threadReady() }) { result ->
+            checkingThread = false
+            form.threadChecked(result)
+            render()
+        }
+    }
+
+    private fun chooseNetwork(thread: Boolean) {
+        if (form.thread == thread) return
+        form.thread = thread
+        form.status = null
+        if (thread) checkThread()
+        render()
     }
 
     private fun switchLights(on: Boolean) {
@@ -385,7 +415,8 @@ class MainActivity : Activity() {
         }
         val payload = form.payload ?: return
         val roomId = form.roomId ?: return
-        val wifi = form.wifi ?: return
+        // Thread bulbs take the network matterjs-server holds; only Wi-Fi bulbs need one handed over.
+        val wifi = if (form.thread) null else form.wifi ?: return
         val name = form.name.trim()
         form.busy = true
         form.status = null
@@ -478,18 +509,32 @@ class MainActivity : Activity() {
             (layoutParams as LinearLayout.LayoutParams).topMargin = dp(24)
         }
 
+        val tabs = RadioGroup(this).apply { orientation = RadioGroup.HORIZONTAL }
+        content.addView(tabs, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+        wifiTab = tab(tabs, "Wi-Fiの電球") { chooseNetwork(thread = false) }
+        // The example goes to its own line rather than breaking wherever the width runs out.
+        threadTab = tab(tabs, "Threadの電球\n（T2など）") { chooseNetwork(thread = true) }
+
         val mode = panel()
         label(mode, "つなぎ方", 18, bold = true)
         val choices = RadioGroup(this).apply { orientation = RadioGroup.VERTICAL }
         mode.addView(choices, LinearLayout.LayoutParams(-1, -2))
-        bluetoothChoice = choice(choices, "新しいWi-Fi電球をBluetoothでつなぐ") { form.bluetooth = true }
+        bluetoothChoice = choice(choices, "") { form.bluetooth = true }
         recordChoice = choice(choices, "記録だけ（つながっている機器）") { form.bluetooth = false }
         bluetoothGuide = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         mode.addView(bluetoothGuide, LinearLayout.LayoutParams(-1, -2))
-        label(bluetoothGuide, "電球をペアリング待ちにし、電話を近づけて登録します。" +
+        wifiGuide = label(bluetoothGuide, "電球をペアリング待ちにし、電話を近づけて登録します。" +
             "BEAMTECは電源のオフ・オンを5回くり返します。ほかはメーカーの手順に従ってください。", 14, muted = true)
-        label(bluetoothGuide, "ThreadやZigbeeの電球（Aqara T2など）はこの方法でつなげません。" +
+        threadGuide = label(bluetoothGuide, "電球をペアリング待ちにし、電話を近づけて登録します。" +
+            "Aqara T2は電源のオフ・オンを1秒間隔で10回くり返すと初期化され、ペアリング待ちになります（初期はThreadで動きます）。" +
+            "ほかはメーカーの手順に従ってください。", 14, muted = true)
+        label(bluetoothGuide, "Zigbeeの電球はこの方法でつなげません。" +
             "Aqara Homeで追加してから「記録だけ」で登録してください。", 14, muted = true)
+
+        threadPanel = panel()
+        label(threadPanel, "Thread網", 18, bold = true)
+        threadState = label(threadPanel, "", 16).apply { accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE }
+        threadCheckButton = button(threadPanel, "もう一度確かめる") { checkThread() }
 
         wifiPanel = panel()
         label(wifiPanel, "電球に渡すWi-Fi", 18, bold = true)
@@ -607,12 +652,37 @@ class MainActivity : Activity() {
         }
         pinButton.visibility = if (canPinWidget) View.VISIBLE else View.GONE
 
+        for ((tab, selected) in listOf(wifiTab to !form.thread, threadTab to form.thread)) {
+            tab.isChecked = selected
+            tab.isEnabled = !form.busy
+            tab.typeface = if (selected) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+        }
+        bluetoothChoice.text = if (form.thread) "新しいThread電球をBluetoothでつなぐ" else "新しいWi-Fi電球をBluetoothでつなぐ"
         bluetoothChoice.isChecked = form.bluetooth
         recordChoice.isChecked = !form.bluetooth
         bluetoothChoice.isEnabled = !form.busy
         recordChoice.isEnabled = !form.busy
         bluetoothGuide.visibility = if (form.bluetooth) View.VISIBLE else View.GONE
-        wifiPanel.visibility = if (form.bluetooth) View.VISIBLE else View.GONE
+        wifiGuide.visibility = if (form.thread) View.GONE else View.VISIBLE
+        threadGuide.visibility = if (form.thread) View.VISIBLE else View.GONE
+        wifiPanel.visibility = if (form.bluetooth && !form.thread) View.VISIBLE else View.GONE
+        threadPanel.visibility = if (form.bluetooth && form.thread) View.VISIBLE else View.GONE
+        threadState.text = when {
+            checkingThread -> "Thread網を確かめています…"
+            form.threadReady == true -> "準備できています。電球にはmatterjs-serverが持つThread網の設定を渡します"
+            form.threadReady == false -> "Thread網が未準備です。homeserverでThread網（OTBR）を用意するまで、Threadの電球は登録できません"
+            form.threadFailed -> "Thread網の状態を確かめられませんでした。home-linkにつながるか確かめてから、もう一度確かめてください"
+            else -> ""
+        }
+        threadState.setTextColor(getColor(if (!checkingThread && form.threadReady != true) R.color.danger else R.color.text))
+        threadState.setCompoundDrawablesRelativeWithIntrinsicBounds(when {
+            checkingThread || threadState.text.isEmpty() -> 0
+            form.threadReady == true -> R.drawable.ic_success
+            else -> R.drawable.ic_error
+        }, 0, 0, 0)
+        threadState.compoundDrawablePadding = dp(8)
+        threadCheckButton.visibility = if (!checkingThread && form.threadReady != true) View.VISIBLE else View.GONE
+        threadCheckButton.isEnabled = !form.busy
         val ssids = savedWifi.networks.map { it.ssid }
         fill(wifiAdapter, ssids)
         val chosen = ssids.indexOf(savedWifi.selected?.ssid)
@@ -690,7 +760,7 @@ class MainActivity : Activity() {
         val result = when (status) {
             is Status.Commissioned -> with(status.device) {
                 when {
-                    !registered -> "Wi-Fiにつなぎました。台帳の" +
+                    !registered -> (if (form.thread) "Thread網" else "Wi-Fi") + "につなぎました。台帳の" +
                         (if (name.isEmpty()) "${room}の機器" else "「$name」（$room）") + "として登録済みです"
                     name.isEmpty() -> "${room}に機器をつなぎ、登録しました"
                     else -> "${room}に「$name」をつなぎ、登録しました"
@@ -726,6 +796,9 @@ class MainActivity : Activity() {
                 ApiError.COMMISSION_FAILED -> "電球を登録できませんでした。電球を初期化してから、もう一度お試しください"
                 ApiError.BLUETOOTH_UNAVAILABLE -> "matterjs-serverでBluetoothの中継が有効になっていません。サーバーの設定を確かめてください"
                 ApiError.INVALID_WIFI -> "Wi-Fiの名前かパスワードが長すぎます。「Wi-Fiを追加」から入力し直してください"
+                ApiError.THREAD_NOT_READY -> "Thread網が未準備です。homeserverでThread網を用意してから登録してください"
+                ApiError.THREAD_FAILED -> "電球がThread網につながりませんでした。Thread網（OTBR）が動いているか確かめてから、" +
+                    "もう一度お試しください"
             }
             else -> null
         }
@@ -743,9 +816,37 @@ class MainActivity : Activity() {
         Stage.PREPARING -> "matterjs-serverに接続しています…"
         Stage.SEARCHING -> "電球を探しています…"
         Stage.CONNECTING -> "電球に接続しています…"
-        Stage.SENDING -> "電球にコードとWi-Fiの設定を送っています…"
-        Stage.JOINING -> "電球がWi-Fiにつながるのを待っています…"
+        Stage.SENDING -> "電球にコードと${network()}の設定を送っています…"
+        Stage.JOINING -> "電球が${network()}につながるのを待っています…"
     }
+
+    private fun network() = if (form.thread) "Thread網" else "Wi-Fi"
+
+    /** A tab: text on the background, underlined in the accent while selected. */
+    private fun tab(group: RadioGroup, value: String, select: () -> Unit): RadioButton = RadioButton(this).apply {
+        text = value
+        textSize = 16f
+        minHeight = dp(48)
+        gravity = Gravity.CENTER
+        buttonDrawable = null
+        setPadding(dp(8), dp(12), dp(8), dp(12))
+        setTextColor(ColorStateList(arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
+            intArrayOf(getColor(R.color.text), getColor(R.color.muted))))
+        val line = StateListDrawable().apply {
+            addState(intArrayOf(android.R.attr.state_checked), underline(R.color.accent, dp(3)))
+            addState(intArrayOf(), underline(R.color.border, dp(1)))
+        }
+        background = RippleDrawable(ColorStateList.valueOf(getColor(R.color.border)), line, null)
+        setOnClickListener { select() }
+        // Both tabs take the taller one's height so the underlines line up.
+        group.addView(this, RadioGroup.LayoutParams(0, -1, 1f))
+    }
+
+    private fun underline(color: Int, height: Int) =
+        LayerDrawable(arrayOf(GradientDrawable().apply { setColor(getColor(color)) })).apply {
+            setLayerGravity(0, Gravity.BOTTOM or Gravity.FILL_HORIZONTAL)
+            setLayerHeight(0, height)
+        }
 
     /** A select box: the input surface with an expand arrow, so it reads apart from buttons. */
     private fun select(parent: LinearLayout, items: ArrayAdapter<String>, description: String,

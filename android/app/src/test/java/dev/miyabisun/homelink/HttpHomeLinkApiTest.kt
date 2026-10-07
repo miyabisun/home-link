@@ -89,12 +89,33 @@ class HttpHomeLinkApiTest {
         assertEquals("押入れ1", body.getString("name"))
         assertEquals("home-2g", body.getString("wifi_ssid"))
         assertEquals("pass word", body.getString("wifi_password"))
+        assertEquals("wifi", body.getString("network"))
 
         // A device the ledger already holds keeps its own room and name.
         respond("/api/commission", 200, """{"node_id":17,"registered":false,"device":{"id":3,"room_id":1,
             "room_name":"寝室","name":"読書灯","created_at":"t"}}""")
         assertEquals(ApiResult.Ok(Commissioned(false, "寝室", "読書灯")), api.commission(2, "34970112332", "", wifi))
         assertEquals("34970112332", JSONObject(requests.last().substringAfter("/api/commission ")).getString("manual_code"))
+    }
+
+    @Test fun commissionsOntoThreadWithoutWifi() {
+        respond("/api/commission", 201, """{"node_id":21,"registered":true,"device":{"id":5,"room_id":2,
+            "room_name":"寝室","name":"T2","created_at":"t"}}""")
+        assertEquals(ApiResult.Ok(Commissioned(true, "寝室", "T2")), api.commission(2, "34970112332", "T2", null))
+        val body = JSONObject(requests.single().substringAfter("/api/commission "))
+        assertEquals("thread", body.getString("network"))
+        assertFalse(body.has("wifi_ssid"))
+        assertFalse(body.has("wifi_password"))
+    }
+
+    @Test fun readsWhetherTheThreadNetworkIsReady() {
+        respond("/api/thread", 200, """{"ready":true}""")
+        assertEquals(ApiResult.Ok(true), api.threadReady())
+        assertEquals("GET /api/thread", requests.single())
+        respond("/api/thread", 200, """{"ready":false}""")
+        assertEquals(ApiResult.Ok(false), api.threadReady())
+        respond("/api/thread", 502, """{"error":"matter_server_unreachable"}""")
+        assertEquals(ApiResult.Failed(ApiError.MATTER_UNREACHABLE), api.threadReady())
     }
 
     @Test fun mapsCommissioningFailures() {
@@ -106,6 +127,8 @@ class HttpHomeLinkApiTest {
             Triple(422, "commission_failed", ApiError.COMMISSION_FAILED),
             Triple(503, "bluetooth_unavailable", ApiError.BLUETOOTH_UNAVAILABLE),
             Triple(400, "invalid_wifi", ApiError.INVALID_WIFI),
+            Triple(503, "thread_not_ready", ApiError.THREAD_NOT_READY),
+            Triple(422, "thread_failed", ApiError.THREAD_FAILED),
             Triple(400, "invalid_qr_payload", ApiError.INVALID_QR),
             Triple(404, "room_not_found", ApiError.ROOM_NOT_FOUND),
             Triple(502, "matter_server_unreachable", ApiError.MATTER_UNREACHABLE),

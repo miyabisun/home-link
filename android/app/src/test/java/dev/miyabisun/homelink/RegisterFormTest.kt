@@ -152,6 +152,42 @@ class RegisterFormTest {
         assertTrue(form.canRegister())
     }
 
+    @Test fun threadRegistrationNeedsAReadyThreadNetworkInsteadOfWifi() {
+        val form = RegisterForm()
+        form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
+        form.scanned(qr)
+        form.wifi = WifiNetwork("home-2g", "secret")
+        form.thread = true
+        assertNull(form.threadReady)
+        assertFalse(form.canRegister())
+        form.threadChecked(ApiResult.Ok(false))
+        assertEquals(false, form.threadReady)
+        assertFalse(form.canRegister())
+        form.threadChecked(ApiResult.Ok(true))
+        form.wifi = null
+        assertTrue(form.canRegister())
+        // A failed check is not taken as ready.
+        form.threadChecked(ApiResult.Failed(ApiError.UNREACHABLE))
+        assertNull(form.threadReady)
+        assertTrue(form.threadFailed)
+        assertFalse(form.canRegister())
+        // Recording only needs neither network.
+        form.bluetooth = false
+        assertTrue(form.canRegister())
+    }
+
+    @Test fun aThreadNotReadyRefusalMarksTheNetworkNotReady() {
+        val form = RegisterForm().apply { thread = true }
+        form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
+        form.scanned(qr)
+        form.threadChecked(ApiResult.Ok(true))
+        form.busy = true
+        form.commissioned(ApiResult.Failed(ApiError.THREAD_NOT_READY))
+        assertEquals(false, form.threadReady)
+        assertEquals(qr, form.payload)
+        assertFalse(form.canRegister())
+    }
+
     @Test fun commissioningClearsTheCodeAndNameOnlyOnSuccess() {
         val form = RegisterForm()
         form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
