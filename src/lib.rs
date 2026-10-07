@@ -86,6 +86,31 @@ pub fn open_db(path: &str) -> rusqlite::Result<Connection> {
             COMMIT;",
         )?;
     }
+    if version < 3 {
+        // Version 3 moves each light's floor to a label holding only its warm white.
+        db.execute_batch(
+            "BEGIN;
+            CREATE TABLE labels (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                day_level INTEGER,
+                night_level INTEGER,
+                cool_kelvin INTEGER,
+                warm_kelvin INTEGER
+            );
+            INSERT INTO labels (name, warm_kelvin)
+                SELECT DISTINCT '夜' || min_kelvin || 'K', min_kelvin FROM devices
+                WHERE min_kelvin IS NOT NULL ORDER BY min_kelvin;
+            ALTER TABLE devices ADD COLUMN label_id INTEGER
+                REFERENCES labels(id) ON DELETE SET NULL;
+            UPDATE devices SET label_id =
+                (SELECT id FROM labels WHERE warm_kelvin = devices.min_kelvin)
+                WHERE min_kelvin IS NOT NULL;
+            ALTER TABLE devices DROP COLUMN min_kelvin;
+            PRAGMA user_version = 3;
+            COMMIT;",
+        )?;
+    }
     Ok(db)
 }
 
@@ -177,6 +202,11 @@ fn router(state: Db) -> Router {
         .route(
             "/devices/{id}",
             get(get_device).patch(update_device).delete(delete_device),
+        )
+        .route("/labels", get(list_labels).post(create_label))
+        .route(
+            "/labels/{id}",
+            axum::routing::patch(update_label).delete(delete_label),
         )
         .route("/commission", axum::routing::post(commission))
         .route("/thread", get(thread))
@@ -378,8 +408,9 @@ struct Device {
     vendor: Option<String>,
     serial_number: Option<String>,
     mac: Option<String>,
-    /// The schedule never sends this light a colour temperature below this.
-    min_kelvin: Option<u16>,
+    /// The label whose values the schedule uses for this light.
+    label_id: Option<i64>,
+    label_name: Option<String>,
     created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     qr_payload: Option<String>,
@@ -402,7 +433,8 @@ struct DeviceInput {
 }
 
 const DEVICE_SELECT: &str = "SELECT devices.id, room_id, rooms.name, devices.name, created_at,
-    qr_payload, vendor, serial_number, mac, min_kelvin FROM devices JOIN rooms ON rooms.id = room_id";
+    qr_payload, vendor, serial_number, mac, label_id, labels.name
+    FROM devices JOIN rooms ON rooms.id = room_id LEFT JOIN labels ON labels.id = label_id";
 
 /// The `qr_payload` column stores either form; a QR payload starts with `MT:`.
 fn device_row(row: &rusqlite::Row, with_payload: bool) -> rusqlite::Result<Device> {
@@ -419,7 +451,8 @@ fn device_row(row: &rusqlite::Row, with_payload: bool) -> rusqlite::Result<Devic
         vendor: row.get(6)?,
         serial_number: row.get(7)?,
         mac: row.get(8)?,
-        min_kelvin: row.get(9)?,
+        label_id: row.get(9)?,
+        label_name: row.get(10)?,
         created_at: row.get(4)?,
         qr_payload,
         manual_code,
@@ -621,35 +654,194 @@ async fn create_device(
     }
 }
 
-/// A ledger change to a device; `min_kelvin` null removes the floor.
+/// A ledger change to a device; `label_id` null removes its label.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DeviceUpdate {
-    min_kelvin: Option<u16>,
+    label_id: Option<i64>,
 }
 
 async fn update_device(
     State(db): State<Db>,
     Path(id): Path<i64>,
-    Json(input): Json<DeviceUpdate>,
+    Json(input): Json<serde_json::Value>,
 ) -> ApiResult<Json<Device>> {
-    if input
-        .min_kelvin
-        .is_some_and(|k| !(1000..=10000).contains(&k))
-    {
-        return Err(ApiError(
-            StatusCode::BAD_REQUEST,
-            "invalid_min_kelvin",
-            "min_kelvinは1000〜10000Kか、nullで指定してください".into(),
-        ));
-    }
+    // `label_id` must be given: an empty body does not remove the label.
+    let given = input
+        .as_object()
+        .is_some_and(|o| o.contains_key("label_id"));
+    let input: DeviceUpdate = serde_json::from_value(input)
+        .ok()
+        .filter(|_| given)
+        .ok_or_else(|| {
+            ApiError(
+                StatusCode::BAD_REQUEST,
+                "invalid_device_update",
+                "変更は {\"label_id\": labelのid} か、nullで外す形で送ってください".into(),
+            )
+        })?;
     let db = db.db.lock().unwrap();
     find_device(&db, id, false)?;
+    if let Some(label) = input.label_id {
+        find_label(&db, label)?;
+    }
     db.execute(
-        "UPDATE devices SET min_kelvin = ?1 WHERE id = ?2",
-        params![input.min_kelvin, id],
+        "UPDATE devices SET label_id = ?1 WHERE id = ?2",
+        params![input.label_id, id],
     )?;
     Ok(Json(find_device(&db, id, false)?))
+}
+
+/// A label and its values; `null` values are the schedule's.
+#[derive(Serialize)]
+struct Label {
+    id: i64,
+    name: String,
+    #[serde(flatten)]
+    values: schedule::Label,
+    device_count: i64,
+}
+
+const LABEL_SELECT: &str = "SELECT id, name, day_level, night_level, cool_kelvin, warm_kelvin,
+    (SELECT count(*) FROM devices WHERE label_id = labels.id) FROM labels";
+
+fn label_row(row: &rusqlite::Row) -> rusqlite::Result<Label> {
+    Ok(Label {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        values: schedule::Label {
+            day_level: row.get(2)?,
+            night_level: row.get(3)?,
+            cool_kelvin: row.get(4)?,
+            warm_kelvin: row.get(5)?,
+        },
+        device_count: row.get(6)?,
+    })
+}
+
+fn labels(db: &Connection) -> rusqlite::Result<Vec<Label>> {
+    let mut statement = db.prepare(&format!("{LABEL_SELECT} ORDER BY id"))?;
+    statement.query_map([], label_row)?.collect()
+}
+
+fn find_label(db: &Connection, id: i64) -> ApiResult<Label> {
+    db.query_row(&format!("{LABEL_SELECT} WHERE id = ?1"), [id], label_row)
+        .optional()?
+        .ok_or_else(|| {
+            ApiError(
+                StatusCode::NOT_FOUND,
+                "label_not_found",
+                "labelが見つかりません".into(),
+            )
+        })
+}
+
+/// The name and values in `input`, checked over the schedule's current settings.
+fn label_input(
+    db: &Connection,
+    mut input: serde_json::Value,
+) -> ApiResult<(String, schedule::Label)> {
+    let invalid = |message: String| ApiError(StatusCode::BAD_REQUEST, "invalid_label", message);
+    let fields = input
+        .as_object_mut()
+        .ok_or_else(|| invalid("labelはJSONのオブジェクトで送ってください".into()))?;
+    let name = fields
+        .remove("name")
+        .and_then(|name| clean_name(name.as_str()?, false))
+        .ok_or_else(|| {
+            ApiError(
+                StatusCode::BAD_REQUEST,
+                "invalid_label_name",
+                format!("label名は1〜{MAX_NAME_CHARS}文字で入力してください"),
+            )
+        })?;
+    let values: schedule::Label =
+        serde_json::from_value(input).map_err(|e| invalid(e.to_string()))?;
+    if let Some(message) = load::<schedule::Settings>(db, SCHEDULE)?
+        .with(&values)
+        .invalid()
+    {
+        return Err(invalid(message.into()));
+    }
+    Ok((name, values))
+}
+
+fn save_label(
+    db: &Connection,
+    id: Option<i64>,
+    name: &str,
+    values: &schedule::Label,
+) -> ApiResult<i64> {
+    let result = db.execute(
+        "INSERT INTO labels (id, name, day_level, night_level, cool_kelvin, warm_kelvin)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT (id) DO UPDATE SET name = excluded.name, day_level = excluded.day_level,
+            night_level = excluded.night_level, cool_kelvin = excluded.cool_kelvin,
+            warm_kelvin = excluded.warm_kelvin",
+        params![
+            id,
+            name,
+            values.day_level,
+            values.night_level,
+            values.cool_kelvin,
+            values.warm_kelvin
+        ],
+    );
+    match result {
+        Err(error) if is_unique_violation(&error) => Err(ApiError(
+            StatusCode::CONFLICT,
+            "duplicate_label_name",
+            "同じ名前のlabelがあります".into(),
+        )),
+        result => {
+            result?;
+            Ok(id.unwrap_or_else(|| db.last_insert_rowid()))
+        }
+    }
+}
+
+async fn list_labels(State(db): State<Db>) -> ApiResult<Json<Vec<Label>>> {
+    Ok(Json(labels(&db.db.lock().unwrap())?))
+}
+
+async fn create_label(
+    State(db): State<Db>,
+    Json(input): Json<serde_json::Value>,
+) -> ApiResult<(StatusCode, Json<Label>)> {
+    let db = db.db.lock().unwrap();
+    let (name, values) = label_input(&db, input)?;
+    let id = save_label(&db, None, &name, &values)?;
+    Ok((StatusCode::CREATED, Json(find_label(&db, id)?)))
+}
+
+/// Merges the given fields into the label; a `null` value returns to the schedule's.
+async fn update_label(
+    State(db): State<Db>,
+    Path(id): Path<i64>,
+    Json(input): Json<serde_json::Value>,
+) -> ApiResult<Json<Label>> {
+    let db = db.db.lock().unwrap();
+    let label = find_label(&db, id)?;
+    let mut merged = json!(label.values);
+    merged["name"] = json!(label.name);
+    if let Some(fields) = input.as_object() {
+        for (key, value) in fields {
+            merged[key] = value.clone();
+        }
+    } else {
+        merged = input;
+    }
+    let (name, values) = label_input(&db, merged)?;
+    save_label(&db, Some(id), &name, &values)?;
+    Ok(Json(find_label(&db, id)?))
+}
+
+/// Deletes the label; its lights return to the schedule's values.
+async fn delete_label(State(db): State<Db>, Path(id): Path<i64>) -> ApiResult<StatusCode> {
+    let db = db.db.lock().unwrap();
+    find_label(&db, id)?;
+    db.execute("DELETE FROM labels WHERE id = ?1", [id])?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn delete_device(State(db): State<Db>, Path(id): Path<i64>) -> ApiResult<StatusCode> {
@@ -1111,21 +1303,27 @@ fn store<T: Serialize>(db: &Connection, key: &str, value: &T) -> rusqlite::Resul
     Ok(())
 }
 
-/// Adjusts every light that is on to the values for `unix`, raised to its
-/// ledger floor, and records the run: nothing is written while "all off" is in
-/// force or the schedule is disabled, nor what was already sent.
+/// Adjusts every light that is on to the values for `unix`, its label's in
+/// place of the schedule's, and records the run: nothing is written while
+/// "all off" is in force or the schedule is disabled, nor what was already sent.
 async fn adjust(state: &AppState, unix: i64, trigger: &'static str) {
     let loaded = {
         let db = state.db.lock().unwrap();
-        load::<schedule::Settings>(&db, SCHEDULE)
-            .and_then(|settings| Ok((settings, load::<Option<Intent>>(&db, INTENT)?, ledger(&db)?)))
+        load::<schedule::Settings>(&db, SCHEDULE).and_then(|settings| {
+            Ok((
+                settings,
+                load::<Option<Intent>>(&db, INTENT)?,
+                ledger(&db)?,
+                labels(&db)?,
+            ))
+        })
     };
     let (day, minute) = schedule::local(unix);
     let mut run = json!({ "at": schedule::timestamp(unix), "trigger": trigger, "commands": 0 });
     let result = match (&loaded, &state.matter_url) {
         (Err(error), _) => Err(error.to_string()),
         (_, None) => Err("MATTER_SERVER_URL is not set".into()),
-        (Ok((settings, intent, devices)), Some(url)) => {
+        (Ok((settings, intent, devices, labels)), Some(url)) => {
             let sun = schedule::sun_times(day, settings.latitude, settings.longitude);
             let goal = schedule::target(minute, sun, settings);
             let all_off = intent.as_ref().is_some_and(|i| i.action == "off");
@@ -1134,47 +1332,51 @@ async fn adjust(state: &AppState, unix: i64, trigger: &'static str) {
             run["level"] = json!(goal.0);
             run["kelvin"] = json!(goal.1);
             let sent = state.sent.lock().unwrap().clone();
+            let goal_of = |nodes: &[serde_json::Value], light: &matter::Light| {
+                let label = devices_of(devices, nodes, light)
+                    .find_map(|d| labels.iter().find(|l| Some(l.id) == d.label_id));
+                let goal = label.map_or(goal, |label| {
+                    schedule::target(minute, sun, &settings.with(&label.values))
+                });
+                (label.map(|l| l.name.clone()), goal)
+            };
             matter::tune(url, |nodes, light| {
-                let floor = devices_of(devices, nodes, light).find_map(|d| d.min_kelvin);
                 let last = sent.get(&(light.node_id, light.endpoint)).copied();
-                schedule::plan(light, all_off, settings, goal, floor, last)
+                schedule::plan(light, all_off, settings, goal_of(nodes, light).1, last)
             })
             .await
+            .map(|tuned| {
+                let goals: Vec<_> = tuned
+                    .lights
+                    .iter()
+                    .map(|(light, _)| goal_of(&tuned.nodes, light))
+                    .collect();
+                (tuned, goals)
+            })
         }
     };
     match result {
-        Ok(tuned) => {
+        Ok((tuned, goals)) => {
             let lights: Vec<_> = tuned.lights.iter().map(|(l, _)| l.clone()).collect();
-            let devices = loaded.map(|(_, _, devices)| devices).unwrap_or_default();
+            let devices = loaded.map(|(_, _, devices, _)| devices).unwrap_or_default();
             let (names, _) = match_ledger(&devices, &tuned.nodes, &lights);
             let mut memory = state.sent.lock().unwrap();
             let entries: Vec<_> = tuned
                 .lights
                 .iter()
                 .zip(names)
-                .map(|((light, decision), (name, room_name))| {
+                .zip(goals)
+                .map(|(((light, decision), (name, room_name)), (label, goal))| {
                     let mut entry = json!({
                         "node_id": light.node_id,
                         "endpoint": light.endpoint,
                         "name": name,
                         "room_name": room_name,
+                        "label": label,
+                        "target_level": goal.0,
+                        "target_kelvin": goal.1,
                     });
-                    entry["decision"] = match decision {
-                        matter::Decision::Skipped(skip) => json!(skip),
-                        matter::Decision::Off => json!("off"),
-                        matter::Decision::NoResponse => json!("no_response"),
-                        matter::Decision::Failed => json!("failed"),
-                        matter::Decision::Sent(target) => {
-                            let last = memory
-                                .entry((light.node_id, light.endpoint))
-                                .or_insert(*target);
-                            last.level = target.level.or(last.level);
-                            last.mireds = target.mireds.or(last.mireds);
-                            entry["level"] = json!(target.level);
-                            entry["mireds"] = json!(target.mireds);
-                            json!("sent")
-                        }
-                    };
+                    entry["decision"] = decide(&mut memory, light, *decision, &mut entry);
                     entry
                 })
                 .collect();
@@ -1194,41 +1396,75 @@ async fn adjust(state: &AppState, unix: i64, trigger: &'static str) {
     runs.truncate(RUNS_KEPT);
 }
 
-/// The ledger devices with a colour temperature floor.
+/// `decision` for the run's `entry`, remembering what was sent `light`.
+fn decide(
+    memory: &mut HashMap<(u64, u16), schedule::Target>,
+    light: &matter::Light,
+    decision: matter::Decision,
+    entry: &mut serde_json::Value,
+) -> serde_json::Value {
+    match decision {
+        matter::Decision::Skipped(skip) => json!(skip),
+        matter::Decision::Off => json!("off"),
+        matter::Decision::NoResponse => json!("no_response"),
+        matter::Decision::Failed => json!("failed"),
+        matter::Decision::Sent(target) => {
+            let last = memory
+                .entry((light.node_id, light.endpoint))
+                .or_insert(target);
+            last.level = target.level.or(last.level);
+            last.mireds = target.mireds.or(last.mireds);
+            entry["level"] = json!(target.level);
+            entry["mireds"] = json!(target.mireds);
+            json!("sent")
+        }
+    }
+}
+
+/// A ledger device with a label.
 #[derive(Serialize)]
-struct Floor {
+struct LabelledDevice {
     id: i64,
     name: String,
     room_name: String,
-    min_kelvin: u16,
 }
 
-/// The schedule's settings, the ledger's colour temperature floors, the user's
-/// last "all on"/"all off" and the latest runs.
+/// The schedule's settings, each label's values and devices, the user's last
+/// "all on"/"all off" and the latest runs.
 async fn get_schedule(State(state): State<Db>) -> ApiResult<Json<serde_json::Value>> {
-    let (settings, intent, floors) = {
+    let (settings, intent, labels) = {
         let db = state.db.lock().unwrap();
-        let floors: Vec<_> = ledger(&db)?
+        let devices = ledger(&db)?;
+        let labels: Vec<_> = labels(&db)?
             .into_iter()
-            .filter_map(|device| {
-                Some(Floor {
-                    min_kelvin: device.min_kelvin?,
-                    id: device.id,
-                    name: device.name,
-                    room_name: device.room_name,
-                })
+            .map(|label| {
+                let mut entry = json!(label.values);
+                entry["id"] = json!(label.id);
+                entry["name"] = json!(label.name);
+                entry["devices"] = json!(
+                    devices
+                        .iter()
+                        .filter(|d| d.label_id == Some(label.id))
+                        .map(|d| LabelledDevice {
+                            id: d.id,
+                            name: d.name.clone(),
+                            room_name: d.room_name.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                );
+                entry
             })
             .collect();
         (
             load::<schedule::Settings>(&db, SCHEDULE)?,
             load::<Option<Intent>>(&db, INTENT)?,
-            floors,
+            labels,
         )
     };
     let runs: Vec<_> = state.runs.lock().unwrap().iter().cloned().collect();
     Ok(Json(json!({
         "settings": settings,
-        "floors": floors,
+        "labels": labels,
         "intent": intent,
         "runs": runs,
     })))

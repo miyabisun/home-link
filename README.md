@@ -138,15 +138,19 @@ matterjs-serverにdatasetが入ると、アプリを変えずに登録できる�
 | `GET /api/devices` | 機器の一覧。コードは含みません | |
 | `POST /api/devices` | 機器の登録 | 400 `invalid_qr_payload`・`invalid_manual_code`・`missing_setup_code`・`invalid_identifier`・`invalid_mac`・`invalid_device_name`、404 `room_not_found`、409 `duplicate_qr_payload`・`duplicate_identifier` |
 | `GET /api/devices/{id}` | 機器1台。登録したコードの全文 `qr_payload` または `manual_code` を含みます | 404 `device_not_found` |
-| `PATCH /api/devices/{id}` | 自動調整の色温度の下限の変更。本文は `{"min_kelvin": 4000}`、`null` で下限なし | 400 `invalid_min_kelvin`、404 `device_not_found` |
+| `PATCH /api/devices/{id}` | labelの割り当て。本文は `{"label_id": 1}`、`null` で外す | 400 `invalid_device_update`、404 `device_not_found`・`label_not_found` |
 | `DELETE /api/devices/{id}` | 機器の削除 | 404 `device_not_found` |
+| `GET /api/labels` | labelの一覧（値と割り当てた機器の台数つき） | |
+| `POST /api/labels` | labelの作成。本文は `{"name": "キッチン", "night_level": 76, "warm_kelvin": 2700}` | 400 `invalid_label_name`・`invalid_label`、409 `duplicate_label_name` |
+| `PATCH /api/labels/{id}` | labelの名前・値のうち、送った項目だけを変更します。`null` の値は全体の設定に戻ります | 400 `invalid_label_name`・`invalid_label`、404 `label_not_found`、409 `duplicate_label_name` |
+| `DELETE /api/labels/{id}` | labelの削除。割り当てた機器はlabel無しに戻ります | 404 `label_not_found` |
 | `POST /api/commission` | 機器をmatterjs-serverへBluetoothで登録（commissioning）し、台帳に登録 | 400 `missing_setup_code`・`invalid_qr_payload`・`invalid_manual_code`・`invalid_network`・`invalid_wifi`・`invalid_device_name`、404 `room_not_found`、422 `device_not_found`・`wrong_code`・`wifi_failed`・`thread_failed`・`commission_failed`、504 `commission_timeout`、502 `matter_server_unreachable`、503 `matter_server_not_configured`・`bluetooth_unavailable`・`thread_not_ready` |
 | `GET /api/thread` | Thread電球を登録できるか（matterjs-serverがThread網のdatasetを持つか）を `{"ready": true}` で返します | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `GET /api/status` | 台帳の機器ごとに、matterjs-serverで見えるか（`visible`）と今の `node_id`・`endpoint` | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `GET /api/lights` | 照明ごとの今の状態（`on`・`off`・`no_response`）と、その件数 | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `POST /api/lights/on` | 全部の照明をオンにし、照明ごとの結果（`switched`・`no_response`・`failed`）と件数を返します | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `POST /api/lights/off` | 全部の照明をオフにします。応答は `on` と同じ形です | 同上 |
-| `GET /api/lights/schedule` | 明るさと色温度の自動調整の設定（`settings`）、照明ごとの色温度の下限（`floors`）、最後に押された全部オン・全部オフ（`intent`）、直近の調整の記録（`runs`、新しい順に144回分） | |
+| `GET /api/lights/schedule` | 明るさと色温度の自動調整の設定（`settings`）、labelごとの値と割り当てた機器（`labels`）、最後に押された全部オン・全部オフ（`intent`）、直近の調整の記録（`runs`、新しい順に144回分） | |
 | `PUT /api/lights/schedule` | 自動調整の設定のうち、送った項目だけを変更します。応答は `GET` と同じ形です | 400 `invalid_schedule` |
 | `GET /api/health` | 稼働確認と版（`{"status":"ok","version":"0.1.4"}`） | |
 | `GET /healthz` | 稼働確認（`ok`） | |
@@ -202,7 +206,10 @@ nodeが使えない照明と、ブリッジが届かないと報告している�
 | 夜: 22時 → 翌朝の開始 | `night_level` | `warm_kelvin` |
 
 - 日の出・日の入りは `latitude`・`longitude` とAsia/Tokyoの時刻で計算します。既定は東京（新宿）です。
-- 台帳の機器に色温度の下限（`min_kelvin`、`PATCH /api/devices/{id}`）があれば、その照明へはそれより低い色温度を送りません。
+- 台帳の機器にlabelを割り当てると、その照明はlabelの値（`day_level`・`night_level`・`cool_kelvin`・`warm_kelvin`）で同じ曲線をたどります。
+  labelの値が `null` の項目と、時刻（朝の終わり・22時・日の出と日の入りの地点）は全体の設定を使います。
+  1台に割り当てられるlabelは1つで、部屋とは別に持ちます。
+  labelの値の範囲は全体の設定と同じで、全体の設定と重ねた結果が `warm_kelvin` ≤ `cool_kelvin` でなければ `invalid_label` で拒否します。
 - 色温度と明るさは、照明ごとに報告された範囲へ収めます。色温度に対応しない照明へは色温度を、調光しない照明へは明るさを送りません。
 - 1回の変化は30秒（`transitionTime` 300）かけて移します。
 - 前回送った値と同じ値は送りません。送った値はメモリだけに持ち、再起動後は改めて送ります。
@@ -226,8 +233,9 @@ nodeが使えない照明と、ブリッジが届かないと報告している�
   押された操作と時刻は保存し、再起動しても保ちます。照明ごとのオン・オフは保存せず、毎回matterjs-serverから読みます。
 - 有効なときに「全部オン」を押すと、点けた後にその時刻の値へ合わせます。
 
-`runs` は調整ごとに、時刻（`at`）、きっかけ（`trigger`: `scheduled` または `lights_on`）、目標値（`level`・`kelvin`）、
+`runs` は調整ごとに、時刻（`at`）、きっかけ（`trigger`: `scheduled` または `lights_on`）、全体の設定の目標値（`level`・`kelvin`）、
 日の出・日の入り、送った命令の数（`commands`）、照明ごとの判断（`decision`）を持ちます。
+照明ごとに、割り当てたlabelの名前（`label`、無ければ `null`）と、その照明の目標値（`target_level`・`target_kelvin`）も持ちます。
 判断は、送った `sent`、全部オフ中の `all_off`、無効の `disabled`、消えていた `off`、届かない `no_response`、
 エラーが返った `failed`、調光にも色温度にも対応しない `unsupported`、前回と同じ値の `unchanged` です。
 `sent` の照明の `level`・`mireds` は、前回から変わって送った値だけを持ちます。
@@ -236,15 +244,25 @@ nodeが使えない照明と、ブリッジが届かないと報告している�
 ```sh
 curl -X PUT http://homeserver:5011/api/lights/schedule -H 'content-type: application/json' -d '{"enabled":true}'
 # {"settings":{"enabled":true,"latitude":35.6895,"longitude":139.6917,"morning_end_minute":600,"day_level":203,"night_level":102,"warm_kelvin":3000,"cool_kelvin":5000},
-#  "floors":[{"id":3,"name":"Tapo 1","room_name":"リビング","min_kelvin":4000},…],"intent":{"action":"on","at":"2026-10-05T21:10:00+09:00"},"runs":[…]}
+#  "labels":[{"id":1,"name":"キッチン","day_level":null,"night_level":76,"cool_kelvin":null,"warm_kelvin":2700,
+#             "devices":[{"id":5,"name":"キッチン1","room_name":"リビング"},…]},…],"intent":{"action":"on","at":"2026-10-05T21:10:00+09:00"},"runs":[…]}
 
 curl http://homeserver:5011/api/lights/schedule
 # {…,"runs":[{"at":"2026-10-05T23:00:00+09:00","trigger":"scheduled","sunrise":"05:39","sunset":"17:23","level":102,"kelvin":3000,"commands":2,
-#   "lights":[{"node_id":1,"endpoint":3,"name":"キッチン","room_name":"リビング","decision":"sent","level":102,"mireds":333},
-#             {"node_id":5,"endpoint":1,"name":"読書灯","room_name":"寝室","decision":"off"},…]},…]}
+#   "lights":[{"node_id":1,"endpoint":3,"name":"キッチン1","room_name":"リビング","label":"キッチン","target_level":76,"target_kelvin":2700,
+#              "decision":"sent","level":76,"mireds":370},
+#             {"node_id":5,"endpoint":1,"name":"読書灯","room_name":"寝室","label":null,"target_level":102,"target_kelvin":3000,"decision":"off"},…]},…]}
 
-curl -X PATCH http://homeserver:5011/api/devices/3 -H 'content-type: application/json' -d '{"min_kelvin":4000}'
+curl -X POST http://homeserver:5011/api/labels -H 'content-type: application/json' -d '{"name":"キッチン","night_level":76,"warm_kelvin":2700}'
+# 201 {"id":1,"name":"キッチン","day_level":null,"night_level":76,"cool_kelvin":null,"warm_kelvin":2700,"device_count":0}
+
+curl -X PATCH http://homeserver:5011/api/devices/5 -H 'content-type: application/json' -d '{"label_id":1}'
+# {"id":5,…,"label_id":1,"label_name":"キッチン",…}
 ```
+
+以前の版の色温度の下限（`min_kelvin`）は、更新後の最初の起動で、値ごとに `warm_kelvin` だけを持つlabel（`夜3500K` など）へ移り、
+その照明に割り当てられます。下限は日の入り〜22時の途中でも効いていましたが、labelの `warm_kelvin` は夜の値なので、
+その間は全体の `cool_kelvin` からlabelの値へ線形に下がります。`PATCH /api/devices/{id}` に `min_kelvin` を送ると400です。
 
 ### 例
 
@@ -267,7 +285,7 @@ curl -X POST http://homeserver:5011/api/devices -H 'content-type: application/js
 curl -X POST http://homeserver:5011/api/commission -H 'content-type: application/json' \
   -d '{"room_id":2,"qr_payload":"MT:Y.K9042C00KA0648G00","name":"押入れ1","wifi_ssid":"home-2g","wifi_password":"…"}'
 # 201 {"node_id":17,"registered":true,"device":{"id":9,"room_id":2,"room_name":"押入れ","name":"押入れ1","vendor":"Tapo",
-#      "serial_number":"CCBABDE0C244","mac":"CCBABDE0C244","min_kelvin":null,"created_at":"2026-10-06T03:30:00Z"}}
+#      "serial_number":"CCBABDE0C244","mac":"CCBABDE0C244","label_id":null,"label_name":null,"created_at":"2026-10-06T03:30:00Z"}}
 # 422 {"error":"wifi_failed","message":"機器がWi-Fi「home-2g」に接続できませんでした"}
 
 curl http://homeserver:5011/api/status

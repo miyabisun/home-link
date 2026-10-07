@@ -65,6 +65,30 @@ impl Settings {
     }
 }
 
+/// A label's own values for its lights; `None` keeps the schedule's.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Label {
+    pub day_level: Option<u8>,
+    pub night_level: Option<u8>,
+    pub cool_kelvin: Option<u16>,
+    pub warm_kelvin: Option<u16>,
+}
+
+impl Settings {
+    /// These settings with `label`'s values in place of the schedule's.
+    #[must_use]
+    pub fn with(&self, label: &Label) -> Self {
+        Self {
+            day_level: label.day_level.unwrap_or(self.day_level),
+            night_level: label.night_level.unwrap_or(self.night_level),
+            cool_kelvin: label.cool_kelvin.unwrap_or(self.cool_kelvin),
+            warm_kelvin: label.warm_kelvin.unwrap_or(self.warm_kelvin),
+            ..self.clone()
+        }
+    }
+}
+
 /// The day of the year (1-based) and the minute of the day in Asia/Tokyo at `unix` seconds.
 #[must_use]
 pub fn local(unix: i64) -> (u32, u32) {
@@ -185,12 +209,11 @@ pub struct Target {
     pub mireds: Option<u16>,
 }
 
-/// Fits `level` and `kelvin`, raised to the light's `floor`, into the ranges `light` reports.
+/// Fits `level` and `kelvin` into the ranges `light` reports.
 // The values are rounded and clamped into range before the casts.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 #[must_use]
-pub fn fit(level: u8, kelvin: u16, floor: Option<u16>, light: &Light) -> Target {
-    let kelvin = kelvin.max(floor.unwrap_or(0));
+pub fn fit(level: u8, kelvin: u16, light: &Light) -> Target {
     Target {
         level: light
             .levels
@@ -226,10 +249,9 @@ pub fn plan(
     all_off: bool,
     settings: &Settings,
     goal: (u8, u16),
-    floor: Option<u16>,
     last: Option<Target>,
 ) -> Result<Target, Skip> {
-    let target = fit(goal.0, goal.1, floor, light);
+    let target = fit(goal.0, goal.1, light);
     let last = last.unwrap_or(Target {
         level: None,
         mireds: None,
@@ -392,40 +414,25 @@ mod tests {
         // T2: 153–370 mired. 2700 K is 370; 2000 K clamps to it, 10000 K to 153.
         let t2 = bulb(Some((1, 254)), Some((153, 370)));
         assert_eq!(
-            fit(40, 2700, None, &t2),
+            fit(40, 2700, &t2),
             Target {
                 level: Some(40),
                 mireds: Some(370)
             }
         );
-        assert_eq!(fit(40, 2000, None, &t2).mireds, Some(370));
-        assert_eq!(fit(40, 10000, None, &t2).mireds, Some(153));
+        assert_eq!(fit(40, 2000, &t2).mireds, Some(370));
+        assert_eq!(fit(40, 10000, &t2).mireds, Some(153));
         // Tapo reports MinLevel 0: level 1 is the lowest sent.
-        assert_eq!(
-            fit(0, 5000, None, &bulb(Some((0, 254)), None)).level,
-            Some(1)
-        );
-        assert_eq!(
-            fit(254, 5000, None, &bulb(Some((1, 200)), None)).level,
-            Some(200)
-        );
+        assert_eq!(fit(0, 5000, &bulb(Some((0, 254)), None)).level, Some(1));
+        assert_eq!(fit(254, 5000, &bulb(Some((1, 200)), None)).level, Some(200));
         // A light without the control gets no value for it.
         assert_eq!(
-            fit(40, 5000, None, &bulb(None, None)),
+            fit(40, 5000, &bulb(None, None)),
             Target {
                 level: None,
                 mireds: None
             }
         );
-    }
-
-    #[test]
-    fn a_lights_floor_raises_its_colour_temperature() {
-        let tapo = bulb(Some((0, 254)), Some((153, 400)));
-        // 3000 K is 333 mired; a 4000 K floor sends 250.
-        assert_eq!(fit(102, 3000, Some(4000), &tapo).mireds, Some(250));
-        assert_eq!(fit(102, 5000, Some(4000), &tapo).mireds, Some(200));
-        assert_eq!(fit(102, 3000, None, &tapo).mireds, Some(333));
     }
 
     fn on() -> Settings {
@@ -439,14 +446,14 @@ mod tests {
     fn all_off_and_disabled_leave_every_light_alone() {
         let t2 = bulb(Some((1, 254)), Some((153, 370)));
         let night = (102, 3000);
-        assert_eq!(plan(&t2, true, &on(), night, None, None), Err(Skip::AllOff));
+        assert_eq!(plan(&t2, true, &on(), night, None), Err(Skip::AllOff));
         // "All off" wins over disabled, so the status shows why nothing was sent.
         assert_eq!(
-            plan(&t2, true, &Settings::default(), night, None, None),
+            plan(&t2, true, &Settings::default(), night, None),
             Err(Skip::AllOff)
         );
         assert_eq!(
-            plan(&t2, false, &Settings::default(), night, None, None),
+            plan(&t2, false, &Settings::default(), night, None),
             Err(Skip::Disabled)
         );
         let unreachable = Light {
@@ -454,15 +461,15 @@ mod tests {
             ..t2.clone()
         };
         assert_eq!(
-            plan(&unreachable, false, &on(), night, None, None),
+            plan(&unreachable, false, &on(), night, None),
             Err(Skip::NoResponse)
         );
         assert_eq!(
-            plan(&bulb(None, None), false, &on(), night, None, None),
+            plan(&bulb(None, None), false, &on(), night, None),
             Err(Skip::Unsupported)
         );
         assert_eq!(
-            plan(&t2, false, &on(), night, None, None),
+            plan(&t2, false, &on(), night, None),
             Ok(Target {
                 level: Some(102),
                 mireds: Some(333)
@@ -478,32 +485,114 @@ mod tests {
             mireds: Some(333),
         };
         assert_eq!(
-            plan(&t2, false, &on(), (102, 3000), None, Some(sent)),
+            plan(&t2, false, &on(), (102, 3000), Some(sent)),
             Err(Skip::Unchanged)
         );
         assert_eq!(
-            plan(&t2, false, &on(), (105, 3000), None, Some(sent)),
+            plan(&t2, false, &on(), (105, 3000), Some(sent)),
             Ok(Target {
                 level: Some(105),
                 mireds: None
             })
         );
         assert_eq!(
-            plan(&t2, false, &on(), (102, 3100), None, Some(sent)),
+            plan(&t2, false, &on(), (102, 3100), Some(sent)),
             Ok(Target {
                 level: None,
                 mireds: Some(323)
             })
         );
-        // The floor counts: 3000 K and 3100 K both send 4000 K.
-        let floored = Target {
-            level: Some(102),
-            mireds: Some(250),
-        };
+    }
+
+    fn kitchen() -> Label {
+        Label {
+            night_level: Some(76),
+            warm_kelvin: Some(2700),
+            ..Label::default()
+        }
+    }
+
+    #[test]
+    fn a_labels_values_replace_the_schedules_and_nulls_keep_them() {
+        let s = day();
+        assert_eq!(s.with(&Label::default()), s);
+        let merged = s.with(&kitchen());
+        assert_eq!((merged.day_level, merged.night_level), (s.day_level, 76));
         assert_eq!(
-            plan(&t2, false, &on(), (102, 3100), Some(4000), Some(floored)),
-            Err(Skip::Unchanged)
+            (merged.cool_kelvin, merged.warm_kelvin),
+            (s.cool_kelvin, 2700)
         );
+        let all = Label {
+            day_level: Some(150),
+            night_level: Some(50),
+            cool_kelvin: Some(4500),
+            warm_kelvin: Some(3500),
+        };
+        let merged = s.with(&all);
+        assert_eq!(
+            (
+                merged.day_level,
+                merged.night_level,
+                merged.cool_kelvin,
+                merged.warm_kelvin
+            ),
+            (150, 50, 4500, 3500)
+        );
+        // The times stay the schedule's.
+        assert_eq!(merged.morning_end_minute, s.morning_end_minute);
+        assert_eq!((merged.latitude, merged.enabled), (s.latitude, s.enabled));
+    }
+
+    #[test]
+    fn a_label_follows_the_schedules_curve_with_its_own_values() {
+        let s = day().with(&kitchen());
+        let sun = (at(6, 0), at(18, 0));
+        // Night from 22:00 until sunrise, the day's values from the morning end.
+        assert_eq!(target(at(22, 0), sun, &s), (76, 2700));
+        assert_eq!(target(at(5, 59), sun, &s), (76, 2700));
+        assert_eq!(target(at(6, 0), sun, &s), (76, 2700));
+        assert_eq!(target(at(10, 0), sun, &s), (203, 5000));
+        // Halfway through the morning and the evening.
+        assert_eq!(target(at(8, 0), sun, &s), (140, 3850));
+        assert_eq!(target(at(20, 0), sun, &s), (140, 3850));
+        // A minute before 22:00 is a 240th of the way back up.
+        assert_eq!(target(at(21, 59), sun, &s).0, 77);
+    }
+
+    #[test]
+    fn labels_out_of_range_or_warmer_than_cool_are_rejected() {
+        let s = day();
+        assert_eq!(s.with(&kitchen()).invalid(), None);
+        for bad in [
+            Label {
+                day_level: Some(0),
+                ..Label::default()
+            },
+            Label {
+                night_level: Some(255),
+                ..Label::default()
+            },
+            Label {
+                warm_kelvin: Some(999),
+                ..Label::default()
+            },
+            Label {
+                cool_kelvin: Some(10001),
+                ..Label::default()
+            },
+            Label {
+                warm_kelvin: Some(4000),
+                cool_kelvin: Some(3500),
+                ..Label::default()
+            },
+            // Warmer than the schedule's cool white.
+            Label {
+                warm_kelvin: Some(5500),
+                ..Label::default()
+            },
+        ] {
+            assert!(s.with(&bad).invalid().is_some(), "{bad:?}");
+        }
     }
 
     #[test]
