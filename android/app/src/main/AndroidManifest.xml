@@ -6,6 +6,11 @@
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <!-- Android 17 blocks LAN connections, including to the BLE proxy, without it; 16 ignores it. -->
     <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
+    <!-- Android names the connected Wi-Fi only to apps with fine location; used to fill in the SSID. -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <!-- Reading the connected network through ConnectivityManager. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
     <application android:label="@string/app_name" android:icon="@drawable/ic_home_link"
         android:theme="@style/AppTheme" android:allowBackup="false"

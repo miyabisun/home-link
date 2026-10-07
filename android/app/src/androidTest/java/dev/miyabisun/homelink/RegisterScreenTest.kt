@@ -37,12 +37,14 @@ class RegisterScreenTest {
     private val scanner = FakeScanner()
     private val link = FakeLink()
     private val wifi = MemoryWifiStore()
+    private val reader = FakeWifiReader()
 
     @Before fun install() {
         MainActivity.apiFactory = { api }
         MainActivity.scannerFactory = { scanner }
         MainActivity.linkFactory = { link }
         MainActivity.wifiStoreFactory = { wifi }
+        MainActivity.wifiReaderFactory = { reader }
     }
 
     @After fun uninstall() {
@@ -50,6 +52,7 @@ class RegisterScreenTest {
         MainActivity.scannerFactory = null
         MainActivity.linkFactory = null
         MainActivity.wifiStoreFactory = null
+        MainActivity.wifiReaderFactory = null
     }
 
     /** The ledger-only registration the earlier tests exercise. */
@@ -75,11 +78,11 @@ class RegisterScreenTest {
                 eventually(screen) { hasLabel(it, "部屋「$room」を追加しました") }
             }
             screen.onActivity { activity ->
-                val spinner = views(activity).filterIsInstance<Spinner>().single()
+                val spinner = spinner(activity, "部屋")
                 assertEquals("リビングと続きの和室（南側・大きな窓のある部屋）", spinner.selectedItem)
                 spinner.setSelection(0)
             }
-            eventually(screen) { views(it).filterIsInstance<Spinner>().single().selectedItem == "寝室" }
+            eventually(screen) { spinner(it, "部屋").selectedItem == "寝室" }
 
             scanner.next = ScanResult.Read(qr)
             screen.onActivity { activity ->
@@ -96,7 +99,7 @@ class RegisterScreenTest {
             screen.onActivity { activity ->
                 assertTrue(hasLabel(activity, "まだ読み取っていません"))
                 assertEquals("", field(activity, "機器名（任意）").text.toString())
-                assertEquals("寝室", views(activity).filterIsInstance<Spinner>().single().selectedItem)
+                assertEquals("寝室", spinner(activity, "部屋").selectedItem)
                 assertFalse(button(activity, "登録").isEnabled)
             }
             capture(screen, "registered")
@@ -116,7 +119,7 @@ class RegisterScreenTest {
         api.rooms += Room(1, "寝室")
         ActivityScenario.launch(MainActivity::class.java).use { screen ->
             recordOnly(screen)
-            eventually(screen) { views(it).filterIsInstance<Spinner>().single().selectedItem == "寝室" }
+            eventually(screen) { spinner(it, "部屋").selectedItem == "寝室" }
             scanner.next = ScanResult.Read(qr)
             screen.onActivity { activity ->
                 button(activity, "QRを読み取る").performClick()
@@ -143,7 +146,7 @@ class RegisterScreenTest {
             screen.onActivity { button(it, "登録").performClick() }
             eventually(screen) { activity ->
                 hasLabel(activity, "選んだ部屋が見つかりません。部屋を選び直してください") &&
-                    views(activity).filterIsInstance<Spinner>().single().selectedItem == "居間"
+                    spinner(activity, "部屋").selectedItem == "居間"
             }
             screen.onActivity { activity ->
                 assertTrue(hasLabel(activity, "読み取り済み：MT:Y.K90…"))
@@ -171,7 +174,7 @@ class RegisterScreenTest {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         ActivityScenario.launch(MainActivity::class.java).use { screen ->
             recordOnly(screen)
-            eventually(screen) { views(it).filterIsInstance<Spinner>().single().selectedItem == "寝室" }
+            eventually(screen) { spinner(it, "部屋").selectedItem == "寝室" }
             screen.onActivity { button(it, "数字で入力").performClick() }
             eventually(screen) { field(it, "11桁の数字").hasFocus() }
             instrumentation.waitForIdleSync()
@@ -253,7 +256,7 @@ class RegisterScreenTest {
             api.rooms += Room(1, "寝室")
             screen.onActivity { button(it, "再接続").performClick() }
             eventually(screen) { activity ->
-                views(activity).filterIsInstance<Spinner>().single().selectedItem == "寝室" &&
+                spinner(activity, "部屋").selectedItem == "寝室" &&
                     !hasLabel(activity, "部屋を読み込めませんでした")
             }
         }
@@ -263,16 +266,16 @@ class RegisterScreenTest {
         api.rooms += listOf(Room(1, "寝室"), Room(2, "居間"))
         ActivityScenario.launch(MainActivity::class.java).use { screen ->
             recordOnly(screen)
-            eventually(screen) { views(it).filterIsInstance<Spinner>().single().count == 2 }
+            eventually(screen) { spinner(it, "部屋").count == 2 }
             scanner.next = ScanResult.Read(qr)
-            screen.onActivity { views(it).filterIsInstance<Spinner>().single().setSelection(1) }
+            screen.onActivity { spinner(it, "部屋").setSelection(1) }
             InstrumentationRegistry.getInstrumentation().waitForIdleSync()
             screen.onActivity { activity ->
                 button(activity, "QRを読み取る").performClick()
                 field(activity, "機器名（任意）").setText("天井灯")
             }
             screen.recreate()
-            eventually(screen) { views(it).filterIsInstance<Spinner>().single().selectedItem == "居間" }
+            eventually(screen) { spinner(it, "部屋").selectedItem == "居間" }
             screen.onActivity { activity ->
                 assertTrue(hasLabel(activity, "読み取り済み：MT:Y.K90…"))
                 assertEquals("天井灯", field(activity, "機器名（任意）").text.toString())
@@ -330,16 +333,20 @@ class RegisterScreenTest {
     @Test fun commissionOverBluetoothShowsEachStage() {
         api.rooms += Room(1, "押入れ")
         ActivityScenario.launch(MainActivity::class.java).use { screen ->
-            eventually(screen) { views(it).filterIsInstance<Spinner>().single().selectedItem == "押入れ" }
+            eventually(screen) { spinner(it, "部屋").selectedItem == "押入れ" }
             scanner.next = ScanResult.Read(qr)
             screen.onActivity { activity ->
                 assertTrue(views(activity).filterIsInstance<RadioButton>().first { it.text.startsWith("新しいWi-Fi電球") }.isChecked)
-                assertTrue(hasLabel(activity, "まだ設定していません"))
+                assertTrue(hasLabel(activity, "まだ保存していません"))
                 button(activity, "QRを読み取る").performClick()
                 field(activity, "機器名（任意）").setText("押入れ1")
                 // No Wi-Fi to hand over yet.
                 assertFalse(button(activity, "登録").isEnabled)
-                field(activity, "Wi-Fiの名前（SSID）").setText("home-2g")
+                button(activity, "Wi-Fiを追加").performClick()
+                // The network the phone is on fills in the name; only the password is left.
+                assertEquals("home-2g", field(activity, "Wi-Fiの名前（SSID）").text.toString())
+                assertTrue(hasLabel(activity, "今つながっているWi-Fiの名前を入れました。パスワードを入力してください"))
+                assertTrue(field(activity, "Wi-Fiのパスワード").isFocused)
                 field(activity, "Wi-Fiのパスワード").setText("x".repeat(65))
                 button(activity, "保存").performClick()
                 assertTrue(hasLabel(activity, "Wi-Fiの名前（32バイトまで）とパスワード（64文字まで）を入力してください"))
@@ -348,11 +355,11 @@ class RegisterScreenTest {
             capture(screen, "bt-wifi")
             screen.onActivity { activity ->
                 button(activity, "保存").performClick()
-                assertTrue(hasLabel(activity, "「home-2g」を渡します"))
+                assertEquals("home-2g", spinner(activity, "電球に渡すWi-Fi").selectedItem)
                 assertFalse(field(activity, "Wi-Fiのパスワード").isShown)
                 assertTrue(button(activity, "登録").isEnabled)
             }
-            assertEquals(WifiNetwork("home-2g", "kakushi"), wifi.saved)
+            assertEquals(SavedWifi(listOf(WifiNetwork("home-2g", "kakushi")), "home-2g"), wifi.saved)
             capture(screen, "bt-ready")
 
             link.script = listOf("start_scan", "stop_scan", "connect", "discover_services", "write_and_subscribe", "disconnect")
@@ -394,12 +401,12 @@ class RegisterScreenTest {
 
     @Test fun commissioningFailuresSayWhatToDoAndKeepTheInputs() {
         api.rooms += Room(1, "押入れ")
-        wifi.saved = WifiNetwork("home-2g", "kakushi")
+        wifi.saved = SavedWifi().added(WifiNetwork("home-2g", "kakushi"))
         ActivityScenario.launch(MainActivity::class.java).use { screen ->
-            eventually(screen) { views(it).filterIsInstance<Spinner>().single().selectedItem == "押入れ" }
+            eventually(screen) { spinner(it, "部屋").selectedItem == "押入れ" }
             scanner.next = ScanResult.Read(qr)
             screen.onActivity { activity ->
-                assertTrue(hasLabel(activity, "「home-2g」を渡します"))
+                assertEquals("home-2g", spinner(activity, "電球に渡すWi-Fi").selectedItem)
                 button(activity, "QRを読み取る").performClick()
                 field(activity, "機器名（任意）").setText("押入れ1")
             }
@@ -435,26 +442,116 @@ class RegisterScreenTest {
             capture(screen, "bt-already")
             // An unreachable proxy never reaches the API.
             assertEquals(7, api.commissionings.size)
+        }
+    }
 
-            // Changing the Wi-Fi asks for the password again.
+    @Test fun savedNetworksAreChosenFromTheListAddedAndDeleted() {
+        api.rooms += Room(1, "押入れ")
+        val home = WifiNetwork("home-2g", "kakushi")
+        val annex = WifiNetwork("離れの2.4GHz（物置と作業部屋）", "hanare")
+        wifi.saved = SavedWifi(listOf(home, annex), last = annex.ssid)
+        api.commissioned = ApiResult.Ok(Commissioned(true, "押入れ", ""))
+        ActivityScenario.launch(MainActivity::class.java).use { screen ->
+            eventually(screen) { spinner(it, "部屋").selectedItem == "押入れ" }
+            // The network used last is chosen already.
             screen.onActivity { activity ->
-                button(activity, "変更").performClick()
+                val choice = spinner(activity, "電球に渡すWi-Fi")
+                assertEquals(annex.ssid, choice.selectedItem)
+                assertEquals(listOf(home.ssid, annex.ssid), (0 until choice.count).map { choice.getItemAtPosition(it) })
+            }
+            capture(screen, "wifi-list")
+            scanner.next = ScanResult.Read(qr)
+            screen.onActivity { activity ->
+                button(activity, "QRを読み取る").performClick()
+                button(activity, "登録").performClick()
+            }
+            eventually(screen) { hasLabel(it, "押入れに機器をつなぎ、登録しました") }
+            assertEquals(annex, api.commissionings.last().wifi)
+
+            // Choosing another network is remembered, also across a recreated screen.
+            screen.onActivity { spinner(it, "電球に渡すWi-Fi").setSelection(0) }
+            eventually(screen) { wifi.saved.last == home.ssid }
+            screen.recreate()
+            screen.onActivity { assertEquals(home.ssid, spinner(it, "電球に渡すWi-Fi").selectedItem) }
+            scanner.next = ScanResult.Read(qr)
+            screen.onActivity { activity ->
+                button(activity, "QRを読み取る").performClick()
+                button(activity, "登録").performClick()
+            }
+            eventually(screen) { api.commissionings.size == 2 }
+            assertEquals(home, api.commissionings.last().wifi)
+
+            // On 5GHz, the adder says the bulbs need 2.4GHz.
+            reader.next = CurrentWifi("home-5g", 5180)
+            screen.onActivity { button(it, "Wi-Fiを追加").performClick() }
+            screen.onActivity { activity ->
+                assertEquals("home-5g", field(activity, "Wi-Fiの名前（SSID）").text.toString())
+                assertTrue(hasLabel(activity, "今つながっている「home-5g」は5GHzです。電球は2.4GHzにしかつながりません。" +
+                    "ルーターが2.4GHzを別の名前で出している場合は、その名前に直してください"))
+                assertFalse(spinner(activity, "電球に渡すWi-Fi").isShown)
+            }
+            capture(screen, "wifi-5ghz")
+            // The adder survives a recreated screen with the typed name but never the password.
+            screen.onActivity { activity ->
+                field(activity, "Wi-Fiの名前（SSID）").setText("home-2g")
+                field(activity, "Wi-Fiのパスワード").setText("new-pass")
+            }
+            screen.recreate()
+            screen.onActivity { activity ->
                 assertEquals("home-2g", field(activity, "Wi-Fiの名前（SSID）").text.toString())
                 assertEquals("", field(activity, "Wi-Fiのパスワード").text.toString())
-                assertFalse(button(activity, "保存").isEnabled)
-                button(activity, "やめる").performClick()
-                assertTrue(hasLabel(activity, "「home-2g」を渡します"))
+                // The same name replaces the saved password instead of adding a second entry.
+                field(activity, "Wi-Fiのパスワード").setText("new-pass")
+                button(activity, "保存").performClick()
+                assertEquals(home.ssid, spinner(activity, "電球に渡すWi-Fi").selectedItem)
             }
+            assertEquals(SavedWifi(listOf(WifiNetwork("home-2g", "new-pass"), annex), home.ssid), wifi.saved)
+
+            // Without the name of the network, the adder says why and leaves the name to type.
+            for ((current, text) in listOf(
+                    null to "Wi-Fiにつながっていません。電球に渡すWi-Fiの名前を入力してください",
+                    CurrentWifi(null, 2437) to "今つながっているWi-Fiの名前を読めませんでした。位置情報がオンか確かめるか、名前を入力してください")) {
+                reader.next = current
+                screen.onActivity { activity ->
+                    button(activity, "Wi-Fiを追加").performClick()
+                    assertTrue(hasLabel(activity, text))
+                    assertEquals("", field(activity, "Wi-Fiの名前（SSID）").text.toString())
+                    assertFalse(button(activity, "保存").isEnabled)
+                    button(activity, "やめる").performClick()
+                    assertTrue(spinner(activity, "電球に渡すWi-Fi").isShown)
+                }
+            }
+
+            // Deleting the chosen network falls back to the one left, then to none.
+            screen.onActivity { activity ->
+                button(activity, "このWi-Fiを削除").performClick()
+                assertTrue(hasLabel(activity, "「home-2g」を削除しました"))
+                assertEquals(annex.ssid, spinner(activity, "電球に渡すWi-Fi").selectedItem)
+                assertEquals(1, spinner(activity, "電球に渡すWi-Fi").count)
+            }
+            capture(screen, "wifi-deleted")
+            screen.onActivity { activity ->
+                button(activity, "このWi-Fiを削除").performClick()
+                assertTrue(hasLabel(activity, "まだ保存していません"))
+                assertFalse(spinner(activity, "電球に渡すWi-Fi").isShown)
+                assertFalse(views(activity).filterIsInstance<Button>().any { it.isShown && it.text == "このWi-Fiを削除" })
+                scanner.next = ScanResult.Read(qr)
+                button(activity, "QRを読み取る").performClick()
+                assertFalse(button(activity, "登録").isEnabled)
+            }
+            assertEquals(SavedWifi(), wifi.saved)
+            capture(screen, "wifi-empty")
         }
     }
 
     @Test fun theWifiPasswordIsKeptEncryptedInTheKeystore() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val store = KeystoreWifiStore(context)
-        store.save(WifiNetwork("home-2g", "kakushi-pass"))
-        assertEquals(WifiNetwork("home-2g", "kakushi-pass"), KeystoreWifiStore(context).load())
+        val saved = SavedWifi().added(WifiNetwork("home-2g", "kakushi-pass")).added(WifiNetwork("guest", "welcome-pass"))
+        store.save(saved)
+        assertEquals(saved, KeystoreWifiStore(context).load())
         val prefs = context.getSharedPreferences("wifi", android.content.Context.MODE_PRIVATE).all.values.joinToString()
-        assertFalse("kakushi-pass" in prefs || "home-2g" in prefs)
+        assertFalse(listOf("kakushi-pass", "home-2g", "welcome-pass", "guest").any { it in prefs })
         context.getSharedPreferences("wifi", android.content.Context.MODE_PRIVATE).edit().clear().commit()
     }
 
@@ -462,7 +559,7 @@ class RegisterScreenTest {
         screen.onActivity { activity ->
             assertTrue(hasLabel(activity, "読み取り済み：MT:Y.K90…"))
             assertEquals(name, field(activity, "機器名（任意）").text.toString())
-            assertEquals(room, views(activity).filterIsInstance<Spinner>().single().selectedItem)
+            assertEquals(room, spinner(activity, "部屋").selectedItem)
             assertTrue(button(activity, "登録").isEnabled)
         }
 
@@ -538,6 +635,8 @@ class RegisterScreenTest {
         views(activity).filterIsInstance<TextView>().any { it.isShown && it.text.toString() == text }
     private fun button(activity: MainActivity, text: String) =
         views(activity).filterIsInstance<Button>().first { it.isShown && it.text.toString() == text }
+    private fun spinner(activity: MainActivity, description: String) =
+        views(activity).filterIsInstance<Spinner>().first { it.contentDescription == description }
     private fun field(activity: MainActivity, description: String) =
         views(activity).filterIsInstance<EditText>().first { it.contentDescription == description }
 }
@@ -607,9 +706,14 @@ private class FakeLink : BleLink {
 }
 
 private class MemoryWifiStore : WifiStore {
-    @Volatile var saved: WifiNetwork? = null
+    @Volatile var saved = SavedWifi()
     override fun load() = saved
-    override fun save(network: WifiNetwork) { saved = network }
+    override fun save(saved: SavedWifi) { this.saved = saved }
+}
+
+private class FakeWifiReader : WifiReader {
+    @Volatile var next: CurrentWifi? = CurrentWifi("home-2g", 2437)
+    override fun read(done: (CurrentWifi?) -> Unit) = done(next)
 }
 
 private class FakeScanner : QrScanner {

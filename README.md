@@ -50,6 +50,7 @@ Android 16以降の端末と、Tailscaleへの接続が必要です。
 アプリは `http://homeserver:5011` へ接続します。
 `homeserver` はtailnetのMagicDNS名なので、Tailscaleが有効なら家の外からも使えます。
 QRの読み取りにはGoogle Playサービスのコードスキャナーを使うため、カメラの権限は求めません。
+位置情報の許可は、電球に渡すWi-Fiを追加するときに、今つながっているWi-FiのSSIDを読むためだけに求めます。
 
 [リリース](https://github.com/miyabisun/home-link/releases/latest)のAssetsから
 `home-link-vX.Y.Z.apk` をダウンロードし、端末で開いてインストールします。
@@ -80,7 +81,11 @@ Matter over ThreadやZigbeeの電球（Aqara T2など）は対象外です。Thr
 matterjs-serverはBluetoothを有効にして（BLE Proxyを受け付けて）起動しておく必要があります。
 
 1. 「つなぎ方」で「新しいWi-Fi電球をBluetoothでつなぐ」を選びます（既定）。
-2. 初回だけ「電球に渡すWi-Fi」に家のWi-FiのSSIDとパスワードを入力して保存します。
+2. 「電球に渡すWi-Fi」のセレクトボックスで、電球をつなぐWi-Fiを選びます。最後に選んだWi-Fiが選ばれています。
+   初回は「Wi-Fiを追加」を押します。今つながっているWi-FiのSSIDが入るので、パスワードを入力して保存します。
+   SSIDを読むために、Androidの仕様で位置情報（正確な位置）の許可を求めます。許可しない場合はSSIDを入力します。
+   電球は2.4GHzのWi-Fiにしかつながりません。今のWi-Fiが5GHzなら、追加の画面にそう表示されます。
+   Wi-Fiは複数保存でき、要らなくなったものは「このWi-Fiを削除」で消せます。
    パスワードはこの電話の中だけに、Android Keystoreの鍵で暗号化して保存します。
    登録のたびにhome-link経由でmatterjs-serverへ渡し、home-linkのデータベースやログには残しません。
 3. 電球をペアリング待ちにします。BEAMTECは電源のオフ・オンを5回くり返します。ほかはメーカーの手順に従います。
