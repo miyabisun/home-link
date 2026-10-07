@@ -33,3 +33,21 @@ fun lightsMessage(on: Boolean, result: ApiResult<LightsResult>, host: String, na
     }
     return if (left.isEmpty()) LightsMessage(done, failed = false) else LightsMessage("$done。$left", failed = true)
 }
+
+/** The short label a one-row widget shows on the pressed button; `failed` as in [lightsMessage]. */
+fun lightsLabel(on: Boolean, result: ApiResult<LightsResult>): LightsMessage {
+    val lights = when (result) {
+        is ApiResult.Failed -> return LightsMessage(when (result.error) {
+            ApiError.UNREACHABLE, ApiError.MATTER_UNREACHABLE -> "接続不可"
+            ApiError.MATTER_NOT_CONFIGURED -> "未設定"
+            else -> "エラー"
+        }, failed = true)
+        is ApiResult.Ok -> result.value
+    }
+    val total = lights.switched + lights.noResponse + lights.failed + lights.missing.size
+    return when {
+        total == 0 -> LightsMessage("照明なし", failed = true)
+        lights.switched == total -> LightsMessage("${total}台${if (on) "オン" else "オフ"}", failed = false)
+        else -> LightsMessage("${lights.switched}/${total}台", failed = true)
+    }
+}

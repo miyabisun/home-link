@@ -1,0 +1,11 @@
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@android:id/background" android:layout_width="match_parent"
+    android:layout_height="match_parent" android:orientation="horizontal" android:gravity="center_vertical"
+    android:background="@drawable/widget_background" android:paddingHorizontal="8dp"
+    android:paddingVertical="4dp">
+    <Button android:id="@+id/light_on" style="@style/WidgetButton"
+        android:layout_marginEnd="8dp" android:text="@string/lights_on"
+        android:drawableStart="@drawable/ic_light_on" />
+    <Button android:id="@+id/light_off" style="@style/WidgetButton"
+        android:text="@string/lights_off" android:drawableStart="@drawable/ic_light_off" />
+</LinearLayout>

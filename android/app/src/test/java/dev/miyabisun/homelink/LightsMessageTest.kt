@@ -36,4 +36,20 @@ class LightsMessageTest {
         assertEquals(LightsMessage("home-linkでエラーが発生しました。時間をおいてお試しください", failed = true),
             message(false, ApiResult.Failed(ApiError.SERVER)))
     }
+
+    @Test fun theOneRowLabelIsShortAndKeepsLeftoversAFailure() {
+        assertEquals(LightsMessage("11台オン", failed = false), lightsLabel(true, ApiResult.Ok(LightsResult(11, 0, 0, emptyList()))))
+        assertEquals(LightsMessage("11台オフ", failed = false), lightsLabel(false, ApiResult.Ok(LightsResult(11, 0, 0, emptyList()))))
+        assertEquals(LightsMessage("8/13台", failed = true),
+            lightsLabel(false, ApiResult.Ok(LightsResult(8, 2, 1, listOf("台所", "通路")))))
+        assertEquals(LightsMessage("0/3台", failed = true), lightsLabel(true, ApiResult.Ok(LightsResult(0, 3, 0, emptyList()))))
+        assertEquals(LightsMessage("照明なし", failed = true), lightsLabel(true, ApiResult.Ok(LightsResult(0, 0, 0, emptyList()))))
+    }
+
+    @Test fun theOneRowLabelNamesTheFailure() {
+        assertEquals(LightsMessage("接続不可", failed = true), lightsLabel(true, ApiResult.Failed(ApiError.UNREACHABLE)))
+        assertEquals(LightsMessage("接続不可", failed = true), lightsLabel(true, ApiResult.Failed(ApiError.MATTER_UNREACHABLE)))
+        assertEquals(LightsMessage("未設定", failed = true), lightsLabel(false, ApiResult.Failed(ApiError.MATTER_NOT_CONFIGURED)))
+        assertEquals(LightsMessage("エラー", failed = true), lightsLabel(false, ApiResult.Failed(ApiError.SERVER)))
+    }
 }
