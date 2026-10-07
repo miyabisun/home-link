@@ -1261,11 +1261,17 @@ enum Commission {
     Silent,
 }
 
-/// Serves server info (with `bluetooth_enabled`), `set_wifi_credentials`,
-/// `commission_with_code` and `read_attribute` the way matterjs-server does,
-/// recording every command.
+/// Server info as matterjs-server greets a connection, with Bluetooth and a
+/// Thread dataset set or not.
+fn server_info(bluetooth: bool, thread: bool) -> Value {
+    json!({ "fabric_id": 1, "schema_version": 13, "wifi_credentials_set": false,
+            "thread_credentials_set": thread, "bluetooth_enabled": bluetooth })
+}
+
+/// Serves `info`, `set_wifi_credentials`, `commission_with_code` and
+/// `read_attribute` the way matterjs-server does, recording every command.
 async fn fake_commissioner(
-    bluetooth: bool,
+    info: Value,
     commission: Commission,
     read: Value,
 ) -> (SocketAddr, Arc<Mutex<Vec<Value>>>) {
@@ -1277,8 +1283,6 @@ async fn fake_commissioner(
         loop {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-            let info =
-                json!({ "fabric_id": 1, "schema_version": 13, "bluetooth_enabled": bluetooth });
             ws.send(Message::text(info.to_string())).await.unwrap();
             while let Some(Ok(Message::Text(text))) = ws.next().await {
                 let command: Value = serde_json::from_str(&text).unwrap();
@@ -1328,7 +1332,12 @@ fn commissioning_app(addr: SocketAddr, db: rusqlite::Connection) -> Router {
 
 #[tokio::test]
 async fn commissioning_hands_over_wifi_then_registers_the_new_node() {
-    let (addr, commands) = fake_commissioner(true, Commission::Node(tapo_node()), json!({})).await;
+    let (addr, commands) = fake_commissioner(
+        server_info(true, false),
+        Commission::Node(tapo_node()),
+        json!({}),
+    )
+    .await;
     let path = std::env::temp_dir().join(format!("home-link-commission-{}.db", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let app = commissioning_app(addr, home_link::open_db(path.to_str().unwrap()).unwrap());
@@ -1398,7 +1407,8 @@ async fn commissioning_hands_over_wifi_then_registers_the_new_node() {
 async fn commissioning_reads_identifiers_missing_from_the_new_node() {
     let node = json!({ "node_id": 18, "attributes": {} });
     let read = json!({ "0/40/1": "Uascent", "0/40/15": "U2025", "0/51/0": [] });
-    let (addr, commands) = fake_commissioner(true, Commission::Node(node), read).await;
+    let (addr, commands) =
+        fake_commissioner(server_info(true, false), Commission::Node(node), read).await;
     let app = commissioning_app(addr, home_link::open_db(":memory:").unwrap());
     let room = create_room(&app, "押入れ").await;
     let body = json!({ "room_id": room, "manual_code": "3497-011-2332",
@@ -1462,7 +1472,7 @@ async fn commissioning_failures_are_told_apart_and_register_nothing() {
         ),
     ];
     for (commission, status, code) in cases {
-        let (addr, _) = fake_commissioner(true, commission, json!({})).await;
+        let (addr, _) = fake_commissioner(server_info(true, false), commission, json!({})).await;
         let app = commissioning_app(addr, home_link::open_db(":memory:").unwrap());
         let room = create_room(&app, "押入れ").await;
         let (got, error) = call(&app, "POST", "/api/commission", Some(commission_body(room))).await;
@@ -1479,7 +1489,12 @@ async fn commissioning_failures_are_told_apart_and_register_nothing() {
 
 #[tokio::test]
 async fn commissioning_a_device_already_in_the_ledger_keeps_one_entry() {
-    let (addr, _) = fake_commissioner(true, Commission::Node(tapo_node()), json!({})).await;
+    let (addr, _) = fake_commissioner(
+        server_info(true, false),
+        Commission::Node(tapo_node()),
+        json!({}),
+    )
+    .await;
     let app = commissioning_app(addr, home_link::open_db(":memory:").unwrap());
     let room = create_room(&app, "寝室").await;
     // Recorded by its code before, without identifiers.
@@ -1524,7 +1539,12 @@ async fn commissioning_a_device_already_in_the_ledger_keeps_one_entry() {
 
 #[tokio::test]
 async fn commissioning_checks_its_input_before_reaching_the_matter_server() {
-    let (addr, commands) = fake_commissioner(true, Commission::Node(tapo_node()), json!({})).await;
+    let (addr, commands) = fake_commissioner(
+        server_info(true, false),
+        Commission::Node(tapo_node()),
+        json!({}),
+    )
+    .await;
     let app = commissioning_app(addr, home_link::open_db(":memory:").unwrap());
     let room = create_room(&app, "押入れ").await;
     let with = |field: &str, value: Value| {
@@ -1592,7 +1612,12 @@ async fn commissioning_checks_its_input_before_reaching_the_matter_server() {
 
 #[tokio::test]
 async fn commissioning_needs_a_matter_server_with_bluetooth() {
-    let (addr, commands) = fake_commissioner(false, Commission::Node(tapo_node()), json!({})).await;
+    let (addr, commands) = fake_commissioner(
+        server_info(false, true),
+        Commission::Node(tapo_node()),
+        json!({}),
+    )
+    .await;
     let ble_off = commissioning_app(addr, home_link::open_db(":memory:").unwrap());
     let room = create_room(&ble_off, "押入れ").await;
     let (status, error) = call(
@@ -1628,4 +1653,152 @@ async fn commissioning_needs_a_matter_server_with_bluetooth() {
     let (status, error) = call(&app, "POST", "/api/commission", Some(commission_body(room))).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert_eq!(error["error"], "matter_server_unreachable");
+}
+
+/// A T2 bulb as matterjs-server returns it after commissioning onto Thread.
+fn t2_node() -> Value {
+    json!({ "node_id": 21, "available": true, "attributes": {
+        "0/40/1": "Aqara", "0/40/15": "T2-0001", "0/40/3": "Light Bulb T2",
+        "0/51/0": [{ "0": "thread0", "4": "AAECAwQFBgc=", "7": 4 }],
+    }})
+}
+
+fn thread_body(room: i64) -> Value {
+    json!({ "room_id": room, "network": "thread", "manual_code": MANUAL, "name": "寝室T2" })
+}
+
+#[tokio::test]
+async fn thread_commissioning_uses_the_stored_dataset_and_registers_the_node() {
+    let (addr, commands) = fake_commissioner(
+        server_info(true, true),
+        Commission::Node(t2_node()),
+        json!({}),
+    )
+    .await;
+    let app = commissioning_app(addr, home_link::open_db(":memory:").unwrap());
+    let room = create_room(&app, "寝室").await;
+
+    let (status, body) = call(&app, "POST", "/api/commission", Some(thread_body(room))).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["node_id"], 21);
+    let device = &body["device"];
+    assert_eq!(
+        (
+            &device["name"],
+            &device["vendor"],
+            &device["serial_number"],
+            &device["mac"]
+        ),
+        (
+            &json!("寝室T2"),
+            &json!("Aqara"),
+            &json!("T2-0001"),
+            &Value::Null
+        )
+    );
+    // No Wi-Fi is handed over: matterjs-server commissions with its own dataset.
+    let commands = commands.lock().unwrap().clone();
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0]["command"], "commission_with_code");
+    assert_eq!(
+        commands[0]["args"],
+        json!({ "code": MANUAL, "network_only": false })
+    );
+}
+
+#[tokio::test]
+async fn thread_commissioning_is_refused_until_the_thread_network_is_ready() {
+    let (addr, commands) = fake_commissioner(
+        server_info(true, false),
+        Commission::Node(t2_node()),
+        json!({}),
+    )
+    .await;
+    let app = commissioning_app(addr, home_link::open_db(":memory:").unwrap());
+    let room = create_room(&app, "寝室").await;
+    let (status, error) = call(&app, "POST", "/api/commission", Some(thread_body(room))).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(error["error"], "thread_not_ready");
+    assert_eq!(error["message"], "Thread網が未準備です");
+    assert_eq!(commands.lock().unwrap().len(), 0);
+    let (_, devices) = call(&app, "GET", "/api/devices", None).await;
+    assert_eq!(devices, json!([]));
+}
+
+#[tokio::test]
+async fn thread_commissioning_checks_the_network_and_ignores_wifi_fields() {
+    let (addr, commands) = fake_commissioner(
+        server_info(true, true),
+        Commission::Node(t2_node()),
+        json!({}),
+    )
+    .await;
+    let app = commissioning_app(addr, home_link::open_db(":memory:").unwrap());
+    let room = create_room(&app, "寝室").await;
+    let mut body = thread_body(room);
+    body["network"] = json!("zigbee");
+    let (status, error) = call(&app, "POST", "/api/commission", Some(body)).await;
+    assert_eq!(
+        (status, error["error"].as_str().unwrap()),
+        (StatusCode::BAD_REQUEST, "invalid_network")
+    );
+    assert_eq!(commands.lock().unwrap().len(), 0);
+
+    // Wi-Fi stays the default and still needs its credentials.
+    let mut body = thread_body(room);
+    body.as_object_mut().unwrap().remove("network");
+    let (status, error) = call(&app, "POST", "/api/commission", Some(body)).await;
+    assert_eq!(
+        (status, error["error"].as_str().unwrap()),
+        (StatusCode::BAD_REQUEST, "invalid_wifi")
+    );
+}
+
+#[tokio::test]
+async fn thread_failures_are_told_apart() {
+    let (addr, _) = fake_commissioner(
+        server_info(true, true),
+        Commission::Error("Commission failed: Commissionee failed to connect to Thread network \"home\": NetworkNotFound"),
+        json!({}),
+    )
+    .await;
+    let app = commissioning_app(addr, home_link::open_db(":memory:").unwrap());
+    let room = create_room(&app, "寝室").await;
+    let (status, error) = call(&app, "POST", "/api/commission", Some(thread_body(room))).await;
+    assert_eq!(
+        (status, error["error"].as_str().unwrap()),
+        (StatusCode::UNPROCESSABLE_ENTITY, "thread_failed")
+    );
+}
+
+#[tokio::test]
+async fn thread_readiness_follows_the_matter_server() {
+    for thread in [true, false] {
+        let (addr, commands) =
+            fake_commissioner(server_info(true, thread), Commission::Silent, json!({})).await;
+        let app = commissioning_app(addr, home_link::open_db(":memory:").unwrap());
+        let (status, body) = call(&app, "GET", "/api/thread", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({ "ready": thread }));
+        assert_eq!(commands.lock().unwrap().len(), 0);
+    }
+    let (status, error) = call(&app(), "GET", "/api/thread", None).await;
+    assert_eq!(
+        (status, error["error"].as_str().unwrap()),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "matter_server_not_configured"
+        )
+    );
+    let closed = TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let app = commissioning_app(closed, home_link::open_db(":memory:").unwrap());
+    let (status, error) = call(&app, "GET", "/api/thread", None).await;
+    assert_eq!(
+        (status, error["error"].as_str().unwrap()),
+        (StatusCode::BAD_GATEWAY, "matter_server_unreachable")
+    );
 }

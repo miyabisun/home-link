@@ -179,6 +179,7 @@ fn router(state: Db) -> Router {
             get(get_device).patch(update_device).delete(delete_device),
         )
         .route("/commission", axum::routing::post(commission))
+        .route("/thread", get(thread))
         .route("/status", get(status))
         .route("/lights", get(light_states))
         .route("/lights/on", axum::routing::post(lights_on))
@@ -667,7 +668,11 @@ struct CommissionInput {
     manual_code: Option<String>,
     #[serde(default)]
     name: String,
+    /// `wifi` (the default) or `thread`.
+    network: Option<String>,
+    #[serde(default)]
     wifi_ssid: String,
+    #[serde(default)]
     wifi_password: String,
 }
 
@@ -686,8 +691,23 @@ async fn commission(
                 "QRコードか手動ペアリングコードのどちらか一方を送ってください".into(),
             )
         })?;
+    let network = match input.network.as_deref() {
+        None | Some("wifi") => commission::Network::Wifi {
+            ssid: &input.wifi_ssid,
+            password: &input.wifi_password,
+        },
+        Some("thread") => commission::Network::Thread,
+        Some(_) => {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                "invalid_network",
+                "networkは wifi か thread で指定してください".into(),
+            ));
+        }
+    };
     // SSIDs are up to 32 bytes; WPA passphrases 8–63 characters or 64 hex digits.
-    if !(1..=32).contains(&input.wifi_ssid.len()) || !(1..=64).contains(&input.wifi_password.len())
+    if let commission::Network::Wifi { ssid, password } = network
+        && (!(1..=32).contains(&ssid.len()) || !(1..=64).contains(&password.len()))
     {
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
@@ -698,18 +718,12 @@ async fn commission(
     let name = device_name(&input.name)?;
     find_room(&state.db.lock().unwrap(), input.room_id)?.ok_or_else(room_not_found)?;
     let url = matter_url(&state)?;
-    let commissioned = commission::commission(
-        url,
-        &code,
-        &input.wifi_ssid,
-        &input.wifi_password,
-        state.commission_timeout,
-    )
-    .await
-    .map_err(|error| match error {
-        commission::Error::Unreachable(error) => matter_unreachable(error),
-        commission::Error::Failed(failure) => commission_failed(failure, &input.wifi_ssid),
-    })?;
+    let commissioned = commission::commission(url, &code, &network, state.commission_timeout)
+        .await
+        .map_err(|error| match error {
+            commission::Error::Unreachable(error) => matter_unreachable(error),
+            commission::Error::Failed(failure) => commission_failed(failure, &input.wifi_ssid),
+        })?;
     let db = state.db.lock().unwrap();
     let (registered, device) = record(&db, input.room_id, &name, &code, &commissioned)?;
     tracing::info!(
@@ -751,6 +765,16 @@ fn commission_failed(failure: commission::Failure, ssid: &str) -> ApiError {
             "wifi_failed",
             format!("機器がWi-Fi「{ssid}」に接続できませんでした"),
         ),
+        Failure::Thread => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "thread_failed",
+            "機器がThread網に参加できませんでした".to_owned(),
+        ),
+        Failure::ThreadNotReady => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "thread_not_ready",
+            "Thread網が未準備です".to_owned(),
+        ),
         Failure::Timeout => (
             StatusCode::GATEWAY_TIMEOUT,
             "commission_timeout",
@@ -769,6 +793,16 @@ fn commission_failed(failure: commission::Failure, ssid: &str) -> ApiError {
     };
     ApiError(status, code, message)
 }
+
+/// Whether Thread devices can be commissioned: matterjs-server holds a dataset.
+async fn thread(State(state): State<Db>) -> ApiResult<Json<serde_json::Value>> {
+    let ready = commission::thread_ready(matter_url(&state)?, THREAD_TIMEOUT)
+        .await
+        .map_err(matter_unreachable)?;
+    Ok(Json(json!({ "ready": ready })))
+}
+
+const THREAD_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Records a commissioned device; `false` with the existing entry when the
 /// ledger already holds it.

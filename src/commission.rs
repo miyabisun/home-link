@@ -26,32 +26,55 @@ pub enum Error {
 const IDENTITY_PATHS: [&str; 3] = ["0/40/1", "0/40/15", "0/51/0"];
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Hands matterjs-server the Wi-Fi credentials, then has it commission the
-/// device behind `code` over Bluetooth (not `network_only`), and reads the new
-/// node's identifiers. The password goes only to matterjs-server.
+/// The network a device joins once commissioned.
+pub enum Network<'a> {
+    /// Wi-Fi, whose credentials are handed to matterjs-server first.
+    Wifi { ssid: &'a str, password: &'a str },
+    /// Thread, with the dataset matterjs-server already holds.
+    Thread,
+}
+
+/// Hands matterjs-server the Wi-Fi credentials (for Wi-Fi), then has it
+/// commission the device behind `code` over Bluetooth (not `network_only`),
+/// and reads the new node's identifiers. The password goes only to matterjs-server.
 ///
 /// # Errors
-/// Fails when matterjs-server cannot be reached, has no Bluetooth, refuses the
-/// credentials or the device, or does not finish within `timeout`.
+/// Fails when matterjs-server cannot be reached, has no Bluetooth or, for
+/// Thread, no dataset, refuses the credentials or the device, or does not
+/// finish within `timeout`.
 pub async fn commission(
     url: &str,
     code: &str,
-    ssid: &str,
-    password: &str,
+    network: &Network<'_>,
     timeout: Duration,
 ) -> Result<Commissioned, Error> {
     let deadline = Instant::now() + timeout;
     let mut ws = connect(url).await.map_err(Error::Unreachable)?;
-    let result = session(&mut ws, code, ssid, password, deadline).await;
+    let result = session(&mut ws, code, network, deadline).await;
     let _ = ws.close(None).await;
     result
+}
+
+/// Whether matterjs-server holds a Thread dataset to commission Thread devices with.
+///
+/// # Errors
+/// Fails when matterjs-server cannot be reached in time.
+pub async fn thread_ready(url: &str, timeout: Duration) -> Result<bool, String> {
+    tokio::time::timeout(timeout, async {
+        let mut ws = connect(url).await?;
+        // matterjs-server greets every connection with its server info.
+        let info = receive(&mut ws).await.map_err(|e| e.0);
+        let _ = ws.close(None).await;
+        Ok(info?["thread_credentials_set"] == true)
+    })
+    .await
+    .map_err(|_| "timed out".to_owned())?
 }
 
 async fn session(
     ws: &mut Socket,
     code: &str,
-    ssid: &str,
-    password: &str,
+    network: &Network<'_>,
     deadline: Instant,
 ) -> Result<Commissioned, Error> {
     // matterjs-server greets every connection with its server info.
@@ -59,14 +82,22 @@ async fn session(
     if info["bluetooth_enabled"] == false {
         return Err(Error::Failed(Failure::BluetoothDisabled));
     }
-    let wifi = json!({
-        "message_id": "wifi",
-        "command": "set_wifi_credentials",
-        "args": { "ssid": ssid, "credentials": password },
-    });
-    let reply = call(ws, &wifi, deadline).await?;
-    if let Some(details) = error(&reply) {
-        return Err(Error::Failed(Failure::Other(details)));
+    match network {
+        Network::Thread if info["thread_credentials_set"] != true => {
+            return Err(Error::Failed(Failure::ThreadNotReady));
+        }
+        Network::Thread => {}
+        Network::Wifi { ssid, password } => {
+            let wifi = json!({
+                "message_id": "wifi",
+                "command": "set_wifi_credentials",
+                "args": { "ssid": ssid, "credentials": password },
+            });
+            let reply = call(ws, &wifi, deadline).await?;
+            if let Some(details) = error(&reply) {
+                return Err(Error::Failed(Failure::Other(details)));
+            }
+        }
     }
     let request = json!({
         "message_id": "commission",
@@ -82,7 +113,8 @@ async fn session(
         .as_u64()
         .ok_or_else(|| Error::Unreachable("commission_with_code returned no node_id".into()))?;
     let mut attributes = node["attributes"].clone();
-    if identity(&attributes).is_none() || wifi_mac(&attributes).is_none() {
+    let wifi = matches!(network, Network::Wifi { .. });
+    if identity(&attributes).is_none() || (wifi && wifi_mac(&attributes).is_none()) {
         // A freshly commissioned node may not be in matterjs-server's cache yet.
         let read = json!({
             "message_id": "identity",
@@ -149,6 +181,10 @@ pub enum Failure {
     WrongCode,
     /// The device could not join the Wi-Fi network.
     Wifi,
+    /// The device could not join the Thread network.
+    Thread,
+    /// matterjs-server holds no Thread dataset yet.
+    ThreadNotReady,
     /// Commissioning did not finish in time.
     Timeout,
     /// matterjs-server has no Bluetooth to commission with.
@@ -164,6 +200,8 @@ pub fn classify(details: &str) -> Failure {
     let has = |word: &str| details.contains(word);
     if has("WiFi network") || has("Wi-Fi network") {
         Failure::Wifi
+    } else if has("Thread network") {
+        Failure::Thread
     } else if has("timed out") || has("maximum timeframe") || has("Timeout") {
         Failure::Timeout
     } else if has("No commissionable device") || has("Node not found") || has("No device found") {
@@ -257,6 +295,10 @@ mod tests {
             (
                 "Commission failed: Commissionee failed to add WiFi network \"home\"",
                 Failure::Wifi,
+            ),
+            (
+                "Commission failed: Commissionee failed to connect to Thread network \"home\": NetworkNotFound",
+                Failure::Thread,
             ),
             (
                 "Commission failed: Commissioning time exceeds the maximum timeframe of 300s",
