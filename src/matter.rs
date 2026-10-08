@@ -204,58 +204,89 @@ const RECONNECT_DELAY: Duration = Duration::from_millis(500);
 /// The connection ended or failed before the expected replies arrived.
 pub(crate) struct Dropped(pub(crate) String);
 
+/// Sends to every reachable light, then again, with the nodes read again, to
+/// those that have not answered, up to `ATTEMPTS` times within `deadline`.
+/// A late answer to an earlier send counts.
 async fn switch_once(
     ws: &mut Socket,
     on: bool,
     deadline: Instant,
 ) -> Result<(Vec<Value>, Vec<(Light, Outcome)>), Dropped> {
-    let nodes = get_nodes(ws).await?;
+    let mut nodes = get_nodes(ws).await?;
     let mut results: Vec<_> = lights(&nodes)
         .into_iter()
         .map(|light| (light, Outcome::NoResponse))
         .collect();
     let command = if on { "On" } else { "Off" };
-    let mut pending = 0;
-    for (index, (light, _)) in results.iter().enumerate() {
-        if !light.reachable {
-            continue;
+    let mut awaiting = std::collections::HashSet::new();
+    for attempt in 1..=ATTEMPTS {
+        if attempt > 1 {
+            if Instant::now() + RETRY_DELAY >= deadline {
+                break;
+            }
+            tokio::time::sleep(RETRY_DELAY).await;
+            nodes = get_nodes(ws).await?;
+            for light in lights(&nodes) {
+                let key = (light.node_id, light.endpoint);
+                if let Some((known, _)) = results
+                    .iter_mut()
+                    .find(|(l, o)| (l.node_id, l.endpoint) == key && *o == Outcome::NoResponse)
+                {
+                    *known = light;
+                }
+            }
         }
-        let request = json!({
-            "message_id": index.to_string(),
-            "command": "device_command",
-            "args": {
-                "node_id": light.node_id,
-                "endpoint_id": light.endpoint,
-                "cluster_id": 6,
-                "command_name": command,
-                "payload": {},
-            },
-        });
-        send(ws, &request).await?;
-        pending += 1;
-    }
-    while pending > 0 {
-        let Ok(reply) = tokio::time::timeout_at(deadline, receive(ws)).await else {
-            break; // Lights still unanswered stay NoResponse.
-        };
-        let reply = reply?;
-        let Some(index) = reply["message_id"]
-            .as_str()
-            .and_then(|id| id.parse::<usize>().ok())
-        else {
-            continue;
-        };
-        if let Some((_, outcome)) = results.get_mut(index) {
-            *outcome = if reply.get("error_code").is_some() {
-                Outcome::Failed
-            } else {
-                Outcome::Switched
+        for (index, (light, outcome)) in results.iter().enumerate() {
+            if !light.reachable || *outcome != Outcome::NoResponse {
+                continue;
+            }
+            let request = json!({
+                "message_id": index.to_string(),
+                "command": "device_command",
+                "args": {
+                    "node_id": light.node_id,
+                    "endpoint_id": light.endpoint,
+                    "cluster_id": 6,
+                    "command_name": command,
+                    "payload": {},
+                },
+            });
+            send(ws, &request).await?;
+            awaiting.insert(index);
+        }
+        let wait = deadline.min(Instant::now() + ATTEMPT_WAIT);
+        while !awaiting.is_empty() {
+            let Ok(reply) = tokio::time::timeout_at(wait, receive(ws)).await else {
+                break; // Lights still unanswered stay NoResponse.
             };
-            pending -= 1;
+            let reply = reply?;
+            let Some(index) = reply["message_id"]
+                .as_str()
+                .and_then(|id| id.parse::<usize>().ok())
+            else {
+                continue;
+            };
+            if awaiting.remove(&index)
+                && let Some((_, outcome)) = results.get_mut(index)
+            {
+                *outcome = if reply.get("error_code").is_some() {
+                    Outcome::Failed
+                } else {
+                    Outcome::Switched
+                };
+            }
+        }
+        if results.iter().all(|(_, o)| *o != Outcome::NoResponse) {
+            break;
         }
     }
     Ok((nodes, results))
 }
+
+/// At most three sends to a light that has not answered, all within `TIMEOUT`.
+const ATTEMPTS: usize = 3;
+const ATTEMPT_WAIT: Duration = Duration::from_secs(2);
+const RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// What became of one light in an adjustment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -288,16 +319,20 @@ const TRANSITION: u16 = 300;
 /// lights read as on. Commands never carry `ExecuteIfOff`, so a light switched
 /// off in between ignores them and stays off.
 ///
+/// A light in `switched_on`, just switched on, is not read: its On may not be
+/// reported yet. It gets the values at once, lighting it if still off.
+///
 /// # Errors
 /// Fails when the server cannot be reached, drops the connection or the whole
 /// adjustment overruns.
 pub async fn tune(
     url: &str,
+    switched_on: &[(u64, u16)],
     plan: impl Fn(&[Value], &Light) -> Result<Target, Skip>,
 ) -> Result<Tuned, String> {
     tokio::time::timeout(TUNE_TIMEOUT, async {
         let mut ws = connect(url).await?;
-        let result = tune_all(&mut ws, plan).await.map_err(|e| e.0);
+        let result = tune_all(&mut ws, switched_on, plan).await.map_err(|e| e.0);
         let _ = ws.close(None).await;
         result
     })
@@ -307,6 +342,7 @@ pub async fn tune(
 
 async fn tune_all(
     ws: &mut Socket,
+    switched_on: &[(u64, u16)],
     plan: impl Fn(&[Value], &Light) -> Result<Target, Skip>,
 ) -> Result<Tuned, Dropped> {
     let nodes = get_nodes(ws).await?;
@@ -318,7 +354,10 @@ async fn tune_all(
     for light in lights(&nodes) {
         let decision = match plan(&nodes, &light) {
             Err(skip) => Decision::Skipped(skip),
-            Ok(target) => tune_one(ws, &light, target, &mut tuned.commands).await?,
+            Ok(target) => {
+                let on = switched_on.contains(&(light.node_id, light.endpoint));
+                tune_one(ws, &light, target, on, &mut tuned.commands).await?
+            }
         };
         tuned.lights.push((light, decision));
     }
@@ -330,36 +369,45 @@ async fn tune_one(
     ws: &mut Socket,
     light: &Light,
     target: Target,
+    switched_on: bool,
     commands: &mut usize,
 ) -> Result<Decision, Dropped> {
-    let path = format!("{}/6/0", light.endpoint);
-    let read = json!({
-        "command": "read_attribute",
-        "args": { "node_id": light.node_id, "attribute_path": [path] },
-    });
-    match request(ws, read).await? {
-        None => return Ok(Decision::NoResponse),
-        Some(reply) if reply["result"][&path] != true => {
-            return Ok(if reply.get("error_code").is_some() {
-                Decision::NoResponse
-            } else {
-                Decision::Off
-            });
+    if !switched_on {
+        let path = format!("{}/6/0", light.endpoint);
+        let read = json!({
+            "command": "read_attribute",
+            "args": { "node_id": light.node_id, "attribute_path": [path] },
+        });
+        match request(ws, read).await? {
+            None => return Ok(Decision::NoResponse),
+            Some(reply) if reply["result"][&path] != true => {
+                return Ok(if reply.get("error_code").is_some() {
+                    Decision::NoResponse
+                } else {
+                    Decision::Off
+                });
+            }
+            Some(_) => {}
         }
-        Some(_) => {}
     }
+    // Just switched on: at once and even if still off (`ExecuteIfOff`).
+    let (level_command, transition, options) = if switched_on {
+        ("MoveToLevelWithOnOff", 0, 1)
+    } else {
+        ("MoveToLevel", TRANSITION, 0)
+    };
     let level = target.level.map(|level| {
         (
             8,
-            "MoveToLevel",
-            json!({ "level": level, "transitionTime": TRANSITION, "optionsMask": 0, "optionsOverride": 0 }),
+            level_command,
+            json!({ "level": level, "transitionTime": transition, "optionsMask": options, "optionsOverride": options }),
         )
     });
     let mireds = target.mireds.map(|mireds| {
         (
             768,
             "MoveToColorTemperature",
-            json!({ "colorTemperatureMireds": mireds, "transitionTime": TRANSITION, "optionsMask": 0, "optionsOverride": 0 }),
+            json!({ "colorTemperatureMireds": mireds, "transitionTime": transition, "optionsMask": options, "optionsOverride": options }),
         )
     });
     for (cluster, command, payload) in level.into_iter().chain(mireds) {

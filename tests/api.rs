@@ -540,6 +540,11 @@ struct Fake {
     read_off: Vec<(u64, u64)>,
     /// Off is accepted but the lights stay on, as if switched on again by other means.
     ignore_off: bool,
+    /// `(node_id, endpoint)` whose On is accepted before the bridge reports it:
+    /// the served and read On/Off stay off.
+    late_on: Vec<(u64, u64)>,
+    /// `(node_id, endpoint)` that leaves its first command unanswered.
+    silent_first: Vec<(u64, u64)>,
 }
 
 /// Serves `get_nodes` and On/Off `device_command` the way matterjs-server does,
@@ -554,6 +559,7 @@ async fn fake_light_server(
     let connections = Arc::new(Mutex::new(0));
     let nodes = Arc::new(Mutex::new(nodes));
     let (seen, count) = (commands.clone(), connections.clone());
+    let answered = Arc::new(Mutex::new(Vec::new()));
     tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
@@ -603,11 +609,19 @@ async fn fake_light_server(
                         if fake.silent.contains(&target) {
                             continue;
                         }
+                        if fake.silent_first.contains(&target) {
+                            let mut answered = answered.lock().unwrap();
+                            if !answered.contains(&target) {
+                                answered.push(target);
+                                continue;
+                            }
+                        }
                         if fake.failing.contains(&target) {
                             json!({ "message_id": id, "error_code": 0, "details": "failed" })
                         } else {
                             if args["cluster_id"] == 6
                                 && !(fake.ignore_off && args["command_name"] == "Off")
+                                && !(fake.late_on.contains(&target) && args["command_name"] == "On")
                             {
                                 let on = args["command_name"] == "On";
                                 for node in nodes.lock().unwrap().as_array_mut().unwrap() {
@@ -827,6 +841,31 @@ async fn switching_reconnects_when_the_connection_drops() {
     assert_eq!(*connections.lock().unwrap(), 2);
     // On is absolute, so the light commanded before the drop is commanded again.
     assert_eq!(commands.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn lights_that_miss_the_first_on_are_sent_it_again() {
+    let fake = Fake {
+        silent_first: vec![(5, 1)],
+        ..Fake::default()
+    };
+    let (addr, commands, _) = fake_light_server(home_nodes(), fake).await;
+    let app = light_app(addr).await;
+
+    let (status, body) = call(&app, "POST", "/api/lights/on", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        (&body["switched"], &body["no_response"]),
+        (&json!(2), &json!(2))
+    );
+    assert_eq!(body["lights"][2]["result"], "switched");
+    let to_tapo = commands
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c["node_id"] == 5 && c["command_name"] == "On")
+        .count();
+    assert_eq!(to_tapo, 2);
 }
 
 #[tokio::test]
@@ -1169,13 +1208,13 @@ async fn a_labelled_light_gets_its_labels_values_and_others_the_schedules() {
     assert_eq!(status, StatusCode::NO_CONTENT);
     commands.lock().unwrap().clear();
     home.adjust(NIGHT + 1200, "scheduled").await;
-    assert_eq!(
-        sent_values(&commands),
-        [
-            (json!(1), json!(3), json!(102)),
-            (json!(1), json!(3), json!(333))
-        ]
-    );
+    // "All on" set the others to the wall clock's values: only the T2 is compared.
+    let sent: Vec<_> = sent_values(&commands)
+        .into_iter()
+        .map(|v| v.2)
+        .take(2)
+        .collect();
+    assert_eq!(sent, [json!(102), json!(333)]);
 }
 
 #[tokio::test]
@@ -1528,6 +1567,66 @@ async fn all_off_stops_adjustment_until_all_on_across_restarts() {
         ]
     );
     let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn all_on_writes_the_current_values_to_lights_whose_on_is_reported_late() {
+    // The T2 behind the bridge accepts On but is still reported off.
+    let fake = Fake {
+        late_on: vec![(1, 3)],
+        ..Fake::default()
+    };
+    let (addr, commands, _) = fake_light_server(tuning_nodes(), fake).await;
+    let home = home_link::Home::new(
+        home_link::open_db(":memory:").unwrap(),
+        Some(format!("ws://{addr}/ws")),
+    );
+    let app = home.router();
+    enable(&app).await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .cast_signed();
+    // The current values were already sent while it was on.
+    home.adjust(now, "scheduled").await;
+    assert_eq!(
+        call(&app, "POST", "/api/lights/off", None).await.0,
+        StatusCode::OK
+    );
+
+    commands.lock().unwrap().clear();
+    let (status, body) = call(&app, "POST", "/api/lights/on", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["lights"][1]["result"], "switched");
+    // Switched on in this request, it is not read again but written at once,
+    // even if off, with the values sent before.
+    assert!(!reads(&commands).contains(&(json!(1), json!(["3/6/0"]))));
+    let (_, schedule) = call(&app, "GET", "/api/lights/schedule", None).await;
+    let run = &schedule["runs"][0];
+    assert_eq!(run["trigger"], "lights_on");
+    assert_eq!(run["lights"][1]["decision"], "sent");
+    let (level, mireds) = (&run["lights"][1]["level"], &run["lights"][1]["mireds"]);
+    let t2: Vec<_> = tunings(&commands)
+        .into_iter()
+        .filter(|(node, endpoint, ..)| (node, endpoint) == (&json!(1), &json!(3)))
+        .map(|(_, _, cluster, command, payload)| (cluster, command, payload))
+        .collect();
+    assert_eq!(
+        t2,
+        [
+            (
+                json!(8),
+                json!("MoveToLevelWithOnOff"),
+                json!({ "level": level, "transitionTime": 0, "optionsMask": 1, "optionsOverride": 1 })
+            ),
+            (
+                json!(768),
+                json!("MoveToColorTemperature"),
+                json!({ "colorTemperatureMireds": mireds, "transitionTime": 0, "optionsMask": 1, "optionsOverride": 1 })
+            ),
+        ]
+    );
 }
 
 #[tokio::test]

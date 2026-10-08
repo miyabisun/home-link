@@ -171,7 +171,7 @@ impl Home {
 
     /// Adjusts the lights that are on for `unix` seconds and records the run.
     pub async fn adjust(&self, unix: i64, trigger: &'static str) {
-        adjust(&self.0, unix, trigger).await;
+        adjust(&self.0, unix, trigger, &[]).await;
     }
 
     /// Adjusts the lights every ten minutes on the clock, forever.
@@ -1224,21 +1224,25 @@ async fn light_states(State(state): State<Db>) -> ApiResult<Json<serde_json::Val
 
 /// Switches every light on and, when the schedule is on, brings them to the current values.
 async fn lights_on(State(state): State<Db>) -> ApiResult<Json<serde_json::Value>> {
-    let response = switch_lights(&state, true).await?;
+    let (response, switched) = switch_lights(&state, true).await?;
     if load::<schedule::Settings>(&state.db.lock().unwrap(), SCHEDULE)?.enabled {
-        adjust(&state, now(), "lights_on").await;
+        adjust(&state, now(), "lights_on", &switched).await;
     }
     Ok(response)
 }
 
 async fn lights_off(State(state): State<Db>) -> ApiResult<Json<serde_json::Value>> {
-    switch_lights(&state, false).await
+    Ok(switch_lights(&state, false).await?.0)
 }
 
 /// Records "all on" or "all off" as the user's intent, switches every light
-/// matterjs-server serves and reports each light's result.
+/// matterjs-server serves and reports each light's result, with the node and
+/// endpoint of the switched ones.
 /// Only a light whose command was accepted counts as switched.
-async fn switch_lights(state: &AppState, on: bool) -> ApiResult<Json<serde_json::Value>> {
+async fn switch_lights(
+    state: &AppState,
+    on: bool,
+) -> ApiResult<(Json<serde_json::Value>, Vec<(u64, u16)>)> {
     let url = matter_url(state)?;
     let intent = Intent {
         action: if on { "on" } else { "off" }.into(),
@@ -1247,6 +1251,12 @@ async fn switch_lights(state: &AppState, on: bool) -> ApiResult<Json<serde_json:
     store(&state.db.lock().unwrap(), INTENT, &intent)?;
     let (nodes, results) = matter::switch(url, on).await.map_err(matter_unreachable)?;
     let (lights, outcomes): (Vec<_>, Vec<_>) = results.into_iter().unzip();
+    let switched = lights
+        .iter()
+        .zip(&outcomes)
+        .filter(|(_, outcome)| **outcome == matter::Outcome::Switched)
+        .map(|(light, _)| (light.node_id, light.endpoint))
+        .collect();
     let outcomes: Vec<&str> = outcomes
         .into_iter()
         .map(|outcome| match outcome {
@@ -1262,7 +1272,7 @@ async fn switch_lights(state: &AppState, on: bool) -> ApiResult<Json<serde_json:
         lights = lights.len(),
         "lights switched"
     );
-    Ok(Json(json!({
+    let response = Json(json!({
         "action": if on { "on" } else { "off" },
         "switched": count(&outcomes, "switched"),
         "no_response": count(&outcomes, "no_response"),
@@ -1270,7 +1280,8 @@ async fn switch_lights(state: &AppState, on: bool) -> ApiResult<Json<serde_json:
         "missing": missing.len(),
         "lights": light_entries(&lights, names, &outcomes, "result"),
         "missing_devices": missing,
-    })))
+    }));
+    Ok((response, switched))
 }
 
 const INTENT: &str = "lights_intent";
@@ -1305,8 +1316,9 @@ fn store<T: Serialize>(db: &Connection, key: &str, value: &T) -> rusqlite::Resul
 
 /// Adjusts every light that is on to the values for `unix`, its label's in
 /// place of the schedule's, and records the run: nothing is written while
-/// "all off" is in force or the schedule is disabled, nor what was already sent.
-async fn adjust(state: &AppState, unix: i64, trigger: &'static str) {
+/// "all off" is in force or the schedule is disabled, nor what was already sent
+/// unless `switched_on` holds the light: just switched on, it gets all values.
+async fn adjust(state: &AppState, unix: i64, trigger: &'static str, switched_on: &[(u64, u16)]) {
     let loaded = {
         let db = state.db.lock().unwrap();
         load::<schedule::Settings>(&db, SCHEDULE).and_then(|settings| {
@@ -1340,8 +1352,12 @@ async fn adjust(state: &AppState, unix: i64, trigger: &'static str) {
                 });
                 (label.map(|l| l.name.clone()), goal)
             };
-            matter::tune(url, |nodes, light| {
-                let last = sent.get(&(light.node_id, light.endpoint)).copied();
+            matter::tune(url, switched_on, |nodes, light| {
+                let key = (light.node_id, light.endpoint);
+                let last = sent
+                    .get(&key)
+                    .copied()
+                    .filter(|_| !switched_on.contains(&key));
                 schedule::plan(light, all_off, settings, goal_of(nodes, light).1, last)
             })
             .await

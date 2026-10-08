@@ -189,6 +189,7 @@ node IDとendpointはmatterjs-serverが振る番号なので台帳には保存�
 On/Offの属性があるendpointを照明として扱います。Aqara Hub M3などのブリッジ配下の照明も、endpointごとに1台と数えます。
 nodeが使えない照明と、ブリッジが届かないと報告している照明には命令を送らず、`no_response` とします。
 命令を受け付けた照明だけを `switched` に数え、エラーが返った照明は `failed`、10秒以内に応答の無かった照明は `no_response` です。
+応答の無い照明へは、2秒待ってから全nodeを読み直し、届くようになった照明も含めて同じ要求の中で送り直します（最大3回）。
 途中で接続が切れた場合は、つなぎ直して全部の照明へ送り直します（オン・オフは状態に依らない指定なので、二重に届いても結果は同じです）。
 照明の `name` は台帳の機器名で、台帳に無い照明は製品名です。台帳の機器のうちmatterjs-serverに見えないものは `missing_devices` に並び、
 `missing` に数えます。状態の `GET /api/lights` は、matterjs-serverが最後に読んだOn/Offの値を返します。
@@ -232,6 +233,8 @@ nodeが使えない照明と、ブリッジが届かないと報告している�
   ほかの手段で点けられた照明も含めて何も送りません。
   押された操作と時刻は保存し、再起動しても保ちます。照明ごとのオン・オフは保存せず、毎回matterjs-serverから読みます。
 - 有効なときに「全部オン」を押すと、点けた後にその時刻の値へ合わせます。
+  オンを受け付けた照明は、点灯の報告が遅れるブリッジ配下の照明もあるため読み直さず、前回と同じ値でも、
+  `MoveToLevelWithOnOff` と `ExecuteIfOff` 付きの `MoveToColorTemperature` ですぐに（`transitionTime` 0）送ります。
 
 `runs` は調整ごとに、時刻（`at`）、きっかけ（`trigger`: `scheduled` または `lights_on`）、全体の設定の目標値（`level`・`kelvin`）、
 日の出・日の入り、送った命令の数（`commands`）、照明ごとの判断（`decision`）を持ちます。
