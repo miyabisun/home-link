@@ -204,8 +204,10 @@ nodeが使えない照明と、ブリッジが届かないと報告している�
 | 朝: 日の出（5時より前なら5時）→ `morning_end_minute` | `night_level` → `day_level` へ線形に上げる | `warm_kelvin` → `cool_kelvin` へ線形に上げる |
 | 昼: `morning_end_minute` → 日の入り | `day_level` | `cool_kelvin` |
 | 夕: 日の入り → 22時 | `day_level` → `night_level` へ線形に下げる | `cool_kelvin` → `warm_kelvin` へ線形に下げる |
-| 夜: 22時 → 翌朝の開始 | `night_level` | `warm_kelvin` |
+| 夜: 22時 → 0時 | `night_level` | `warm_kelvin` |
+| 深夜: 0時 → 翌朝の開始 | `night_level` の `late_night_percent`%（既定は半分、1以上） | `warm_kelvin` |
 
+- 朝の上昇は、深夜の値ではなく通常の `night_level` から始まります。
 - 日の出・日の入りは `latitude`・`longitude` とAsia/Tokyoの時刻で計算します。既定は東京（新宿）です。
 - 台帳の機器にlabelを割り当てると、その照明はlabelの値（`day_level`・`night_level`・`cool_kelvin`・`warm_kelvin`）で同じ曲線をたどります。
   labelの値が `null` の項目と、時刻（朝の終わり・22時・日の出と日の入りの地点）は全体の設定を使います。
@@ -222,6 +224,7 @@ nodeが使えない照明と、ブリッジが届かないと報告している�
 | `morning_end_minute` | `600`（10:00） | 朝の上昇が昼の値に達する時刻（0時からの分、301〜1319） |
 | `day_level`・`night_level` | `203`・`102` | 昼と夜の明るさ（1〜254） |
 | `warm_kelvin`・`cool_kelvin` | `3000`・`5000` | 夜と昼の色温度（K）。`warm_kelvin` は `cool_kelvin` 以下 |
+| `late_night_percent` | `50` | 0時から朝の開始までの明るさを、各照明の `night_level`（labelの値を重ねた後）の何%にするか（1〜100、四捨五入）。`100` で減らしません |
 
 点灯を伴う書き込みはしません。
 
@@ -246,7 +249,7 @@ nodeが使えない照明と、ブリッジが届かないと報告している�
 
 ```sh
 curl -X PUT http://homeserver:5011/api/lights/schedule -H 'content-type: application/json' -d '{"enabled":true}'
-# {"settings":{"enabled":true,"latitude":35.6895,"longitude":139.6917,"morning_end_minute":600,"day_level":203,"night_level":102,"warm_kelvin":3000,"cool_kelvin":5000},
+# {"settings":{"enabled":true,"latitude":35.6895,"longitude":139.6917,"morning_end_minute":600,"day_level":203,"night_level":102,"warm_kelvin":3000,"cool_kelvin":5000,"late_night_percent":50},
 #  "labels":[{"id":1,"name":"キッチン","day_level":null,"night_level":76,"cool_kelvin":null,"warm_kelvin":2700,
 #             "devices":[{"id":5,"name":"キッチン1","room_name":"リビング"},…]},…],"intent":{"action":"on","at":"2026-10-05T21:10:00+09:00"},"runs":[…]}
 

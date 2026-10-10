@@ -1629,6 +1629,65 @@ async fn all_on_writes_the_current_values_to_lights_whose_on_is_reported_late() 
     );
 }
 
+/// 00:30 in Tokyo on 2026-10-06, before sunrise.
+const AFTER_MIDNIGHT: i64 = NIGHT + 90 * 60;
+
+#[tokio::test]
+async fn after_midnight_the_schedule_and_all_on_write_half_the_night_level() {
+    let (addr, commands, _) = fake_light_server(tuning_nodes(), Fake::default()).await;
+    let home = home_link::Home::new(
+        home_link::open_db(":memory:").unwrap(),
+        Some(format!("ws://{addr}/ws")),
+    )
+    .with_clock(|| AFTER_MIDNIGHT);
+    let app = home.router();
+    enable(&app).await;
+
+    home.adjust(AFTER_MIDNIGHT, "scheduled").await;
+    // The lights read as on get half the night's level and its usual colour.
+    let tuned: Vec<_> = tunings(&commands)
+        .into_iter()
+        .map(|(node, _, _, command, payload)| (node, command, payload))
+        .collect();
+    assert_eq!(
+        tuned,
+        [
+            (json!(1), json!("MoveToLevel"), level(51)),
+            (json!(1), json!("MoveToColorTemperature"), mireds(333)),
+            (json!(5), json!("MoveToLevel"), level(51)),
+            (json!(5), json!("MoveToColorTemperature"), mireds(333)),
+        ]
+    );
+    let (_, body) = call(&app, "GET", "/api/lights/schedule", None).await;
+    let run = &body["runs"][0];
+    assert_eq!(run["at"], "2026-10-06T00:30:00+09:00");
+    assert_eq!(run["level"], 51);
+    assert_eq!(run["lights"][1]["target_level"], 51);
+
+    // "All on" after midnight lights them at half the night's level too.
+    commands.lock().unwrap().clear();
+    assert_eq!(
+        call(&app, "POST", "/api/lights/on", None).await.0,
+        StatusCode::OK
+    );
+    let levels: Vec<_> = tunings(&commands)
+        .into_iter()
+        .filter(|(_, _, cluster, ..)| cluster == &json!(8))
+        .map(|(node, _, _, command, payload)| (node, command, payload["level"].clone()))
+        .collect();
+    assert_eq!(
+        levels,
+        [
+            (json!(1), json!("MoveToLevelWithOnOff"), json!(51)),
+            (json!(5), json!("MoveToLevelWithOnOff"), json!(51)),
+            (json!(6), json!("MoveToLevelWithOnOff"), json!(51)),
+        ]
+    );
+    let (_, body) = call(&app, "GET", "/api/lights/schedule", None).await;
+    assert_eq!(body["runs"][0]["trigger"], "lights_on");
+    assert_eq!(body["runs"][0]["at"], "2026-10-06T00:30:00+09:00");
+}
+
 #[tokio::test]
 async fn schedule_settings_merge_and_are_validated() {
     let app = app();
@@ -1638,7 +1697,7 @@ async fn schedule_settings_merge_and_are_validated() {
         body["settings"],
         json!({ "enabled": false, "latitude": 35.6895, "longitude": 139.6917,
                 "morning_end_minute": 600, "day_level": 203, "night_level": 102,
-                "warm_kelvin": 3000, "cool_kelvin": 5000 })
+                "warm_kelvin": 3000, "cool_kelvin": 5000, "late_night_percent": 50 })
     );
     assert_eq!(body["intent"], Value::Null);
     assert_eq!(body["runs"], json!([]));
@@ -1659,6 +1718,8 @@ async fn schedule_settings_merge_and_are_validated() {
         json!({ "warm_kelvin": 6000 }),
         json!({ "latitude": 91 }),
         json!({ "morning_end_minute": 1320 }),
+        json!({ "late_night_percent": 0 }),
+        json!({ "late_night_percent": 101 }),
         json!({ "enable": true }),
         json!({ "enabled": "yes" }),
         json!([]),

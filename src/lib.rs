@@ -123,6 +123,8 @@ struct AppState {
     sent: Mutex<HashMap<(u64, u16), schedule::Target>>,
     /// How long one commissioning may take, Bluetooth discovery to Wi-Fi join.
     commission_timeout: Duration,
+    /// The current time in Unix seconds for "all on" and its intent.
+    clock: fn() -> i64,
 }
 
 const COMMISSION_TIMEOUT: Duration = Duration::from_mins(5);
@@ -150,7 +152,20 @@ impl Home {
             runs: Mutex::new(VecDeque::new()),
             sent: Mutex::new(HashMap::new()),
             commission_timeout: COMMISSION_TIMEOUT,
+            clock: now,
         }))
+    }
+
+    /// Replaces the system clock that "all on" and "all off" read.
+    ///
+    /// # Panics
+    /// Panics once the router or a clone shares this `Home`.
+    #[must_use]
+    pub fn with_clock(mut self, clock: fn() -> i64) -> Self {
+        Arc::get_mut(&mut self.0)
+            .expect("set before the Home is shared")
+            .clock = clock;
+        self
     }
 
     /// Replaces the five-minute limit on one commissioning.
@@ -1226,7 +1241,7 @@ async fn light_states(State(state): State<Db>) -> ApiResult<Json<serde_json::Val
 async fn lights_on(State(state): State<Db>) -> ApiResult<Json<serde_json::Value>> {
     let (response, switched) = switch_lights(&state, true).await?;
     if load::<schedule::Settings>(&state.db.lock().unwrap(), SCHEDULE)?.enabled {
-        adjust(&state, now(), "lights_on", &switched).await;
+        adjust(&state, (state.clock)(), "lights_on", &switched).await;
     }
     Ok(response)
 }
@@ -1246,7 +1261,7 @@ async fn switch_lights(
     let url = matter_url(state)?;
     let intent = Intent {
         action: if on { "on" } else { "off" }.into(),
-        at: schedule::timestamp(now()),
+        at: schedule::timestamp((state.clock)()),
     };
     store(&state.db.lock().unwrap(), INTENT, &intent)?;
     let (nodes, results) = matter::switch(url, on).await.map_err(matter_unreachable)?;

@@ -26,10 +26,13 @@ pub struct Settings {
     /// Warm white at night, cool white by day.
     pub warm_kelvin: u16,
     pub cool_kelvin: u16,
+    /// The percentage of the night's level from midnight until the morning starts, 1–100.
+    pub late_night_percent: u8,
 }
 
 impl Default for Settings {
-    /// 80% and 40% of 254, 5000 K and 3000 K, the morning ending at 10:00.
+    /// 80% and 40% of 254, 5000 K and 3000 K, the morning ending at 10:00,
+    /// half the night's level after midnight.
     fn default() -> Self {
         Self {
             enabled: false,
@@ -40,6 +43,7 @@ impl Default for Settings {
             night_level: 102,
             warm_kelvin: 3000,
             cool_kelvin: 5000,
+            late_night_percent: 50,
         }
     }
 }
@@ -59,6 +63,8 @@ impl Settings {
             Some("色温度は1000〜10000Kで、warm_kelvinをcool_kelvin以下にしてください")
         } else if !(MORNING_FROM + 1..NIGHT_FROM).contains(&self.morning_end_minute) {
             Some("morning_end_minuteは301〜1319（05:01〜21:59）で指定してください")
+        } else if !(1..=100).contains(&self.late_night_percent) {
+            Some("late_night_percentは1〜100で指定してください")
         } else {
             None
         }
@@ -173,7 +179,8 @@ pub fn sun_times(day_of_year: u32, latitude: f64, longitude: f64) -> (u32, u32) 
 /// The level and colour temperature in kelvin for `minute` of the day, given
 /// `sun` as sunrise and sunset minutes: the night's values rise linearly from
 /// the morning's start to the day's by the morning end, and fall back from
-/// sunset to 22:00.
+/// sunset to 22:00. From midnight until the morning starts, the night's level
+/// is scaled by `late_night_percent`, never below 1.
 // The values are rounded and clamped into range before the casts.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 #[must_use]
@@ -190,11 +197,15 @@ pub fn target(minute: u32, sun: (u32, u32), settings: &Settings) -> (u8, u16) {
         1.0 - between(sun.1, NIGHT_FROM)
     };
     let lerp = |night: f64, by_day: f64| (night + (by_day - night) * day).round();
+    let night_level = if minute < start {
+        (f64::from(settings.night_level) * f64::from(settings.late_night_percent) / 100.0)
+            .round()
+            .max(1.0)
+    } else {
+        f64::from(settings.night_level)
+    };
     (
-        lerp(
-            f64::from(settings.night_level),
-            f64::from(settings.day_level),
-        ) as u8,
+        lerp(night_level, f64::from(settings.day_level)) as u8,
         lerp(
             f64::from(settings.warm_kelvin),
             f64::from(settings.cool_kelvin),
@@ -335,6 +346,7 @@ mod tests {
         assert_eq!((s.day_level, s.night_level), (203, 102));
         assert_eq!((s.cool_kelvin, s.warm_kelvin), (5000, 3000));
         assert_eq!(s.morning_end_minute, at(10, 0));
+        assert_eq!(s.late_night_percent, 50);
     }
 
     #[test]
@@ -342,8 +354,13 @@ mod tests {
         let s = day();
         let sun = (at(5, 39), at(17, 24));
         assert_eq!(target(at(22, 0), sun, &s), (102, 3000));
-        assert_eq!(target(at(2, 0), sun, &s), (102, 3000));
-        assert_eq!(target(at(5, 38), sun, &s), (102, 3000));
+        assert_eq!(target(at(23, 59), sun, &s), (102, 3000));
+        // From midnight the level is halved, the colour kept.
+        assert_eq!(target(at(0, 0), sun, &s), (51, 3000));
+        assert_eq!(target(at(2, 0), sun, &s), (51, 3000));
+        assert_eq!(target(at(5, 38), sun, &s), (51, 3000));
+        // The morning rises from the night's usual values.
+        assert_eq!(target(at(5, 39), sun, &s), (102, 3000));
         // The evening reaches the night's values at 22:00.
         assert_eq!(target(at(21, 59), sun, &s).0, 102);
     }
@@ -352,7 +369,7 @@ mod tests {
     fn mornings_rise_linearly_from_sunrise_to_the_morning_end() {
         let s = day();
         let sun = (at(6, 0), at(17, 0));
-        assert_eq!(target(at(5, 59), sun, &s), (102, 3000));
+        assert_eq!(target(at(5, 59), sun, &s), (51, 3000));
         assert_eq!(target(at(6, 0), sun, &s), (102, 3000));
         // Halfway from 06:00 to 10:00.
         assert_eq!(target(at(8, 0), sun, &s), (153, 4000));
@@ -365,7 +382,7 @@ mod tests {
     fn mornings_start_at_5_when_the_sun_rises_earlier() {
         let s = day();
         let sun = (at(4, 25), at(19, 0));
-        assert_eq!(target(at(4, 30), sun, &s), (102, 3000));
+        assert_eq!(target(at(4, 30), sun, &s), (51, 3000));
         assert_eq!(target(at(5, 0), sun, &s), (102, 3000));
         // A fifth of 05:00 to 10:00.
         assert_eq!(target(at(6, 0), sun, &s), (122, 3400));
@@ -392,7 +409,7 @@ mod tests {
         assert_eq!(target(at(7, 0), sun, &s), (153, 4000));
         assert_eq!(target(at(8, 0), sun, &s), (203, 5000));
         // A sunrise after the morning end jumps to the day's values.
-        assert_eq!(target(at(9, 0), (at(9, 30), at(17, 0)), &s), (102, 3000));
+        assert_eq!(target(at(9, 0), (at(9, 30), at(17, 0)), &s), (51, 3000));
         assert_eq!(target(at(9, 30), (at(9, 30), at(17, 0)), &s), (203, 5000));
     }
 
@@ -549,7 +566,7 @@ mod tests {
         let sun = (at(6, 0), at(18, 0));
         // Night from 22:00 until sunrise, the day's values from the morning end.
         assert_eq!(target(at(22, 0), sun, &s), (76, 2700));
-        assert_eq!(target(at(5, 59), sun, &s), (76, 2700));
+        assert_eq!(target(at(5, 59), sun, &s), (38, 2700));
         assert_eq!(target(at(6, 0), sun, &s), (76, 2700));
         assert_eq!(target(at(10, 0), sun, &s), (203, 5000));
         // Halfway through the morning and the evening.
@@ -557,6 +574,41 @@ mod tests {
         assert_eq!(target(at(20, 0), sun, &s), (140, 3850));
         // A minute before 22:00 is a 240th of the way back up.
         assert_eq!(target(at(21, 59), sun, &s).0, 77);
+    }
+
+    #[test]
+    fn after_midnight_each_lights_night_level_is_scaled_by_the_percent() {
+        let s = Settings {
+            night_level: 51,
+            warm_kelvin: 2700,
+            ..day()
+        };
+        let sun = (at(5, 39), at(17, 24));
+        let hallway = Label {
+            night_level: Some(64),
+            ..Label::default()
+        };
+        let game_pc = Label {
+            warm_kelvin: Some(3500),
+            ..Label::default()
+        };
+        assert_eq!(target(at(1, 0), sun, &s.with(&kitchen())), (38, 2700));
+        assert_eq!(target(at(1, 0), sun, &s.with(&hallway)), (32, 2700));
+        // 25.5 rounds up.
+        assert_eq!(target(at(1, 0), sun, &s), (26, 2700));
+        assert_eq!(target(at(1, 0), sun, &s.with(&game_pc)), (26, 3500));
+        // 100% leaves the night as it is; the lowest level sent stays 1.
+        let full = Settings {
+            late_night_percent: 100,
+            ..s.clone()
+        };
+        assert_eq!(target(at(1, 0), sun, &full), (51, 2700));
+        let faint = Settings {
+            night_level: 1,
+            late_night_percent: 1,
+            ..s
+        };
+        assert_eq!(target(at(1, 0), sun, &faint), (1, 2700));
     }
 
     #[test]
@@ -621,6 +673,14 @@ mod tests {
             },
             Settings {
                 morning_end_minute: 22 * 60,
+                ..Settings::default()
+            },
+            Settings {
+                late_night_percent: 0,
+                ..Settings::default()
+            },
+            Settings {
+                late_night_percent: 101,
                 ..Settings::default()
             },
         ] {
