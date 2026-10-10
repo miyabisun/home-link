@@ -93,6 +93,47 @@ impl Settings {
             ..self.clone()
         }
     }
+
+    /// These settings with every one of a light's `labels` stacked; they share no value.
+    #[must_use]
+    pub fn with_all<'a>(&self, labels: impl IntoIterator<Item = &'a Label>) -> Self {
+        labels
+            .into_iter()
+            .fold(self.clone(), |settings, label| settings.with(label))
+    }
+
+    /// The day's level and colour temperature in kelvin.
+    #[must_use]
+    pub fn day(&self) -> (u8, u16) {
+        (self.day_level, self.cool_kelvin)
+    }
+}
+
+impl Label {
+    /// The names of the values this label sets.
+    fn set(&self) -> impl Iterator<Item = &'static str> {
+        [
+            ("day_level", self.day_level.is_some()),
+            ("night_level", self.night_level.is_some()),
+            ("cool_kelvin", self.cool_kelvin.is_some()),
+            ("warm_kelvin", self.warm_kelvin.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(name, set)| set.then_some(name))
+    }
+}
+
+/// Why the named `labels` cannot share one light: two of them set the same value.
+#[must_use]
+pub fn overlap(labels: &[(&str, &Label)]) -> Option<String> {
+    labels.iter().enumerate().find_map(|(i, (a, first))| {
+        labels[i + 1..].iter().find_map(|(b, second)| {
+            let value = first.set().find(|v| second.set().any(|w| w == *v))?;
+            Some(format!(
+                "labelの「{a}」と「{b}」がどちらも{value}を持つため、同じ電球に付けられません"
+            ))
+        })
+    })
 }
 
 /// The day of the year (1-based) and the minute of the day in Asia/Tokyo at `unix` seconds.
@@ -611,6 +652,66 @@ mod tests {
             ..s
         };
         assert_eq!(target(at(1, 0), sun, &faint), (1, 2700));
+    }
+
+    #[test]
+    fn a_lights_labels_stack_and_its_day_is_their_day_level_and_cool_white() {
+        let s = day();
+        let work = Label::default();
+        let game_pc = Label {
+            warm_kelvin: Some(3500),
+            ..Label::default()
+        };
+        let bright = Label {
+            day_level: Some(254),
+            cool_kelvin: Some(6000),
+            ..Label::default()
+        };
+        assert_eq!(s.with_all([&work, &kitchen()]), s.with(&kitchen()));
+        let merged = s.with_all([&kitchen(), &bright, &work]);
+        assert_eq!(
+            (
+                merged.day_level,
+                merged.night_level,
+                merged.cool_kelvin,
+                merged.warm_kelvin
+            ),
+            (254, 76, 6000, 2700)
+        );
+        assert_eq!(merged.day(), (254, 6000));
+        assert_eq!(s.with_all([]).day(), (203, 5000));
+        assert_eq!(s.with(&game_pc).day(), (203, 5000));
+    }
+
+    #[test]
+    fn labels_setting_the_same_value_cannot_share_a_light() {
+        let work = Label::default();
+        let game_pc = Label {
+            warm_kelvin: Some(3500),
+            ..Label::default()
+        };
+        assert_eq!(
+            overlap(&[
+                ("作業", &work),
+                ("キッチン", &kitchen()),
+                ("ゲームPC", &work)
+            ]),
+            None
+        );
+        assert_eq!(
+            overlap(&[("作業", &work), ("キッチン", &kitchen()), ("ゲームPC", &game_pc)]),
+            Some("labelの「キッチン」と「ゲームPC」がどちらもwarm_kelvinを持つため、同じ電球に付けられません".into())
+        );
+        let dim = Label {
+            night_level: Some(50),
+            day_level: Some(100),
+            ..Label::default()
+        };
+        assert_eq!(
+            overlap(&[("暗め", &dim), ("キッチン", &kitchen())]),
+            Some("labelの「暗め」と「キッチン」がどちらもnight_levelを持つため、同じ電球に付けられません".into())
+        );
+        assert_eq!(overlap(&[]), None);
     }
 
     #[test]

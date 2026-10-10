@@ -388,21 +388,10 @@ async fn tune_one(
     commands: &mut usize,
 ) -> Result<Decision, Dropped> {
     if !switched_on {
-        let path = format!("{}/6/0", light.endpoint);
-        let read = json!({
-            "command": "read_attribute",
-            "args": { "node_id": light.node_id, "attribute_path": [path] },
-        });
-        match request(ws, read).await? {
+        match read_on_off(ws, light).await? {
             None => return Ok(Decision::NoResponse),
-            Some(reply) if reply["result"][&path] != true => {
-                return Ok(if reply.get("error_code").is_some() {
-                    Decision::NoResponse
-                } else {
-                    Decision::Off
-                });
-            }
-            Some(_) => {}
+            Some(false) => return Ok(Decision::Off),
+            Some(true) => {}
         }
     }
     // Just switched on: at once and even if still off (`ExecuteIfOff`).
@@ -444,6 +433,47 @@ async fn tune_one(
         }
     }
     Ok(Decision::Sent(target))
+}
+
+/// The light's On/Off as it answers itself; `None` without an answer.
+async fn read_on_off(ws: &mut Socket, light: &Light) -> Result<Option<bool>, Dropped> {
+    let path = format!("{}/6/0", light.endpoint);
+    let read = json!({
+        "command": "read_attribute",
+        "args": { "node_id": light.node_id, "attribute_path": [path] },
+    });
+    Ok(request(ws, read)
+        .await?
+        .filter(|reply| reply.get("error_code").is_none())
+        .map(|reply| reply["result"][&path] == true))
+}
+
+/// Reads from each light `pick` chooses its own On/Off, with the nodes read.
+///
+/// # Errors
+/// Fails when the server cannot be reached, drops the connection or the reads overrun.
+pub async fn read_on(
+    url: &str,
+    pick: impl Fn(&[Value], &Light) -> bool,
+) -> Result<(Vec<Value>, Vec<(Light, Option<bool>)>), String> {
+    tokio::time::timeout(TUNE_TIMEOUT, async {
+        let mut ws = connect(url).await?;
+        let result = async {
+            let nodes = get_nodes(&mut ws).await?;
+            let mut read = Vec::new();
+            for light in lights(&nodes).into_iter().filter(|l| pick(&nodes, l)) {
+                let on = read_on_off(&mut ws, &light).await?;
+                read.push((light, on));
+            }
+            Ok((nodes, read))
+        }
+        .await
+        .map_err(|e: Dropped| e.0);
+        let _ = ws.close(None).await;
+        result
+    })
+    .await
+    .map_err(|_| "timed out".to_owned())?
 }
 
 /// Sends `request` under a fresh message id and waits for its reply; `None`

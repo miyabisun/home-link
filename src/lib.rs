@@ -28,6 +28,8 @@ const MAX_QR_CHARS: usize = 512;
 ///
 /// # Errors
 /// Fails when the file cannot be opened or the schema cannot be applied.
+// One step per schema version.
+#[allow(clippy::too_many_lines)]
 pub fn open_db(path: &str) -> rusqlite::Result<Connection> {
     let db = Connection::open(path)?;
     db.pragma_update(None, "journal_mode", "WAL")?;
@@ -118,6 +120,42 @@ pub fn open_db(path: &str) -> rusqlite::Result<Connection> {
             ALTER TABLE devices ADD COLUMN ignored INTEGER NOT NULL DEFAULT 0;
             PRAGMA user_version = 4;
             COMMIT;",
+        )?;
+    }
+    if version < 5 {
+        // Version 5 lets a light carry several labels, and a label be boosted.
+        // The devices table is rebuilt, as a column with a foreign key cannot be dropped.
+        db.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+            BEGIN;
+            CREATE TABLE device_labels (
+                device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+                label_id INTEGER NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
+                PRIMARY KEY (device_id, label_id)
+            );
+            INSERT INTO device_labels SELECT id, label_id FROM devices WHERE label_id IS NOT NULL;
+            CREATE TABLE devices_v5 (
+                id INTEGER PRIMARY KEY,
+                room_id INTEGER NOT NULL REFERENCES rooms(id) ON DELETE RESTRICT,
+                qr_payload TEXT UNIQUE,
+                vendor TEXT,
+                serial_number TEXT,
+                mac TEXT UNIQUE,
+                name TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                ignored INTEGER NOT NULL DEFAULT 0,
+                UNIQUE (vendor, serial_number),
+                CHECK (qr_payload IS NOT NULL OR serial_number IS NOT NULL)
+            );
+            INSERT INTO devices_v5
+                SELECT id, room_id, qr_payload, vendor, serial_number, mac, name, created_at, ignored
+                FROM devices;
+            DROP TABLE devices;
+            ALTER TABLE devices_v5 RENAME TO devices;
+            ALTER TABLE labels ADD COLUMN boost TEXT;
+            PRAGMA user_version = 5;
+            COMMIT;
+            PRAGMA foreign_keys = ON;",
         )?;
     }
     Ok(db)
@@ -238,6 +276,7 @@ fn router(state: Db) -> Router {
         .route("/lights", get(light_states))
         .route("/lights/on", axum::routing::post(lights_on))
         .route("/lights/off", axum::routing::post(lights_off))
+        .route("/lights/boost", axum::routing::post(boost))
         .route("/lights/schedule", get(get_schedule).put(update_schedule))
         .fallback(not_found)
         // ponytail: one connection behind a global lock; a pool if writes ever contend.
@@ -432,9 +471,8 @@ struct Device {
     vendor: Option<String>,
     serial_number: Option<String>,
     mac: Option<String>,
-    /// The label whose values the schedule uses for this light.
-    label_id: Option<i64>,
-    label_name: Option<String>,
+    /// The labels whose values the schedule uses for this light.
+    labels: Vec<LabelRef>,
     /// Left out of switching, adjusting and the counts.
     ignored: bool,
     created_at: String,
@@ -458,9 +496,19 @@ struct DeviceInput {
     name: String,
 }
 
+/// A label as a device lists it.
+#[derive(Serialize, Deserialize)]
+struct LabelRef {
+    id: i64,
+    name: String,
+}
+
 const DEVICE_SELECT: &str = "SELECT devices.id, room_id, rooms.name, devices.name, created_at,
-    qr_payload, vendor, serial_number, mac, label_id, labels.name, ignored
-    FROM devices JOIN rooms ON rooms.id = room_id LEFT JOIN labels ON labels.id = label_id";
+    qr_payload, vendor, serial_number, mac,
+    (SELECT json_group_array(json_object('id', labels.id, 'name', labels.name) ORDER BY labels.id)
+        FROM device_labels JOIN labels ON labels.id = label_id WHERE device_id = devices.id),
+    ignored
+    FROM devices JOIN rooms ON rooms.id = room_id";
 
 /// The `qr_payload` column stores either form; a QR payload starts with `MT:`.
 fn device_row(row: &rusqlite::Row, with_payload: bool) -> rusqlite::Result<Device> {
@@ -477,9 +525,8 @@ fn device_row(row: &rusqlite::Row, with_payload: bool) -> rusqlite::Result<Devic
         vendor: row.get(6)?,
         serial_number: row.get(7)?,
         mac: row.get(8)?,
-        label_id: row.get(9)?,
-        label_name: row.get(10)?,
-        ignored: row.get(11)?,
+        labels: serde_json::from_str(&row.get::<_, String>(9)?).unwrap_or_default(),
+        ignored: row.get(10)?,
         created_at: row.get(4)?,
         qr_payload,
         manual_code,
@@ -681,12 +728,11 @@ async fn create_device(
     }
 }
 
-/// A ledger change to a device: the fields given change; `label_id` null removes its label.
+/// A ledger change to a device: the fields given change; `label_ids` replaces its labels.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DeviceUpdate {
-    #[serde(default)]
-    label_id: Option<i64>,
+    label_ids: Option<Vec<i64>>,
     ignored: Option<bool>,
 }
 
@@ -697,27 +743,38 @@ async fn update_device(
 ) -> ApiResult<Json<Device>> {
     // An empty body does not remove the label, nor does a null `ignored` mean false.
     let has = |key| input.as_object().is_some_and(|o| o.contains_key(key));
-    let (label_given, ignored_given) = (has("label_id"), has("ignored"));
+    let (labels_given, ignored_given) = (has("label_ids"), has("ignored"));
     let input: DeviceUpdate = serde_json::from_value(input)
         .ok()
-        .filter(|u: &DeviceUpdate| (label_given || ignored_given) && ignored_given == u.ignored.is_some())
+        .filter(|u: &DeviceUpdate| {
+            (labels_given || ignored_given)
+                && ignored_given == u.ignored.is_some()
+                && labels_given == u.label_ids.is_some()
+        })
         .ok_or_else(|| {
             ApiError(
                 StatusCode::BAD_REQUEST,
                 "invalid_device_update",
-                "変更は {\"label_id\": labelのidかnull} か {\"ignored\": trueかfalse} の形で送ってください".into(),
+                "変更は {\"label_ids\": [labelのid, …]} か {\"ignored\": trueかfalse} の形で送ってください".into(),
             )
         })?;
     let db = db.db.lock().unwrap();
     find_device(&db, id, false)?;
-    if let Some(label) = input.label_id {
-        find_label(&db, label)?;
-    }
-    if label_given {
-        db.execute(
-            "UPDATE devices SET label_id = ?1 WHERE id = ?2",
-            params![input.label_id, id],
-        )?;
+    if let Some(mut ids) = input.label_ids {
+        ids.sort_unstable();
+        ids.dedup();
+        let given = ids
+            .iter()
+            .map(|label| find_label(&db, *label))
+            .collect::<ApiResult<Vec<_>>>()?;
+        no_overlap(&given.iter().collect::<Vec<_>>())?;
+        db.execute("DELETE FROM device_labels WHERE device_id = ?1", [id])?;
+        for label in ids {
+            db.execute(
+                "INSERT INTO device_labels (device_id, label_id) VALUES (?1, ?2)",
+                [id, label],
+            )?;
+        }
     }
     if let Some(ignored) = input.ignored {
         db.execute(
@@ -736,10 +793,15 @@ struct Label {
     #[serde(flatten)]
     values: schedule::Label,
     device_count: i64,
+    /// Its lights are held at the day's values.
+    boosted: bool,
+    /// While boosted, the ledger devices that were off before.
+    #[serde(skip)]
+    was_off: Option<Vec<i64>>,
 }
 
 const LABEL_SELECT: &str = "SELECT id, name, day_level, night_level, cool_kelvin, warm_kelvin,
-    (SELECT count(*) FROM devices WHERE label_id = labels.id) FROM labels";
+    (SELECT count(*) FROM device_labels WHERE label_id = labels.id), boost FROM labels";
 
 fn label_row(row: &rusqlite::Row) -> rusqlite::Result<Label> {
     Ok(Label {
@@ -752,7 +814,27 @@ fn label_row(row: &rusqlite::Row) -> rusqlite::Result<Label> {
             warm_kelvin: row.get(5)?,
         },
         device_count: row.get(6)?,
+        boosted: row.get::<_, Option<String>>(7)?.is_some(),
+        was_off: row
+            .get::<_, Option<String>>(7)?
+            .map(|ids| serde_json::from_str(&ids).unwrap_or_default()),
     })
+}
+
+/// Refuses `labels` for one light when two of them set the same value.
+fn no_overlap(labels: &[&Label]) -> ApiResult<()> {
+    let named: Vec<_> = labels
+        .iter()
+        .map(|l| (l.name.as_str(), &l.values))
+        .collect();
+    match schedule::overlap(&named) {
+        Some(message) => Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "conflicting_labels",
+            message,
+        )),
+        None => Ok(()),
+    }
 }
 
 fn labels(db: &Connection) -> rusqlite::Result<Vec<Label>> {
@@ -760,16 +842,18 @@ fn labels(db: &Connection) -> rusqlite::Result<Vec<Label>> {
     statement.query_map([], label_row)?.collect()
 }
 
+fn label_not_found() -> ApiError {
+    ApiError(
+        StatusCode::NOT_FOUND,
+        "label_not_found",
+        "labelが見つかりません".into(),
+    )
+}
+
 fn find_label(db: &Connection, id: i64) -> ApiResult<Label> {
     db.query_row(&format!("{LABEL_SELECT} WHERE id = ?1"), [id], label_row)
         .optional()?
-        .ok_or_else(|| {
-            ApiError(
-                StatusCode::NOT_FOUND,
-                "label_not_found",
-                "labelが見つかりません".into(),
-            )
-        })
+        .ok_or_else(label_not_found)
 }
 
 /// The name and values in `input`, checked over the schedule's current settings.
@@ -868,6 +952,22 @@ async fn update_label(
         merged = input;
     }
     let (name, values) = label_input(&db, merged)?;
+    let changed = Label {
+        name: name.clone(),
+        values: values.clone(),
+        ..label
+    };
+    let others = labels(&db)?;
+    for device in ledger(&db)? {
+        if device.labels.iter().any(|l| l.id == id) {
+            let stacked: Vec<_> = others
+                .iter()
+                .filter(|l| l.id != id && device.labels.iter().any(|r| r.id == l.id))
+                .chain([&changed])
+                .collect();
+            no_overlap(&stacked)?;
+        }
+    }
     save_label(&db, Some(id), &name, &values)?;
     Ok(Json(find_label(&db, id)?))
 }
@@ -1280,6 +1380,214 @@ async fn lights_off(State(state): State<Db>) -> ApiResult<Json<serde_json::Value
     Ok(switch_lights(&state, false).await?.0)
 }
 
+/// The label whose lights to boost or release.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BoostInput {
+    label: String,
+}
+
+/// Toggles the named label's boost. Boosting switches its lights on at the day's values,
+/// those that were off too, and holds them there; releasing switches off those that were
+/// off and returns the others to the clock's values. A light still under another boosted
+/// label is left as it is. A boost that switched no light is not kept.
+#[allow(clippy::too_many_lines)]
+async fn boost(
+    State(state): State<Db>,
+    Json(input): Json<serde_json::Value>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let name = serde_json::from_value::<BoostInput>(input)
+        .map_err(|_| {
+            ApiError(
+                StatusCode::BAD_REQUEST,
+                "invalid_boost",
+                "本文は {\"label\": \"labelの名前\"} の形で送ってください".into(),
+            )
+        })?
+        .label;
+    let url = matter_url(&state)?;
+    let (settings, devices, labels) = {
+        let db = state.db.lock().unwrap();
+        (
+            load::<schedule::Settings>(&db, SCHEDULE)?,
+            ledger(&db)?,
+            labels(&db)?,
+        )
+    };
+    let label = labels
+        .iter()
+        .find(|l| l.name == name.trim())
+        .ok_or_else(label_not_found)?;
+    let members: Vec<&Device> = devices
+        .iter()
+        .filter(|d| !d.ignored && d.labels.iter().any(|r| r.id == label.id))
+        .collect();
+    if members.is_empty() {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "label_has_no_lights",
+            format!("labelの「{}」に照明が割り当てられていません", label.name),
+        ));
+    }
+    let of_label = |nodes: &[serde_json::Value], light: &matter::Light| {
+        !is_ignored(&devices, nodes, light)
+            && labels_of(&devices, nodes, light, &labels)
+                .iter()
+                .any(|l| l.id == label.id)
+    };
+    let key = |light: &matter::Light| (light.node_id, light.endpoint);
+    let result = |decision: matter::Decision| match decision {
+        matter::Decision::NoResponse => "no_response",
+        matter::Decision::Failed => "failed",
+        _ => "switched",
+    };
+    let outcome = |outcome: matter::Outcome| match outcome {
+        matter::Outcome::NoResponse => "no_response",
+        matter::Outcome::Failed => "failed",
+        _ => "switched",
+    };
+    let (boosted, tuned, results) = if let Some(was_off) = &label.was_off {
+        let labels = {
+            let db = state.db.lock().unwrap();
+            db.execute("UPDATE labels SET boost = NULL WHERE id = ?1", [label.id])?;
+            self::labels(&db)?
+        };
+        let held = |nodes: &[serde_json::Value], light: &matter::Light| {
+            labels_of(&devices, nodes, light, &labels)
+                .iter()
+                .any(|l| l.boosted)
+        };
+        let off = |nodes: &[serde_json::Value], light: &matter::Light| {
+            devices_of(&devices, nodes, light).any(|d| was_off.contains(&d.id))
+        };
+        let (_, switched) = matter::switch(url, false, |nodes, light| {
+            !(of_label(nodes, light) && !held(nodes, light) && off(nodes, light))
+        })
+        .await
+        .map_err(matter_unreachable)?;
+        let (day, minute) = schedule::local((state.clock)());
+        let sun = schedule::sun_times(day, settings.latitude, settings.longitude);
+        let tuned = matter::tune(url, &[], |nodes, light| {
+            if of_label(nodes, light) && !held(nodes, light) && !off(nodes, light) {
+                let labels = labels_of(&devices, nodes, light, &labels);
+                let (level, kelvin) = light_goal(&settings, minute, sun, &labels);
+                Ok(schedule::fit(level, kelvin, light))
+            } else {
+                Err(schedule::Skip::Unchanged)
+            }
+        })
+        .await
+        .map_err(matter_unreachable)?;
+        let results: Vec<_> = tuned
+            .lights
+            .iter()
+            .filter(|(light, _)| of_label(&tuned.nodes, light))
+            .map(|(light, decision)| {
+                let done = if held(&tuned.nodes, light) {
+                    "switched"
+                } else if off(&tuned.nodes, light) {
+                    switched
+                        .iter()
+                        .find(|(l, _)| key(l) == key(light))
+                        .map_or("no_response", |(_, o)| outcome(*o))
+                } else {
+                    result(*decision)
+                };
+                (light.clone(), done)
+            })
+            .collect();
+        (false, tuned, results)
+    } else {
+        let (nodes, read) = matter::read_on(url, of_label)
+            .await
+            .map_err(matter_unreachable)?;
+        let was_off: Vec<i64> = read
+            .iter()
+            .filter(|(_, on)| *on == Some(false))
+            .flat_map(|(light, _)| devices_of(&devices, &nodes, light))
+            .filter(|d| members.iter().any(|m| m.id == d.id))
+            .map(|d| d.id)
+            .collect();
+        let (_, switched) = matter::switch(url, true, |nodes, light| !of_label(nodes, light))
+            .await
+            .map_err(matter_unreachable)?;
+        let on: Vec<_> = switched
+            .iter()
+            .filter(|(_, o)| *o == matter::Outcome::Switched)
+            .map(|(light, _)| key(light))
+            .collect();
+        let tuned = matter::tune(url, &on, |nodes, light| {
+            if of_label(nodes, light) {
+                let labels = labels_of(&devices, nodes, light, &labels);
+                let (level, kelvin) = settings.with_all(labels.iter().map(|l| &l.values)).day();
+                Ok(schedule::fit(level, kelvin, light))
+            } else {
+                Err(schedule::Skip::Unchanged)
+            }
+        })
+        .await
+        .map_err(matter_unreachable)?;
+        let results: Vec<_> = switched
+            .into_iter()
+            .filter(|(light, _)| of_label(&tuned.nodes, light))
+            .map(|(light, switch)| {
+                let decision = tuned
+                    .lights
+                    .iter()
+                    .find(|(l, _)| key(l) == key(&light))
+                    .map_or(matter::Decision::NoResponse, |(_, d)| *d);
+                let done = match outcome(switch) {
+                    "switched" => result(decision),
+                    other => other,
+                };
+                (light, done)
+            })
+            .collect();
+        let boosted = results.iter().any(|(_, r)| *r == "switched");
+        if boosted {
+            state.db.lock().unwrap().execute(
+                "UPDATE labels SET boost = ?1 WHERE id = ?2",
+                params![json!(was_off).to_string(), label.id],
+            )?;
+        }
+        (boosted, tuned, results)
+    };
+    {
+        let mut memory = state.sent.lock().unwrap();
+        for (light, decision) in &tuned.lights {
+            decide(&mut memory, light, *decision, &mut json!({}));
+        }
+    }
+    let (lights, outcomes): (Vec<_>, Vec<_>) = results.into_iter().unzip();
+    let (names, _) = match_ledger(&devices, &tuned.nodes, &lights);
+    let missing: Vec<_> = members
+        .iter()
+        .filter(|d| place(d, &tuned.nodes).is_none())
+        .map(|d| MissingDevice {
+            id: d.id,
+            name: d.name.clone(),
+            room_name: d.room_name.clone(),
+        })
+        .collect();
+    tracing::info!(
+        label = label.name,
+        boosted,
+        switched = count(&outcomes, "switched"),
+        lights = lights.len(),
+        "label boost toggled"
+    );
+    Ok(Json(json!({
+        "label": label.name,
+        "boosted": boosted,
+        "switched": count(&outcomes, "switched"),
+        "no_response": count(&outcomes, "no_response"),
+        "failed": count(&outcomes, "failed"),
+        "missing": missing.len(),
+        "lights": light_entries(&lights, names, &outcomes, "result"),
+        "missing_devices": missing,
+    })))
+}
+
 /// Records "all on" or "all off" as the user's intent, switches every light
 /// matterjs-server serves and reports each light's result, with the node and
 /// endpoint of the switched ones.
@@ -1296,6 +1604,9 @@ async fn switch_lights(
     let devices = {
         let db = state.db.lock().unwrap();
         store(&db, INTENT, &intent)?;
+        if !on {
+            db.execute("UPDATE labels SET boost = NULL", [])?;
+        }
         ledger(&db)?
     };
     let (nodes, results) =
@@ -1398,12 +1709,10 @@ async fn adjust(state: &AppState, unix: i64, trigger: &'static str, switched_on:
             run["kelvin"] = json!(goal.1);
             let sent = state.sent.lock().unwrap().clone();
             let goal_of = |nodes: &[serde_json::Value], light: &matter::Light| {
-                let label = devices_of(devices, nodes, light)
-                    .find_map(|d| labels.iter().find(|l| Some(l.id) == d.label_id));
-                let goal = label.map_or(goal, |label| {
-                    schedule::target(minute, sun, &settings.with(&label.values))
-                });
-                (label.map(|l| l.name.clone()), goal)
+                let labels = labels_of(devices, nodes, light, labels);
+                let goal = light_goal(settings, minute, sun, &labels);
+                let names: Vec<_> = labels.iter().map(|l| l.name.clone()).collect();
+                (names, goal)
             };
             matter::tune(url, switched_on, |nodes, light| {
                 if is_ignored(devices, nodes, light) {
@@ -1439,13 +1748,13 @@ async fn adjust(state: &AppState, unix: i64, trigger: &'static str, switched_on:
                 .zip(names)
                 .zip(goals)
                 .map(
-                    |(((light, decision), (name, room_name, _)), (label, goal))| {
+                    |(((light, decision), (name, room_name, _)), (labels, goal))| {
                         let mut entry = json!({
                             "node_id": light.node_id,
                             "endpoint": light.endpoint,
                             "name": name,
                             "room_name": room_name,
-                            "label": label,
+                            "labels": labels,
                             "target_level": goal.0,
                             "target_kelvin": goal.1,
                         });
@@ -1468,6 +1777,39 @@ async fn adjust(state: &AppState, unix: i64, trigger: &'static str, switched_on:
     let mut runs = state.runs.lock().unwrap();
     runs.push_front(run);
     runs.truncate(RUNS_KEPT);
+}
+
+/// The labels of `light`'s ledger device among `labels`.
+fn labels_of<'a>(
+    devices: &[Device],
+    nodes: &[serde_json::Value],
+    light: &matter::Light,
+    labels: &'a [Label],
+) -> Vec<&'a Label> {
+    devices_of(devices, nodes, light)
+        .find(|d| !d.labels.is_empty())
+        .map(|d| {
+            labels
+                .iter()
+                .filter(|l| d.labels.iter().any(|r| r.id == l.id))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The level and kelvin at `minute` for a light with `labels`: the day's while one is boosted.
+fn light_goal(
+    settings: &schedule::Settings,
+    minute: u32,
+    sun: (u32, u32),
+    labels: &[&Label],
+) -> (u8, u16) {
+    let stacked = settings.with_all(labels.iter().map(|l| &l.values));
+    if labels.iter().any(|l| l.boosted) {
+        stacked.day()
+    } else {
+        schedule::target(minute, sun, &stacked)
+    }
 }
 
 /// `decision` for the run's `entry`, remembering what was sent `light`.
@@ -1515,10 +1857,11 @@ async fn get_schedule(State(state): State<Db>) -> ApiResult<Json<serde_json::Val
                 let mut entry = json!(label.values);
                 entry["id"] = json!(label.id);
                 entry["name"] = json!(label.name);
+                entry["boosted"] = json!(label.boosted);
                 entry["devices"] = json!(
                     devices
                         .iter()
-                        .filter(|d| d.label_id == Some(label.id))
+                        .filter(|d| d.labels.iter().any(|r| r.id == label.id))
                         .map(|d| LabelledDevice {
                             id: d.id,
                             name: d.name.clone(),
