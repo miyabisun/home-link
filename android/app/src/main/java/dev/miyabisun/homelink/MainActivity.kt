@@ -256,9 +256,9 @@ class MainActivity : Activity() {
         val host = Uri.parse(BuildConfig.HOME_LINK_URL).authority.orEmpty()
         background(lightsWorker, { api.switchLights(on) }) { result ->
             switching = null
-            lightsResult = lightsMessage(on, result, host, names = true)
+            lightsResult = lightsMessage(on, result, host, detail = true)
             render()
-            LightsWidget.show(this, lightsMessage(on, result, host, names = false))
+            LightsWidget.show(this, lightsMessage(on, result, host, detail = false))
         }
     }
 

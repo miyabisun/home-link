@@ -2284,3 +2284,229 @@ async fn thread_readiness_follows_the_matter_server() {
         (StatusCode::BAD_GATEWAY, "matter_server_unreachable")
     );
 }
+
+#[tokio::test]
+async fn devices_are_ignored_and_unignored_by_patch() {
+    let app = app();
+    let room = create_room(&app, "リビング").await;
+    let (_, label) = call(&app, "POST", "/api/labels", Some(json!({ "name": "夜" }))).await;
+    let (_, device) = call(
+        &app,
+        "POST",
+        "/api/devices",
+        Some(json!({ "room_id": room, "vendor": "Aqara", "serial_number": "54ef44100126e0a6" })),
+    )
+    .await;
+    assert_eq!(device["ignored"], false);
+    let uri = format!("/api/devices/{}", device["id"]);
+    call(
+        &app,
+        "PATCH",
+        &uri,
+        Some(json!({ "label_id": label["id"] })),
+    )
+    .await;
+
+    // Ignoring keeps the label; the label alone keeps the ignoring.
+    let (status, device) = call(&app, "PATCH", &uri, Some(json!({ "ignored": true }))).await;
+    assert_eq!(status, StatusCode::OK, "{device}");
+    assert_eq!(
+        (&device["ignored"], &device["label_id"]),
+        (&json!(true), &label["id"])
+    );
+    let (_, list) = call(&app, "GET", "/api/devices", None).await;
+    assert_eq!(list[0]["ignored"], true);
+    let (_, device) = call(&app, "PATCH", &uri, Some(json!({ "label_id": null }))).await;
+    assert_eq!(
+        (&device["ignored"], &device["label_id"]),
+        (&json!(true), &Value::Null)
+    );
+    let (status, device) = call(
+        &app,
+        "PATCH",
+        &uri,
+        Some(json!({ "ignored": false, "label_id": label["id"] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{device}");
+    assert_eq!(
+        (&device["ignored"], &device["label_id"]),
+        (&json!(false), &label["id"])
+    );
+
+    for bad in [
+        json!({ "ignored": null }),
+        json!({ "ignored": "true" }),
+        json!({ "ignored": 1 }),
+        json!({ "ignored": true, "muted": true }),
+        json!([true]),
+    ] {
+        let (status, error) = call(&app, "PATCH", &uri, Some(bad.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+        assert_eq!(error["error"], "invalid_device_update", "{bad}");
+    }
+    let (_, device) = call(&app, "GET", &uri, None).await;
+    assert_eq!(device["ignored"], false);
+    let (status, _) = call(
+        &app,
+        "PATCH",
+        "/api/devices/999",
+        Some(json!({ "ignored": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Ignores the ledger devices at `ids`.
+async fn ignore(app: &Router, ids: &[i64]) {
+    for id in ids {
+        let (status, body) = call(
+            app,
+            "PATCH",
+            &format!("/api/devices/{id}"),
+            Some(json!({ "ignored": true })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+}
+
+#[tokio::test]
+async fn ignored_lights_get_no_switch_and_are_not_counted() {
+    let (addr, commands, _) = fake_light_server(home_nodes(), Fake::default()).await;
+    let app = light_app(addr).await;
+    // The unreachable T2 behind the bridge, the reachable Tapo (読書灯, id 1) and
+    // a ledger device matterjs-server does not serve.
+    let room = create_room(&app, "通路").await;
+    let mut ids = vec![1];
+    for serial in ["t2-a", "gone-for-good"] {
+        let vendor = if serial == "t2-a" { "Aqara" } else { "Tapo" };
+        let (_, device) = call(
+            &app,
+            "POST",
+            "/api/devices",
+            Some(json!({ "room_id": room, "vendor": vendor, "serial_number": serial })),
+        )
+        .await;
+        ids.push(device["id"].as_i64().unwrap());
+    }
+    ignore(&app, &ids).await;
+
+    for (action, command) in [("on", "On"), ("off", "Off")] {
+        commands.lock().unwrap().clear();
+        let (status, body) = call(&app, "POST", &format!("/api/lights/{action}"), None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            (
+                &body["switched"],
+                &body["no_response"],
+                &body["failed"],
+                &body["missing"]
+            ),
+            (&json!(1), &json!(1), &json!(0), &json!(1)),
+            "{body}"
+        );
+        assert_eq!(
+            results(&body, "result"),
+            [
+                (
+                    json!(1),
+                    json!(2),
+                    json!("Aqara LED Bulb T2"),
+                    json!("ignored")
+                ),
+                (json!(1), json!(3), json!("台所"), json!("switched")),
+                (json!(5), json!(1), json!("読書灯"), json!("ignored")),
+                (
+                    json!(16),
+                    json!(1),
+                    json!("Smart Bulb"),
+                    json!("no_response")
+                ),
+            ]
+        );
+        assert_eq!(
+            body["missing_devices"],
+            json!([{ "id": 3, "name": "消えた灯", "room_name": "寝室" }])
+        );
+        let sent: Vec<_> = commands
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                (
+                    c["node_id"].clone(),
+                    c["endpoint_id"].clone(),
+                    c["command_name"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(sent, [(json!(1), json!(3), json!(command))]);
+    }
+
+    let (_, body) = call(&app, "GET", "/api/lights", None).await;
+    assert_eq!(
+        (
+            &body["on"],
+            &body["off"],
+            &body["no_response"],
+            &body["missing"]
+        ),
+        (&json!(0), &json!(1), &json!(1), &json!(1))
+    );
+    assert_eq!(body["lights"][0]["state"], "ignored");
+    assert_eq!(body["lights"][2]["state"], "ignored");
+
+    // Ignoring is undone the same way.
+    let (_, _) = call(
+        &app,
+        "PATCH",
+        "/api/devices/1",
+        Some(json!({ "ignored": false })),
+    )
+    .await;
+    let (_, body) = call(&app, "POST", "/api/lights/on", None).await;
+    assert_eq!(body["switched"], 2);
+}
+
+#[tokio::test]
+async fn ignored_lights_get_no_adjustment() {
+    let (addr, commands, _) = fake_light_server(tuning_nodes(), Fake::default()).await;
+    let home = home_link::Home::new(
+        home_link::open_db(":memory:").unwrap(),
+        Some(format!("ws://{addr}/ws")),
+    );
+    let app = home.router();
+    enable(&app).await;
+    let room = create_room(&app, "寝室").await;
+    let (_, tapo) = call(
+        &app,
+        "POST",
+        "/api/devices",
+        Some(json!({ "room_id": room, "vendor": "Tapo", "serial_number": TAPO })),
+    )
+    .await;
+    ignore(&app, &[tapo["id"].as_i64().unwrap()]).await;
+
+    home.adjust(NIGHT, "scheduled").await;
+    let (_, body) = call(&app, "GET", "/api/lights/schedule", None).await;
+    assert_eq!(body["runs"][0]["lights"][2]["decision"], "ignored");
+    // The Tapo is on but neither read nor written.
+    assert!(!reads(&commands).contains(&(json!(5), json!(["1/6/0"]))));
+    assert!(tunings(&commands).iter().all(|(node, ..)| node != 5));
+
+    // "All on" neither switches nor adjusts it.
+    commands.lock().unwrap().clear();
+    let (status, body) = call(&app, "POST", "/api/lights/on", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        commands
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|c| c["node_id"] != 5 && c["args"]["node_id"] != 5)
+    );
+    let (_, body) = call(&app, "GET", "/api/lights/schedule", None).await;
+    assert_eq!(body["runs"][0]["trigger"], "lights_on");
+    assert_eq!(body["runs"][0]["lights"][2]["decision"], "ignored");
+}

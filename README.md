@@ -62,11 +62,12 @@ APKは開発用のdebug署名です。PCからADBで導入する方法と、フ�
 アプリの上部にある「照明オン」「照明オフ」を押すと、matterjs-serverに登録された照明を全部切り替えます。
 結果は切り替えた台数と、応答のなかった照明・失敗した照明・台帳にあるのに見つからない機器の台数で示します。
 1台でも切り替えられなかった照明があれば、失敗の色で表示します。
+無視の対象にした照明（下の「二度と応答しない照明を無視する」）は、切り替えず、台数にも数えません。
 
 「ホーム画面にボタンを置く」を押すと、同じ2つのボタンのウィジェットをホーム画面へ置けます。
 ウィジェットは横4マス・縦1段で置かれ、横は2マスまで縮められます。
-1段では、押したボタンの文字が数秒だけ結果（切り替えた台数や接続できないことなど）に変わります。
-縦に広げると、ボタンの下に直前の結果を表示します。
+1段では、押したボタンの文字が数秒だけ結果（「オン完了」「一部失敗」「接続不可」など）に変わります。
+縦に広げると、ボタンの下に直前の結果を表示します。ウィジェットは台数を示さず、成功か、切り替えられなかった照明があるかだけを示します。
 
 ### Wi-Fi電球をBluetoothでつなぐ
 
@@ -138,7 +139,7 @@ matterjs-serverにdatasetが入ると、アプリを変えずに登録できる�
 | `GET /api/devices` | 機器の一覧。コードは含みません | |
 | `POST /api/devices` | 機器の登録 | 400 `invalid_qr_payload`・`invalid_manual_code`・`missing_setup_code`・`invalid_identifier`・`invalid_mac`・`invalid_device_name`、404 `room_not_found`、409 `duplicate_qr_payload`・`duplicate_identifier` |
 | `GET /api/devices/{id}` | 機器1台。登録したコードの全文 `qr_payload` または `manual_code` を含みます | 404 `device_not_found` |
-| `PATCH /api/devices/{id}` | labelの割り当て。本文は `{"label_id": 1}`、`null` で外す | 400 `invalid_device_update`、404 `device_not_found`・`label_not_found` |
+| `PATCH /api/devices/{id}` | labelの割り当てと無視の設定。本文は送った項目だけを変えます。`{"label_id": 1}`（`null` で外す）、`{"ignored": true}`（`false` で戻す） | 400 `invalid_device_update`、404 `device_not_found`・`label_not_found` |
 | `DELETE /api/devices/{id}` | 機器の削除 | 404 `device_not_found` |
 | `GET /api/labels` | labelの一覧（値と割り当てた機器の台数つき） | |
 | `POST /api/labels` | labelの作成。本文は `{"name": "キッチン", "night_level": 76, "warm_kelvin": 2700}` | 400 `invalid_label_name`・`invalid_label`、409 `duplicate_label_name` |
@@ -147,8 +148,8 @@ matterjs-serverにdatasetが入ると、アプリを変えずに登録できる�
 | `POST /api/commission` | 機器をmatterjs-serverへBluetoothで登録（commissioning）し、台帳に登録 | 400 `missing_setup_code`・`invalid_qr_payload`・`invalid_manual_code`・`invalid_network`・`invalid_wifi`・`invalid_device_name`、404 `room_not_found`、422 `device_not_found`・`wrong_code`・`wifi_failed`・`thread_failed`・`commission_failed`、504 `commission_timeout`、502 `matter_server_unreachable`、503 `matter_server_not_configured`・`bluetooth_unavailable`・`thread_not_ready` |
 | `GET /api/thread` | Thread電球を登録できるか（matterjs-serverがThread網のdatasetを持つか）を `{"ready": true}` で返します | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `GET /api/status` | 台帳の機器ごとに、matterjs-serverで見えるか（`visible`）と今の `node_id`・`endpoint` | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
-| `GET /api/lights` | 照明ごとの今の状態（`on`・`off`・`no_response`）と、その件数 | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
-| `POST /api/lights/on` | 全部の照明をオンにし、照明ごとの結果（`switched`・`no_response`・`failed`）と件数を返します | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
+| `GET /api/lights` | 照明ごとの今の状態（`on`・`off`・`no_response`・`ignored`）と、無視の照明を除いた件数 | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
+| `POST /api/lights/on` | 無視の照明を除く全部の照明をオンにし、照明ごとの結果（`switched`・`no_response`・`failed`・`ignored`）と、無視の照明を除いた件数を返します | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `POST /api/lights/off` | 全部の照明をオフにします。応答は `on` と同じ形です | 同上 |
 | `GET /api/lights/schedule` | 明るさと色温度の自動調整の設定（`settings`）、labelごとの値と割り当てた機器（`labels`）、最後に押された全部オン・全部オフ（`intent`）、直近の調整の記録（`runs`、新しい順に144回分） | |
 | `PUT /api/lights/schedule` | 自動調整の設定のうち、送った項目だけを変更します。応答は `GET` と同じ形です | 400 `invalid_schedule` |
@@ -193,6 +194,21 @@ nodeが使えない照明と、ブリッジが届かないと報告している�
 途中で接続が切れた場合は、つなぎ直して全部の照明へ送り直します（オン・オフは状態に依らない指定なので、二重に届いても結果は同じです）。
 照明の `name` は台帳の機器名で、台帳に無い照明は製品名です。台帳の機器のうちmatterjs-serverに見えないものは `missing_devices` に並び、
 `missing` に数えます。状態の `GET /api/lights` は、matterjs-serverが最後に読んだOn/Offの値を返します。
+
+#### 二度と応答しない照明を無視する
+
+ブリッジ配下に残った電球など、二度と応答しない照明は、台帳に登録して無視の対象にできます。
+無視の照明には、全部オン・全部オフと自動調整の命令を送りません。全部オン・全部オフの件数（`switched`・`no_response`・`failed`・`missing`）と、
+`GET /api/lights` の件数にも数えません。照明ごとの項目には、`result` または `state` が `ignored` として残ります。
+応答の無い照明を自動で無視にはしません。
+
+```sh
+# ブリッジ配下のT2を、VendorNameとSerialNumberで登録してから無視にする
+curl -X POST http://homeserver:5011/api/devices -H 'content-type: application/json' \
+  -d '{"room_id":1,"vendor":"Aqara","serial_number":"54ef44100126e0a6","name":"外したT2"}'
+curl -X PATCH http://homeserver:5011/api/devices/7 -H 'content-type: application/json' -d '{"ignored":true}'
+# {"id":7,…,"ignored":true,…}
+```
 
 ### 明るさと色温度の自動調整
 
@@ -243,7 +259,7 @@ nodeが使えない照明と、ブリッジが届かないと報告している�
 日の出・日の入り、送った命令の数（`commands`）、照明ごとの判断（`decision`）を持ちます。
 照明ごとに、割り当てたlabelの名前（`label`、無ければ `null`）と、その照明の目標値（`target_level`・`target_kelvin`）も持ちます。
 判断は、送った `sent`、全部オフ中の `all_off`、無効の `disabled`、消えていた `off`、届かない `no_response`、
-エラーが返った `failed`、調光にも色温度にも対応しない `unsupported`、前回と同じ値の `unchanged` です。
+エラーが返った `failed`、調光にも色温度にも対応しない `unsupported`、前回と同じ値の `unchanged`、無視の照明の `ignored` です。
 `sent` の照明の `level`・`mireds` は、前回から変わって送った値だけを持ちます。
 記録はメモリだけに持ち、再起動で消えます。
 

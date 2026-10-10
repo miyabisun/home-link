@@ -134,7 +134,7 @@ class LightsWidget : AppWidgetProvider() {
                 val api = MainActivity.apiFactory?.invoke() ?: HttpHomeLinkApi(BuildConfig.HOME_LINK_URL)
                 val host = Uri.parse(BuildConfig.HOME_LINK_URL).authority.orEmpty()
                 val result = api.switchLights(on)
-                show(context, lightsMessage(on, result, host, names = false), progress = false, Press(on, lightsLabel(on, result)))
+                show(context, lightsMessage(on, result, host, detail = false), progress = false, Press(on, lightsLabel(on, result)))
                 // The receiver stays alive for the pause: a cached process may be frozen before a later callback.
                 Thread.sleep(LABEL_MS)
                 if (presses.get() == press) show(context)

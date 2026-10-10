@@ -248,6 +248,8 @@ pub enum Skip {
     Unsupported,
     /// Already sent these values.
     Unchanged,
+    /// Ignored in the ledger.
+    Ignored,
 }
 
 /// What to send `light` for the `goal` level and kelvin, before its On/Off is

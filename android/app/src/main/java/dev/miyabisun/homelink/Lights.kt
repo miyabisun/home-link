@@ -6,8 +6,11 @@ data class LightsResult(val switched: Int, val noResponse: Int, val failed: Int,
 /** The result line of a switch; `failed` when any light was left behind or the request failed. */
 data class LightsMessage(val text: String, val failed: Boolean)
 
-/** Words the result of switching every light `on` or off; `names` lists the missing devices. */
-fun lightsMessage(on: Boolean, result: ApiResult<LightsResult>, host: String, names: Boolean): LightsMessage {
+/**
+ * Words the result of switching every light `on` or off. With `detail` it counts the lights and names
+ * the missing devices; without, as on the widget, it only tells success from lights left behind.
+ */
+fun lightsMessage(on: Boolean, result: ApiResult<LightsResult>, host: String, detail: Boolean): LightsMessage {
     val verb = if (on) "オン" else "オフ"
     val lights = when (result) {
         is ApiResult.Failed -> return LightsMessage(when (result.error) {
@@ -18,8 +21,17 @@ fun lightsMessage(on: Boolean, result: ApiResult<LightsResult>, host: String, na
         }, failed = true)
         is ApiResult.Ok -> result.value
     }
+    if (!detail) {
+        val left = lights.noResponse + lights.failed + lights.missing.size
+        return when {
+            lights.switched + left == 0 -> LightsMessage("照明が見つかりません", failed = true)
+            left == 0 -> LightsMessage("照明を${verb}にしました", failed = false)
+            lights.switched > 0 -> LightsMessage("一部の照明を${verb}にできませんでした", failed = true)
+            else -> LightsMessage("照明を${verb}にできませんでした", failed = true)
+        }
+    }
     val missing = lights.missing.size.takeIf { it > 0 }?.let { count ->
-        "見つからない${count}台" + if (names) lights.missing.joinToString("、", "（", "）") else ""
+        "見つからない${count}台" + lights.missing.joinToString("、", "（", "）")
     }
     val left = listOfNotNull(
         lights.noResponse.takeIf { it > 0 }?.let { "応答なし${it}台" },
@@ -47,7 +59,8 @@ fun lightsLabel(on: Boolean, result: ApiResult<LightsResult>): LightsMessage {
     val total = lights.switched + lights.noResponse + lights.failed + lights.missing.size
     return when {
         total == 0 -> LightsMessage("照明なし", failed = true)
-        lights.switched == total -> LightsMessage("${total}台${if (on) "オン" else "オフ"}", failed = false)
-        else -> LightsMessage("${lights.switched}/${total}台", failed = true)
+        lights.switched == total -> LightsMessage("${if (on) "オン" else "オフ"}完了", failed = false)
+        lights.switched > 0 -> LightsMessage("一部失敗", failed = true)
+        else -> LightsMessage("失敗", failed = true)
     }
 }

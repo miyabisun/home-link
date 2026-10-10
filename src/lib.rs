@@ -111,6 +111,15 @@ pub fn open_db(path: &str) -> rusqlite::Result<Connection> {
             COMMIT;",
         )?;
     }
+    if version < 4 {
+        // Version 4 lets a light that will never answer be ignored.
+        db.execute_batch(
+            "BEGIN;
+            ALTER TABLE devices ADD COLUMN ignored INTEGER NOT NULL DEFAULT 0;
+            PRAGMA user_version = 4;
+            COMMIT;",
+        )?;
+    }
     Ok(db)
 }
 
@@ -426,6 +435,8 @@ struct Device {
     /// The label whose values the schedule uses for this light.
     label_id: Option<i64>,
     label_name: Option<String>,
+    /// Left out of switching, adjusting and the counts.
+    ignored: bool,
     created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     qr_payload: Option<String>,
@@ -448,7 +459,7 @@ struct DeviceInput {
 }
 
 const DEVICE_SELECT: &str = "SELECT devices.id, room_id, rooms.name, devices.name, created_at,
-    qr_payload, vendor, serial_number, mac, label_id, labels.name
+    qr_payload, vendor, serial_number, mac, label_id, labels.name, ignored
     FROM devices JOIN rooms ON rooms.id = room_id LEFT JOIN labels ON labels.id = label_id";
 
 /// The `qr_payload` column stores either form; a QR payload starts with `MT:`.
@@ -468,6 +479,7 @@ fn device_row(row: &rusqlite::Row, with_payload: bool) -> rusqlite::Result<Devic
         mac: row.get(8)?,
         label_id: row.get(9)?,
         label_name: row.get(10)?,
+        ignored: row.get(11)?,
         created_at: row.get(4)?,
         qr_payload,
         manual_code,
@@ -669,11 +681,13 @@ async fn create_device(
     }
 }
 
-/// A ledger change to a device; `label_id` null removes its label.
+/// A ledger change to a device: the fields given change; `label_id` null removes its label.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DeviceUpdate {
+    #[serde(default)]
     label_id: Option<i64>,
+    ignored: Option<bool>,
 }
 
 async fn update_device(
@@ -681,18 +695,17 @@ async fn update_device(
     Path(id): Path<i64>,
     Json(input): Json<serde_json::Value>,
 ) -> ApiResult<Json<Device>> {
-    // `label_id` must be given: an empty body does not remove the label.
-    let given = input
-        .as_object()
-        .is_some_and(|o| o.contains_key("label_id"));
+    // An empty body does not remove the label, nor does a null `ignored` mean false.
+    let has = |key| input.as_object().is_some_and(|o| o.contains_key(key));
+    let (label_given, ignored_given) = (has("label_id"), has("ignored"));
     let input: DeviceUpdate = serde_json::from_value(input)
         .ok()
-        .filter(|_| given)
+        .filter(|u: &DeviceUpdate| (label_given || ignored_given) && ignored_given == u.ignored.is_some())
         .ok_or_else(|| {
             ApiError(
                 StatusCode::BAD_REQUEST,
                 "invalid_device_update",
-                "変更は {\"label_id\": labelのid} か、nullで外す形で送ってください".into(),
+                "変更は {\"label_id\": labelのidかnull} か {\"ignored\": trueかfalse} の形で送ってください".into(),
             )
         })?;
     let db = db.db.lock().unwrap();
@@ -700,10 +713,18 @@ async fn update_device(
     if let Some(label) = input.label_id {
         find_label(&db, label)?;
     }
-    db.execute(
-        "UPDATE devices SET label_id = ?1 WHERE id = ?2",
-        params![input.label_id, id],
-    )?;
+    if label_given {
+        db.execute(
+            "UPDATE devices SET label_id = ?1 WHERE id = ?2",
+            params![input.label_id, id],
+        )?;
+    }
+    if let Some(ignored) = input.ignored {
+        db.execute(
+            "UPDATE devices SET ignored = ?1 WHERE id = ?2",
+            params![ignored, id],
+        )?;
+    }
     Ok(Json(find_device(&db, id, false)?))
 }
 
@@ -1117,8 +1138,8 @@ struct MissingDevice {
     room_name: String,
 }
 
-/// A light's ledger name (else its product name) and room.
-type LightName = (Option<String>, Option<String>);
+/// A light's ledger name (else its product name), room and whether it is ignored.
+type LightName = (Option<String>, Option<String>, bool);
 
 fn ledger(db: &Connection) -> rusqlite::Result<Vec<Device>> {
     let mut statement = db.prepare(&format!("{DEVICE_SELECT} ORDER BY devices.id"))?;
@@ -1164,16 +1185,17 @@ fn match_ledger(
     let names = lights
         .iter()
         .map(|light| {
-            devices_of(devices, nodes, light)
+            let (name, room) = devices_of(devices, nodes, light)
                 .find(|device| !device.name.is_empty())
                 .map_or((light.product.clone(), None), |device| {
                     (Some(device.name.clone()), Some(device.room_name.clone()))
-                })
+                });
+            (name, room, is_ignored(devices, nodes, light))
         })
         .collect();
     let missing = devices
         .iter()
-        .filter(|device| place(device, nodes).is_none())
+        .filter(|device| !device.ignored && place(device, nodes).is_none())
         .map(|device| MissingDevice {
             id: device.id,
             name: device.name.clone(),
@@ -1181,6 +1203,10 @@ fn match_ledger(
         })
         .collect();
     (names, missing)
+}
+
+fn is_ignored(devices: &[Device], nodes: &[serde_json::Value], light: &matter::Light) -> bool {
+    devices_of(devices, nodes, light).any(|device| device.ignored)
 }
 
 /// Each light with its ledger name (else its product name) and room, and `field`'s value.
@@ -1194,7 +1220,7 @@ fn light_entries(
         .iter()
         .zip(names)
         .zip(values)
-        .map(|((light, (name, room_name)), value)| {
+        .map(|((light, (name, room_name, _)), value)| {
             json!({
                 "node_id": light.node_id,
                 "endpoint": light.endpoint,
@@ -1218,15 +1244,19 @@ async fn light_states(State(state): State<Db>) -> ApiResult<Json<serde_json::Val
         .await
         .map_err(matter_unreachable)?;
     let lights = matter::lights(&nodes);
+    let (names, missing) = match_ledger(&ledger(&state.db.lock().unwrap())?, &nodes, &lights);
     let states: Vec<&str> = lights
         .iter()
-        .map(|light| match (light.reachable, light.on) {
-            (true, Some(true)) => "on",
-            (true, Some(false)) => "off",
-            _ => "no_response",
-        })
+        .zip(&names)
+        .map(
+            |(light, (_, _, ignored))| match (ignored, light.reachable, light.on) {
+                (true, ..) => "ignored",
+                (_, true, Some(true)) => "on",
+                (_, true, Some(false)) => "off",
+                _ => "no_response",
+            },
+        )
         .collect();
-    let (names, missing) = match_ledger(&ledger(&state.db.lock().unwrap())?, &nodes, &lights);
     Ok(Json(json!({
         "on": count(&states, "on"),
         "off": count(&states, "off"),
@@ -1263,8 +1293,15 @@ async fn switch_lights(
         action: if on { "on" } else { "off" }.into(),
         at: schedule::timestamp((state.clock)()),
     };
-    store(&state.db.lock().unwrap(), INTENT, &intent)?;
-    let (nodes, results) = matter::switch(url, on).await.map_err(matter_unreachable)?;
+    let devices = {
+        let db = state.db.lock().unwrap();
+        store(&db, INTENT, &intent)?;
+        ledger(&db)?
+    };
+    let (nodes, results) =
+        matter::switch(url, on, |nodes, light| is_ignored(&devices, nodes, light))
+            .await
+            .map_err(matter_unreachable)?;
     let (lights, outcomes): (Vec<_>, Vec<_>) = results.into_iter().unzip();
     let switched = lights
         .iter()
@@ -1278,9 +1315,10 @@ async fn switch_lights(
             matter::Outcome::Switched => "switched",
             matter::Outcome::NoResponse => "no_response",
             matter::Outcome::Failed => "failed",
+            matter::Outcome::Ignored => "ignored",
         })
         .collect();
-    let (names, missing) = match_ledger(&ledger(&state.db.lock().unwrap())?, &nodes, &lights);
+    let (names, missing) = match_ledger(&devices, &nodes, &lights);
     tracing::info!(
         on,
         switched = count(&outcomes, "switched"),
@@ -1368,6 +1406,9 @@ async fn adjust(state: &AppState, unix: i64, trigger: &'static str, switched_on:
                 (label.map(|l| l.name.clone()), goal)
             };
             matter::tune(url, switched_on, |nodes, light| {
+                if is_ignored(devices, nodes, light) {
+                    return Err(schedule::Skip::Ignored);
+                }
                 let key = (light.node_id, light.endpoint);
                 let last = sent
                     .get(&key)
@@ -1397,19 +1438,21 @@ async fn adjust(state: &AppState, unix: i64, trigger: &'static str, switched_on:
                 .iter()
                 .zip(names)
                 .zip(goals)
-                .map(|(((light, decision), (name, room_name)), (label, goal))| {
-                    let mut entry = json!({
-                        "node_id": light.node_id,
-                        "endpoint": light.endpoint,
-                        "name": name,
-                        "room_name": room_name,
-                        "label": label,
-                        "target_level": goal.0,
-                        "target_kelvin": goal.1,
-                    });
-                    entry["decision"] = decide(&mut memory, light, *decision, &mut entry);
-                    entry
-                })
+                .map(
+                    |(((light, decision), (name, room_name, _)), (label, goal))| {
+                        let mut entry = json!({
+                            "node_id": light.node_id,
+                            "endpoint": light.endpoint,
+                            "name": name,
+                            "room_name": room_name,
+                            "label": label,
+                            "target_level": goal.0,
+                            "target_kelvin": goal.1,
+                        });
+                        entry["decision"] = decide(&mut memory, light, *decision, &mut entry);
+                        entry
+                    },
+                )
                 .collect();
             let sent = entries.iter().filter(|e| e["decision"] == "sent").count();
             tracing::info!(trigger, commands = tuned.commands, sent, "lights adjusted");

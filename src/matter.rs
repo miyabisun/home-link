@@ -164,9 +164,11 @@ pub enum Outcome {
     NoResponse,
     /// matterjs-server answered with an error.
     Failed,
+    /// Ignored in the ledger: nothing sent.
+    Ignored,
 }
 
-/// Sends On or Off to every reachable light and reports each light's outcome,
+/// Sends On or Off to every reachable light but those `ignored` and reports each light's outcome,
 /// with the nodes read in the same session.
 ///
 /// A connection dropped mid-session is opened again and the whole switch
@@ -175,11 +177,16 @@ pub enum Outcome {
 ///
 /// # Errors
 /// Fails when the server cannot be reached or its nodes cannot be read in time.
-pub async fn switch(url: &str, on: bool) -> Result<(Vec<Value>, Vec<(Light, Outcome)>), String> {
+pub async fn switch(
+    url: &str,
+    on: bool,
+    ignored: impl Fn(&[Value], &Light) -> bool,
+) -> Result<(Vec<Value>, Vec<(Light, Outcome)>), String> {
     let deadline = Instant::now() + TIMEOUT;
     let mut ws = connect(url).await?;
     loop {
-        let result = tokio::time::timeout_at(deadline, switch_once(&mut ws, on, deadline)).await;
+        let result =
+            tokio::time::timeout_at(deadline, switch_once(&mut ws, on, deadline, &ignored)).await;
         let _ = ws.close(None).await;
         let Dropped(error) = match result {
             Err(_) => return Err("timed out".into()),
@@ -211,11 +218,19 @@ async fn switch_once(
     ws: &mut Socket,
     on: bool,
     deadline: Instant,
+    ignored: &impl Fn(&[Value], &Light) -> bool,
 ) -> Result<(Vec<Value>, Vec<(Light, Outcome)>), Dropped> {
     let mut nodes = get_nodes(ws).await?;
     let mut results: Vec<_> = lights(&nodes)
         .into_iter()
-        .map(|light| (light, Outcome::NoResponse))
+        .map(|light| {
+            let outcome = if ignored(&nodes, &light) {
+                Outcome::Ignored
+            } else {
+                Outcome::NoResponse
+            };
+            (light, outcome)
+        })
         .collect();
     let command = if on { "On" } else { "Off" };
     let mut awaiting = std::collections::HashSet::new();
