@@ -64,9 +64,11 @@ APKは開発用のdebug署名です。PCからADBで導入する方法と、フ�
 1台でも切り替えられなかった照明があれば、失敗の色で表示します。
 無視の対象にした照明（下の「二度と応答しない照明を無視する」）は、切り替えず、台数にも数えません。
 
-「ホーム画面にボタンを置く」を押すと、同じ2つのボタンのウィジェットをホーム画面へ置けます。
-ウィジェットは横4マス・縦1段で置かれ、横は2マスまで縮められます。
-1段では、押したボタンの文字が数秒だけ結果（「オン完了」「一部失敗」「接続不可」など）に変わります。
+「ホーム画面にボタンを置く」を押すと、同じ2つのボタンに「仕事」「作業」を加えた4つのボタンのウィジェットをホーム画面へ置けます。
+「仕事」はlabel「仕事用デスク」、「作業」はlabel「作業」の照明だけを昼の明るさで点け、もう一度押すと元に戻します
+（下の「labelの照明を明るくする」）。labelはAPIで作って照明に割り当てます。
+ウィジェットは横4マス・縦1段で置かれ、横は約240dp（電話で3マス程度）まで縮められます。
+1段では、押したボタンの文字が数秒だけ結果（「オン完了」「解除完了」「一部失敗」「接続不可」「ラベルなし」「照明なし」など）に変わります。
 縦に広げると、ボタンの下に直前の結果を表示します。ウィジェットは台数を示さず、成功か、切り替えられなかった照明があるかだけを示します。
 
 ### Wi-Fi電球をBluetoothでつなぐ
@@ -139,18 +141,19 @@ matterjs-serverにdatasetが入ると、アプリを変えずに登録できる�
 | `GET /api/devices` | 機器の一覧。コードは含みません | |
 | `POST /api/devices` | 機器の登録 | 400 `invalid_qr_payload`・`invalid_manual_code`・`missing_setup_code`・`invalid_identifier`・`invalid_mac`・`invalid_device_name`、404 `room_not_found`、409 `duplicate_qr_payload`・`duplicate_identifier` |
 | `GET /api/devices/{id}` | 機器1台。登録したコードの全文 `qr_payload` または `manual_code` を含みます | 404 `device_not_found` |
-| `PATCH /api/devices/{id}` | labelの割り当てと無視の設定。本文は送った項目だけを変えます。`{"label_id": 1}`（`null` で外す）、`{"ignored": true}`（`false` で戻す） | 400 `invalid_device_update`、404 `device_not_found`・`label_not_found` |
+| `PATCH /api/devices/{id}` | labelの割り当てと無視の設定。本文は送った項目だけを変えます。`{"label_ids": [1, 2]}`（割り当てを置き換え、`[]` で外す）、`{"ignored": true}`（`false` で戻す） | 400 `invalid_device_update`・`conflicting_labels`、404 `device_not_found`・`label_not_found` |
 | `DELETE /api/devices/{id}` | 機器の削除 | 404 `device_not_found` |
-| `GET /api/labels` | labelの一覧（値と割り当てた機器の台数つき） | |
+| `GET /api/labels` | labelの一覧（値と割り当てた機器の台数、明るくしている最中か `boosted` つき） | |
 | `POST /api/labels` | labelの作成。本文は `{"name": "キッチン", "night_level": 76, "warm_kelvin": 2700}` | 400 `invalid_label_name`・`invalid_label`、409 `duplicate_label_name` |
-| `PATCH /api/labels/{id}` | labelの名前・値のうち、送った項目だけを変更します。`null` の値は全体の設定に戻ります | 400 `invalid_label_name`・`invalid_label`、404 `label_not_found`、409 `duplicate_label_name` |
+| `PATCH /api/labels/{id}` | labelの名前・値のうち、送った項目だけを変更します。`null` の値は全体の設定に戻ります | 400 `invalid_label_name`・`invalid_label`・`conflicting_labels`、404 `label_not_found`、409 `duplicate_label_name` |
 | `DELETE /api/labels/{id}` | labelの削除。割り当てた機器はlabel無しに戻ります | 404 `label_not_found` |
 | `POST /api/commission` | 機器をmatterjs-serverへBluetoothで登録（commissioning）し、台帳に登録 | 400 `missing_setup_code`・`invalid_qr_payload`・`invalid_manual_code`・`invalid_network`・`invalid_wifi`・`invalid_device_name`、404 `room_not_found`、422 `device_not_found`・`wrong_code`・`wifi_failed`・`thread_failed`・`commission_failed`、504 `commission_timeout`、502 `matter_server_unreachable`、503 `matter_server_not_configured`・`bluetooth_unavailable`・`thread_not_ready` |
 | `GET /api/thread` | Thread電球を登録できるか（matterjs-serverがThread網のdatasetを持つか）を `{"ready": true}` で返します | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `GET /api/status` | 台帳の機器ごとに、matterjs-serverで見えるか（`visible`）と今の `node_id`・`endpoint` | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `GET /api/lights` | 照明ごとの今の状態（`on`・`off`・`no_response`・`ignored`）と、無視の照明を除いた件数 | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `POST /api/lights/on` | 無視の照明を除く全部の照明をオンにし、照明ごとの結果（`switched`・`no_response`・`failed`・`ignored`）と、無視の照明を除いた件数を返します | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
-| `POST /api/lights/off` | 全部の照明をオフにします。応答は `on` と同じ形です | 同上 |
+| `POST /api/lights/off` | 全部の照明をオフにし、すべてのlabelの明るくする状態を切ります。応答は `on` と同じ形です | 同上 |
+| `POST /api/lights/boost` | 本文 `{"label": "作業"}` のlabelの照明を明るくする状態を切り替えます。応答は `on` と同じ件数に、`label`・`action`（`boost` か `release`）・`boosted` を加えた形です | 400 `invalid_boost`、404 `label_not_found`、422 `label_has_no_lights`、503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `GET /api/lights/schedule` | 明るさと色温度の自動調整の設定（`settings`）、labelごとの値と割り当てた機器（`labels`）、最後に押された全部オン・全部オフ（`intent`）、直近の調整の記録（`runs`、新しい順に144回分） | |
 | `PUT /api/lights/schedule` | 自動調整の設定のうち、送った項目だけを変更します。応答は `GET` と同じ形です | 400 `invalid_schedule` |
 | `GET /api/health` | 稼働確認と版（`{"status":"ok","version":"0.1.4"}`） | |
@@ -227,7 +230,9 @@ curl -X PATCH http://homeserver:5011/api/devices/7 -H 'content-type: application
 - 日の出・日の入りは `latitude`・`longitude` とAsia/Tokyoの時刻で計算します。既定は東京（新宿）です。
 - 台帳の機器にlabelを割り当てると、その照明はlabelの値（`day_level`・`night_level`・`cool_kelvin`・`warm_kelvin`）で同じ曲線をたどります。
   labelの値が `null` の項目と、時刻（朝の終わり・22時・日の出と日の入りの地点）は全体の設定を使います。
-  1台に割り当てられるlabelは1つで、部屋とは別に持ちます。
+  1台に複数のlabelを割り当てられ、それぞれの値を重ねます。部屋とは別に持ちます。
+  同じ照明の2つのlabelが同じ項目に値を持つと、どちらを使うか決まらないため、その割り当てとlabelの変更は `conflicting_labels` で拒否します。
+  値を持たないlabel（「作業」など）は、ほかのlabelと重ねられます。
   labelの値の範囲は全体の設定と同じで、全体の設定と重ねた結果が `warm_kelvin` ≤ `cool_kelvin` でなければ `invalid_label` で拒否します。
 - 色温度と明るさは、照明ごとに報告された範囲へ収めます。色温度に対応しない照明へは色温度を、調光しない照明へは明るさを送りません。
 - 1回の変化は30秒（`transitionTime` 300）かけて移します。
@@ -257,7 +262,7 @@ curl -X PATCH http://homeserver:5011/api/devices/7 -H 'content-type: application
 
 `runs` は調整ごとに、時刻（`at`）、きっかけ（`trigger`: `scheduled` または `lights_on`）、全体の設定の目標値（`level`・`kelvin`）、
 日の出・日の入り、送った命令の数（`commands`）、照明ごとの判断（`decision`）を持ちます。
-照明ごとに、割り当てたlabelの名前（`label`、無ければ `null`）と、その照明の目標値（`target_level`・`target_kelvin`）も持ちます。
+照明ごとに、割り当てたlabelの名前（`labels`、無ければ `[]`）と、その照明の目標値（`target_level`・`target_kelvin`）も持ちます。
 判断は、送った `sent`、全部オフ中の `all_off`、無効の `disabled`、消えていた `off`、届かない `no_response`、
 エラーが返った `failed`、調光にも色温度にも対応しない `unsupported`、前回と同じ値の `unchanged`、無視の照明の `ignored` です。
 `sent` の照明の `level`・`mireds` は、前回から変わって送った値だけを持ちます。
@@ -266,20 +271,47 @@ curl -X PATCH http://homeserver:5011/api/devices/7 -H 'content-type: application
 ```sh
 curl -X PUT http://homeserver:5011/api/lights/schedule -H 'content-type: application/json' -d '{"enabled":true}'
 # {"settings":{"enabled":true,"latitude":35.6895,"longitude":139.6917,"morning_end_minute":600,"day_level":203,"night_level":102,"warm_kelvin":3000,"cool_kelvin":5000,"late_night_percent":50},
-#  "labels":[{"id":1,"name":"キッチン","day_level":null,"night_level":76,"cool_kelvin":null,"warm_kelvin":2700,
+#  "labels":[{"id":1,"name":"キッチン","day_level":null,"night_level":76,"cool_kelvin":null,"warm_kelvin":2700,"boosted":false,
 #             "devices":[{"id":5,"name":"キッチン1","room_name":"リビング"},…]},…],"intent":{"action":"on","at":"2026-10-05T21:10:00+09:00"},"runs":[…]}
 
 curl http://homeserver:5011/api/lights/schedule
 # {…,"runs":[{"at":"2026-10-05T23:00:00+09:00","trigger":"scheduled","sunrise":"05:39","sunset":"17:23","level":102,"kelvin":3000,"commands":2,
-#   "lights":[{"node_id":1,"endpoint":3,"name":"キッチン1","room_name":"リビング","label":"キッチン","target_level":76,"target_kelvin":2700,
+#   "lights":[{"node_id":1,"endpoint":3,"name":"キッチン1","room_name":"リビング","labels":["キッチン"],"target_level":76,"target_kelvin":2700,
 #              "decision":"sent","level":76,"mireds":370},
-#             {"node_id":5,"endpoint":1,"name":"読書灯","room_name":"寝室","label":null,"target_level":102,"target_kelvin":3000,"decision":"off"},…]},…]}
+#             {"node_id":5,"endpoint":1,"name":"読書灯","room_name":"寝室","labels":[],"target_level":102,"target_kelvin":3000,"decision":"off"},…]},…]}
 
 curl -X POST http://homeserver:5011/api/labels -H 'content-type: application/json' -d '{"name":"キッチン","night_level":76,"warm_kelvin":2700}'
-# 201 {"id":1,"name":"キッチン","day_level":null,"night_level":76,"cool_kelvin":null,"warm_kelvin":2700,"device_count":0}
+# 201 {"id":1,"name":"キッチン","day_level":null,"night_level":76,"cool_kelvin":null,"warm_kelvin":2700,"device_count":0,"boosted":false}
 
-curl -X PATCH http://homeserver:5011/api/devices/5 -H 'content-type: application/json' -d '{"label_id":1}'
-# {"id":5,…,"label_id":1,"label_name":"キッチン",…}
+curl -X PATCH http://homeserver:5011/api/devices/5 -H 'content-type: application/json' -d '{"label_ids":[1]}'
+# {"id":5,…,"labels":[{"id":1,"name":"キッチン"}],…}
+```
+
+0.1.19までの1台1つのlabel（`label_id`）は、更新後の最初の起動でそのまま `labels` へ移ります。
+`PATCH /api/devices/{id}` の `label_id` は廃止し、送ると400 `invalid_device_update` です。
+
+#### labelの照明を明るくする
+
+`POST /api/lights/boost` は、labelの照明を明るくする状態を、押すたびに入れる・切るで切り替えます。
+ウィジェットの「仕事」「作業」がこれを使います。状態はlabelごとにDBへ保存し、再起動しても保ちます。
+
+- 入れると、そのlabelの照明（無視の照明を除く）を、消えていた照明も含めて点け、昼の値にします。
+  昼の値は、その照明のlabelの `day_level`・`cool_kelvin` を重ねた全体の昼の値です。
+  全部オンと同じく、オンの後に `MoveToLevelWithOnOff` と `ExecuteIfOff` 付きの `MoveToColorTemperature` をすぐに送ります。
+  自動調整が無効でも働きます。
+- 入れている間は、自動調整（0時以降の半減を含む）と全部オンが、その照明を昼の値のまま保ちます。
+- もう一度押すと切ります。入れる前に消えていた照明は消し、点いていた照明はその時刻の目標値へ戻します。
+  別の明るくしているlabelにも属する照明は、そのlabelを切るまで昼の値のままです。
+- 全部オフは、すべてのlabelの状態を切ります。
+- 入れたときに1台も点けられなければ、状態は入れません（`boosted` が `false`）。
+- labelが無ければ404 `label_not_found`、無視でない照明が1台も割り当てられていなければ422 `label_has_no_lights` です。
+
+```sh
+curl -X POST http://homeserver:5011/api/labels -H 'content-type: application/json' -d '{"name":"作業"}'
+curl -X PATCH http://homeserver:5011/api/devices/5 -H 'content-type: application/json' -d '{"label_ids":[1,2]}'
+curl -X POST http://homeserver:5011/api/lights/boost -H 'content-type: application/json' -d '{"label":"作業"}'
+# {"label":"作業","action":"boost","boosted":true,"switched":6,"no_response":0,"failed":0,"missing":0,
+#  "lights":[{"node_id":1,"endpoint":3,"name":"キッチン1","room_name":"リビング","result":"switched"},…],"missing_devices":[]}
 ```
 
 以前の版の色温度の下限（`min_kelvin`）は、更新後の最初の起動で、値ごとに `warm_kelvin` だけを持つlabel（`夜3500K` など）へ移り、
@@ -307,7 +339,7 @@ curl -X POST http://homeserver:5011/api/devices -H 'content-type: application/js
 curl -X POST http://homeserver:5011/api/commission -H 'content-type: application/json' \
   -d '{"room_id":2,"qr_payload":"MT:Y.K9042C00KA0648G00","name":"押入れ1","wifi_ssid":"home-2g","wifi_password":"…"}'
 # 201 {"node_id":17,"registered":true,"device":{"id":9,"room_id":2,"room_name":"押入れ","name":"押入れ1","vendor":"Tapo",
-#      "serial_number":"CCBABDE0C244","mac":"CCBABDE0C244","label_id":null,"label_name":null,"created_at":"2026-10-06T03:30:00Z"}}
+#      "serial_number":"CCBABDE0C244","mac":"CCBABDE0C244","labels":[],"created_at":"2026-10-06T03:30:00Z"}}
 # 422 {"error":"wifi_failed","message":"機器がWi-Fi「home-2g」に接続できませんでした"}
 
 curl http://homeserver:5011/api/status

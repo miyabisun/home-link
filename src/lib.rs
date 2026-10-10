@@ -1578,6 +1578,7 @@ async fn boost(
     );
     Ok(Json(json!({
         "label": label.name,
+        "action": if label.was_off.is_some() { "release" } else { "boost" },
         "boosted": boosted,
         "switched": count(&outcomes, "switched"),
         "no_response": count(&outcomes, "no_response"),

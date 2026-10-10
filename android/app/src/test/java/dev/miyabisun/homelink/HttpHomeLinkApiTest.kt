@@ -161,6 +161,28 @@ class HttpHomeLinkApiTest {
         }
     }
 
+    @Test fun togglesALabelsBoostAndCountsEachResult() {
+        respond("/api/lights/boost", 200, """{"label":"作業","action":"boost","boosted":true,"switched":2,"no_response":1,
+            "failed":0,"missing":1,"lights":[],"missing_devices":[{"id":3,"name":"デスク","room_name":"寝室"}]}""")
+        assertEquals(ApiResult.Ok(BoostResult(boost = true, LightsResult(2, 1, 0, listOf("デスク")))), api.toggleBoost("作業"))
+        assertEquals("作業", JSONObject(requests.single().substringAfter("/api/lights/boost ")).getString("label"))
+        respond("/api/lights/boost", 200, """{"label":"作業","action":"release","boosted":false,"switched":2,"no_response":0,
+            "failed":0,"missing":0,"lights":[],"missing_devices":[]}""")
+        assertEquals(ApiResult.Ok(BoostResult(boost = false, LightsResult(2, 0, 0, emptyList()))), api.toggleBoost("作業"))
+    }
+
+    @Test fun mapsBoostFailures() {
+        val cases = listOf(
+            Triple(404, "label_not_found", ApiError.LABEL_NOT_FOUND),
+            Triple(422, "label_has_no_lights", ApiError.LABEL_HAS_NO_LIGHTS),
+            Triple(502, "matter_server_unreachable", ApiError.MATTER_UNREACHABLE),
+        )
+        for ((status, code, expected) in cases) {
+            respond("/api/lights/boost", status, """{"error":"$code"}""")
+            assertEquals("$status $code", ApiResult.Failed(expected), api.toggleBoost("仕事用デスク"))
+        }
+    }
+
     @Test fun reportsAnUnreachableServer() {
         val port = ServerSocket(0).use { it.localPort }
         val offline = HttpHomeLinkApi("http://127.0.0.1:$port")

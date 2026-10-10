@@ -2882,8 +2882,8 @@ async fn boosting_a_label_lights_only_its_lights_at_the_days_values_until_presse
     let (status, body) = boost(&app, "作業").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
-        (&body["label"], &body["boosted"]),
-        (&json!("作業"), &json!(true))
+        (&body["label"], &body["action"], &body["boosted"]),
+        (&json!("作業"), &json!("boost"), &json!(true))
     );
     assert_eq!(
         (
@@ -2999,8 +2999,8 @@ async fn boosting_a_label_lights_only_its_lights_at_the_days_values_until_presse
     let (status, body) = boost(&app, "作業").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
-        (&body["boosted"], &body["switched"]),
-        (&json!(false), &json!(2))
+        (&body["action"], &body["boosted"], &body["switched"]),
+        (&json!("release"), &json!(false), &json!(2))
     );
     assert_eq!(switches(&commands), [(json!(6), json!(1), json!("Off"))]);
     assert_eq!(
@@ -3127,8 +3127,13 @@ async fn a_boost_that_reaches_no_light_is_not_kept() {
     let (status, body) = boost(&app, "作業").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
-        (&body["boosted"], &body["switched"], &body["no_response"]),
-        (&json!(false), &json!(0), &json!(2))
+        (
+            &body["action"],
+            &body["boosted"],
+            &body["switched"],
+            &body["no_response"]
+        ),
+        (&json!("boost"), &json!(false), &json!(0), &json!(2))
     );
     let (_, labels) = call(&app, "GET", "/api/labels", None).await;
     assert_eq!(boosted(&labels)[1], (json!("作業"), json!(false)));

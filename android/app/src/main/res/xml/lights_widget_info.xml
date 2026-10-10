@@ -1,7 +1,7 @@
 <appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
     android:minWidth="250dp" android:minHeight="40dp"
     android:targetCellWidth="4" android:targetCellHeight="1"
-    android:minResizeWidth="110dp" android:minResizeHeight="40dp"
+    android:minResizeWidth="240dp" android:minResizeHeight="40dp"
     android:resizeMode="horizontal|vertical" android:widgetCategory="home_screen"
     android:updatePeriodMillis="0" android:initialLayout="@layout/lights_widget_row"
     android:previewLayout="@layout/lights_widget_row" android:description="@string/widget_description" />

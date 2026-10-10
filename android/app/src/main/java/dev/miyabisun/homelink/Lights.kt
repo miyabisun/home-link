@@ -3,6 +3,9 @@ package dev.miyabisun.homelink
 /** What switching every light did: `missing` names ledger devices matterjs-server does not serve. */
 data class LightsResult(val switched: Int, val noResponse: Int, val failed: Int, val missing: List<String>)
 
+/** What toggling a label's boost did: `boost` when it was boosting rather than releasing. */
+data class BoostResult(val boost: Boolean, val lights: LightsResult)
+
 /** The result line of a switch; `failed` when any light was left behind or the request failed. */
 data class LightsMessage(val text: String, val failed: Boolean)
 
@@ -13,12 +16,7 @@ data class LightsMessage(val text: String, val failed: Boolean)
 fun lightsMessage(on: Boolean, result: ApiResult<LightsResult>, host: String, detail: Boolean): LightsMessage {
     val verb = if (on) "オン" else "オフ"
     val lights = when (result) {
-        is ApiResult.Failed -> return LightsMessage(when (result.error) {
-            ApiError.UNREACHABLE -> "home-link（$host）に接続できません。Tailscaleの接続を確認してください"
-            ApiError.MATTER_UNREACHABLE -> "照明のサーバー（matterjs-server）に接続できません"
-            ApiError.MATTER_NOT_CONFIGURED -> "home-linkに照明のサーバーが設定されていません"
-            else -> "home-linkでエラーが発生しました。時間をおいてお試しください"
-        }, failed = true)
+        is ApiResult.Failed -> return failure(result.error, host)
         is ApiResult.Ok -> result.value
     }
     if (!detail) {
@@ -46,20 +44,66 @@ fun lightsMessage(on: Boolean, result: ApiResult<LightsResult>, host: String, de
     return if (left.isEmpty()) LightsMessage(done, failed = false) else LightsMessage("$done。$left", failed = true)
 }
 
+private fun failure(error: ApiError, host: String) = LightsMessage(when (error) {
+    ApiError.UNREACHABLE -> "home-link（$host）に接続できません。Tailscaleの接続を確認してください"
+    ApiError.MATTER_UNREACHABLE -> "照明のサーバー（matterjs-server）に接続できません"
+    ApiError.MATTER_NOT_CONFIGURED -> "home-linkに照明のサーバーが設定されていません"
+    else -> "home-linkでエラーが発生しました。時間をおいてお試しください"
+}, failed = true)
+
+private fun failureLabel(error: ApiError) = LightsMessage(when (error) {
+    ApiError.UNREACHABLE, ApiError.MATTER_UNREACHABLE -> "接続不可"
+    ApiError.MATTER_NOT_CONFIGURED -> "未設定"
+    ApiError.LABEL_NOT_FOUND -> "ラベルなし"
+    ApiError.LABEL_HAS_NO_LIGHTS -> "照明なし"
+    else -> "エラー"
+}, failed = true)
+
 /** The short label a one-row widget shows on the pressed button; `failed` as in [lightsMessage]. */
 fun lightsLabel(on: Boolean, result: ApiResult<LightsResult>): LightsMessage {
     val lights = when (result) {
-        is ApiResult.Failed -> return LightsMessage(when (result.error) {
-            ApiError.UNREACHABLE, ApiError.MATTER_UNREACHABLE -> "接続不可"
-            ApiError.MATTER_NOT_CONFIGURED -> "未設定"
-            else -> "エラー"
-        }, failed = true)
+        is ApiResult.Failed -> return failureLabel(result.error)
         is ApiResult.Ok -> result.value
     }
     val total = lights.switched + lights.noResponse + lights.failed + lights.missing.size
     return when {
         total == 0 -> LightsMessage("照明なし", failed = true)
         lights.switched == total -> LightsMessage("${if (on) "オン" else "オフ"}完了", failed = false)
+        lights.switched > 0 -> LightsMessage("一部失敗", failed = true)
+        else -> LightsMessage("失敗", failed = true)
+    }
+}
+
+/** Words toggling the boost of `label`'s lights, without counts, as the widget shows it. */
+fun boostMessage(label: String, result: ApiResult<BoostResult>, host: String): LightsMessage {
+    val boost = when (result) {
+        is ApiResult.Failed -> return when (result.error) {
+            ApiError.LABEL_NOT_FOUND -> LightsMessage("label「$label」がありません", failed = true)
+            ApiError.LABEL_HAS_NO_LIGHTS -> LightsMessage("label「$label」に照明がありません", failed = true)
+            else -> failure(result.error, host)
+        }
+        is ApiResult.Ok -> result.value
+    }
+    val lights = boost.lights
+    val left = lights.noResponse + lights.failed + lights.missing.size
+    val (done, undone) = if (boost.boost) "明るくしました" to "明るくできませんでした" else "元に戻しました" to "元に戻せませんでした"
+    return when {
+        left == 0 -> LightsMessage("${label}の照明を$done", failed = false)
+        lights.switched > 0 -> LightsMessage("一部の${label}の照明を$undone", failed = true)
+        else -> LightsMessage("${label}の照明を$undone", failed = true)
+    }
+}
+
+/** The short label a one-row widget shows on a pressed label button: whether it boosted or released. */
+fun boostLabel(result: ApiResult<BoostResult>): LightsMessage {
+    val boost = when (result) {
+        is ApiResult.Failed -> return failureLabel(result.error)
+        is ApiResult.Ok -> result.value
+    }
+    val lights = boost.lights
+    val left = lights.noResponse + lights.failed + lights.missing.size
+    return when {
+        left == 0 -> LightsMessage(if (boost.boost) "オン完了" else "解除完了", failed = false)
         lights.switched > 0 -> LightsMessage("一部失敗", failed = true)
         else -> LightsMessage("失敗", failed = true)
     }

@@ -14,21 +14,29 @@ import android.widget.RemoteViews
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Home-screen buttons that switch every light on or off. One row shows a press's result on the
- * pressed button for a while; a taller widget keeps the last result below the buttons.
+ * Home-screen buttons that switch every light on or off, and boost or release the lights of the
+ * work desk and work labels. One row shows a press's result on the pressed button for a while;
+ * a taller widget keeps the last result below the buttons.
  */
 class LightsWidget : AppWidgetProvider() {
+    /** A widget button: switching every light `on` or off, or toggling the boost of `label`. */
+    private enum class WidgetButton(val id: Int, val action: String, val text: Int, val icon: Int,
+                                    val on: Boolean = false, val label: String? = null) {
+        ON(R.id.light_on, "dev.miyabisun.homelink.LIGHTS_ON", R.string.lights_on, R.drawable.ic_light_on, on = true),
+        OFF(R.id.light_off, "dev.miyabisun.homelink.LIGHTS_OFF", R.string.lights_off, R.drawable.ic_light_off),
+        WORK(R.id.light_work, "dev.miyabisun.homelink.BOOST_WORK", R.string.lights_work, R.drawable.ic_work, label = "仕事用デスク"),
+        TASK(R.id.light_task, "dev.miyabisun.homelink.BOOST_TASK", R.string.lights_task, R.drawable.ic_task, label = "作業"),
+    }
+
     /** The button a widget press went through and its short result; no `label` while sending. */
-    private class Press(val on: Boolean, val label: LightsMessage?)
+    private class Press(val button: WidgetButton, val label: LightsMessage?)
 
     companion object {
-        private const val ACTION_ON = "dev.miyabisun.homelink.LIGHTS_ON"
-        private const val ACTION_OFF = "dev.miyabisun.homelink.LIGHTS_OFF"
         private const val PREFS = "lights_widget"
         /** Above one row of any launcher grid (about 96dp on a phone, 120dp on a tablet), the result line fits below. */
         private const val TALL_DP = 160f
-        /** The width from which a label fits beside its icon (two buttons of about 120dp). */
-        private const val WIDE_DP = 270f
+        /** The width from which a label fits beside its icon (four buttons of about 120dp). */
+        private const val WIDE_DP = 520f
         /** How long one row shows a press's result before its button reads as a button again. */
         private const val LABEL_MS = 5_000L
         private val presses = AtomicInteger()
@@ -73,17 +81,17 @@ class LightsWidget : AppWidgetProvider() {
 
         private fun buttons(context: Context, views: RemoteViews, narrow: Boolean, press: Press?, message: LightsMessage?) {
             val padding = (4 * context.resources.displayMetrics.density).toInt()
-            for (on in listOf(true, false)) {
-                val id = if (on) R.id.light_on else R.id.light_off
-                views.setOnClickPendingIntent(id, action(context, if (on) ACTION_ON else ACTION_OFF))
-                val name = context.getString(if (on) R.string.lights_on else R.string.lights_off)
-                val pressed = press?.takeIf { it.on == on }
+            for (button in WidgetButton.entries) {
+                val id = button.id
+                views.setOnClickPendingIntent(id, action(context, button.action))
+                val name = context.getString(button.text)
+                val pressed = press?.takeIf { it.button == button }
                 val label = pressed?.label
                 views.setTextViewText(id, if (pressed == null) name else label?.text ?: "送信中…")
                 // A resource, not a value, so a widget drawn before the OS switches dark or light follows it.
                 views.setColorStateList(id, "setTextColor", if (label?.failed == true) R.color.danger else R.color.text)
                 val icon = when {
-                    label == null -> if (on) R.drawable.ic_light_on else R.drawable.ic_light_off
+                    label == null -> button.icon
                     label.failed -> R.drawable.ic_error
                     else -> R.drawable.ic_success
                 }
@@ -120,21 +128,29 @@ class LightsWidget : AppWidgetProvider() {
     override fun onUpdate(context: Context, manager: AppWidgetManager, ids: IntArray) = show(context)
 
     override fun onReceive(context: Context, intent: Intent) {
-        val on = when (intent.action) {
-            ACTION_ON -> true
-            ACTION_OFF -> false
-            else -> return super.onReceive(context, intent)
-        }
+        val button = WidgetButton.entries.find { it.action == intent.action }
+            ?: return super.onReceive(context, intent)
+        val label = button.label
         val press = presses.incrementAndGet()
-        show(context, LightsMessage(if (on) "照明をオンにしています…" else "照明をオフにしています…", failed = false),
-            progress = true, Press(on, label = null))
+        val sending = when {
+            label != null -> "${label}の照明を切り替えています…"
+            button.on -> "照明をオンにしています…"
+            else -> "照明をオフにしています…"
+        }
+        show(context, LightsMessage(sending, failed = false), progress = true, Press(button, label = null))
         val pending = goAsync()
         Thread {
             try {
                 val api = MainActivity.apiFactory?.invoke() ?: HttpHomeLinkApi(BuildConfig.HOME_LINK_URL)
                 val host = Uri.parse(BuildConfig.HOME_LINK_URL).authority.orEmpty()
-                val result = api.switchLights(on)
-                show(context, lightsMessage(on, result, host, detail = false), progress = false, Press(on, lightsLabel(on, result)))
+                val (message, short) = if (label != null) {
+                    val result = api.toggleBoost(label)
+                    boostMessage(label, result, host) to boostLabel(result)
+                } else {
+                    val result = api.switchLights(button.on)
+                    lightsMessage(button.on, result, host, detail = false) to lightsLabel(button.on, result)
+                }
+                show(context, message, progress = false, Press(button, short))
                 // The receiver stays alive for the pause: a cached process may be frozen before a later callback.
                 Thread.sleep(LABEL_MS)
                 if (presses.get() == press) show(context)

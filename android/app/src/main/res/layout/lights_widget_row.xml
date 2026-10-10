@@ -7,5 +7,10 @@
         android:layout_marginEnd="8dp" android:text="@string/lights_on"
         android:drawableStart="@drawable/ic_light_on" />
     <Button android:id="@+id/light_off" style="@style/WidgetButton"
-        android:text="@string/lights_off" android:drawableStart="@drawable/ic_light_off" />
+        android:layout_marginEnd="8dp" android:text="@string/lights_off" android:drawableStart="@drawable/ic_light_off" />
+    <Button android:id="@+id/light_work" style="@style/WidgetButton"
+        android:layout_marginEnd="8dp" android:text="@string/lights_work"
+        android:drawableStart="@drawable/ic_work" />
+    <Button android:id="@+id/light_task" style="@style/WidgetButton"
+        android:text="@string/lights_task" android:drawableStart="@drawable/ic_task" />
 </LinearLayout>

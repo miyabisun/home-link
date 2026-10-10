@@ -12,7 +12,7 @@ data class Room(val id: Long, val name: String)
 enum class ApiError { UNREACHABLE, DUPLICATE_QR, ROOM_NOT_FOUND, DUPLICATE_ROOM, INVALID_QR, INVALID_MANUAL, INVALID_NAME,
     MATTER_UNREACHABLE, MATTER_NOT_CONFIGURED, SERVER,
     DEVICE_NOT_FOUND, WRONG_CODE, WIFI_FAILED, COMMISSION_TIMEOUT, COMMISSION_FAILED, BLUETOOTH_UNAVAILABLE, INVALID_WIFI,
-    THREAD_NOT_READY, THREAD_FAILED }
+    THREAD_NOT_READY, THREAD_FAILED, LABEL_NOT_FOUND, LABEL_HAS_NO_LIGHTS }
 
 /** The Wi-Fi network handed to a new device. */
 data class WifiNetwork(val ssid: String, val password: String)
@@ -33,6 +33,8 @@ interface HomeLinkApi {
     fun register(roomId: Long, payload: String, name: String): ApiResult<Unit>
     /** Switches every light matterjs-server serves on or off. */
     fun switchLights(on: Boolean): ApiResult<LightsResult>
+    /** Boosts the lights of the label named `label` to the day's values, or releases them if boosted. */
+    fun toggleBoost(label: String): ApiResult<BoostResult>
     /**
      * Has matterjs-server commission the device behind `payload` over the BLE proxy
      * this phone holds open, onto `wifi` or, when null, onto Thread, and records it.
@@ -79,17 +81,24 @@ class HttpHomeLinkApi(baseUrl: String) : HomeLinkApi {
     }
 
     override fun switchLights(on: Boolean): ApiResult<LightsResult> =
-        call("POST", if (on) "/api/lights/on" else "/api/lights/off", null) { body ->
+        call("POST", if (on) "/api/lights/on" else "/api/lights/off", null) { lights(JSONObject(it)) }
+
+    override fun toggleBoost(label: String): ApiResult<BoostResult> =
+        call("POST", "/api/lights/boost", JSONObject().put("label", label)) { body ->
             val json = JSONObject(body)
-            val missing = json.getJSONArray("missing_devices")
-            LightsResult(
-                json.getInt("switched"), json.getInt("no_response"), json.getInt("failed"),
-                (0 until missing.length()).map { index ->
-                    val device = missing.getJSONObject(index)
-                    device.getString("name").ifEmpty { device.getString("room_name") + "の機器" }
-                },
-            )
+            BoostResult(json.getString("action") == "boost", lights(json))
         }
+
+    private fun lights(json: JSONObject): LightsResult {
+        val missing = json.getJSONArray("missing_devices")
+        return LightsResult(
+            json.getInt("switched"), json.getInt("no_response"), json.getInt("failed"),
+            (0 until missing.length()).map { index ->
+                val device = missing.getJSONObject(index)
+                device.getString("name").ifEmpty { device.getString("room_name") + "の機器" }
+            },
+        )
+    }
 
     private fun room(json: JSONObject) = Room(json.getLong("id"), json.getString("name"))
 
@@ -145,6 +154,8 @@ class HttpHomeLinkApi(baseUrl: String) : HomeLinkApi {
             "invalid_wifi" -> ApiError.INVALID_WIFI
             "thread_not_ready" -> ApiError.THREAD_NOT_READY
             "thread_failed" -> ApiError.THREAD_FAILED
+            "label_not_found" -> ApiError.LABEL_NOT_FOUND
+            "label_has_no_lights" -> ApiError.LABEL_HAS_NO_LIGHTS
             else -> ApiError.SERVER
         }
     }
