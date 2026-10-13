@@ -2,16 +2,18 @@ pub mod commission;
 pub mod matter;
 pub mod onboarding;
 pub mod schedule;
+pub mod sesame;
 
 use std::{
     collections::{HashMap, VecDeque},
+    net::SocketAddr,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{ConnectInfo, Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
@@ -170,8 +172,10 @@ struct AppState {
     sent: Mutex<HashMap<(u64, u16), schedule::Target>>,
     /// How long one commissioning may take, Bluetooth discovery to Wi-Fi join.
     commission_timeout: Duration,
-    /// The current time in Unix seconds for "all on" and its intent.
+    /// The current time in Unix seconds for "all on" and its intent, and for signing an unlock.
     clock: fn() -> i64,
+    /// The front door's SESAME, or why it cannot be unlocked.
+    sesame: Result<sesame::Config, &'static str>,
 }
 
 const COMMISSION_TIMEOUT: Duration = Duration::from_mins(5);
@@ -200,7 +204,20 @@ impl Home {
             sent: Mutex::new(HashMap::new()),
             commission_timeout: COMMISSION_TIMEOUT,
             clock: now,
+            sesame: sesame::Config::new(None, None, None, sesame::API_URL),
         }))
+    }
+
+    /// Sets the SESAME that `POST /api/door/unlock` opens, or why there is none.
+    ///
+    /// # Panics
+    /// Panics once the router or a clone shares this `Home`.
+    #[must_use]
+    pub fn with_sesame(mut self, sesame: Result<sesame::Config, &'static str>) -> Self {
+        Arc::get_mut(&mut self.0)
+            .expect("set before the Home is shared")
+            .sesame = sesame;
+        self
     }
 
     /// Replaces the system clock that "all on" and "all off" read.
@@ -278,6 +295,7 @@ fn router(state: Db) -> Router {
         .route("/lights/off", axum::routing::post(lights_off))
         .route("/lights/boost", axum::routing::post(boost))
         .route("/lights/schedule", get(get_schedule).put(update_schedule))
+        .route("/door/unlock", axum::routing::post(unlock_door))
         .fallback(not_found)
         // ponytail: one connection behind a global lock; a pool if writes ever contend.
         .with_state(state);
@@ -326,6 +344,51 @@ fn clean_name(name: &str, allow_empty: bool) -> Option<String> {
     let name = name.trim();
     let ok = (allow_empty || !name.is_empty()) && name.chars().count() <= MAX_NAME_CHARS;
     ok.then(|| name.to_owned())
+}
+
+/// Unlocks the front door, for tailnet addresses only: the LAN also reaches this
+/// unauthenticated API, and other vendors' devices live there.
+async fn unlock_door(
+    State(state): State<Db>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if !sesame::is_tailnet(peer.ip()) {
+        tracing::warn!(peer = %peer.ip(), "unlock refused outside the tailnet");
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            "not_tailnet",
+            "解錠はtailnetからだけ受け付けます".into(),
+        ));
+    }
+    let config = state.sesame.as_ref().map_err(|message| {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "sesame_not_configured",
+            (*message).into(),
+        )
+    })?;
+    match sesame::unlock(config, (state.clock)()).await {
+        Ok(()) => {
+            tracing::info!(peer = %peer.ip(), "unlock accepted");
+            Ok(Json(json!({ "status": "accepted" })))
+        }
+        Err(sesame::Failure::Rejected(status)) => {
+            tracing::warn!(status, "unlock rejected by CANDY HOUSE");
+            Err(ApiError(
+                StatusCode::BAD_GATEWAY,
+                "sesame_rejected",
+                format!("SESAMEのAPIが解錠を受け付けませんでした（HTTP {status}）"),
+            ))
+        }
+        Err(sesame::Failure::Unreachable(error)) => {
+            tracing::warn!(%error, "CANDY HOUSE unreachable");
+            Err(ApiError(
+                StatusCode::BAD_GATEWAY,
+                "sesame_unreachable",
+                "SESAMEのAPIに接続できませんでした".into(),
+            ))
+        }
+    }
 }
 
 async fn healthz() -> &'static str {

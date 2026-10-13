@@ -26,14 +26,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "matterjs-server"
     );
 
-    let home = home_link::Home::new(db, matter_url.clone());
+    let sesame = home_link::sesame::Config::from_env();
+    match &sesame {
+        Ok(config) => info!(?config, "SESAME"),
+        Err(reason) => info!(reason, "SESAME unlock disabled"),
+    }
+
+    let home = home_link::Home::new(db, matter_url.clone()).with_sesame(sesame);
     if matter_url.is_some() {
         tokio::spawn(home.clone().every_ten_minutes());
     }
 
-    axum::serve(listener, home.router())
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        home.router()
+            .into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     info!("server stopped");
     Ok(())

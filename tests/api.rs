@@ -3138,3 +3138,239 @@ async fn a_boost_that_reaches_no_light_is_not_kept() {
     let (_, labels) = call(&app, "GET", "/api/labels", None).await;
     assert_eq!(boosted(&labels)[1], (json!("作業"), json!(false)));
 }
+
+const SESAME_UUID: &str = "3DE4DE72-AAF9-25C1-8D0F-C9E019BB060C";
+const SESAME_API_KEY: &str = "test-api-key-6f1d2c";
+const SESAME_SECRET: &str = "2b7e151628aed2a6abf7158809cf4f3c";
+const TAILNET: [u8; 4] = [100, 101, 102, 103];
+
+/// One unlock as the fake CANDY HOUSE received it: path, `x-api-key` and JSON body.
+type Received = Arc<Mutex<Vec<(String, String, Value)>>>;
+
+/// A CANDY HOUSE stand-in answering every command with `status`.
+async fn fake_candy_house(status: StatusCode) -> (String, Received) {
+    let received = Received::default();
+    let log = received.clone();
+    let app = Router::new().route(
+        "/api/sesame2/{uuid}/cmd",
+        axum::routing::post(
+            move |uri: axum::http::Uri, headers: axum::http::HeaderMap, body: String| async move {
+                let key = headers["x-api-key"].to_str().unwrap().to_owned();
+                let body = serde_json::from_str(&body).unwrap();
+                log.lock().unwrap().push((uri.path().to_owned(), key, body));
+                status
+            },
+        ),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), received)
+}
+
+fn door_app(sesame: Result<home_link::sesame::Config, &'static str>) -> Router {
+    home_link::Home::new(home_link::open_db(":memory:").unwrap(), None)
+        .with_clock(|| 1_791_856_659)
+        .with_sesame(sesame)
+        .router()
+}
+
+fn sesame_config(api_url: &str) -> Result<home_link::sesame::Config, &'static str> {
+    home_link::sesame::Config::new(
+        Some(SESAME_API_KEY),
+        Some(SESAME_UUID),
+        Some(SESAME_SECRET),
+        api_url,
+    )
+}
+
+async fn unlock_from(app: &Router, ip: impl Into<std::net::IpAddr>) -> (StatusCode, String) {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/door/unlock")
+        .body(Body::empty())
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(axum::extract::ConnectInfo(SocketAddr::new(
+            ip.into(),
+            50_000,
+        )));
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, String::from_utf8(bytes.to_vec()).unwrap())
+}
+
+/// Collects every log line, at every level, written while the guard lives.
+fn capture_logs() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard) {
+    #[derive(Clone)]
+    struct Logs(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Logs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let logs = Arc::new(Mutex::new(Vec::new()));
+    let writer = Logs(logs.clone());
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(move || writer.clone())
+        .finish();
+    (logs, tracing::subscriber::set_default(subscriber))
+}
+
+fn assert_no_keys(text: &str) {
+    assert!(!text.contains(SESAME_API_KEY), "API key leaked: {text}");
+    assert!(
+        !text.to_lowercase().contains(SESAME_SECRET),
+        "secret key leaked: {text}"
+    );
+}
+
+#[tokio::test]
+async fn unlock_sends_a_signed_command_to_candy_house() {
+    let (logs, _guard) = capture_logs();
+    let (api_url, received) = fake_candy_house(StatusCode::OK).await;
+    let app = door_app(sesame_config(&api_url));
+
+    let (status, body) = unlock_from(&app, TAILNET).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap(),
+        json!({ "status": "accepted" })
+    );
+    let (status, _) = unlock_from(
+        &app,
+        "fd7a:115c:a1e0::5".parse::<std::net::IpAddr>().unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let received = received.lock().unwrap().clone();
+    assert_eq!(received.len(), 2);
+    let (path, key, command) = &received[0];
+    assert_eq!(path, &format!("/api/sesame2/{SESAME_UUID}/cmd"));
+    assert_eq!(key, SESAME_API_KEY);
+    // The signature for 1791856659 (bytes 90 cd 6a), computed with `openssl mac ... CMAC`.
+    assert_eq!(
+        command,
+        &json!({ "cmd": 83, "history": "aG9tZS1saW5r", "sign": "48751c14a4d146ec34bfd1d580c74164" })
+    );
+    let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert!(
+        logs.contains("unlock accepted"),
+        "logs were not captured: {logs}"
+    );
+    assert_no_keys(&logs);
+    assert_no_keys(&body);
+}
+
+#[tokio::test]
+async fn unlock_reports_refusals_and_lost_connections_as_failures() {
+    let (logs, _guard) = capture_logs();
+    let (api_url, _) = fake_candy_house(StatusCode::UNAUTHORIZED).await;
+    let (status, body) = unlock_from(&door_app(sesame_config(&api_url)), TAILNET).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    let error: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(error["error"], "sesame_rejected");
+    assert!(error["message"].as_str().unwrap().contains("401"), "{body}");
+    assert_no_keys(&body);
+
+    // Accepts the connection, then drops it without answering.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            drop(socket);
+        }
+    });
+    let (status, body) =
+        unlock_from(&door_app(sesame_config(&format!("http://{addr}"))), TAILNET).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["error"],
+        "sesame_unreachable"
+    );
+    assert_no_keys(&body);
+
+    // Nothing listens there any more.
+    let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = closed.local_addr().unwrap();
+    drop(closed);
+    let (status, body) =
+        unlock_from(&door_app(sesame_config(&format!("http://{addr}"))), TAILNET).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["error"],
+        "sesame_unreachable"
+    );
+
+    let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert!(
+        logs.contains("CANDY HOUSE unreachable"),
+        "logs were not captured: {logs}"
+    );
+    assert_no_keys(&logs);
+}
+
+#[tokio::test]
+async fn unlock_without_settings_says_so_and_leaves_other_apis_working() {
+    let app = door_app(home_link::sesame::Config::new(
+        None,
+        None,
+        None,
+        "http://unused",
+    ));
+    let (status, body) = unlock_from(&app, TAILNET).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    let error: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(error["error"], "sesame_not_configured");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("SESAME_API_KEY"),
+        "{body}"
+    );
+
+    let (status, _) = call(&app, "GET", "/api/rooms", None).await;
+    assert_eq!(status, StatusCode::OK);
+    // The plain app, as built from the environment, has no SESAME either.
+    let (status, _) = unlock_from(&app_unset(), TAILNET).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+fn app_unset() -> Router {
+    home_link::app(home_link::open_db(":memory:").unwrap(), None)
+}
+
+#[tokio::test]
+async fn unlock_is_refused_outside_the_tailnet_before_reaching_candy_house() {
+    let (api_url, received) = fake_candy_house(StatusCode::OK).await;
+    let app = door_app(sesame_config(&api_url));
+    for ip in [
+        "192.168.1.50",
+        "127.0.0.1",
+        "172.17.0.1",
+        "100.128.0.1",
+        "::1",
+        "::ffff:192.168.1.50",
+    ] {
+        let (status, body) = unlock_from(&app, ip.parse::<std::net::IpAddr>().unwrap()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{ip}: {body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap()["error"],
+            "not_tailnet"
+        );
+    }
+    assert!(received.lock().unwrap().is_empty());
+    // Refused even when SESAME is not set up.
+    let (status, _) = unlock_from(&app_unset(), [192, 168, 1, 50]).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
