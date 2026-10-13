@@ -785,7 +785,8 @@ class MainActivity : Activity() {
                 ApiError.INVALID_MANUAL -> "この数字はMatterの機器のコードとして使えません。数字を入力し直してください"
                 ApiError.INVALID_NAME -> "名前は${MAX_NAME}文字以内で入力してください"
                 ApiError.SERVER, ApiError.MATTER_UNREACHABLE, ApiError.MATTER_NOT_CONFIGURED,
-                ApiError.LABEL_NOT_FOUND, ApiError.LABEL_HAS_NO_LIGHTS ->
+                ApiError.LABEL_NOT_FOUND, ApiError.LABEL_HAS_NO_LIGHTS, ApiError.NOT_TAILNET,
+                ApiError.SESAME_NOT_CONFIGURED, ApiError.SESAME_REJECTED, ApiError.SESAME_UNREACHABLE ->
                     "home-linkでエラーが発生しました。時間をおいてお試しください"
                 ApiError.DUPLICATE_ROOM -> null
                 ApiError.DEVICE_NOT_FOUND -> "電球が見つかりませんでした。電球をペアリング待ちにし、" +

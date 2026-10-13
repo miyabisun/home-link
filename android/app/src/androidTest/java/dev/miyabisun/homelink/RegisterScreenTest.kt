@@ -836,6 +836,7 @@ private class FakeApi : HomeLinkApi {
     }
 
     override fun toggleBoost(label: String): ApiResult<BoostResult> = ApiResult.Failed(ApiError.SERVER)
+    override fun unlockDoor(): ApiResult<Unit> = ApiResult.Failed(ApiError.SERVER)
 
     val commissionings: MutableList<Commissioning> = Collections.synchronizedList(mutableListOf())
     @Volatile var commissioned: ApiResult<Commissioned> = ApiResult.Failed(ApiError.SERVER)

@@ -44,7 +44,7 @@ fun lightsMessage(on: Boolean, result: ApiResult<LightsResult>, host: String, de
     return if (left.isEmpty()) LightsMessage(done, failed = false) else LightsMessage("$done。$left", failed = true)
 }
 
-private fun failure(error: ApiError, host: String) = LightsMessage(when (error) {
+internal fun failure(error: ApiError, host: String) = LightsMessage(when (error) {
     ApiError.UNREACHABLE -> "home-link（$host）に接続できません。Tailscaleの接続を確認してください"
     ApiError.MATTER_UNREACHABLE -> "照明のサーバー（matterjs-server）に接続できません"
     ApiError.MATTER_NOT_CONFIGURED -> "home-linkに照明のサーバーが設定されていません"

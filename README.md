@@ -2,6 +2,7 @@
 
 住まいの機器を、部屋と名前で記録するサービスです。
 家じゅうの照明を、Androidのボタン1つで全部オン・全部オフにできます。
+玄関のSESAME 5なども、ホーム画面のボタン1つで家の外から解錠できます（CANDY HOUSEのWeb API経由）。
 電球などに印刷されたMatterのQRコードをAndroidアプリで読み取り、部屋と名前を付けて登録します。
 QRコードが無い機器は、印字された11桁の数字（Matterの手動ペアリングコード）を入力して登録します。
 新しいWi-Fi電球とThread電球（Aqara T2など）は、電話のBluetoothで直接つなぎ、家のWi-FiかThread網とmatterjs-serverへ入れてから台帳に登録できます。
@@ -21,6 +22,11 @@ APIに認証はありません。家庭LANとTailscaleのtailnetなど、信頼�
 インターネットへ直接公開しないでください。
 MatterのQRコードと手動ペアリングコードには、機器のsetup passcodeが含まれます。
 そのためコードの全文は機器1台の取得APIだけが返し、一覧APIとログには出しません。
+
+解錠API（`POST /api/door/unlock`）は、tailnetのアドレス（`100.64.0.0/10` と `fd7a:115c:a1e0::/48`）からだけ受け付けます。
+家庭LANなどほかのアドレスには403を返し、LANにいる他社製の電球などから玄関を開けられないようにしています。
+送信元はTCP接続の相手で判断するため、リバースプロキシやTailscale Serveを前に置くと解錠できません。
+CANDY HOUSEのAPIキーとSESAMEの秘密鍵は、データベース・ログ・応答には出しません。
 
 ## サーバーの起動
 
@@ -43,6 +49,12 @@ curl http://127.0.0.1:5011/healthz
 | `DATABASE_PATH` | `home-link.db`（コンテナでは `/data/home-link.db`） | SQLiteデータベースのファイル。無ければ作成します。 |
 | `LOG_LEVEL` | `info` | `off`・`error`・`warn`・`info`・`debug`・`trace` のいずれか。 |
 | `MATTER_SERVER_URL` | なし | matterjs-serverのWebSocket API（例: `ws://192.168.1.100:5580/ws`）。未設定なら状態API・照明API・機器のBluetooth登録は503を返します。 |
+| `SESAME_API_KEY` | なし | CANDY HOUSEのWeb APIのAPIキー（[CANDY HOUSEのパートナー向けページ](https://partners.candyhouse.co/)で発行）。 |
+| `SESAME_UUID` | なし | 解錠するSESAMEのUUID（SESAMEアプリの機器の画面にあります）。 |
+| `SESAME_SECRET_KEY` | なし | SESAMEの秘密鍵（32桁の16進数）。SESAMEアプリで共有する鍵のQRコードを上のページで読み取ると得られます。 |
+
+`SESAME_` の3つは、解錠APIだけが使います。どれかが無いか形式が違うと、解錠APIは503 `sesame_not_configured` を返し、ほかの機能はそのまま動きます。
+SESAMEはWi-Fiモジュールでインターネットにつながっている必要があります。
 
 ## Androidアプリ
 
@@ -70,6 +82,24 @@ APKは開発用のdebug署名です。PCからADBで導入する方法と、フ�
 ウィジェットは横4マス・縦1段で置かれ、横は約240dp（電話で3マス程度）まで縮められます。
 1段では、押したボタンの文字が数秒だけ結果（「オン完了」「解除完了」「一部失敗」「接続不可」「ラベルなし」「照明なし」など）に変わります。
 縦に広げると、ボタンの下に直前の結果を表示します。ウィジェットは台数を示さず、成功か、切り替えられなかった照明があるかだけを示します。
+
+### 玄関を解錠する
+
+ホーム画面のウィジェットの一覧から、home-linkの「玄関の解錠」（1×1マス）を置きます。
+照明のウィジェットとは別にしてあり、照明のボタンを押し間違えて玄関が開くことはありません。
+ボタンを押すと、home-linkを通じてCANDY HOUSEのWeb APIへ解錠を送ります。施錠のボタンは無いので、閉め忘れはSESAMEのオートロックで防いでください。
+SESAMEアプリの履歴には `home-link` の名前で記録されます。
+
+ボタンの文字は「送信中…」のあと、数秒だけ次の結果に変わります。
+
+| 表示 | 意味 |
+| --- | --- |
+| 受付済み | CANDY HOUSEが解錠の指示を受け付けました。扉が開いたことの確認ではありません |
+| 接続不可 | home-linkに届きません。Tailscaleの接続を確かめてください |
+| tailnet外 | 要求がTailscaleを通っていません |
+| 未設定 | サーバーに `SESAME_` の環境変数がありません |
+| 拒否 | CANDY HOUSEが受け付けませんでした。APIキー・UUID・秘密鍵を確かめてください |
+| API不通 | home-linkからCANDY HOUSEに届きません |
 
 ### Wi-Fi電球をBluetoothでつなぐ
 
@@ -156,6 +186,7 @@ matterjs-serverにdatasetが入ると、アプリを変えずに登録できる�
 | `POST /api/lights/boost` | 本文 `{"label": "作業"}` のlabelの照明を明るくする状態を切り替えます。応答は `on` と同じ件数に、`label`・`action`（`boost` か `release`）・`boosted` を加えた形です | 400 `invalid_boost`、404 `label_not_found`、422 `label_has_no_lights`、503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `GET /api/lights/schedule` | 明るさと色温度の自動調整の設定（`settings`）、labelごとの値と割り当てた機器（`labels`）、最後に押された全部オン・全部オフ（`intent`）、直近の調整の記録（`runs`、新しい順に144回分） | |
 | `PUT /api/lights/schedule` | 自動調整の設定のうち、送った項目だけを変更します。応答は `GET` と同じ形です | 400 `invalid_schedule` |
+| `POST /api/door/unlock` | 玄関のSESAMEの解錠をCANDY HOUSEのWeb APIへ送り、受け付けられたら `{"status":"accepted"}` を返します。tailnetのアドレスからだけ受け付けます | 403 `not_tailnet`、503 `sesame_not_configured`、502 `sesame_rejected`（CANDY HOUSEのHTTPステータスを `message` に含みます）・`sesame_unreachable` |
 | `GET /api/health` | 稼働確認と版（`{"status":"ok","version":"0.1.4"}`） | |
 | `GET /healthz` | 稼働確認（`ok`） | |
 

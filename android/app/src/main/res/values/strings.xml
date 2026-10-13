@@ -6,4 +6,7 @@
     <string name="lights_task">作業</string>
     <string name="widget_name">照明</string>
     <string name="widget_description">家の照明を全部オン・全部オフにし、仕事と作業の照明を明るくします</string>
+    <string name="door_unlock">解錠</string>
+    <string name="door_widget_name">玄関の解錠</string>
+    <string name="door_widget_description">玄関のSESAMEを解錠します。施錠はオートロックに任せます</string>
 </resources>
