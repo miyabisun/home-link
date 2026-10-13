@@ -20,7 +20,7 @@ const INVALID_API_KEY: &str = "SESAME_API_KEYは英数字と記号で設定し�
 const INVALID_UUID: &str = "SESAME_UUIDは英数字とハイフンで設定してください";
 const INVALID_SECRET: &str = "SESAME_SECRET_KEYは32桁の16進数で設定してください";
 
-/// Where and how to reach one SESAME. `Debug` leaves the keys out.
+/// Where and how to reach one SESAME. `Debug` leaves the keys and the UUID out.
 #[derive(Clone)]
 pub struct Config {
     api_key: HeaderValue,
@@ -32,7 +32,6 @@ pub struct Config {
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Config")
-            .field("uuid", &self.uuid)
             .field("api_url", &self.api_url)
             .finish_non_exhaustive()
     }
@@ -279,13 +278,15 @@ mod tests {
             "{:?}",
             Config::new(
                 Some("api-key-value"),
-                Some("uuid"),
+                Some("3DE4DE72-AAF9-25C1-8D0F-C9E019BB060C"),
                 Some("2b7e151628aed2a6abf7158809cf4f3c"),
                 API_URL
             )
             .unwrap()
         );
+        assert!(shown.contains(API_URL), "{shown}");
         assert!(!shown.contains("api-key-value"), "{shown}");
+        assert!(!shown.to_lowercase().contains("3de4de72"), "{shown}");
         assert!(!shown.contains("2b7e") && !shown.contains("43"), "{shown}");
     }
 

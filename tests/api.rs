@@ -3227,6 +3227,10 @@ fn capture_logs() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard) {
 fn assert_no_keys(text: &str) {
     assert!(!text.contains(SESAME_API_KEY), "API key leaked: {text}");
     assert!(
+        !text.to_lowercase().contains(&SESAME_UUID.to_lowercase()),
+        "UUID leaked: {text}"
+    );
+    assert!(
         !text.to_lowercase().contains(SESAME_SECRET),
         "secret key leaked: {text}"
     );
