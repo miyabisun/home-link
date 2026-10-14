@@ -1452,7 +1452,7 @@ struct BoostInput {
 
 /// Toggles the named label's boost. Boosting switches its lights on at the day's values,
 /// those that were off too, and holds them there; releasing switches off those that were
-/// off and returns the others to the clock's values. A light still under another boosted
+/// off and returns the others at once to the clock's values. A light still under another boosted
 /// label is left as it is. A boost that switched no light is not kept.
 #[allow(clippy::too_many_lines)]
 async fn boost(
@@ -1530,7 +1530,7 @@ async fn boost(
         .map_err(matter_unreachable)?;
         let (day, minute) = schedule::local((state.clock)());
         let sun = schedule::sun_times(day, settings.latitude, settings.longitude);
-        let tuned = matter::tune(url, &[], |nodes, light| {
+        let tuned = matter::tune(url, &[], 0, |nodes, light| {
             if of_label(nodes, light) && !held(nodes, light) && !off(nodes, light) {
                 let labels = labels_of(&devices, nodes, light, &labels);
                 let (level, kelvin) = light_goal(&settings, minute, sun, &labels);
@@ -1579,7 +1579,7 @@ async fn boost(
             .filter(|(_, o)| *o == matter::Outcome::Switched)
             .map(|(light, _)| key(light))
             .collect();
-        let tuned = matter::tune(url, &on, |nodes, light| {
+        let tuned = matter::tune(url, &on, matter::TRANSITION, |nodes, light| {
             if of_label(nodes, light) {
                 let labels = labels_of(&devices, nodes, light, &labels);
                 let (level, kelvin) = settings.with_all(labels.iter().map(|l| &l.values)).day();
@@ -1778,7 +1778,7 @@ async fn adjust(state: &AppState, unix: i64, trigger: &'static str, switched_on:
                 let names: Vec<_> = labels.iter().map(|l| l.name.clone()).collect();
                 (names, goal)
             };
-            matter::tune(url, switched_on, |nodes, light| {
+            matter::tune(url, switched_on, matter::TRANSITION, |nodes, light| {
                 if is_ignored(devices, nodes, light) {
                     return Err(schedule::Skip::Ignored);
                 }

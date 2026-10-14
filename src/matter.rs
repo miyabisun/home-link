@@ -326,13 +326,14 @@ pub struct Tuned {
 
 const TUNE_TIMEOUT: Duration = Duration::from_mins(1);
 const REPLY_TIMEOUT: Duration = Duration::from_secs(3);
-/// Each change fades over 30 s (tenths of a second) so a step every ten minutes goes unnoticed.
-const TRANSITION: u16 = 300;
+/// Each scheduled change fades over 30 s (tenths of a second) so a step every ten minutes goes unnoticed.
+pub const TRANSITION: u16 = 300;
 
 /// Reads every light, asks `plan` what to send each given the nodes read, reads the On/Off of each
 /// light to write to again, and sends the level and colour temperature only to
-/// lights read as on. Commands never carry `ExecuteIfOff`, so a light switched
-/// off in between ignores them and stays off.
+/// lights read as on, fading over `transition` tenths of a second. Commands
+/// never carry `ExecuteIfOff`, so a light switched off in between ignores them
+/// and stays off.
 ///
 /// A light in `switched_on`, just switched on, is not read: its On may not be
 /// reported yet. It gets the values at once, lighting it if still off.
@@ -343,11 +344,14 @@ const TRANSITION: u16 = 300;
 pub async fn tune(
     url: &str,
     switched_on: &[(u64, u16)],
+    transition: u16,
     plan: impl Fn(&[Value], &Light) -> Result<Target, Skip>,
 ) -> Result<Tuned, String> {
     tokio::time::timeout(TUNE_TIMEOUT, async {
         let mut ws = connect(url).await?;
-        let result = tune_all(&mut ws, switched_on, plan).await.map_err(|e| e.0);
+        let result = tune_all(&mut ws, switched_on, transition, plan)
+            .await
+            .map_err(|e| e.0);
         let _ = ws.close(None).await;
         result
     })
@@ -358,6 +362,7 @@ pub async fn tune(
 async fn tune_all(
     ws: &mut Socket,
     switched_on: &[(u64, u16)],
+    transition: u16,
     plan: impl Fn(&[Value], &Light) -> Result<Target, Skip>,
 ) -> Result<Tuned, Dropped> {
     let nodes = get_nodes(ws).await?;
@@ -371,7 +376,7 @@ async fn tune_all(
             Err(skip) => Decision::Skipped(skip),
             Ok(target) => {
                 let on = switched_on.contains(&(light.node_id, light.endpoint));
-                tune_one(ws, &light, target, on, &mut tuned.commands).await?
+                tune_one(ws, &light, target, on, transition, &mut tuned.commands).await?
             }
         };
         tuned.lights.push((light, decision));
@@ -385,6 +390,7 @@ async fn tune_one(
     light: &Light,
     target: Target,
     switched_on: bool,
+    transition: u16,
     commands: &mut usize,
 ) -> Result<Decision, Dropped> {
     if !switched_on {
@@ -398,7 +404,7 @@ async fn tune_one(
     let (level_command, transition, options) = if switched_on {
         ("MoveToLevelWithOnOff", 0, 1)
     } else {
-        ("MoveToLevel", TRANSITION, 0)
+        ("MoveToLevel", transition, 0)
     };
     let level = target.level.map(|level| {
         (

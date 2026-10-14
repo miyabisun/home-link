@@ -2798,6 +2798,22 @@ fn at_once(command: &str, cluster: u64, value: u64) -> (Value, Value, Value) {
     (json!(cluster), json!(command), payload)
 }
 
+/// A release's tuning of a light left on: at once, but without `ExecuteIfOff`.
+fn released(level: u64, mireds: u64) -> [(Value, Value, Value); 2] {
+    [
+        (
+            json!(8),
+            json!("MoveToLevel"),
+            json!({ "level": level, "transitionTime": 0, "optionsMask": 0, "optionsOverride": 0 }),
+        ),
+        (
+            json!(768),
+            json!("MoveToColorTemperature"),
+            json!({ "colorTemperatureMireds": mireds, "transitionTime": 0, "optionsMask": 0, "optionsOverride": 0 }),
+        ),
+    ]
+}
+
 /// The commands but On/Off sent to `(node, endpoint)`.
 fn tunings_of(
     commands: &Arc<Mutex<Vec<Value>>>,
@@ -2994,7 +3010,8 @@ async fn boosting_a_label_lights_only_its_lights_at_the_days_values_until_presse
     assert_eq!(t2, [json!(230), json!(200)]);
 
     // Pressed again: the light that was off goes off, the one that was on
-    // returns to the clock's values (キッチン's half night level, 2700 K).
+    // returns at once, without ExecuteIfOff, to the clock's values
+    // (キッチン's half night level, 2700 K).
     commands.lock().unwrap().clear();
     let (status, body) = boost(&app, "作業").await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -3003,13 +3020,7 @@ async fn boosting_a_label_lights_only_its_lights_at_the_days_values_until_presse
         (&json!("release"), &json!(false), &json!(2))
     );
     assert_eq!(switches(&commands), [(json!(6), json!(1), json!("Off"))]);
-    assert_eq!(
-        tunings_of(&commands, 1, 3),
-        [
-            (json!(8), json!("MoveToLevel"), level(38)),
-            (json!(768), json!("MoveToColorTemperature"), mireds(370))
-        ]
-    );
+    assert_eq!(tunings_of(&commands, 1, 3), released(38, 370));
     assert_eq!(tunings_of(&commands, 5, 1), []);
     let (_, labels) = call(&app, "GET", "/api/labels", None).await;
     assert!(boosted(&labels).iter().all(|(_, b)| b == false));
@@ -3035,13 +3046,7 @@ async fn a_light_under_two_boosted_labels_stays_bright_until_both_are_released()
     let (_, body) = boost(&app, "キッチン").await;
     assert_eq!(body["boosted"], false);
     assert_eq!(switches(&commands), []);
-    assert_eq!(
-        tunings_of(&commands, 1, 3),
-        [
-            (json!(8), json!("MoveToLevel"), level(38)),
-            (json!(768), json!("MoveToColorTemperature"), mireds(370))
-        ]
-    );
+    assert_eq!(tunings_of(&commands, 1, 3), released(38, 370));
 }
 
 #[tokio::test]

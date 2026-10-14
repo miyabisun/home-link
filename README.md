@@ -266,7 +266,7 @@ curl -X PATCH http://homeserver:5011/api/devices/7 -H 'content-type: application
   値を持たないlabel（「作業」など）は、ほかのlabelと重ねられます。
   labelの値の範囲は全体の設定と同じで、全体の設定と重ねた結果が `warm_kelvin` ≤ `cool_kelvin` でなければ `invalid_label` で拒否します。
 - 色温度と明るさは、照明ごとに報告された範囲へ収めます。色温度に対応しない照明へは色温度を、調光しない照明へは明るさを送りません。
-- 1回の変化は30秒（`transitionTime` 300）かけて移します。
+- 定時の1回の変化は30秒（`transitionTime` 300）かけて移します。
 - 前回送った値と同じ値は送りません。送った値はメモリだけに持ち、再起動後は改めて送ります。
 
 | 設定 | 既定値 | 内容 |
@@ -331,7 +331,8 @@ curl -X PATCH http://homeserver:5011/api/devices/5 -H 'content-type: application
   全部オンと同じく、オンの後に `MoveToLevelWithOnOff` と `ExecuteIfOff` 付きの `MoveToColorTemperature` をすぐに送ります。
   自動調整が無効でも働きます。
 - 入れている間は、自動調整（0時以降の半減を含む）と全部オンが、その照明を昼の値のまま保ちます。
-- もう一度押すと切ります。入れる前に消えていた照明は消し、点いていた照明はその時刻の目標値へ戻します。
+- もう一度押すと切ります。入れる前に消えていた照明は消し、点いていた照明はその時刻の目標値へすぐ戻します。
+  戻す `MoveToLevel`・`MoveToColorTemperature` は `transitionTime` 0で、`ExecuteIfOff` を付けません（押す間に消された照明は消えたままです）。
   別の明るくしているlabelにも属する照明は、そのlabelを切るまで昼の値のままです。
 - 全部オフは、すべてのlabelの状態を切ります。
 - 入れたときに1台も点けられなければ、状態は入れません（`boosted` が `false`）。
