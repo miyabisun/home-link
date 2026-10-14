@@ -94,8 +94,11 @@ fun boostMessage(label: String, result: ApiResult<BoostResult>, host: String): L
     }
 }
 
-/** The short label a one-row widget shows on a pressed label button: whether it boosted or released. */
-fun boostLabel(result: ApiResult<BoostResult>): LightsMessage {
+/**
+ * The short label a one-row widget shows on a pressed label button when the press fell short;
+ * none on success, as the button then shows the label's new state.
+ */
+fun boostLabel(result: ApiResult<BoostResult>): LightsMessage? {
     val boost = when (result) {
         is ApiResult.Failed -> return failureLabel(result.error)
         is ApiResult.Ok -> result.value
@@ -103,8 +106,39 @@ fun boostLabel(result: ApiResult<BoostResult>): LightsMessage {
     val lights = boost.lights
     val left = lights.noResponse + lights.failed + lights.missing.size
     return when {
-        left == 0 -> LightsMessage(if (boost.boost) "オン完了" else "解除完了", failed = false)
+        left == 0 -> null
         lights.switched > 0 -> LightsMessage("一部失敗", failed = true)
         else -> LightsMessage("失敗", failed = true)
     }
 }
+
+/** How a widget button reads: [Tone.ACTIVE] fills it with the accent, [Tone.FAILED] words it in the failure colour. */
+enum class Tone { PLAIN, ACTIVE, FAILED }
+
+/** The words, icon and tone a widget button shows. */
+data class ButtonFace(val text: String, val icon: Int, val tone: Tone)
+
+/**
+ * The face of the widget button `name` with `icon`: a press's short `label` (keeping `icon` while `sending`),
+ * else "<name>中" with its own icon while the server says its label is `boosted`. An unknown (null)
+ * boost reads as released, so the widget never claims a boost it could not read.
+ */
+fun buttonFace(name: String, icon: Int, boosted: Boolean?, label: LightsMessage?, sending: Boolean = false): ButtonFace = when {
+    label == null -> if (boosted == true) ButtonFace("${name}中", R.drawable.ic_boosted, Tone.ACTIVE) else ButtonFace(name, icon, Tone.PLAIN)
+    sending -> ButtonFace(label.text, icon, Tone.PLAIN)
+    label.failed -> ButtonFace(label.text, R.drawable.ic_error, Tone.FAILED)
+    else -> ButtonFace(label.text, R.drawable.ic_success, Tone.PLAIN)
+}
+
+/**
+ * The boosted labels after a toggle of `label` answered `result`, until the next read: the answer sets that
+ * label alone, and labels never read stay unclaimed rather than shown as boosted.
+ */
+fun boostsAfterToggle(boosted: Set<String>?, label: String, result: ApiResult<BoostResult>): Set<String>? = when (result) {
+    is ApiResult.Failed -> boosted
+    is ApiResult.Ok -> if (result.value.boost) boosted.orEmpty() + label else boosted.orEmpty() - label
+}
+
+/** The boosted labels after switching every light `on` or off answered `result`: all off releases every boost. */
+fun boostsAfterSwitch(boosted: Set<String>?, on: Boolean, result: ApiResult<LightsResult>): Set<String>? =
+    if (!on && result is ApiResult.Ok) emptySet() else boosted

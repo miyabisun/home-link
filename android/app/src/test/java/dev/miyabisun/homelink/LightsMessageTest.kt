@@ -95,9 +95,9 @@ class LightsMessageTest {
             boost(ApiResult.Failed(ApiError.MATTER_UNREACHABLE)))
     }
 
-    @Test fun theOneRowBoostLabelTellsOnFromReleased() {
-        assertEquals(LightsMessage("オン完了", failed = false), boostLabel(ApiResult.Ok(BoostResult(true, all))))
-        assertEquals(LightsMessage("解除完了", failed = false), boostLabel(ApiResult.Ok(BoostResult(false, all))))
+    @Test fun theOneRowBoostLabelShowsNothingOnSuccessSoTheNewStateShows() {
+        assertEquals(null, boostLabel(ApiResult.Ok(BoostResult(true, all))))
+        assertEquals(null, boostLabel(ApiResult.Ok(BoostResult(false, all))))
         assertEquals(LightsMessage("一部失敗", failed = true),
             boostLabel(ApiResult.Ok(BoostResult(true, LightsResult(1, 0, 0, listOf("デスク"))))))
         assertEquals(LightsMessage("失敗", failed = true), boostLabel(ApiResult.Ok(BoostResult(true, LightsResult(0, 2, 0, emptyList())))))
@@ -105,5 +105,44 @@ class LightsMessageTest {
         assertEquals(LightsMessage("照明なし", failed = true), boostLabel(ApiResult.Failed(ApiError.LABEL_HAS_NO_LIGHTS)))
         assertEquals(LightsMessage("接続不可", failed = true), boostLabel(ApiResult.Failed(ApiError.UNREACHABLE)))
         assertEquals(LightsMessage("エラー", failed = true), boostLabel(ApiResult.Failed(ApiError.SERVER)))
+    }
+
+    @Test fun aBoostedLabelButtonReadsAsInEffect() {
+        assertEquals(ButtonFace("作業中", R.drawable.ic_boosted, Tone.ACTIVE),
+            buttonFace("作業", R.drawable.ic_task, boosted = true, label = null))
+        assertEquals(ButtonFace("作業", R.drawable.ic_task, Tone.PLAIN),
+            buttonFace("作業", R.drawable.ic_task, boosted = false, label = null))
+    }
+
+    @Test fun anUnknownBoostNeverReadsAsInEffect() {
+        assertEquals(ButtonFace("仕事", R.drawable.ic_work, Tone.PLAIN),
+            buttonFace("仕事", R.drawable.ic_work, boosted = null, label = null))
+    }
+
+    @Test fun aPressShowsItsProgressThenItsShortResult() {
+        val sending = LightsMessage("送信中…", failed = false)
+        assertEquals(ButtonFace("送信中…", R.drawable.ic_task, Tone.PLAIN),
+            buttonFace("作業", R.drawable.ic_task, boosted = true, label = sending, sending = true))
+        assertEquals(ButtonFace("照明なし", R.drawable.ic_error, Tone.FAILED),
+            buttonFace("仕事", R.drawable.ic_work, boosted = true, label = LightsMessage("照明なし", failed = true)))
+        assertEquals(ButtonFace("オン完了", R.drawable.ic_success, Tone.PLAIN),
+            buttonFace("照明オン", R.drawable.ic_light_on, boosted = null, label = LightsMessage("オン完了", failed = false)))
+    }
+
+    @Test fun aBoostAnswerSetsOnlyItsLabelUntilTheNextRead() {
+        val work = ApiResult.Ok(BoostResult(true, all))
+        assertEquals(setOf("作業", "仕事用デスク"), boostsAfterToggle(setOf("仕事用デスク"), "作業", work))
+        assertEquals(setOf("仕事用デスク"), boostsAfterToggle(setOf("作業", "仕事用デスク"), "作業", ApiResult.Ok(BoostResult(false, all))))
+        assertEquals(setOf("作業"), boostsAfterToggle(null, "作業", work))
+        assertEquals(null, boostsAfterToggle(null, "作業", ApiResult.Failed(ApiError.UNREACHABLE)))
+        assertEquals(setOf("作業"), boostsAfterToggle(setOf("作業"), "作業", ApiResult.Failed(ApiError.LABEL_HAS_NO_LIGHTS)))
+    }
+
+    @Test fun allOffReleasesEveryBoostAndAllOnKeepsThem() {
+        val partial = ApiResult.Ok(LightsResult(1, 1, 0, emptyList()))
+        assertEquals(emptySet<String>(), boostsAfterSwitch(setOf("作業"), on = false, partial))
+        assertEquals(emptySet<String>(), boostsAfterSwitch(null, on = false, partial))
+        assertEquals(setOf("作業"), boostsAfterSwitch(setOf("作業"), on = true, partial))
+        assertEquals(setOf("作業"), boostsAfterSwitch(setOf("作業"), on = false, ApiResult.Failed(ApiError.UNREACHABLE)))
     }
 }

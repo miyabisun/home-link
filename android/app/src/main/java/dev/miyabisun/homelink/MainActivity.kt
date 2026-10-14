@@ -254,7 +254,8 @@ class MainActivity : Activity() {
         lightsResult = null
         render()
         val host = Uri.parse(BuildConfig.HOME_LINK_URL).authority.orEmpty()
-        background(lightsWorker, { api.switchLights(on) }) { result ->
+        // All off releases every boost, so the widget's buttons read the boosts again.
+        background(lightsWorker, { api.switchLights(on).also { LightsWidget.saveBoosts(this, api.boostedLabels()) } }) { result ->
             switching = null
             lightsResult = lightsMessage(on, result, host, detail = true)
             render()

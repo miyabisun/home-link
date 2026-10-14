@@ -36,15 +36,7 @@ class DoorWidget : AppWidgetProvider() {
             views.setOnClickPendingIntent(id, PendingIntent.getBroadcast(
                 context, 0, Intent(context, DoorWidget::class.java).setAction(UNLOCK), PendingIntent.FLAG_IMMUTABLE,
             ))
-            views.setTextViewText(id, label?.text ?: name)
-            // A resource, not a value, so a widget drawn before the OS switches dark or light follows it.
-            views.setColorStateList(id, "setTextColor", if (label?.failed == true) R.color.danger else R.color.text)
-            val icon = when {
-                label == null || sending -> R.drawable.ic_unlock
-                label.failed -> R.drawable.ic_error
-                else -> R.drawable.ic_success
-            }
-            views.setTextViewCompoundDrawablesRelative(id, 0, icon, 0, 0)
+            views.showFace(id, R.id.door_unlock_text, buttonFace(name, R.drawable.ic_unlock, null, label, sending))
             views.setContentDescription(id, if (message == null) name else "$name：$message")
             manager.updateAppWidget(ids, views)
         }

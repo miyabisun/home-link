@@ -36,6 +36,8 @@ interface HomeLinkApi {
     fun switchLights(on: Boolean): ApiResult<LightsResult>
     /** Boosts the lights of the label named `label` to the day's values, or releases them if boosted. */
     fun toggleBoost(label: String): ApiResult<BoostResult>
+    /** The names of the labels whose lights are boosted now. */
+    fun boostedLabels(): ApiResult<Set<String>>
     /**
      * Has matterjs-server commission the device behind `payload` over the BLE proxy
      * this phone holds open, onto `wifi` or, when null, onto Thread, and records it.
@@ -93,6 +95,13 @@ class HttpHomeLinkApi(baseUrl: String) : HomeLinkApi {
             val json = JSONObject(body)
             BoostResult(json.getString("action") == "boost", lights(json))
         }
+
+    // A short wait: the widget reads this within the time a broadcast receiver may run.
+    override fun boostedLabels(): ApiResult<Set<String>> = call("GET", "/api/lights/schedule", null, readTimeout = 3_000) { body ->
+        val labels = JSONObject(body).getJSONArray("labels")
+        (0 until labels.length()).map { labels.getJSONObject(it) }.filter { it.getBoolean("boosted") }
+            .map { it.getString("name") }.toSet()
+    }
 
     private fun lights(json: JSONObject): LightsResult {
         val missing = json.getJSONArray("missing_devices")

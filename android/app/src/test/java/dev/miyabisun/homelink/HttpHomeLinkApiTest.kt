@@ -171,6 +171,15 @@ class HttpHomeLinkApiTest {
         assertEquals(ApiResult.Ok(BoostResult(boost = false, LightsResult(2, 0, 0, emptyList()))), api.toggleBoost("作業"))
     }
 
+    @Test fun readsWhichLabelsAreBoosted() {
+        respond("/api/lights/schedule", 200, """{"settings":{},"intent":null,"runs":[],"labels":[
+            {"id":1,"name":"仕事用デスク","boosted":false,"devices":[]},{"id":2,"name":"作業","boosted":true,"devices":[]}]}""")
+        assertEquals(ApiResult.Ok(setOf("作業")), api.boostedLabels())
+        assertEquals("GET /api/lights/schedule", requests.single())
+        respond("/api/lights/schedule", 500, """{"error":"internal"}""")
+        assertEquals(ApiResult.Failed(ApiError.SERVER), api.boostedLabels())
+    }
+
     @Test fun mapsBoostFailures() {
         val cases = listOf(
             Triple(404, "label_not_found", ApiError.LABEL_NOT_FOUND),
