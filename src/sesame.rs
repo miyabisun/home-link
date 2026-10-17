@@ -1,4 +1,4 @@
-//! Unlocking the front door's SESAME through the CANDY HOUSE Web API and its Wi-Fi module.
+//! Unlocking and locking the front door's SESAME through the CANDY HOUSE Web API and its Wi-Fi module.
 //! The request follows <https://github.com/CANDY-HOUSE/API_document> (`SesameOS3/webapi.md`).
 
 use std::{fmt, net::IpAddr, time::Duration};
@@ -8,8 +8,6 @@ use cmac::{Cmac, Mac};
 use reqwest::header::HeaderValue;
 
 pub const API_URL: &str = "https://app.candyhouse.co";
-/// The command code for unlocking (toggle 88, lock 82, unlock 83).
-const UNLOCK: u8 = 83;
 /// `home-link` in base64, the name the SESAME app shows in its history (21 bytes at most).
 const HISTORY: &str = "aG9tZS1saW5r";
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -86,7 +84,24 @@ fn present(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|v| !v.is_empty())
 }
 
-/// Why an unlock was not accepted.
+/// What to have the SESAME do.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Command {
+    Lock,
+    Unlock,
+}
+
+impl Command {
+    /// The CANDY HOUSE command code (toggle 88, lock 82, unlock 83).
+    const fn code(self) -> u8 {
+        match self {
+            Self::Lock => 82,
+            Self::Unlock => 83,
+        }
+    }
+}
+
+/// Why a command was not accepted.
 #[derive(Debug, PartialEq)]
 pub enum Failure {
     /// CANDY HOUSE answered with this HTTP status.
@@ -95,13 +110,13 @@ pub enum Failure {
     Unreachable(String),
 }
 
-/// Sends the unlock command signed for `unix` seconds; `Ok` once CANDY HOUSE accepts it.
+/// Sends `command` signed for `unix` seconds; `Ok` once CANDY HOUSE accepts it.
 ///
 /// # Errors
 /// [`Failure`] when CANDY HOUSE refuses the command or cannot be reached.
-pub async fn unlock(config: &Config, unix: i64) -> Result<(), Failure> {
+pub async fn send(config: &Config, command: Command, unix: i64) -> Result<(), Failure> {
     let body = serde_json::json!({
-        "cmd": UNLOCK,
+        "cmd": command.code(),
         "history": HISTORY,
         "sign": sign(&config.secret, unix),
     });

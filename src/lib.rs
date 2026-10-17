@@ -172,9 +172,9 @@ struct AppState {
     sent: Mutex<HashMap<(u64, u16), schedule::Target>>,
     /// How long one commissioning may take, Bluetooth discovery to Wi-Fi join.
     commission_timeout: Duration,
-    /// The current time in Unix seconds for "all on" and its intent, and for signing an unlock.
+    /// The current time in Unix seconds for "all on" and its intent, and for signing a door command.
     clock: fn() -> i64,
-    /// The front door's SESAME, or why it cannot be unlocked.
+    /// The front door's SESAME, or why it cannot be unlocked or locked.
     sesame: Result<sesame::Config, &'static str>,
 }
 
@@ -208,7 +208,7 @@ impl Home {
         }))
     }
 
-    /// Sets the SESAME that `POST /api/door/unlock` opens, or why there is none.
+    /// Sets the SESAME that `POST /api/door/unlock` and `/lock` act on, or why there is none.
     ///
     /// # Panics
     /// Panics once the router or a clone shares this `Home`.
@@ -296,6 +296,7 @@ fn router(state: Db) -> Router {
         .route("/lights/boost", axum::routing::post(boost))
         .route("/lights/schedule", get(get_schedule).put(update_schedule))
         .route("/door/unlock", axum::routing::post(unlock_door))
+        .route("/door/lock", axum::routing::post(lock_door))
         .fallback(not_found)
         // ponytail: one connection behind a global lock; a pool if writes ever contend.
         .with_state(state);
@@ -346,18 +347,37 @@ fn clean_name(name: &str, allow_empty: bool) -> Option<String> {
     ok.then(|| name.to_owned())
 }
 
-/// Unlocks the front door, for tailnet addresses only: the LAN also reaches this
-/// unauthenticated API, and other vendors' devices live there.
 async fn unlock_door(
+    state: State<Db>,
+    peer: ConnectInfo<SocketAddr>,
+) -> ApiResult<Json<serde_json::Value>> {
+    door(state, peer, sesame::Command::Unlock).await
+}
+
+async fn lock_door(
+    state: State<Db>,
+    peer: ConnectInfo<SocketAddr>,
+) -> ApiResult<Json<serde_json::Value>> {
+    door(state, peer, sesame::Command::Lock).await
+}
+
+/// Unlocks or locks the front door, for tailnet addresses only: the LAN also reaches this
+/// unauthenticated API, and other vendors' devices live there.
+async fn door(
     State(state): State<Db>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    command: sesame::Command,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let (name, verb) = match command {
+        sesame::Command::Unlock => ("unlock", "解錠"),
+        sesame::Command::Lock => ("lock", "施錠"),
+    };
     if !sesame::is_tailnet(peer.ip()) {
-        tracing::warn!(peer = %peer.ip(), "unlock refused outside the tailnet");
+        tracing::warn!(peer = %peer.ip(), "{name} refused outside the tailnet");
         return Err(ApiError(
             StatusCode::FORBIDDEN,
             "not_tailnet",
-            "解錠はtailnetからだけ受け付けます".into(),
+            format!("{verb}はtailnetからだけ受け付けます"),
         ));
     }
     let config = state.sesame.as_ref().map_err(|message| {
@@ -367,17 +387,17 @@ async fn unlock_door(
             (*message).into(),
         )
     })?;
-    match sesame::unlock(config, (state.clock)()).await {
+    match sesame::send(config, command, (state.clock)()).await {
         Ok(()) => {
-            tracing::info!(peer = %peer.ip(), "unlock accepted");
+            tracing::info!(peer = %peer.ip(), "{name} accepted");
             Ok(Json(json!({ "status": "accepted" })))
         }
         Err(sesame::Failure::Rejected(status)) => {
-            tracing::warn!(status, "unlock rejected by CANDY HOUSE");
+            tracing::warn!(status, "{name} rejected by CANDY HOUSE");
             Err(ApiError(
                 StatusCode::BAD_GATEWAY,
                 "sesame_rejected",
-                format!("SESAMEのAPIが解錠を受け付けませんでした（HTTP {status}）"),
+                format!("SESAMEのAPIが{verb}を受け付けませんでした（HTTP {status}）"),
             ))
         }
         Err(sesame::Failure::Unreachable(error)) => {
