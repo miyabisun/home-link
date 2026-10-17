@@ -78,7 +78,7 @@ class HttpHomeLinkApiTest {
 
     @Test fun commissionsWithTheWifiAndReadsTheLedgerEntry() {
         respond("/api/commission", 201, """{"node_id":17,"registered":true,"device":{"id":9,"room_id":2,
-            "room_name":"押入れ","name":"押入れ1","vendor":"Tapo","serial_number":"CCBABDE0C244","mac":"CCBABDE0C244",
+            "room_name":"押入れ","name":"押入れ1","vendor":"Tapo","serial_number":"AABBCCDDEEFF","mac":"AABBCCDDEEFF",
             "label_id":null,"label_name":null,"created_at":"t"}}""")
         val wifi = WifiNetwork("home-2g", "pass word")
         assertEquals(ApiResult.Ok(Commissioned(true, "押入れ", "押入れ1")),

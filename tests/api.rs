@@ -303,7 +303,7 @@ async fn device_registration_needs_exactly_one_valid_code() {
     }
 }
 
-const TAPO: &str = "CCBABDE0C244";
+const TAPO: &str = "AABBCCDDEEFF";
 
 #[tokio::test]
 async fn devices_register_with_identifiers_and_without_a_code() {
@@ -312,15 +312,15 @@ async fn devices_register_with_identifiers_and_without_a_code() {
     let body = json!({
         "room_id": room,
         "vendor": " Tapo ",
-        "serial_number": " CCBABDE0C244 ",
-        "mac": "cc:ba:bd:e0:c2:44",
+        "serial_number": " AABBCCDDEEFF ",
+        "mac": "aa:bb:cc:dd:ee:ff",
         "name": "天井灯",
     });
     let (status, created) = call(&app, "POST", "/api/devices", Some(body)).await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
     assert_eq!(created["vendor"], "Tapo");
     assert_eq!(created["serial_number"], TAPO);
-    assert_eq!(created["mac"], "CCBABDE0C244");
+    assert_eq!(created["mac"], "AABBCCDDEEFF");
 
     let (_, devices) = call(&app, "GET", "/api/devices", None).await;
     assert_eq!(devices[0]["serial_number"], TAPO);
@@ -351,7 +351,7 @@ async fn device_identifiers_are_validated_and_unique() {
     assert_eq!(post(tapo.clone()).await.0, StatusCode::CREATED);
     for body in [
         json!({ "room_id": room, "vendor": "Tapo", "serial_number": TAPO }),
-        json!({ "room_id": room, "vendor": "Tapo", "serial_number": "OTHER", "mac": "CC-BA-BD-E0-C2-44" }),
+        json!({ "room_id": room, "vendor": "Tapo", "serial_number": "OTHER", "mac": "AA-BB-CC-DD-EE-FF" }),
     ] {
         let (status, error) = post(body.clone()).await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
@@ -370,7 +370,7 @@ async fn device_identifiers_are_validated_and_unique() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert_eq!(error["error"], "invalid_identifier");
     }
-    for mac in ["CCBABDE0C24", "CCBABDE0C24G", "CC:BA:BD:E0:C2:44:00"] {
+    for mac in ["AABBCCDDEEF", "AABBCCDDEEFG", "AA:BB:CC:DD:EE:FF:00"] {
         let body = json!({ "room_id": room, "vendor": "Tapo", "serial_number": "S2", "mac": mac });
         let (status, error) = post(body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{mac}");
@@ -461,7 +461,7 @@ async fn status_locates_ledger_devices_on_the_matter_server() {
     for body in [
         json!({ "room_id": room, "vendor": "Tapo", "serial_number": TAPO, "name": "A" }),
         json!({ "room_id": room, "vendor": "Aqara", "serial_number": "54ef441001372c4c", "name": "B" }),
-        json!({ "room_id": room, "vendor": "Tapo", "serial_number": "CCBABDE0FFFF", "name": "C" }),
+        json!({ "room_id": room, "vendor": "Tapo", "serial_number": "AABBCCDD0000", "name": "C" }),
         json!({ "room_id": room, "manual_code": MANUAL, "name": "D" }),
     ] {
         assert_eq!(
@@ -1812,7 +1812,7 @@ fn commission_body(room: i64) -> Value {
 fn tapo_node() -> Value {
     json!({ "node_id": 17, "available": true, "attributes": {
         "0/40/1": "Tapo", "0/40/15": TAPO, "0/40/3": "Smart Bulb",
-        "0/51/0": [{ "0": "wlan0", "4": "zLq94MJE", "7": 1 }],
+        "0/51/0": [{ "0": "wlan0", "4": "qrvM3e7/", "7": 1 }],
     }})
 }
 
@@ -2560,7 +2560,7 @@ fn opening_a_version_4_ledger_moves_each_lights_label_to_its_labels() {
             INSERT INTO labels (name, night_level, warm_kelvin) VALUES ('キッチン', 76, 2700);
             INSERT INTO labels (name, warm_kelvin) VALUES ('ゲームPC', 3500);
             INSERT INTO devices (id, room_id, vendor, serial_number, mac, name, label_id, ignored) VALUES
-                (3, 1, 'Aqara', 'a', NULL, 'キッチン1', 1, 0), (4, 1, 'Tapo', 'b', 'CCBABDE0C244', 'ゲームPC1', 2, 0),
+                (3, 1, 'Aqara', 'a', NULL, 'キッチン1', 1, 0), (4, 1, 'Tapo', 'b', 'AABBCCDDEEFF', 'ゲームPC1', 2, 0),
                 (5, 1, 'Aqara', 'c', NULL, '消えた灯', NULL, 1);",
         )
         .unwrap();
@@ -2589,7 +2589,7 @@ fn opening_a_version_4_ledger_moves_each_lights_label_to_its_labels() {
             kept,
             [
                 ("キッチン1".into(), None, false),
-                ("ゲームPC1".into(), Some("CCBABDE0C244".into()), false),
+                ("ゲームPC1".into(), Some("AABBCCDDEEFF".into()), false),
                 ("消えた灯".into(), None, true),
             ]
         );

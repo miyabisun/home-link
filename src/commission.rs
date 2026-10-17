@@ -326,11 +326,11 @@ mod tests {
         // General Diagnostics NetworkInterfaces: Thread first, then Wi-Fi (type 1).
         let attributes = json!({ "0/51/0": [
             { "0": "thread0", "4": "AAECAwQFBgc=", "7": 4 },
-            { "0": "wlan0", "4": "zLq94MJE", "7": 1 },
+            { "0": "wlan0", "4": "qrvM3e7/", "7": 1 },
         ]});
-        assert_eq!(wifi_mac(&attributes), Some("CCBABDE0C244".into()));
+        assert_eq!(wifi_mac(&attributes), Some("AABBCCDDEEFF".into()));
         assert_eq!(
-            wifi_mac(&json!({ "0/51/0": [{ "4": "zLq94MJE", "7": 2 }] })),
+            wifi_mac(&json!({ "0/51/0": [{ "4": "qrvM3e7/", "7": 2 }] })),
             None
         );
         assert_eq!(
@@ -342,10 +342,10 @@ mod tests {
 
     #[test]
     fn identity_is_the_basic_information_vendor_and_serial() {
-        let attributes = json!({ "0/40/1": "Tapo", "0/40/15": "CCBABDE0C244" });
+        let attributes = json!({ "0/40/1": "Tapo", "0/40/15": "AABBCCDDEEFF" });
         assert_eq!(
             identity(&attributes),
-            Some(("Tapo".into(), "CCBABDE0C244".into()))
+            Some(("Tapo".into(), "AABBCCDDEEFF".into()))
         );
         assert_eq!(identity(&json!({ "0/40/1": "Tapo", "0/40/15": " " })), None);
         assert_eq!(identity(&json!({ "0/40/15": "S" })), None);

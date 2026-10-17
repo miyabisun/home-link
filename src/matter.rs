@@ -560,7 +560,7 @@ mod tests {
                 "2/57/1": "Aqara", "2/57/15": "54ef44100126e0a6",
                 "3/57/1": "Aqara", "3/57/15": "54ef441001372c4c",
             }}),
-            json!({ "node_id": 5, "attributes": { "0/40/1": "Tapo", "0/40/15": "CCBABDE0C244" }}),
+            json!({ "node_id": 5, "attributes": { "0/40/1": "Tapo", "0/40/15": "AABBCCDDEEFF" }}),
             json!({ "node_id": 16, "attributes": {
                 "0/40/1": "Uascent", "0/40/15": "U20251209000001453",
             }}),
@@ -569,7 +569,7 @@ mod tests {
 
     #[test]
     fn locates_root_devices_by_basic_information() {
-        assert_eq!(locate(&nodes(), "Tapo", "CCBABDE0C244"), Some((5, 0)));
+        assert_eq!(locate(&nodes(), "Tapo", "AABBCCDDEEFF"), Some((5, 0)));
         assert_eq!(
             locate(&nodes(), "Uascent", "U20251209000001453"),
             Some((16, 0))
@@ -584,8 +584,8 @@ mod tests {
 
     #[test]
     fn unseen_or_other_vendor_serials_are_not_located() {
-        assert_eq!(locate(&nodes(), "Tapo", "CCBABDE0FFFF"), None);
-        assert_eq!(locate(&nodes(), "Aqara", "CCBABDE0C244"), None);
+        assert_eq!(locate(&nodes(), "Tapo", "AABBCCDD0000"), None);
+        assert_eq!(locate(&nodes(), "Aqara", "AABBCCDDEEFF"), None);
         // A serial number on another cluster's attribute is not an identity.
         let other = vec![json!({ "node_id": 2, "attributes": { "1/6/15": "X", "1/6/1": "V" }})];
         assert_eq!(locate(&other, "V", "X"), None);
