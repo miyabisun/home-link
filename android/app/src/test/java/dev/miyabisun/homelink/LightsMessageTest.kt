@@ -5,7 +5,7 @@ import org.junit.Test
 
 class LightsMessageTest {
     private fun message(on: Boolean, result: ApiResult<LightsResult>, detail: Boolean = true) =
-        lightsMessage(on, result, "homeserver:5011", detail)
+        lightsMessage(on, result, "home-link.example:5011", detail)
 
     @Test fun allSwitchedIsASuccess() {
         assertEquals(LightsMessage("照明を11台オンにしました", failed = false),
@@ -42,8 +42,10 @@ class LightsMessageTest {
     }
 
     @Test fun failuresNameWhatToCheck() {
-        assertEquals(LightsMessage("home-link（homeserver:5011）に接続できません。Tailscaleの接続を確認してください", failed = true),
+        assertEquals(LightsMessage("home-link（home-link.example:5011）に接続できません。接続先の設定と通信を確かめてください", failed = true),
             message(true, ApiResult.Failed(ApiError.UNREACHABLE)))
+        assertEquals(LightsMessage("接続先が未設定です。アプリの「接続先の設定」でhome-linkのURLを入れてください", failed = true),
+            message(true, ApiResult.Failed(ApiError.NOT_CONFIGURED)))
         assertEquals(LightsMessage("照明のサーバー（matterjs-server）に接続できません", failed = true),
             message(true, ApiResult.Failed(ApiError.MATTER_UNREACHABLE)))
         assertEquals(LightsMessage("home-linkに照明のサーバーが設定されていません", failed = true),
@@ -66,11 +68,12 @@ class LightsMessageTest {
         assertEquals(LightsMessage("接続不可", failed = true), lightsLabel(true, ApiResult.Failed(ApiError.UNREACHABLE)))
         assertEquals(LightsMessage("接続不可", failed = true), lightsLabel(true, ApiResult.Failed(ApiError.MATTER_UNREACHABLE)))
         assertEquals(LightsMessage("未設定", failed = true), lightsLabel(false, ApiResult.Failed(ApiError.MATTER_NOT_CONFIGURED)))
+        assertEquals(LightsMessage("接続先未設定", failed = true), lightsLabel(true, ApiResult.Failed(ApiError.NOT_CONFIGURED)))
         assertEquals(LightsMessage("エラー", failed = true), lightsLabel(false, ApiResult.Failed(ApiError.SERVER)))
     }
 
     private val all = LightsResult(2, 0, 0, emptyList())
-    private fun boost(result: ApiResult<BoostResult>) = boostMessage("作業", result, "homeserver:5011")
+    private fun boost(result: ApiResult<BoostResult>) = boostMessage("作業", result, "home-link.example:5011")
 
     @Test fun aBoostIsToldFromARelease() {
         assertEquals(LightsMessage("作業の照明を明るくしました", failed = false), boost(ApiResult.Ok(BoostResult(true, all))))
@@ -89,7 +92,7 @@ class LightsMessageTest {
         assertEquals(LightsMessage("label「作業」がありません", failed = true), boost(ApiResult.Failed(ApiError.LABEL_NOT_FOUND)))
         assertEquals(LightsMessage("label「作業」に照明がありません", failed = true),
             boost(ApiResult.Failed(ApiError.LABEL_HAS_NO_LIGHTS)))
-        assertEquals(LightsMessage("home-link（homeserver:5011）に接続できません。Tailscaleの接続を確認してください", failed = true),
+        assertEquals(LightsMessage("home-link（home-link.example:5011）に接続できません。接続先の設定と通信を確かめてください", failed = true),
             boost(ApiResult.Failed(ApiError.UNREACHABLE)))
         assertEquals(LightsMessage("照明のサーバー（matterjs-server）に接続できません", failed = true),
             boost(ApiResult.Failed(ApiError.MATTER_UNREACHABLE)))

@@ -13,7 +13,6 @@ import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.LayerDrawable
 import android.graphics.drawable.RippleDrawable
 import android.graphics.drawable.StateListDrawable
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.text.Editable
@@ -84,7 +83,12 @@ class MainActivity : Activity() {
     private var addingWifi = false
     private var checkingThread = false
 
+    /** The home-link URL the rooms were last read from; another after the settings reads them again. */
+    private var loadedUrl: String? = null
+    private var endpoints = Endpoints()
+
     private lateinit var content: LinearLayout
+    private lateinit var endpointNotice: LinearLayout
     private lateinit var wifiTab: RadioButton
     private lateinit var threadTab: RadioButton
     private lateinit var bluetoothChoice: RadioButton
@@ -136,7 +140,9 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        api = apiFactory?.invoke() ?: HttpHomeLinkApi(BuildConfig.HOME_LINK_URL)
+        api = homeLinkApi(this)
+        endpoints = Endpoints.load(this)
+        loadedUrl = endpoints.homeLinkUrl
         scanner = scannerFactory?.invoke(this) ?: GmsQrScanner(this)
         wifiStore = wifiStoreFactory?.invoke(this) ?: KeystoreWifiStore(this)
         wifiReader = wifiReaderFactory?.invoke(this) ?: AndroidWifiReader(this)
@@ -200,6 +206,13 @@ class MainActivity : Activity() {
         val manager = AppWidgetManager.getInstance(this)
         canPinWidget = manager.isRequestPinAppWidgetSupported &&
             manager.getAppWidgetIds(ComponentName(this, LightsWidget::class.java)).isEmpty()
+        // The settings screen or `adb push` may have changed the endpoints meanwhile.
+        endpoints = Endpoints.load(this)
+        if (endpoints.homeLinkUrl != loadedUrl) {
+            loadedUrl = endpoints.homeLinkUrl
+            loadRooms()
+            if (form.thread) checkThread()
+        }
         render()
     }
 
@@ -253,7 +266,7 @@ class MainActivity : Activity() {
         switching = on
         lightsResult = null
         render()
-        val host = Uri.parse(BuildConfig.HOME_LINK_URL).authority.orEmpty()
+        val host = homeLinkHost(this)
         // All off releases every boost, so the widget's buttons read the boosts again.
         background(lightsWorker, { api.switchLights(on).also { LightsWidget.saveBoosts(this, api.boostedLabels()) } }) { result ->
             switching = null
@@ -419,9 +432,14 @@ class MainActivity : Activity() {
         // Thread bulbs take the network matterjs-server holds; only Wi-Fi bulbs need one handed over.
         val wifi = if (form.thread) null else form.wifi ?: return
         val name = form.name.trim()
+        endpoints = Endpoints.load(this)
+        val proxy = endpoints.bleProxyUrl ?: run {
+            form.bleFailed(BleProblem.PROXY_NOT_CONFIGURED)
+            return render()
+        }
+        val link = linkFactory?.invoke(this) ?: ProxyLink(applicationContext, proxy)
         form.busy = true
         form.status = null
-        val link = linkFactory?.invoke(this) ?: ProxyLink(applicationContext, BuildConfig.BLE_PROXY_URL)
         CommissionSession.start(link) { api.commission(roomId, payload, name, wifi) }
         form.stage = CommissionSession.stage
         render()
@@ -480,22 +498,13 @@ class MainActivity : Activity() {
     }
 
     private fun build() {
-        val scroll = ScrollView(this).apply {
-            setBackgroundColor(getColor(R.color.background))
-            isFillViewport = true
-            setOnApplyWindowInsetsListener { view, insets ->
-                val bars = insets.getInsets(WindowInsets.Type.systemBars() or
-                    WindowInsets.Type.displayCutout() or WindowInsets.Type.ime())
-                view.setPadding(bars.left, bars.top, bars.right, bars.bottom)
-                insets
-            }
-        }
-        content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(16), dp(16), dp(24))
-        }
-        scroll.addView(content)
-        setContentView(scroll)
+        content = page()
+
+        // Until home-link's URL is set, nothing can be sent: the way to set it comes first.
+        endpointNotice = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        content.addView(endpointNotice, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(16) })
+        ResultRow(this, endpointNotice, 0).show("接続先が未設定です。home-linkのURLを設定してください", failed = true)
+        button(endpointNotice, "接続先を設定", icon = R.drawable.ic_settings) { openSettings() }
 
         label(content, "照明", 28, bold = true)
         val lights = panel()
@@ -503,7 +512,7 @@ class MainActivity : Activity() {
         lights.addView(lightActions, LinearLayout.LayoutParams(-1, -2))
         lightsOnButton = button(lightActions, "照明オン", icon = R.drawable.ic_light_on, weight = true) { switchLights(true) }
         lightsOffButton = button(lightActions, "照明オフ", icon = R.drawable.ic_light_off, weight = true) { switchLights(false) }
-        lightsRow = ResultRow(lights, dp(8))
+        lightsRow = ResultRow(this, lights, dp(8))
         pinButton = button(lights, "ホーム画面にボタンを置く", icon = R.drawable.ic_widget) { pinWidget() }
 
         label(content, "機器を登録", 28, bold = true).apply {
@@ -636,13 +645,19 @@ class MainActivity : Activity() {
         nameField.hint = "空欄でも登録できます"
         nameField.addTextChangedListener(changed { form.name = it })
 
-        resultRow = ResultRow(content, dp(16))
+        resultRow = ResultRow(this, content, dp(16))
         reconnectButton = button(content, "再接続") { loadRooms() }
         registerButton = button(content, "登録", primary = true) { register() }
+        button(content, "接続先の設定", icon = R.drawable.ic_settings) { openSettings() }.apply {
+            (layoutParams as LinearLayout.LayoutParams).topMargin = dp(24)
+        }
         render()
     }
 
+    private fun openSettings() = startActivity(Intent(this, SettingsActivity::class.java))
+
     private fun render() {
+        endpointNotice.visibility = if (endpoints.homeLinkUrl == null) View.VISIBLE else View.GONE
         val busy = switching != null
         lightsOnButton.isEnabled = !busy
         lightsOffButton.isEnabled = !busy
@@ -771,22 +786,23 @@ class MainActivity : Activity() {
                 BleProblem.PERMISSION -> "Bluetoothで電球を探すには「付近のデバイス」の許可が必要です。" +
                     "許可してから「登録」を押し直してください"
                 BleProblem.BLUETOOTH_OFF -> "Bluetoothがオフです。オンにしてから「登録」を押し直してください"
-                BleProblem.PROXY_UNREACHABLE -> "matterjs-server（${Uri.parse(BuildConfig.BLE_PROXY_URL).authority}）に" +
+                BleProblem.PROXY_NOT_CONFIGURED -> "matterjs-serverのBLE Proxyの接続先が未設定です。「接続先の設定」で入れてください"
+                BleProblem.PROXY_UNREACHABLE -> "matterjs-server（${authority(endpoints.bleProxyUrl)}）に" +
                     "接続できません。家のWi-Fiにつないでから、もう一度お試しください"
                 BleProblem.PROXY_VERSION -> "matterjs-serverのBluetooth中継の版が合いません。アプリを更新してください"
             }
             is Status.Registered -> if (status.name.isEmpty()) "${status.room}に機器を登録しました"
                 else "${status.room}に「${status.name}」を登録しました"
             is Status.Failed -> when (status.error) {
-                ApiError.UNREACHABLE, ApiError.TIMEOUT -> "home-link（${Uri.parse(BuildConfig.HOME_LINK_URL).authority}）に接続できません。" +
-                    "Tailscaleの接続を確認してください"
+                ApiError.NOT_CONFIGURED -> NOT_CONFIGURED
+                ApiError.UNREACHABLE, ApiError.TIMEOUT -> "home-link（${authority(endpoints.homeLinkUrl)}）に接続できません。$CHECK_ENDPOINT"
                 ApiError.DUPLICATE_QR -> "この機器は登録済みです"
                 ApiError.ROOM_NOT_FOUND -> "選んだ部屋が見つかりません。部屋を選び直してください"
                 ApiError.INVALID_QR -> "MatterのQRコードとして読み取れませんでした。読み取り直してください"
                 ApiError.INVALID_MANUAL -> "この数字はMatterの機器のコードとして使えません。数字を入力し直してください"
                 ApiError.INVALID_NAME -> "名前は${MAX_NAME}文字以内で入力してください"
                 ApiError.SERVER, ApiError.MATTER_UNREACHABLE, ApiError.MATTER_NOT_CONFIGURED,
-                ApiError.LABEL_NOT_FOUND, ApiError.LABEL_HAS_NO_LIGHTS, ApiError.NOT_TAILNET,
+                ApiError.LABEL_NOT_FOUND, ApiError.LABEL_HAS_NO_LIGHTS,
                 ApiError.SESAME_NOT_CONFIGURED, ApiError.SESAME_REJECTED, ApiError.SESAME_UNREACHABLE ->
                     "home-linkでエラーが発生しました。時間をおいてお試しください"
                 ApiError.DUPLICATE_ROOM -> null
@@ -892,128 +908,11 @@ class MainActivity : Activity() {
         group.addView(this, RadioGroup.LayoutParams(-1, -2))
     }
 
-    /** A result line: an icon and text on a surface that turns to the failure colors. */
-    private inner class ResultRow(parent: LinearLayout, top: Int) {
-        private val panel = LinearLayout(this@MainActivity).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(12), dp(8), dp(12), dp(8))
-            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
-            parent.addView(this, LinearLayout.LayoutParams(-1, -2).apply { topMargin = top })
-        }
-        private val icon = ImageView(this@MainActivity).apply {
-            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
-            panel.addView(this, LinearLayout.LayoutParams(dp(24), dp(24)).apply { marginEnd = dp(8) })
-        }
-        private val text = TextView(this@MainActivity).apply {
-            textSize = 16f
-            setTextColor(getColor(R.color.text))
-            panel.addView(this, LinearLayout.LayoutParams(0, -2, 1f))
-        }
-
-        fun show(message: String?, failed: Boolean, progress: Int = 0) {
-            panel.visibility = if (message == null) View.GONE else View.VISIBLE
-            if (message == null) return
-            text.text = message
-            icon.setImageResource(when {
-                progress != 0 -> progress
-                failed -> R.drawable.ic_error
-                else -> R.drawable.ic_success
-            })
-            panel.background = GradientDrawable().apply {
-                setColor(getColor(if (failed) R.color.danger_subtle else R.color.surface))
-                cornerRadius = dp(8).toFloat()
-                setStroke(dp(1), getColor(if (failed) R.color.danger else R.color.border))
-            }
-        }
-    }
+    private fun panel() = panel(content)
 
     /** Shows only the start of the code: both forms carry the setup passcode. */
     private fun preview(payload: String) =
         if (payload.startsWith("MT:")) payload.take(8) + "…" else payload.take(4) + " …"
 
-    private fun show(view: TextView, text: String?, failure: Boolean = true) {
-        view.text = text.orEmpty()
-        view.visibility = if (text == null) View.GONE else View.VISIBLE
-        view.setTextColor(getColor(if (failure) R.color.danger else R.color.text))
-    }
 
-    private fun changed(update: (String) -> Unit) = object : TextWatcher {
-        override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
-        override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
-        override fun afterTextChanged(s: Editable?) = update(s.toString())
-    }
-
-    private fun panel(): LinearLayout = LinearLayout(this).apply {
-        orientation = LinearLayout.VERTICAL
-        background = surface(R.color.surface)
-        setPadding(dp(12), dp(8), dp(12), dp(12))
-        content.addView(this, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
-    }
-
-    private fun surface(color: Int) = GradientDrawable().apply {
-        setColor(getColor(color))
-        cornerRadius = dp(8).toFloat()
-        setStroke(dp(1), getColor(R.color.border))
-    }
-
-    private fun label(parent: LinearLayout, value: String, size: Int, bold: Boolean = false,
-                      muted: Boolean = false): TextView = TextView(this).apply {
-        text = value
-        textSize = size.toFloat()
-        setTextColor(getColor(if (muted) R.color.muted else R.color.text))
-        setPadding(0, dp(4), 0, dp(4))
-        if (bold) typeface = Typeface.DEFAULT_BOLD
-        parent.addView(this)
-    }
-
-    private fun message(parent: LinearLayout): TextView = label(parent, "", 14).apply {
-        accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
-        visibility = View.GONE
-    }
-
-    private fun field(parent: LinearLayout, description: String, action: Int, submit: () -> Unit): EditText =
-        EditText(this).apply {
-            textSize = 16f
-            contentDescription = description
-            inputType = InputType.TYPE_CLASS_TEXT
-            imeOptions = action
-            filters = arrayOf(InputFilter.LengthFilter(MAX_NAME))
-            minHeight = dp(48)
-            setTextColor(getColor(R.color.text))
-            setHintTextColor(getColor(R.color.muted))
-            background = surface(R.color.background)
-            setPadding(dp(12), dp(8), dp(12), dp(8))
-            setOnEditorActionListener { _, id, _ -> (id == action).also { if (it) submit() } }
-            parent.addView(this, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
-        }
-
-    private fun button(parent: LinearLayout, value: String, primary: Boolean = false, icon: Int = 0,
-                       weight: Boolean = false, action: () -> Unit): Button = Button(this).apply {
-        text = value
-        textSize = 16f
-        isAllCaps = false
-        setSingleLine(false)
-        minHeight = dp(48)
-        gravity = Gravity.CENTER
-        stateListAnimator = null
-        val fill = if (!primary) surface(R.color.surface) else StateListDrawable().apply {
-            addState(intArrayOf(-android.R.attr.state_enabled), surface(R.color.surface))
-            addState(intArrayOf(), surface(R.color.accent).apply { setStroke(0, 0) })
-        }
-        background = RippleDrawable(ColorStateList.valueOf(getColor(R.color.border)), fill, null)
-        setTextColor(ColorStateList(arrayOf(intArrayOf(-android.R.attr.state_enabled), intArrayOf()),
-            intArrayOf(getColor(R.color.muted), getColor(if (primary) R.color.on_accent else R.color.text))))
-        if (icon != 0) {
-            setCompoundDrawablesRelativeWithIntrinsicBounds(icon, 0, 0, 0)
-            compoundDrawablePadding = dp(8)
-        }
-        setPadding(dp(12), dp(12), dp(12), dp(12))
-        setOnClickListener { action() }
-        val params = if (weight) LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(8) }
-            else LinearLayout.LayoutParams(-1, -2)
-        parent.addView(this, params.apply { topMargin = dp(8) })
-    }
-
-    private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
 }

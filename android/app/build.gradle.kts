@@ -10,15 +10,7 @@ android {
         versionCode = 23
         versionName = "0.1.26"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        // The tailnet URL of the home-link API. Cleartext is permitted only for
-        // the host in res/xml/network_security_config.xml.
-        val url = (findProperty("homeLinkUrl") as String?) ?: "http://homeserver:5011"
-        buildConfigField("String", "HOME_LINK_URL", "\"$url\"")
-        // matterjs-server's BLE proxy endpoint; cleartext is permitted for its host as above.
-        val ble = (findProperty("bleProxyUrl") as String?) ?: "ws://192.168.1.100:5580/ble"
-        buildConfigField("String", "BLE_PROXY_URL", "\"$ble\"")
     }
-    buildFeatures { buildConfig = true }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17

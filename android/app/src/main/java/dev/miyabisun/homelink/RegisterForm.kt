@@ -11,7 +11,7 @@ sealed interface Status {
 }
 
 /** Why the phone could not lend its Bluetooth to matterjs-server. */
-enum class BleProblem { PERMISSION, BLUETOOTH_OFF, PROXY_UNREACHABLE, PROXY_VERSION }
+enum class BleProblem { PERMISSION, BLUETOOTH_OFF, PROXY_NOT_CONFIGURED, PROXY_UNREACHABLE, PROXY_VERSION }
 
 /** How far a Bluetooth registration got, as the proxy commands show it. */
 enum class Stage {

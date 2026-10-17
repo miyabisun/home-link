@@ -7,7 +7,6 @@ import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
-import android.net.Uri
 import android.os.SystemClock
 import android.util.SizeF
 import android.view.View
@@ -126,8 +125,6 @@ class LightsWidget : AppWidgetProvider() {
             PendingIntent.FLAG_IMMUTABLE,
         )
 
-        private fun api() = MainActivity.apiFactory?.invoke() ?: HttpHomeLinkApi(BuildConfig.HOME_LINK_URL)
-
         /** Runs `work` off the main thread while the receiver stays alive for it. */
         private fun BroadcastReceiver.async(work: () -> Unit) {
             val pending = goAsync()
@@ -145,7 +142,7 @@ class LightsWidget : AppWidgetProvider() {
     override fun onUpdate(context: Context, manager: AppWidgetManager, ids: IntArray) {
         show(context)
         async {
-            saveBoosts(context, api().boostedLabels())
+            saveBoosts(context, homeLinkApi(context).boostedLabels())
             show(context)
         }
     }
@@ -156,7 +153,7 @@ class LightsWidget : AppWidgetProvider() {
             val shown = intent.getLongExtra("shown", 0)
             val restore = intent.getBooleanExtra("restore", false)
             return async {
-                saveBoosts(context, api().boostedLabels())
+                saveBoosts(context, homeLinkApi(context).boostedLabels())
                 // The receiver stays alive for the pause: a cached process may be frozen before a later callback.
                 if (restore) Thread.sleep((shown + LABEL_MS - SystemClock.elapsedRealtime()).coerceAtLeast(0))
                 if (presses.get() == press) show(context)
@@ -173,8 +170,8 @@ class LightsWidget : AppWidgetProvider() {
         }
         show(context, LightsMessage(sending, failed = false), progress = true, Press(button, LightsMessage("送信中…", failed = false), sending = true))
         async {
-            val api = api()
-            val host = Uri.parse(BuildConfig.HOME_LINK_URL).authority.orEmpty()
+            val api = homeLinkApi(context)
+            val host = homeLinkHost(context)
             val (message, short) = if (label != null) {
                 val result = api.toggleBoost(label)
                 storeBoosts(context, boostsAfterToggle(boosts(context), label, result))

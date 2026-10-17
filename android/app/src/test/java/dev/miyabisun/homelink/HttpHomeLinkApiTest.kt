@@ -209,7 +209,6 @@ class HttpHomeLinkApiTest {
             assertEquals(ApiResult.Ok(Unit), api.door(command))
             assertEquals("POST $path", requests.single())
             val cases = listOf(
-                Triple(403, "not_tailnet", ApiError.NOT_TAILNET),
                 Triple(503, "sesame_not_configured", ApiError.SESAME_NOT_CONFIGURED),
                 Triple(502, "sesame_rejected", ApiError.SESAME_REJECTED),
                 Triple(502, "sesame_unreachable", ApiError.SESAME_UNREACHABLE),
@@ -230,5 +229,17 @@ class HttpHomeLinkApiTest {
                 HttpHomeLinkApi("http://127.0.0.1:${silent.localPort}").door(DoorCommand.LOCK))
             assert(System.nanoTime() - started >= 15_000_000_000) { "gave up before 15 s" }
         }
+    }
+
+    @Test fun readsTheBaseUrlForEveryRequestAndSendsNothingWithoutOne() {
+        respond("/api/rooms", 200, "[]")
+        var base: String? = null
+        val configured = HttpHomeLinkApi { base }
+        assertEquals(ApiResult.Failed(ApiError.NOT_CONFIGURED), configured.rooms())
+        assertEquals(ApiResult.Failed(ApiError.NOT_CONFIGURED), configured.door(DoorCommand.UNLOCK))
+        assertEquals(emptyList<String>(), requests)
+        base = "http://127.0.0.1:${server.address.port}"
+        assertEquals(ApiResult.Ok(emptyList<Room>()), configured.rooms())
+        assertEquals(listOf("GET /api/rooms"), requests)
     }
 }

@@ -25,6 +25,8 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <activity android:name=".SettingsActivity" android:exported="false"
+            android:windowSoftInputMode="adjustResize" />
         <receiver android:name=".LightsWidget" android:exported="false"
             android:label="@string/widget_name">
             <intent-filter>

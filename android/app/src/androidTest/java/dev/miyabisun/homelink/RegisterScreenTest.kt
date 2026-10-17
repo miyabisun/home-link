@@ -1,5 +1,6 @@
 package dev.miyabisun.homelink
 
+import android.app.Activity
 import android.appwidget.AppWidgetManager
 import android.content.ComponentName
 import android.os.ParcelFileDescriptor
@@ -24,7 +25,10 @@ import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
+import java.io.File
 import java.io.FileInputStream
+import java.net.InetAddress
+import java.net.ServerSocket
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Semaphore
@@ -39,7 +43,12 @@ class RegisterScreenTest {
     private val wifi = MemoryWifiStore()
     private val reader = FakeWifiReader()
 
+    private val context = InstrumentationRegistry.getInstrumentation().targetContext
+    private val endpointsFile get() = File(Endpoints.path(context))
+
     @Before fun install() {
+        // Messages name the host from the endpoints file, as on a phone set up with `adb push`.
+        assertTrue(Endpoints.save(context, Endpoints("http://home-link.example:5011", "ws://192.0.2.10:5580/ble")))
         MainActivity.apiFactory = { api }
         MainActivity.scannerFactory = { scanner }
         MainActivity.linkFactory = { link }
@@ -53,6 +62,7 @@ class RegisterScreenTest {
         MainActivity.linkFactory = null
         MainActivity.wifiStoreFactory = null
         MainActivity.wifiReaderFactory = null
+        endpointsFile.delete()
     }
 
     /** The ledger-only registration the earlier tests exercise. */
@@ -134,7 +144,7 @@ class RegisterScreenTest {
 
             api.failure = ApiError.UNREACHABLE
             screen.onActivity { button(it, "登録").performClick() }
-            eventually(screen) { hasLabel(it, "home-link（homeserver:5011）に接続できません。Tailscaleの接続を確認してください") }
+            eventually(screen) { hasLabel(it, "home-link（home-link.example:5011）に接続できません。接続先の設定と通信を確かめてください") }
             assertInputsKept(screen)
             capture(screen, "unreachable")
             screen.onActivity { button(it, "再接続").performClick() }
@@ -262,6 +272,58 @@ class RegisterScreenTest {
         }
     }
 
+    @Test fun withoutEndpointsNothingIsSentAndTheSettingsAreOffered() {
+        MainActivity.apiFactory = null
+        endpointsFile.delete()
+        val settings = InstrumentationRegistry.getInstrumentation().addMonitor(SettingsActivity::class.java.name, null, true)
+        ActivityScenario.launch(MainActivity::class.java).use { screen ->
+            eventually(screen) {
+                hasLabel(it, "接続先が未設定です。home-linkのURLを設定してください") && hasLabel(it, "部屋を読み込めませんでした")
+            }
+            capture(screen, "no-endpoints")
+            screen.onActivity { button(it, "照明オン").performClick() }
+            eventually(screen) { hasLabel(it, "接続先が未設定です。アプリの「接続先の設定」でhome-linkのURLを入れてください") }
+            screen.onActivity { button(it, "接続先を設定").performClick() }
+            assertEquals(1, settings.hits)
+        }
+        InstrumentationRegistry.getInstrumentation().removeMonitor(settings)
+    }
+
+    @Test fun theSettingsWriteTheYamlAndTheNextRequestUsesIt() {
+        MainActivity.apiFactory = null
+        endpointsFile.delete()
+        FakeHomeLink().use { server ->
+            ActivityScenario.launch(SettingsActivity::class.java).use { screen ->
+                eventually(screen) { hasLabel(it, "home-linkのURLを入れてください（例：http://home-link.example:5011）") }
+                screen.onActivity { activity ->
+                    field(activity, "home-linkのURL").setText("home-link.example:5011")
+                    field(activity, "BLE ProxyのURL").setText("http://192.0.2.10:5580/ble")
+                    button(activity, "保存").performClick()
+                    assertTrue(hasLabel(activity, "http://かhttps://で始まるURLを入れてください（例：http://home-link.example:5011）"))
+                    assertTrue(hasLabel(activity, "ws://かwss://で始まるURLを入れてください（例：ws://192.0.2.10:5580/ble）"))
+                    assertTrue(hasLabel(activity, "URLを直してから保存してください"))
+                }
+                assertFalse(endpointsFile.exists())
+                capture(screen, "settings-invalid")
+                screen.onActivity { activity ->
+                    field(activity, "home-linkのURL").setText(server.url)
+                    field(activity, "BLE ProxyのURL").setText("ws://192.0.2.10:5580/ble")
+                    button(activity, "保存").performClick()
+                    assertTrue(hasLabel(activity, "保存しました。次の要求からこの接続先へ送ります"))
+                }
+                assertEquals(Endpoints(server.url, "ws://192.0.2.10:5580/ble"), Endpoints.parse(endpointsFile.readText()))
+                screen.recreate()
+                screen.onActivity { assertEquals(server.url, field(it, "home-linkのURL").text.toString()) }
+                capture(screen, "settings")
+            }
+            ActivityScenario.launch(MainActivity::class.java).use { screen ->
+                eventually(screen) { hasLabel(it, "部屋がありません。「部屋を追加」から作成してください") }
+                screen.onActivity { assertFalse(hasLabel(it, "接続先が未設定です。home-linkのURLを設定してください")) }
+            }
+            assertTrue(server.requests.toString(), "GET /api/rooms" in server.requests)
+        }
+    }
+
     @Test fun recreationKeepsTheEnteredValues() {
         api.rooms += listOf(Room(1, "寝室"), Room(2, "居間"))
         ActivityScenario.launch(MainActivity::class.java).use { screen ->
@@ -324,7 +386,7 @@ class RegisterScreenTest {
 
             api.lights = ApiResult.Failed(ApiError.UNREACHABLE)
             screen.onActivity { button(it, "照明オン").performClick() }
-            eventually(screen) { hasLabel(it, "home-link（homeserver:5011）に接続できません。Tailscaleの接続を確認してください") }
+            eventually(screen) { hasLabel(it, "home-link（home-link.example:5011）に接続できません。接続先の設定と通信を確かめてください") }
             capture(screen, "lights-unreachable")
         }
     }
@@ -426,10 +488,16 @@ class RegisterScreenTest {
                 if (error == ApiError.DEVICE_NOT_FOUND || error == ApiError.WIFI_FAILED) capture(screen, "bt-${error.name.lowercase()}")
             }
 
+            Endpoints.save(context, Endpoints("http://home-link.example:5011", ""))
+            screen.onActivity { button(it, "登録").performClick() }
+            eventually(screen) { hasLabel(it, "matterjs-serverのBLE Proxyの接続先が未設定です。「接続先の設定」で入れてください") }
+            assertInputsKept(screen, "押入れ1", "押入れ")
+            Endpoints.save(context, Endpoints("http://home-link.example:5011", "ws://192.0.2.10:5580/ble"))
+
             link.opens = ProxyOpen.UNREACHABLE
             screen.onActivity { button(it, "登録").performClick() }
             eventually(screen) {
-                hasLabel(it, "matterjs-server（192.168.1.100:5580）に接続できません。家のWi-Fiにつないでから、もう一度お試しください")
+                hasLabel(it, "matterjs-server（192.0.2.10:5580）に接続できません。家のWi-Fiにつないでから、もう一度お試しください")
             }
             assertInputsKept(screen, "押入れ1", "押入れ")
             capture(screen, "bt-proxy-unreachable")
@@ -725,7 +793,7 @@ class RegisterScreenTest {
             assertTrue(button(activity, "登録").isEnabled)
         }
 
-    private fun eventually(screen: ActivityScenario<MainActivity>, condition: (MainActivity) -> Boolean) {
+    private fun <T : Activity> eventually(screen: ActivityScenario<T>, condition: (T) -> Boolean) {
         val deadline = System.currentTimeMillis() + 5_000
         while (true) {
             var met = false
@@ -737,7 +805,7 @@ class RegisterScreenTest {
     }
 
     /** Saves a screenshot and the text layout, asserting no clipped text and 48dp targets. */
-    private fun capture(screen: ActivityScenario<MainActivity>, name: String) {
+    private fun <T : Activity> capture(screen: ActivityScenario<T>, name: String) {
         InstrumentationRegistry.getInstrumentation().waitForIdleSync()
         val prefix = InstrumentationRegistry.getArguments().getString("capturePrefix", "")
         screen.onActivity { activity ->
@@ -790,16 +858,16 @@ class RegisterScreenTest {
             .use { FileInputStream(it.fileDescriptor).readBytes() }
     }
 
-    private fun views(activity: MainActivity) = descendants(activity.window.decorView)
+    private fun views(activity: Activity) = descendants(activity.window.decorView)
     private fun descendants(view: View): List<View> = listOf(view) +
         if (view is ViewGroup) (0 until view.childCount).flatMap { descendants(view.getChildAt(it)) } else emptyList()
-    private fun hasLabel(activity: MainActivity, text: String) =
+    private fun hasLabel(activity: Activity, text: String) =
         views(activity).filterIsInstance<TextView>().any { it.isShown && it.text.toString() == text }
-    private fun button(activity: MainActivity, text: String) =
+    private fun button(activity: Activity, text: String) =
         views(activity).filterIsInstance<Button>().first { it.isShown && it.text.toString() == text }
-    private fun spinner(activity: MainActivity, description: String) =
+    private fun spinner(activity: Activity, description: String) =
         views(activity).filterIsInstance<Spinner>().first { it.contentDescription == description }
-    private fun field(activity: MainActivity, description: String) =
+    private fun field(activity: Activity, description: String) =
         views(activity).filterIsInstance<EditText>().first { it.contentDescription == description }
 }
 
@@ -893,4 +961,29 @@ private class FakeWifiReader : WifiReader {
 private class FakeScanner : QrScanner {
     var next: ScanResult = ScanResult.Cancelled
     override fun scan(done: (ScanResult) -> Unit) = done(next)
+}
+
+/** A home-link on loopback that answers every request with an empty list and keeps each request line. */
+private class FakeHomeLink : AutoCloseable {
+    private val socket = ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"))
+    val url = "http://127.0.0.1:${socket.localPort}"
+    val requests: MutableList<String> = Collections.synchronizedList(mutableListOf())
+
+    init {
+        Thread {
+            while (!socket.isClosed) {
+                val client = try { socket.accept() } catch (_: java.io.IOException) { break }
+                client.use {
+                    val reader = it.getInputStream().bufferedReader()
+                    val line = reader.readLine().orEmpty()
+                    while (reader.readLine()?.isNotEmpty() == true) Unit
+                    requests += line.substringBeforeLast(" ")
+                    it.getOutputStream().write(("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n" +
+                        "content-length: 2\r\nconnection: close\r\n\r\n[]").toByteArray())
+                }
+            }
+        }.start()
+    }
+
+    override fun close() = socket.close()
 }

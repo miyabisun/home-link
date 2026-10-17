@@ -11,7 +11,6 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.net.Uri
 import android.os.IBinder
 import android.widget.RemoteViews
 import java.util.concurrent.atomic.AtomicInteger
@@ -87,9 +86,8 @@ class DoorService : Service() {
         showDoor(this, command, LightsMessage("送信中…", failed = false), "${command.verb}を送っています", sending = true)
         Thread {
             try {
-                val api = MainActivity.apiFactory?.invoke() ?: HttpHomeLinkApi(BuildConfig.HOME_LINK_URL)
-                val host = Uri.parse(BuildConfig.HOME_LINK_URL).authority.orEmpty()
-                val result = api.door(command)
+                val result = homeLinkApi(this).door(command)
+                val host = homeLinkHost(this)
                 showDoor(this, command, doorLabel(result), doorMessage(command, result, host).text)
                 Thread.sleep(LABEL_MS)
                 if (presses.getValue(command).get() == press) showDoor(this, command)

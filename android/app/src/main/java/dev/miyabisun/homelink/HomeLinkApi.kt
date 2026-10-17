@@ -10,11 +10,11 @@ import java.net.URL
 
 data class Room(val id: Long, val name: String)
 
-enum class ApiError { UNREACHABLE, TIMEOUT, DUPLICATE_QR, ROOM_NOT_FOUND, DUPLICATE_ROOM, INVALID_QR, INVALID_MANUAL, INVALID_NAME,
+enum class ApiError { NOT_CONFIGURED, UNREACHABLE, TIMEOUT, DUPLICATE_QR, ROOM_NOT_FOUND, DUPLICATE_ROOM, INVALID_QR, INVALID_MANUAL, INVALID_NAME,
     MATTER_UNREACHABLE, MATTER_NOT_CONFIGURED, SERVER,
     DEVICE_NOT_FOUND, WRONG_CODE, WIFI_FAILED, COMMISSION_TIMEOUT, COMMISSION_FAILED, BLUETOOTH_UNAVAILABLE, INVALID_WIFI,
     THREAD_NOT_READY, THREAD_FAILED, LABEL_NOT_FOUND, LABEL_HAS_NO_LIGHTS,
-    NOT_TAILNET, SESAME_NOT_CONFIGURED, SESAME_REJECTED, SESAME_UNREACHABLE }
+    SESAME_NOT_CONFIGURED, SESAME_REJECTED, SESAME_UNREACHABLE }
 
 /** The Wi-Fi network handed to a new device. */
 data class WifiNetwork(val ssid: String, val password: String)
@@ -51,8 +51,9 @@ interface HomeLinkApi {
     fun door(command: DoorCommand): ApiResult<Unit>
 }
 
-class HttpHomeLinkApi(baseUrl: String) : HomeLinkApi {
-    private val base = baseUrl.trimEnd('/')
+/** Calls home-link at the URL `baseUrl` gives for each request; none sends nothing. */
+class HttpHomeLinkApi(private val baseUrl: () -> String?) : HomeLinkApi {
+    constructor(baseUrl: String) : this({ baseUrl })
 
     override fun rooms(): ApiResult<List<Room>> = call("GET", "/api/rooms", null) { body ->
         val array = JSONArray(body)
@@ -81,7 +82,7 @@ class HttpHomeLinkApi(baseUrl: String) : HomeLinkApi {
     override fun threadReady(): ApiResult<Boolean> =
         call("GET", "/api/thread", null) { JSONObject(it).getBoolean("ready") }
 
-    // Longer than the lights' wait: over mobile data, Tailscale may still be setting up its path.
+    // Longer than the lights' wait: over mobile data, a path to home-link may take a while to set up.
     override fun door(command: DoorCommand): ApiResult<Unit> =
         call("POST", "/api/door/${command.path}", null, connectTimeout = 15_000, timedOut = ApiError.TIMEOUT) { }
 
@@ -122,6 +123,7 @@ class HttpHomeLinkApi(baseUrl: String) : HomeLinkApi {
     private fun <T> call(method: String, path: String, body: JSONObject?, readTimeout: Int = 20_000,
                          connectTimeout: Int = 5_000, timedOut: ApiError = ApiError.UNREACHABLE,
                          parse: (String) -> T): ApiResult<T> {
+        val base = baseUrl()?.trimEnd('/') ?: return ApiResult.Failed(ApiError.NOT_CONFIGURED)
         val connection = try {
             (URL(base + path).openConnection() as HttpURLConnection).apply {
                 requestMethod = method
@@ -178,7 +180,6 @@ class HttpHomeLinkApi(baseUrl: String) : HomeLinkApi {
             "thread_failed" -> ApiError.THREAD_FAILED
             "label_not_found" -> ApiError.LABEL_NOT_FOUND
             "label_has_no_lights" -> ApiError.LABEL_HAS_NO_LIGHTS
-            "not_tailnet" -> ApiError.NOT_TAILNET
             "sesame_not_configured" -> ApiError.SESAME_NOT_CONFIGURED
             "sesame_rejected" -> ApiError.SESAME_REJECTED
             "sesame_unreachable" -> ApiError.SESAME_UNREACHABLE

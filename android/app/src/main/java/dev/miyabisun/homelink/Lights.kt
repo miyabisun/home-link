@@ -44,14 +44,20 @@ fun lightsMessage(on: Boolean, result: ApiResult<LightsResult>, host: String, de
     return if (left.isEmpty()) LightsMessage(done, failed = false) else LightsMessage("$done。$left", failed = true)
 }
 
+internal const val CHECK_ENDPOINT = "接続先の設定と通信を確かめてください"
+internal const val NOT_CONFIGURED = "接続先が未設定です。アプリの「接続先の設定」でhome-linkのURLを入れてください"
+internal const val NOT_CONFIGURED_LABEL = "接続先未設定"
+
 internal fun failure(error: ApiError, host: String) = LightsMessage(when (error) {
-    ApiError.UNREACHABLE -> "home-link（$host）に接続できません。Tailscaleの接続を確認してください"
+    ApiError.NOT_CONFIGURED -> NOT_CONFIGURED
+    ApiError.UNREACHABLE -> "home-link（$host）に接続できません。$CHECK_ENDPOINT"
     ApiError.MATTER_UNREACHABLE -> "照明のサーバー（matterjs-server）に接続できません"
     ApiError.MATTER_NOT_CONFIGURED -> "home-linkに照明のサーバーが設定されていません"
     else -> "home-linkでエラーが発生しました。時間をおいてお試しください"
 }, failed = true)
 
 private fun failureLabel(error: ApiError) = LightsMessage(when (error) {
+    ApiError.NOT_CONFIGURED -> NOT_CONFIGURED_LABEL
     ApiError.UNREACHABLE, ApiError.MATTER_UNREACHABLE -> "接続不可"
     ApiError.MATTER_NOT_CONFIGURED -> "未設定"
     ApiError.LABEL_NOT_FOUND -> "ラベルなし"
