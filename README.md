@@ -2,7 +2,7 @@
 
 住まいの機器を、部屋と名前で記録するサービスです。
 家じゅうの照明を、Androidのボタン1つで全部オン・全部オフにできます。
-玄関のSESAME 5なども、ホーム画面のボタン1つで家の外から解錠できます（CANDY HOUSEのWeb API経由）。
+玄関のSESAME 5なども、ホーム画面のボタン1つで家の外から解錠・施錠できます（CANDY HOUSEのWeb API経由）。
 電球などに印刷されたMatterのQRコードをAndroidアプリで読み取り、部屋と名前を付けて登録します。
 QRコードが無い機器は、印字された11桁の数字（Matterの手動ペアリングコード）を入力して登録します。
 新しいWi-Fi電球とThread電球（Aqara T2など）は、電話のBluetoothで直接つなぎ、家のWi-FiかThread網とmatterjs-serverへ入れてから台帳に登録できます。
@@ -23,9 +23,9 @@ APIに認証はありません。家庭LANとTailscaleのtailnetなど、信頼�
 MatterのQRコードと手動ペアリングコードには、機器のsetup passcodeが含まれます。
 そのためコードの全文は機器1台の取得APIだけが返し、一覧APIとログには出しません。
 
-解錠API（`POST /api/door/unlock`）は、tailnetのアドレス（`100.64.0.0/10` と `fd7a:115c:a1e0::/48`）からだけ受け付けます。
+解錠と施錠のAPI（`POST /api/door/unlock`・`/lock`）は、tailnetのアドレス（`100.64.0.0/10` と `fd7a:115c:a1e0::/48`）からだけ受け付けます。
 家庭LANなどほかのアドレスには403を返し、LANにいる他社製の電球などから玄関を開けられないようにしています。
-送信元はTCP接続の相手で判断するため、リバースプロキシやTailscale Serveを前に置くと解錠できません。
+送信元はTCP接続の相手で判断するため、リバースプロキシやTailscale Serveを前に置くと解錠も施錠もできません。
 CANDY HOUSEのAPIキーとSESAMEの秘密鍵は、データベース・ログ・応答には出しません。
 
 ## サーバーの起動
@@ -53,7 +53,7 @@ curl http://127.0.0.1:5011/healthz
 | `SESAME_UUID` | なし | 解錠するSESAMEのUUID（SESAMEアプリの機器の画面にあります）。 |
 | `SESAME_SECRET_KEY` | なし | SESAMEの秘密鍵（32桁の16進数）。SESAMEアプリで共有する鍵のQRコードを上のページで読み取ると得られます。 |
 
-`SESAME_` の3つは、解錠APIだけが使います。どれかが無いか形式が違うと、解錠APIは503 `sesame_not_configured` を返し、ほかの機能はそのまま動きます。
+`SESAME_` の3つは、解錠と施錠のAPIだけが使います。どれかが無いか形式が違うと、この2つは503 `sesame_not_configured` を返し、ほかの機能はそのまま動きます。
 SESAMEはWi-Fiモジュールでインターネットにつながっている必要があります。
 
 ## Androidアプリ
@@ -83,19 +83,24 @@ APKは開発用のdebug署名です。PCからADBで導入する方法と、フ�
 1段では、押したボタンの文字が数秒だけ結果（「オン完了」「解除完了」「一部失敗」「接続不可」「ラベルなし」「照明なし」など）に変わります。
 縦に広げると、ボタンの下に直前の結果を表示します。ウィジェットは台数を示さず、成功か、切り替えられなかった照明があるかだけを示します。
 
-### 玄関を解錠する
+### 玄関を解錠・施錠する
 
-ホーム画面のウィジェットの一覧から、home-linkの「玄関の解錠」（1×1マス）を置きます。
+ホーム画面のウィジェットの一覧から、home-linkの「玄関の解錠」と「玄関の施錠」（どちらも1×1マス）を置きます。
 照明のウィジェットとは別にしてあり、照明のボタンを押し間違えて玄関が開くことはありません。
-ボタンを押すと、home-linkを通じてCANDY HOUSEのWeb APIへ解錠を送ります。施錠のボタンは無いので、閉め忘れはSESAMEのオートロックで防いでください。
+ボタンを押すと、home-linkを通じてCANDY HOUSEのWeb APIへ解錠または施錠を送ります。
 SESAMEアプリの履歴には `home-link` の名前で記録されます。
+
+押したあとの送信は、短いフォアグラウンドサービスで行います。
+データセーバーなどで裏の通信が止められていても、モバイル回線から届きます。
+そのとき、通知欄に送信中の通知が一瞬出ることがあります。
 
 ボタンの文字は「送信中…」のあと、数秒だけ次の結果に変わります。
 
 | 表示 | 意味 |
 | --- | --- |
-| 受付済み | CANDY HOUSEが解錠の指示を受け付けました。扉が開いたことの確認ではありません |
+| 受付済み | CANDY HOUSEが指示を受け付けました。扉が開いた・閉まったことの確認ではありません |
 | 接続不可 | home-linkに届きません。Tailscaleの接続を確かめてください |
+| 時間切れ | 15秒以内にhome-linkへつながらないか、20秒以内に応答がありませんでした。Tailscaleの接続を確かめてください |
 | tailnet外 | 要求がTailscaleを通っていません |
 | 未設定 | サーバーに `SESAME_` の環境変数がありません |
 | 拒否 | CANDY HOUSEが受け付けませんでした。APIキー・UUID・秘密鍵を確かめてください |
@@ -187,6 +192,7 @@ matterjs-serverにdatasetが入ると、アプリを変えずに登録できる�
 | `GET /api/lights/schedule` | 明るさと色温度の自動調整の設定（`settings`）、labelごとの値と割り当てた機器（`labels`）、最後に押された全部オン・全部オフ（`intent`）、直近の調整の記録（`runs`、新しい順に144回分） | |
 | `PUT /api/lights/schedule` | 自動調整の設定のうち、送った項目だけを変更します。応答は `GET` と同じ形です | 400 `invalid_schedule` |
 | `POST /api/door/unlock` | 玄関のSESAMEの解錠をCANDY HOUSEのWeb APIへ送り、受け付けられたら `{"status":"accepted"}` を返します。tailnetのアドレスからだけ受け付けます | 403 `not_tailnet`、503 `sesame_not_configured`、502 `sesame_rejected`（CANDY HOUSEのHTTPステータスを `message` に含みます）・`sesame_unreachable` |
+| `POST /api/door/lock` | 玄関のSESAMEの施錠をCANDY HOUSEのWeb APIへ送り、受け付けられたら `{"status":"accepted"}` を返します。tailnetのアドレスからだけ受け付けます | 403 `not_tailnet`、503 `sesame_not_configured`、502 `sesame_rejected`（CANDY HOUSEのHTTPステータスを `message` に含みます）・`sesame_unreachable` |
 | `GET /api/health` | 稼働確認と版（`{"status":"ok","version":"0.1.4"}`） | |
 | `GET /healthz` | 稼働確認（`ok`） | |
 
@@ -365,13 +371,13 @@ curl -X POST http://homeserver:5011/api/devices -H 'content-type: application/js
 # {"error":"duplicate_qr_payload","message":"この機器は登録済みです"}
 
 curl -X POST http://homeserver:5011/api/devices -H 'content-type: application/json' \
-  -d '{"room_id":1,"vendor":"Tapo","serial_number":"CCBABDE0C244","mac":"CC:BA:BD:E0:C2:44","name":"読書灯"}'
-# {"id":2,"room_id":1,"room_name":"寝室","name":"読書灯","vendor":"Tapo","serial_number":"CCBABDE0C244","mac":"CCBABDE0C244","created_at":"2026-10-05T12:30:00Z"}
+  -d '{"room_id":1,"vendor":"Tapo","serial_number":"AABBCCDDEEFF","mac":"AA:BB:CC:DD:EE:FF","name":"読書灯"}'
+# {"id":2,"room_id":1,"room_name":"寝室","name":"読書灯","vendor":"Tapo","serial_number":"AABBCCDDEEFF","mac":"AABBCCDDEEFF","created_at":"2026-10-05T12:30:00Z"}
 
 curl -X POST http://homeserver:5011/api/commission -H 'content-type: application/json' \
   -d '{"room_id":2,"qr_payload":"MT:Y.K9042C00KA0648G00","name":"押入れ1","wifi_ssid":"home-2g","wifi_password":"…"}'
 # 201 {"node_id":17,"registered":true,"device":{"id":9,"room_id":2,"room_name":"押入れ","name":"押入れ1","vendor":"Tapo",
-#      "serial_number":"CCBABDE0C244","mac":"CCBABDE0C244","labels":[],"created_at":"2026-10-06T03:30:00Z"}}
+#      "serial_number":"AABBCCDDEEFF","mac":"AABBCCDDEEFF","labels":[],"created_at":"2026-10-06T03:30:00Z"}}
 # 422 {"error":"wifi_failed","message":"機器がWi-Fi「home-2g」に接続できませんでした"}
 
 curl http://homeserver:5011/api/status
