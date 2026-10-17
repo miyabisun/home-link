@@ -72,12 +72,11 @@ cd android
 
 APKは `android/app/build/outputs/apk/debug/app-debug.apk` に出力します。
 package IDは `dev.miyabisun.homelink` です。
-接続先は既定で `http://homeserver:5011` です。別のURLでビルドするには `-PhomeLinkUrl=http://…` を付けます。
-Bluetoothで機器を登録するときのmatterjs-serverのBLE Proxyは既定で `ws://192.168.1.100:5580/ble` で、`-PbleProxyUrl=ws://…` で変えられます。
-平文HTTPを許可するホストは `app/src/main/res/xml/network_security_config.xml` に書いています。
-ホスト名を変える場合は、このファイルも合わせて変更してください。
+接続先はAPKに埋め込みません。端末の `home-link.yaml`（[README](../README.md#接続先を設定する)）か、アプリの「接続先の設定」で決めます。
+接続先のホストは決まっていないため、平文HTTPはすべてのホストに許可しています（`app/src/main/res/xml/network_security_config.xml`）。
 
-JVMテストは、JDKの一時HTTPサーバーを相手にAPIクライアントを検証します。入力の状態の扱いも単体で検証します。
+JVMテストは、JDKの一時HTTPサーバーを相手にAPIクライアントを検証します。
+接続先のYAMLの読み書きとURLの検査は `EndpointsTest` で、接続先が無いときに何も送らないことは `HttpHomeLinkApiTest` で検証します。入力の状態の扱いも単体で検証します。
 `BleProxyTest` は、OkHttpのMockWebServerでmatterjs-serverの `/ble` を、fakeでBLEの層を置き換え、
 BLE Proxy Protocol v1のhello、各命令とその失敗、`device_discovered` などのevent、binary frame（`WRITE_DATA` と `NOTIFICATION`）を検証します。
 pingへのpongはOkHttpが自動で返します（実サーバーへ75秒接続して切られないことを確認済み）。
@@ -97,6 +96,8 @@ Keystoreに暗号化して保存したWi-Fi情報を読み戻せること、平�
 一覧の操作と保存形式（0.1.13までの1件の形式の読み込みを含む）、2.4GHzの判定は `SavedWifiTest` で検証します。
 実際のSSIDの読み取り（位置情報の許可ダイアログを含む）は、エミュレータの実APKで「AndroidWifi」が入ることで確かめます。
 照明のボタンは、送信中・全部成功・一部の照明が残った場合・接続不可の表示と、画面の再生成での結果の保持を扱います。
+テストは開始時に架空の接続先を `home-link.yaml` へ書き、文言のホスト名をそこから読みます。
+接続先が無いときの案内と送らないこと、設定の画面での入力の検査、YAMLへの保存、保存した接続先への次の要求（ループバックのfakeのhome-link）も扱います。
 ホーム画面のウィジェットは、ランチャーへの配置を伴うため、このテストには含みません。
 エミュレータで、本物のAPIサーバーとmatterjs-server互換のmockを相手に、ウィジェットを配置して押して確かめます。
 玄関のウィジェットは、Wi-Fiを切ってモバイル回線だけにし、データセーバーを入れて（`adb shell svc wifi disable`、
@@ -104,15 +105,17 @@ Keystoreに暗号化して保存したWi-Fi情報を読み戻せること、平�
 broadcast receiverから送ると、この状態では名前解決から止められて「接続不可」になります。
 1段と縦に広げた表示、横4マスと縮めた最小の幅で、電話とタブレット（Lenovo Y700相当の1600×2560・320dpi）のランチャーに置いて確かめます。
 1段の短い結果の文言は `LightsMessageTest` で検証します。
-アプリは `homeserver` だけに平文HTTPを許可しているため、エミュレータのHTTPプロキシをAPIサーバーへ向けると、
-既定の接続先のままのAPKで試せます（APIサーバーはプロキシ形式の要求もそのまま処理します）。
+エミュレータでは、ホストのfakeのhome-linkやAPIサーバーを接続先にします（エミュレータからホストは `10.0.2.2`）。
 
 ```sh
-adb -s emulator-5554 shell settings put global http_proxy 10.0.2.2:PORT
-# 確認後
-adb -s emulator-5554 shell settings delete global http_proxy
+printf 'home_link_url: "http://10.0.2.2:PORT"\n' > home-link.yaml
+adb -s emulator-5554 push home-link.yaml /sdcard/Android/data/dev.miyabisun.homelink/files/home-link.yaml
 ```
-fakeの成功は、実際のカメラでの読み取りや、homeserverへの接続を証明しません。
+
+Android 17は、LANのアドレス（`10.0.2.2` を含む）への接続に付近のデバイスへの接続の許可を要します。
+アプリの「接続先の設定」で保存すると求められます。エミュレータに大域のHTTPプロキシ（`global_http_proxy_host`）が残っていると、
+接続先にかかわらずプロキシへ送られるので、試験の前に `adb shell settings list global | grep proxy` で確かめてください。
+fakeの成功は、実際のカメラでの読み取りや、実際のhome-linkへの接続を証明しません。
 
 ```sh
 sdkmanager 'emulator' 'system-images;android-37.0;google_apis;x86_64'

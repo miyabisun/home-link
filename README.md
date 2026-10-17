@@ -18,14 +18,13 @@ Matterの機器登録（commissioning）はmatterjs-serverが行い、home-link�
 
 ## 公開範囲と認証
 
-APIに認証はありません。家庭LANとTailscaleのtailnetなど、信頼できる経路にだけ公開してください。
+APIに認証はありません。家庭LANやVPNなど、信頼できる経路にだけ公開してください。
 インターネットへ直接公開しないでください。
 MatterのQRコードと手動ペアリングコードには、機器のsetup passcodeが含まれます。
 そのためコードの全文は機器1台の取得APIだけが返し、一覧APIとログには出しません。
 
-解錠と施錠のAPI（`POST /api/door/unlock`・`/lock`）は、tailnetのアドレス（`100.64.0.0/10` と `fd7a:115c:a1e0::/48`）からだけ受け付けます。
-家庭LANなどほかのアドレスには403を返し、LANにいる他社製の電球などから玄関を開けられないようにしています。
-送信元はTCP接続の相手で判断するため、リバースプロキシやTailscale Serveを前に置くと解錠も施錠もできません。
+解錠と施錠のAPI（`POST /api/door/unlock`・`/lock`）も、ほかのAPIと同じく送信元を問わず受け付けます。
+APIに届く経路にいる機器なら、どれからでも玄関を開けられます。公開する範囲はこれを踏まえて決めてください。
 CANDY HOUSEのAPIキーとSESAMEの秘密鍵は、データベース・ログ・応答には出しません。
 
 ## サーバーの起動
@@ -48,7 +47,7 @@ curl http://127.0.0.1:5011/healthz
 | `PORT` | `3000` | 待ち受けるTCPポート。1〜65535の10進数で、不正な値では起動しません。 |
 | `DATABASE_PATH` | `home-link.db`（コンテナでは `/data/home-link.db`） | SQLiteデータベースのファイル。無ければ作成します。 |
 | `LOG_LEVEL` | `info` | `off`・`error`・`warn`・`info`・`debug`・`trace` のいずれか。 |
-| `MATTER_SERVER_URL` | なし | matterjs-serverのWebSocket API（例: `ws://192.168.1.100:5580/ws`）。未設定なら状態API・照明API・機器のBluetooth登録は503を返します。 |
+| `MATTER_SERVER_URL` | なし | matterjs-serverのWebSocket API（例: `ws://192.0.2.10:5580/ws`）。未設定なら状態API・照明API・機器のBluetooth登録は503を返します。 |
 | `SESAME_API_KEY` | なし | CANDY HOUSEのWeb APIのAPIキー（[CANDY HOUSEのパートナー向けページ](https://partners.candyhouse.co/)で発行）。 |
 | `SESAME_UUID` | なし | 解錠するSESAMEのUUID（SESAMEアプリの機器の画面にあります）。 |
 | `SESAME_SECRET_KEY` | なし | SESAMEの秘密鍵（32桁の16進数）。SESAMEアプリで共有する鍵のQRコードを上のページで読み取ると得られます。 |
@@ -58,9 +57,9 @@ SESAMEはWi-Fiモジュールでインターネットにつながっている必
 
 ## Androidアプリ
 
-Android 16以降の端末と、Tailscaleへの接続が必要です。
-アプリは `http://homeserver:5011` へ接続します。
-`homeserver` はtailnetのMagicDNS名なので、Tailscaleが有効なら家の外からも使えます。
+Android 16以降の端末で動きます。
+接続先（home-linkのURLと、Bluetoothでの登録に使うmatterjs-serverのBLE ProxyのURL）は、アプリに埋め込まず端末に保存します。
+家の外から使うなら、電話から届くURL（VPNの中だけで引ける名前など）を設定します。
 QRの読み取りにはGoogle Playサービスのコードスキャナーを使うため、カメラの権限は求めません。
 位置情報の許可は、電球に渡すWi-Fiを追加するときに、今つながっているWi-FiのSSIDを読むためだけに求めます。
 
@@ -68,6 +67,36 @@ QRの読み取りにはGoogle Playサービスのコードスキャナーを使�
 `home-link-vX.Y.Z.apk` をダウンロードし、端末で開いてインストールします。
 APKは開発用のdebug署名です。PCからADBで導入する方法と、ファイルの検証方法は
 [開発ガイド](docs/development.md#adbでのインストール)を参照してください。
+
+### 接続先を設定する
+
+接続先が未設定のあいだ、アプリは何も送らず、画面の上部に「接続先が未設定です」と示します。
+「接続先を設定」（画面の最下部の「接続先の設定」も同じ）を押し、URLを入れて「保存」を押します。
+URLの形が正しくないと保存しません。保存した接続先は、アプリとウィジェットの次の要求から使われます。
+Android 17では、家のLANのアドレスへ送るために、保存のときに付近のデバイスへの接続の許可を求めます。
+
+設定は、端末の次のYAMLファイルに保存します。PCからADBで書き込むこともできます（root不要）。
+
+```text
+/sdcard/Android/data/dev.miyabisun.homelink/files/home-link.yaml
+```
+
+```yaml
+home_link_url: "http://home-link.example:5011"
+ble_proxy_url: "ws://192.0.2.10:5580/ble"
+```
+
+| キー | 内容 |
+| --- | --- |
+| `home_link_url` | home-linkのURL。`http://` か `https://` で始めます。照明・登録・玄関の要求を送ります |
+| `ble_proxy_url` | matterjs-serverのBLE ProxyのURL。`ws://` か `wss://` で始めます。Bluetoothで登録しないなら空でかまいません |
+
+```sh
+adb -s DEVICE_SERIAL push home-link.yaml /sdcard/Android/data/dev.miyabisun.homelink/files/home-link.yaml
+```
+
+アプリは要求を送るたびにこのファイルを読むので、書き換えた後に再起動は要りません。
+アプリを入れ直すとファイルも消えます。
 
 ### 照明を全部オン・全部オフにする
 
@@ -99,9 +128,9 @@ SESAMEアプリの履歴には `home-link` の名前で記録されます。
 | 表示 | 意味 |
 | --- | --- |
 | 受付済み | CANDY HOUSEが指示を受け付けました。扉が開いた・閉まったことの確認ではありません |
-| 接続不可 | home-linkに届きません。Tailscaleの接続を確かめてください |
-| 時間切れ | 15秒以内にhome-linkへつながらないか、20秒以内に応答がありませんでした。Tailscaleの接続を確かめてください |
-| tailnet外 | 要求がTailscaleを通っていません |
+| 接続先未設定 | アプリに接続先がありません。上の「接続先を設定する」で設定してください |
+| 接続不可 | home-linkに届きません。接続先の設定と通信を確かめてください |
+| 時間切れ | 15秒以内にhome-linkへつながらないか、20秒以内に応答がありませんでした。接続先の設定と通信を確かめてください |
 | 未設定 | サーバーに `SESAME_` の環境変数がありません |
 | 拒否 | CANDY HOUSEが受け付けませんでした。APIキー・UUID・秘密鍵を確かめてください |
 | API不通 | home-linkからCANDY HOUSEに届きません |
@@ -115,7 +144,7 @@ Zigbeeの電球は対象外です（親機が要るため）。Aqara Homeで追�
 登録の画面は「Wi-Fiの電球」と「Threadの電球（T2など）」のタブに分かれています。この節はWi-Fiのタブの手順です。
 
 電話がBluetoothでmatterjs-serverの[BLE Proxy](https://github.com/matter-js/matterjs-server/blob/main/docs/ble-proxy-protocol.md)
-（`ws://192.168.1.100:5580/ble`）の中継を務め、Matterの手順（暗号化、Wi-Fi情報の送付、fabricへの参加）はmatterjs-serverが行います。
+（接続先の `ble_proxy_url`）の中継を務め、Matterの手順（暗号化、Wi-Fi情報の送付、fabricへの参加）はmatterjs-serverが行います。
 そのため、登録するときは電話を家のWi-Fiにつなぎ、電球の近くに置きます。
 matterjs-serverはBluetoothを有効にして（BLE Proxyを受け付けて）起動しておく必要があります。
 
@@ -191,8 +220,8 @@ matterjs-serverにdatasetが入ると、アプリを変えずに登録できる�
 | `POST /api/lights/boost` | 本文 `{"label": "作業"}` のlabelの照明を明るくする状態を切り替えます。応答は `on` と同じ件数に、`label`・`action`（`boost` か `release`）・`boosted` を加えた形です | 400 `invalid_boost`、404 `label_not_found`、422 `label_has_no_lights`、503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `GET /api/lights/schedule` | 明るさと色温度の自動調整の設定（`settings`）、labelごとの値と割り当てた機器（`labels`）、最後に押された全部オン・全部オフ（`intent`）、直近の調整の記録（`runs`、新しい順に144回分） | |
 | `PUT /api/lights/schedule` | 自動調整の設定のうち、送った項目だけを変更します。応答は `GET` と同じ形です | 400 `invalid_schedule` |
-| `POST /api/door/unlock` | 玄関のSESAMEの解錠をCANDY HOUSEのWeb APIへ送り、受け付けられたら `{"status":"accepted"}` を返します。tailnetのアドレスからだけ受け付けます | 403 `not_tailnet`、503 `sesame_not_configured`、502 `sesame_rejected`（CANDY HOUSEのHTTPステータスを `message` に含みます）・`sesame_unreachable` |
-| `POST /api/door/lock` | 玄関のSESAMEの施錠をCANDY HOUSEのWeb APIへ送り、受け付けられたら `{"status":"accepted"}` を返します。tailnetのアドレスからだけ受け付けます | 403 `not_tailnet`、503 `sesame_not_configured`、502 `sesame_rejected`（CANDY HOUSEのHTTPステータスを `message` に含みます）・`sesame_unreachable` |
+| `POST /api/door/unlock` | 玄関のSESAMEの解錠をCANDY HOUSEのWeb APIへ送り、受け付けられたら `{"status":"accepted"}` を返します | 503 `sesame_not_configured`、502 `sesame_rejected`（CANDY HOUSEのHTTPステータスを `message` に含みます）・`sesame_unreachable` |
+| `POST /api/door/lock` | 玄関のSESAMEの施錠をCANDY HOUSEのWeb APIへ送り、受け付けられたら `{"status":"accepted"}` を返します | 503 `sesame_not_configured`、502 `sesame_rejected`（CANDY HOUSEのHTTPステータスを `message` に含みます）・`sesame_unreachable` |
 | `GET /api/health` | 稼働確認と版（`{"status":"ok","version":"0.1.4"}`） | |
 | `GET /healthz` | 稼働確認（`ok`） | |
 
@@ -244,9 +273,9 @@ nodeが使えない照明と、ブリッジが届かないと報告している�
 
 ```sh
 # ブリッジ配下のT2を、VendorNameとSerialNumberで登録してから無視にする
-curl -X POST http://homeserver:5011/api/devices -H 'content-type: application/json' \
+curl -X POST http://home-link.example:5011/api/devices -H 'content-type: application/json' \
   -d '{"room_id":1,"vendor":"Aqara","serial_number":"54ef44100126e0a6","name":"外したT2"}'
-curl -X PATCH http://homeserver:5011/api/devices/7 -H 'content-type: application/json' -d '{"ignored":true}'
+curl -X PATCH http://home-link.example:5011/api/devices/7 -H 'content-type: application/json' -d '{"ignored":true}'
 # {"id":7,…,"ignored":true,…}
 ```
 
@@ -306,21 +335,21 @@ curl -X PATCH http://homeserver:5011/api/devices/7 -H 'content-type: application
 記録はメモリだけに持ち、再起動で消えます。
 
 ```sh
-curl -X PUT http://homeserver:5011/api/lights/schedule -H 'content-type: application/json' -d '{"enabled":true}'
+curl -X PUT http://home-link.example:5011/api/lights/schedule -H 'content-type: application/json' -d '{"enabled":true}'
 # {"settings":{"enabled":true,"latitude":35.6895,"longitude":139.6917,"morning_end_minute":600,"day_level":203,"night_level":102,"warm_kelvin":3000,"cool_kelvin":5000,"late_night_percent":50},
 #  "labels":[{"id":1,"name":"キッチン","day_level":null,"night_level":76,"cool_kelvin":null,"warm_kelvin":2700,"boosted":false,
 #             "devices":[{"id":5,"name":"キッチン1","room_name":"リビング"},…]},…],"intent":{"action":"on","at":"2026-10-05T21:10:00+09:00"},"runs":[…]}
 
-curl http://homeserver:5011/api/lights/schedule
+curl http://home-link.example:5011/api/lights/schedule
 # {…,"runs":[{"at":"2026-10-05T23:00:00+09:00","trigger":"scheduled","sunrise":"05:39","sunset":"17:23","level":102,"kelvin":3000,"commands":2,
 #   "lights":[{"node_id":1,"endpoint":3,"name":"キッチン1","room_name":"リビング","labels":["キッチン"],"target_level":76,"target_kelvin":2700,
 #              "decision":"sent","level":76,"mireds":370},
 #             {"node_id":5,"endpoint":1,"name":"読書灯","room_name":"寝室","labels":[],"target_level":102,"target_kelvin":3000,"decision":"off"},…]},…]}
 
-curl -X POST http://homeserver:5011/api/labels -H 'content-type: application/json' -d '{"name":"キッチン","night_level":76,"warm_kelvin":2700}'
+curl -X POST http://home-link.example:5011/api/labels -H 'content-type: application/json' -d '{"name":"キッチン","night_level":76,"warm_kelvin":2700}'
 # 201 {"id":1,"name":"キッチン","day_level":null,"night_level":76,"cool_kelvin":null,"warm_kelvin":2700,"device_count":0,"boosted":false}
 
-curl -X PATCH http://homeserver:5011/api/devices/5 -H 'content-type: application/json' -d '{"label_ids":[1]}'
+curl -X PATCH http://home-link.example:5011/api/devices/5 -H 'content-type: application/json' -d '{"label_ids":[1]}'
 # {"id":5,…,"labels":[{"id":1,"name":"キッチン"}],…}
 ```
 
@@ -345,9 +374,9 @@ curl -X PATCH http://homeserver:5011/api/devices/5 -H 'content-type: application
 - labelが無ければ404 `label_not_found`、無視でない照明が1台も割り当てられていなければ422 `label_has_no_lights` です。
 
 ```sh
-curl -X POST http://homeserver:5011/api/labels -H 'content-type: application/json' -d '{"name":"作業"}'
-curl -X PATCH http://homeserver:5011/api/devices/5 -H 'content-type: application/json' -d '{"label_ids":[1,2]}'
-curl -X POST http://homeserver:5011/api/lights/boost -H 'content-type: application/json' -d '{"label":"作業"}'
+curl -X POST http://home-link.example:5011/api/labels -H 'content-type: application/json' -d '{"name":"作業"}'
+curl -X PATCH http://home-link.example:5011/api/devices/5 -H 'content-type: application/json' -d '{"label_ids":[1,2]}'
+curl -X POST http://home-link.example:5011/api/lights/boost -H 'content-type: application/json' -d '{"label":"作業"}'
 # {"label":"作業","action":"boost","boosted":true,"switched":6,"no_response":0,"failed":0,"missing":0,
 #  "lights":[{"node_id":1,"endpoint":3,"name":"キッチン1","room_name":"リビング","result":"switched"},…],"missing_devices":[]}
 ```
@@ -359,40 +388,40 @@ curl -X POST http://homeserver:5011/api/lights/boost -H 'content-type: applicati
 ### 例
 
 ```sh
-curl -X POST http://homeserver:5011/api/rooms -H 'content-type: application/json' -d '{"name":"寝室"}'
+curl -X POST http://home-link.example:5011/api/rooms -H 'content-type: application/json' -d '{"name":"寝室"}'
 # {"id":1,"name":"寝室","device_count":0}
 
-curl -X POST http://homeserver:5011/api/devices -H 'content-type: application/json' \
+curl -X POST http://home-link.example:5011/api/devices -H 'content-type: application/json' \
   -d '{"room_id":1,"qr_payload":"MT:Y.K9042C00KA0648G00","name":"天井灯"}'
 # {"id":1,"room_id":1,"room_name":"寝室","name":"天井灯","created_at":"2026-10-05T09:46:07Z"}
 
-curl -X POST http://homeserver:5011/api/devices -H 'content-type: application/json' \
+curl -X POST http://home-link.example:5011/api/devices -H 'content-type: application/json' \
   -d '{"room_id":1,"manual_code":"3497 011 2332","name":"天井灯"}'
 # {"error":"duplicate_qr_payload","message":"この機器は登録済みです"}
 
-curl -X POST http://homeserver:5011/api/devices -H 'content-type: application/json' \
+curl -X POST http://home-link.example:5011/api/devices -H 'content-type: application/json' \
   -d '{"room_id":1,"vendor":"Tapo","serial_number":"AABBCCDDEEFF","mac":"AA:BB:CC:DD:EE:FF","name":"読書灯"}'
 # {"id":2,"room_id":1,"room_name":"寝室","name":"読書灯","vendor":"Tapo","serial_number":"AABBCCDDEEFF","mac":"AABBCCDDEEFF","created_at":"2026-10-05T12:30:00Z"}
 
-curl -X POST http://homeserver:5011/api/commission -H 'content-type: application/json' \
+curl -X POST http://home-link.example:5011/api/commission -H 'content-type: application/json' \
   -d '{"room_id":2,"qr_payload":"MT:Y.K9042C00KA0648G00","name":"押入れ1","wifi_ssid":"home-2g","wifi_password":"…"}'
 # 201 {"node_id":17,"registered":true,"device":{"id":9,"room_id":2,"room_name":"押入れ","name":"押入れ1","vendor":"Tapo",
 #      "serial_number":"AABBCCDDEEFF","mac":"AABBCCDDEEFF","labels":[],"created_at":"2026-10-06T03:30:00Z"}}
 # 422 {"error":"wifi_failed","message":"機器がWi-Fi「home-2g」に接続できませんでした"}
 
-curl http://homeserver:5011/api/status
+curl http://home-link.example:5011/api/status
 # {"devices":[{"endpoint":null,"id":1,"name":"天井灯","node_id":null,"room_name":"寝室","visible":false},{"endpoint":0,"id":2,"name":"読書灯","node_id":5,"room_name":"寝室","visible":true}],"version":"0.1.4"}
 
-curl -X POST http://homeserver:5011/api/lights/off
+curl -X POST http://home-link.example:5011/api/lights/off
 # {"action":"off","switched":10,"no_response":1,"failed":0,"missing":1,
 #  "lights":[{"node_id":1,"endpoint":2,"name":"Aqara LED Bulb T2","room_name":null,"result":"no_response"},
 #            {"node_id":5,"endpoint":1,"name":"読書灯","room_name":"寝室","result":"switched"},…],
 #  "missing_devices":[{"id":1,"name":"天井灯","room_name":"寝室"}]}
 
-curl http://homeserver:5011/api/lights
+curl http://home-link.example:5011/api/lights
 # {"on":0,"off":10,"no_response":1,"missing":1,"lights":[{"node_id":5,"endpoint":1,"name":"読書灯","room_name":"寝室","state":"off"},…],"missing_devices":[…]}
 
-curl -X DELETE http://homeserver:5011/api/rooms/1
+curl -X DELETE http://home-link.example:5011/api/rooms/1
 # {"error":"room_has_devices","message":"この部屋には機器が1台登録されています。先に機器を削除してください"}
 ```
 
