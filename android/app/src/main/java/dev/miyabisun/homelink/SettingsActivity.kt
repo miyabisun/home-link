@@ -1,6 +1,9 @@
 package dev.miyabisun.homelink
 
+import android.Manifest
 import android.app.Activity
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.text.InputType
 import android.view.inputmethod.EditorInfo
@@ -82,7 +85,11 @@ class SettingsActivity : Activity() {
         getSystemService(InputMethodManager::class.java).hideSoftInputFromWindow(bleProxyField.windowToken, 0)
         if (!check()) return resultRow.show("URLを直してから保存してください", failed = true)
         val endpoints = Endpoints(homeLinkField.text.toString().trim(), bleProxyField.text.toString().trim())
-        if (Endpoints.save(this, endpoints)) resultRow.show("保存しました。次の要求からこの接続先へ送ります", failed = false)
-        else resultRow.show("保存できませんでした。端末の保存領域を確かめてください", failed = true)
+        if (!Endpoints.save(this, endpoints)) return resultRow.show("保存できませんでした。端末の保存領域を確かめてください", failed = true)
+        resultRow.show("保存しました。次の要求からこの接続先へ送ります", failed = false)
+        // Android 17 blocks connections to LAN addresses, a likely place for home-link, without it.
+        if (Build.VERSION.SDK_INT >= 37 && checkSelfPermission(Manifest.permission.ACCESS_LOCAL_NETWORK) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.ACCESS_LOCAL_NETWORK), 0)
+        }
     }
 }
