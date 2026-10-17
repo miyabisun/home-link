@@ -1,7 +1,7 @@
 //! Unlocking and locking the front door's SESAME through the CANDY HOUSE Web API and its Wi-Fi module.
 //! The request follows <https://github.com/CANDY-HOUSE/API_document> (`SesameOS3/webapi.md`).
 
-use std::{fmt, net::IpAddr, time::Duration};
+use std::{fmt, time::Duration};
 
 use aes::Aes128;
 use cmac::{Cmac, Mac};
@@ -178,15 +178,6 @@ fn parse_secret(hex: &str) -> Option<[u8; 16]> {
     Some(secret)
 }
 
-/// Whether `ip` is a Tailscale address: `100.64.0.0/10` or `fd7a:115c:a1e0::/48`.
-#[must_use]
-pub fn is_tailnet(ip: IpAddr) -> bool {
-    match ip.to_canonical() {
-        IpAddr::V4(v4) => v4.octets()[0] == 100 && v4.octets()[1] & 0xc0 == 64,
-        IpAddr::V6(v6) => v6.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,32 +294,5 @@ mod tests {
         assert!(!shown.contains("api-key-value"), "{shown}");
         assert!(!shown.to_lowercase().contains("3de4de72"), "{shown}");
         assert!(!shown.contains("2b7e") && !shown.contains("43"), "{shown}");
-    }
-
-    #[test]
-    fn only_tailscale_addresses_are_tailnet() {
-        for ip in [
-            "100.64.0.0",
-            "100.100.1.2",
-            "100.127.255.255",
-            "fd7a:115c:a1e0::1",
-            "fd7a:115c:a1e0:ffff::1",
-            "::ffff:100.64.0.1",
-        ] {
-            assert!(is_tailnet(ip.parse().unwrap()), "{ip}");
-        }
-        for ip in [
-            "100.63.255.255",
-            "100.128.0.0",
-            "192.168.1.50",
-            "127.0.0.1",
-            "10.0.0.1",
-            "172.17.0.1",
-            "::1",
-            "fd7a:115c:a1e1::1",
-            "::ffff:192.168.1.50",
-        ] {
-            assert!(!is_tailnet(ip.parse().unwrap()), "{ip}");
-        }
     }
 }

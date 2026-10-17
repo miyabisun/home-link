@@ -361,8 +361,7 @@ async fn lock_door(
     door(state, peer, sesame::Command::Lock).await
 }
 
-/// Unlocks or locks the front door, for tailnet addresses only: the LAN also reaches this
-/// unauthenticated API, and other vendors' devices live there.
+/// Unlocks or locks the front door; `peer` is only logged.
 async fn door(
     State(state): State<Db>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -372,14 +371,6 @@ async fn door(
         sesame::Command::Unlock => ("unlock", "解錠"),
         sesame::Command::Lock => ("lock", "施錠"),
     };
-    if !sesame::is_tailnet(peer.ip()) {
-        tracing::warn!(peer = %peer.ip(), "{name} refused outside the tailnet");
-        return Err(ApiError(
-            StatusCode::FORBIDDEN,
-            "not_tailnet",
-            format!("{verb}はtailnetからだけ受け付けます"),
-        ));
-    }
     let config = state.sesame.as_ref().map_err(|message| {
         ApiError(
             StatusCode::SERVICE_UNAVAILABLE,

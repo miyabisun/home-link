@@ -3147,7 +3147,7 @@ async fn a_boost_that_reaches_no_light_is_not_kept() {
 const SESAME_UUID: &str = "3DE4DE72-AAF9-25C1-8D0F-C9E019BB060C";
 const SESAME_API_KEY: &str = "test-api-key-6f1d2c";
 const SESAME_SECRET: &str = "2b7e151628aed2a6abf7158809cf4f3c";
-const TAILNET: [u8; 4] = [100, 101, 102, 103];
+const PEER: [u8; 4] = [192, 168, 1, 50];
 
 /// One unlock as the fake CANDY HOUSE received it: path, `x-api-key` and JSON body.
 type Received = Arc<Mutex<Vec<(String, String, Value)>>>;
@@ -3256,19 +3256,15 @@ async fn door_commands_are_signed_and_sent_to_candy_house() {
         let (api_url, received) = fake_candy_house(StatusCode::OK).await;
         let app = door_app(sesame_config(&api_url));
 
-        let (status, body) = door_from(&app, action, TAILNET).await;
+        let (status, body) = door_from(&app, action, PEER).await;
         assert_eq!(status, StatusCode::OK, "{action}: {body}");
         assert_eq!(
             serde_json::from_str::<Value>(&body).unwrap(),
             json!({ "status": "accepted" })
         );
         assert_no_keys(&body);
-        let (status, _) = door_from(
-            &app,
-            action,
-            "fd7a:115c:a1e0::5".parse::<std::net::IpAddr>().unwrap(),
-        )
-        .await;
+        let (status, _) =
+            door_from(&app, action, "fd00::5".parse::<std::net::IpAddr>().unwrap()).await;
         assert_eq!(status, StatusCode::OK, "{action}");
 
         let received = received.lock().unwrap().clone();
@@ -3310,7 +3306,7 @@ async fn door_commands_report_refusals_and_lost_connections_as_failures() {
     drop(closed);
 
     for (action, _) in DOOR {
-        let (status, body) = door_from(&door_app(sesame_config(&refusing)), action, TAILNET).await;
+        let (status, body) = door_from(&door_app(sesame_config(&refusing)), action, PEER).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY, "{action}: {body}");
         let error: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(error["error"], "sesame_rejected");
@@ -3319,7 +3315,7 @@ async fn door_commands_report_refusals_and_lost_connections_as_failures() {
 
         for addr in [dropping, closed_addr] {
             let app = door_app(sesame_config(&format!("http://{addr}")));
-            let (status, body) = door_from(&app, action, TAILNET).await;
+            let (status, body) = door_from(&app, action, PEER).await;
             assert_eq!(status, StatusCode::BAD_GATEWAY, "{action}: {body}");
             assert_eq!(
                 serde_json::from_str::<Value>(&body).unwrap()["error"],
@@ -3346,7 +3342,7 @@ async fn door_commands_without_settings_say_so_and_leave_other_apis_working() {
         "http://unused",
     ));
     for (action, _) in DOOR {
-        let (status, body) = door_from(&app, action, TAILNET).await;
+        let (status, body) = door_from(&app, action, PEER).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{action}: {body}");
         let error: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(error["error"], "sesame_not_configured");
@@ -3358,7 +3354,7 @@ async fn door_commands_without_settings_say_so_and_leave_other_apis_working() {
             "{body}"
         );
         // The plain app, as built from the environment, has no SESAME either.
-        let (status, _) = door_from(&app_unset(), action, TAILNET).await;
+        let (status, _) = door_from(&app_unset(), action, PEER).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{action}");
     }
 
@@ -3371,29 +3367,25 @@ fn app_unset() -> Router {
 }
 
 #[tokio::test]
-async fn door_commands_are_refused_outside_the_tailnet_before_reaching_candy_house() {
-    let (api_url, received) = fake_candy_house(StatusCode::OK).await;
-    let app = door_app(sesame_config(&api_url));
-    for (action, _) in DOOR {
-        for ip in [
+async fn door_commands_reach_candy_house_from_any_address() {
+    for (action, cmd) in DOOR {
+        let (api_url, received) = fake_candy_house(StatusCode::OK).await;
+        let app = door_app(sesame_config(&api_url));
+        let ips = [
             "192.168.1.50",
             "127.0.0.1",
             "172.17.0.1",
             "100.128.0.1",
             "::1",
             "::ffff:192.168.1.50",
-        ] {
+        ];
+        for ip in ips {
             let (status, body) =
                 door_from(&app, action, ip.parse::<std::net::IpAddr>().unwrap()).await;
-            assert_eq!(status, StatusCode::FORBIDDEN, "{action} {ip}: {body}");
-            assert_eq!(
-                serde_json::from_str::<Value>(&body).unwrap()["error"],
-                "not_tailnet"
-            );
+            assert_eq!(status, StatusCode::OK, "{action} {ip}: {body}");
         }
-        // Refused even when SESAME is not set up.
-        let (status, _) = door_from(&app_unset(), action, [192, 168, 1, 50]).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{action}");
+        let received = received.lock().unwrap().clone();
+        assert_eq!(received.len(), ips.len(), "{action}");
+        assert!(received.iter().all(|(_, _, command)| command["cmd"] == cmd));
     }
-    assert!(received.lock().unwrap().is_empty());
 }
