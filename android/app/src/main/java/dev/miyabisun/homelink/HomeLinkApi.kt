@@ -5,11 +5,12 @@ import org.json.JSONException
 import org.json.JSONObject
 import java.io.IOException
 import java.net.HttpURLConnection
+import java.net.SocketTimeoutException
 import java.net.URL
 
 data class Room(val id: Long, val name: String)
 
-enum class ApiError { UNREACHABLE, DUPLICATE_QR, ROOM_NOT_FOUND, DUPLICATE_ROOM, INVALID_QR, INVALID_MANUAL, INVALID_NAME,
+enum class ApiError { UNREACHABLE, TIMEOUT, DUPLICATE_QR, ROOM_NOT_FOUND, DUPLICATE_ROOM, INVALID_QR, INVALID_MANUAL, INVALID_NAME,
     MATTER_UNREACHABLE, MATTER_NOT_CONFIGURED, SERVER,
     DEVICE_NOT_FOUND, WRONG_CODE, WIFI_FAILED, COMMISSION_TIMEOUT, COMMISSION_FAILED, BLUETOOTH_UNAVAILABLE, INVALID_WIFI,
     THREAD_NOT_READY, THREAD_FAILED, LABEL_NOT_FOUND, LABEL_HAS_NO_LIGHTS,
@@ -46,8 +47,8 @@ interface HomeLinkApi {
     fun commission(roomId: Long, payload: String, name: String, wifi: WifiNetwork?): ApiResult<Commissioned>
     /** Whether matterjs-server holds the Thread network's credentials to commission Thread devices. */
     fun threadReady(): ApiResult<Boolean>
-    /** Has the front door's SESAME unlocked; `Ok` once CANDY HOUSE accepts the command. */
-    fun unlockDoor(): ApiResult<Unit>
+    /** Has the front door's SESAME unlock or lock; `Ok` once CANDY HOUSE accepts the command. */
+    fun door(command: DoorCommand): ApiResult<Unit>
 }
 
 class HttpHomeLinkApi(baseUrl: String) : HomeLinkApi {
@@ -80,7 +81,9 @@ class HttpHomeLinkApi(baseUrl: String) : HomeLinkApi {
     override fun threadReady(): ApiResult<Boolean> =
         call("GET", "/api/thread", null) { JSONObject(it).getBoolean("ready") }
 
-    override fun unlockDoor(): ApiResult<Unit> = call("POST", "/api/door/unlock", null) { }
+    // Longer than the lights' wait: over mobile data, Tailscale may still be setting up its path.
+    override fun door(command: DoorCommand): ApiResult<Unit> =
+        call("POST", "/api/door/${command.path}", null, connectTimeout = 15_000, timedOut = ApiError.TIMEOUT) { }
 
     private fun device(roomId: Long, payload: String, name: String): JSONObject {
         val field = if (payload.startsWith("MT:")) "qr_payload" else "manual_code"
@@ -117,11 +120,12 @@ class HttpHomeLinkApi(baseUrl: String) : HomeLinkApi {
     private fun room(json: JSONObject) = Room(json.getLong("id"), json.getString("name"))
 
     private fun <T> call(method: String, path: String, body: JSONObject?, readTimeout: Int = 20_000,
+                         connectTimeout: Int = 5_000, timedOut: ApiError = ApiError.UNREACHABLE,
                          parse: (String) -> T): ApiResult<T> {
         val connection = try {
             (URL(base + path).openConnection() as HttpURLConnection).apply {
                 requestMethod = method
-                connectTimeout = 5_000
+                this.connectTimeout = connectTimeout
                 // Switching lights waits up to 10 s for every light's answer.
                 this.readTimeout = readTimeout
                 setRequestProperty("accept", "application/json")
@@ -131,6 +135,8 @@ class HttpHomeLinkApi(baseUrl: String) : HomeLinkApi {
                     outputStream.use { it.write(body.toString().toByteArray()) }
                 }
             }
+        } catch (_: SocketTimeoutException) {
+            return ApiResult.Failed(timedOut)
         } catch (_: IOException) {
             return ApiResult.Failed(ApiError.UNREACHABLE)
         }
@@ -139,6 +145,8 @@ class HttpHomeLinkApi(baseUrl: String) : HomeLinkApi {
             val stream = if (status < 400) connection.inputStream else connection.errorStream
             val text = stream?.use { it.readBytes().decodeToString() }.orEmpty()
             if (status in 200..299) ApiResult.Ok(parse(text)) else ApiResult.Failed(error(text))
+        } catch (_: SocketTimeoutException) {
+            ApiResult.Failed(timedOut)
         } catch (_: IOException) {
             ApiResult.Failed(ApiError.UNREACHABLE)
         } catch (_: JSONException) {

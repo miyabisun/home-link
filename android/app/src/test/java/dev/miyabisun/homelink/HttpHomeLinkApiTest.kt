@@ -201,20 +201,34 @@ class HttpHomeLinkApiTest {
         assertEquals(ApiResult.Failed(ApiError.UNREACHABLE), offline.commission(1, "MT:x", "", WifiNetwork("s", "p")))
     }
 
-    @Test fun unlocksTheDoorAndMapsItsFailures() {
-        respond("/api/door/unlock", 200, """{"status":"accepted"}""")
-        assertEquals(ApiResult.Ok(Unit), api.unlockDoor())
-        assertEquals("POST /api/door/unlock", requests.single())
-        val cases = listOf(
-            Triple(403, "not_tailnet", ApiError.NOT_TAILNET),
-            Triple(503, "sesame_not_configured", ApiError.SESAME_NOT_CONFIGURED),
-            Triple(502, "sesame_rejected", ApiError.SESAME_REJECTED),
-            Triple(502, "sesame_unreachable", ApiError.SESAME_UNREACHABLE),
-            Triple(502, "", ApiError.SERVER),
-        )
-        for ((status, code, expected) in cases) {
-            respond("/api/door/unlock", status, if (code.isEmpty()) "<html>bad gateway</html>" else """{"error":"$code"}""")
-            assertEquals("$status $code", ApiResult.Failed(expected), api.unlockDoor())
+    @Test fun sendsDoorCommandsAndMapsTheirFailures() {
+        for (command in DoorCommand.entries) {
+            val path = "/api/door/${command.path}"
+            requests.clear()
+            respond(path, 200, """{"status":"accepted"}""")
+            assertEquals(ApiResult.Ok(Unit), api.door(command))
+            assertEquals("POST $path", requests.single())
+            val cases = listOf(
+                Triple(403, "not_tailnet", ApiError.NOT_TAILNET),
+                Triple(503, "sesame_not_configured", ApiError.SESAME_NOT_CONFIGURED),
+                Triple(502, "sesame_rejected", ApiError.SESAME_REJECTED),
+                Triple(502, "sesame_unreachable", ApiError.SESAME_UNREACHABLE),
+                Triple(502, "", ApiError.SERVER),
+            )
+            for ((status, code, expected) in cases) {
+                respond(path, status, if (code.isEmpty()) "<html>bad gateway</html>" else """{"error":"$code"}""")
+                assertEquals("$command $status $code", ApiResult.Failed(expected), api.door(command))
+            }
+        }
+    }
+
+    @Test fun aDoorCommandWithoutAnAnswerInTimeIsATimeout() {
+        // Accepts the connection (the backlog does) but never answers.
+        ServerSocket(0).use { silent ->
+            val started = System.nanoTime()
+            assertEquals(ApiResult.Failed(ApiError.TIMEOUT),
+                HttpHomeLinkApi("http://127.0.0.1:${silent.localPort}").door(DoorCommand.LOCK))
+            assert(System.nanoTime() - started >= 15_000_000_000) { "gave up before 15 s" }
         }
     }
 }

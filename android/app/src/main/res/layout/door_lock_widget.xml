@@ -1,0 +1,8 @@
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@android:id/background" style="@style/WidgetFrame">
+    <FrameLayout android:id="@+id/door_button" style="@style/WidgetButton"
+        android:layout_width="match_parent" android:contentDescription="@string/door_lock">
+        <TextView android:id="@+id/door_button_text" style="@style/WidgetButtonText"
+            android:text="@string/door_lock" android:drawableTop="@drawable/ic_lock" />
+    </FrameLayout>
+</FrameLayout>

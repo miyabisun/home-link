@@ -778,7 +778,7 @@ class MainActivity : Activity() {
             is Status.Registered -> if (status.name.isEmpty()) "${status.room}に機器を登録しました"
                 else "${status.room}に「${status.name}」を登録しました"
             is Status.Failed -> when (status.error) {
-                ApiError.UNREACHABLE -> "home-link（${Uri.parse(BuildConfig.HOME_LINK_URL).authority}）に接続できません。" +
+                ApiError.UNREACHABLE, ApiError.TIMEOUT -> "home-link（${Uri.parse(BuildConfig.HOME_LINK_URL).authority}）に接続できません。" +
                     "Tailscaleの接続を確認してください"
                 ApiError.DUPLICATE_QR -> "この機器は登録済みです"
                 ApiError.ROOM_NOT_FOUND -> "選んだ部屋が見つかりません。部屋を選び直してください"

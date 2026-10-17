@@ -8,5 +8,9 @@
     <string name="widget_description">家の照明を全部オン・全部オフにし、仕事と作業の照明を明るくします</string>
     <string name="door_unlock">解錠</string>
     <string name="door_widget_name">玄関の解錠</string>
-    <string name="door_widget_description">玄関のSESAMEを解錠します。施錠はオートロックに任せます</string>
+    <string name="door_widget_description">玄関のSESAMEを解錠します</string>
+    <string name="door_lock">施錠</string>
+    <string name="door_lock_widget_name">玄関の施錠</string>
+    <string name="door_lock_widget_description">玄関のSESAMEを施錠します</string>
+    <string name="door_channel">玄関の解錠・施錠</string>
 </resources>
