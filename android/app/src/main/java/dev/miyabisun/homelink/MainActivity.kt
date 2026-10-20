@@ -457,8 +457,9 @@ class MainActivity : Activity() {
         form.moving = WifiMove.device
         WifiMove.take()?.let { (id, result) ->
             if (form.device?.id == id) form.wifiMoved(result)
-            // The device may answer from the old Wi-Fi or not at all: its state shows which.
-            loadDevices()
+            // A failed device may answer from the old Wi-Fi or not at all: its state shows which.
+            // A moved one is as home-link answered; matterjs-server may not have read its new network yet.
+            if (result is ApiResult.Failed) loadDevices()
         }
         render()
     }

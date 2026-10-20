@@ -746,9 +746,13 @@ class RegisterScreenTest {
             capture(screen, "move-busy")
             screen.recreate()
             eventually(screen) { hasLabel(it, "Wi-Fiを移しています…") && field(it, "機器名（任意）").text.toString() == "押入れ1" }
+            api.listedWifi = "home-2g"
             gate.countDown()
             eventually(screen) { hasLabel(it, "「iot-2g」へ移しました") }
+            InstrumentationRegistry.getInstrumentation().waitForIdleSync()
+            Thread.sleep(300)
             screen.onActivity { assertFalse(views(it).any { v -> v is Button && v.isShown && v.text == move }) }
+            api.listedWifi = null
             assertEquals(listOf(1L), api.moves.toList())
             capture(screen, "move-done")
         }
@@ -919,8 +923,11 @@ private class FakeApi : HomeLinkApi {
     val labels: MutableList<Label> = Collections.synchronizedList(mutableListOf())
     @Volatile var devicesFailure: ApiError? = null
 
-    override fun devices(): ApiResult<List<Device>> =
-        devicesFailure?.let { ApiResult.Failed(it) } ?: ApiResult.Ok(synchronized(ledger) { ledger.map { it.copy(code = null) } })
+    /** A Wi-Fi the list reports for every device, as matterjs-server's cache may before it reads a move. */
+    @Volatile var listedWifi: String? = null
+
+    override fun devices(): ApiResult<List<Device>> = devicesFailure?.let { ApiResult.Failed(it) }
+        ?: ApiResult.Ok(synchronized(ledger) { ledger.map { it.copy(code = null, wifiSsid = listedWifi ?: it.wifiSsid) } })
 
     override fun device(id: Long): ApiResult<Device> =
         ledger.toList().firstOrNull { it.id == id }?.let { ApiResult.Ok(it) } ?: ApiResult.Failed(ApiError.DEVICE_NOT_FOUND)
