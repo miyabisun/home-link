@@ -7,8 +7,8 @@ android {
         applicationId = "dev.miyabisun.homelink"
         minSdk = 36
         targetSdk = 37
-        versionCode = 24
-        versionName = "0.1.27"
+        versionCode = 25
+        versionName = "0.1.30"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
     compileOptions {
