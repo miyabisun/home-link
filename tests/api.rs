@@ -244,7 +244,8 @@ fn opening_a_ledger_from_the_code_only_schema_keeps_its_devices() {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        assert_eq!(row, ("34970112332".into(), "電球".into(), None, 0));
+        // Adjusted by the schedule before, it is under the auto label.
+        assert_eq!(row, ("34970112332".into(), "電球".into(), None, 1));
         db.execute(
             "INSERT INTO devices (room_id, vendor, serial_number) VALUES (1, 'Tapo', ?1)",
             [format!("S{round}")],
@@ -727,7 +728,8 @@ fn tuning_nodes() -> Value {
     json!([
         { "node_id": 1, "available": true, "attributes": {
             "2/29/0": [{ "0": 268, "1": 4 }], "2/6/0": false, "2/8/0": 100,
-            "2/768/65532": 16, "2/57/3": "Aqara LED Bulb T2", "2/57/17": false,
+            "2/768/65532": 16, "2/57/1": "Aqara", "2/57/15": "t2-a",
+            "2/57/3": "Aqara LED Bulb T2", "2/57/17": false,
             "3/29/0": [{ "0": 268, "1": 4 }], "3/6/0": true, "3/8/0": 100, "3/8/2": 1, "3/8/3": 254,
             "3/768/65532": 16, "3/768/16395": 153, "3/768/16396": 370,
             "3/57/1": "Aqara", "3/57/15": "t2-b", "3/57/3": "Aqara LED Bulb T2", "3/57/17": true,
@@ -743,13 +745,51 @@ fn tuning_nodes() -> Value {
             "1/768/65532": 25, "1/768/16395": 153, "1/768/16396": 400,
         }},
         { "node_id": 16, "available": false, "attributes": {
+            "0/40/1": "Uascent", "0/40/15": "beam",
             "0/40/3": "Smart Bulb", "1/29/0": [{ "0": 269, "1": 1 }], "1/6/0": true,
             "1/8/0": 100, "1/768/65532": 16, "1/768/16395": 142, "1/768/16396": 454,
         }},
         { "node_id": 30, "available": true, "attributes": {
+            "0/40/1": "Plainco", "0/40/15": "plain",
             "1/29/0": [{ "0": 256, "1": 1 }], "1/6/0": true,
         }},
     ])
+}
+
+/// The vendor and serial number of every light `tuning_nodes` serves, in its order.
+const TUNING_LIGHTS: [(&str, &str); 6] = [
+    ("Aqara", "t2-a"),
+    ("Aqara", "t2-b"),
+    ("Tapo", TAPO),
+    ("Tapo", "tapo-desk"),
+    ("Uascent", "beam"),
+    ("Plainco", "plain"),
+];
+
+/// A home over `tuning_nodes` whose lights are all in the ledger, unnamed, under the
+/// auto label "room", with the test's connection to the ledger.
+async fn auto_home(
+    addr: SocketAddr,
+    clock: Option<fn() -> i64>,
+) -> (home_link::Home, Router, rusqlite::Connection) {
+    let (db, sql) = ledger();
+    let home = home_link::Home::new(db, Some(format!("ws://{addr}/ws")));
+    let home = match clock {
+        Some(clock) => home.with_clock(clock),
+        None => home,
+    };
+    let app = home.router();
+    let room = create_label(&app, json!({ "name": "room", "auto": true })).await;
+    for (vendor, serial) in TUNING_LIGHTS {
+        let device = add_device(
+            &app,
+            &sql,
+            json!({ "vendor": vendor, "serial_number": serial }),
+        )
+        .await;
+        assert_eq!(assign(&app, &device, &[&room]).await.0, StatusCode::OK);
+    }
+    (home, app, sql)
 }
 
 /// 2026-10-05 23:00 in Tokyo: night, level 102 and 3000 K (333 mired).
@@ -831,11 +871,7 @@ async fn scheduled_adjustment_writes_only_to_lights_read_as_on() {
         ..Fake::default()
     };
     let (addr, commands, _) = fake_light_server(tuning_nodes(), fake).await;
-    let home = home_link::Home::new(
-        home_link::open_db(":memory:").unwrap(),
-        Some(format!("ws://{addr}/ws")),
-    );
-    let app = home.router();
+    let (home, app, _) = auto_home(addr, None).await;
     enable(&app).await;
 
     home.adjust(NIGHT, "scheduled").await;
@@ -930,117 +966,6 @@ fn sent_values(commands: &Arc<Mutex<Vec<Value>>>) -> Vec<(Value, Value, Value)> 
 }
 
 #[tokio::test]
-async fn a_labelled_light_gets_its_labels_values_and_others_the_schedules() {
-    let fake = Fake {
-        ignore_off: true,
-        ..Fake::default()
-    };
-    let (addr, commands, _) = fake_light_server(tuning_nodes(), fake).await;
-    let (db, sql) = ledger();
-    let home = home_link::Home::new(db, Some(format!("ws://{addr}/ws")));
-    let app = home.router();
-    enable(&app).await;
-    let room = create_room(&app, "リビング").await;
-    let t2 = add_device(
-        &app,
-        &sql,
-        json!({ "room_id": room, "vendor": "Aqara", "serial_number": "t2-b", "name": "キッチン" }),
-    )
-    .await;
-    let (_, kitchen) = call(
-        &app,
-        "POST",
-        "/api/labels",
-        Some(json!({ "name": "キッチン", "night_level": 76, "warm_kelvin": 2700 })),
-    )
-    .await;
-    let uri = format!("/api/devices/{}", t2["id"]);
-    let (status, device) = call(
-        &app,
-        "PATCH",
-        &uri,
-        Some(json!({ "label_ids": [kitchen["id"]] })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{device}");
-
-    home.adjust(NIGHT, "scheduled").await;
-
-    // The labelled T2 gets 76 and 2700 K (370 mired); the Tapo without a label
-    // the schedule's 102 and 3000 K (333 mired).
-    assert_eq!(
-        sent_values(&commands),
-        [
-            (json!(1), json!(3), json!(76)),
-            (json!(1), json!(3), json!(370)),
-            (json!(5), json!(1), json!(102)),
-            (json!(5), json!(1), json!(333)),
-        ]
-    );
-    let (_, body) = call(&app, "GET", "/api/lights/schedule", None).await;
-    let run = &body["runs"][0];
-    assert_eq!((&run["level"], &run["kelvin"]), (&json!(102), &json!(3000)));
-    let target = |i: usize| {
-        let l = &run["lights"][i];
-        (
-            l["labels"].clone(),
-            l["target_level"].clone(),
-            l["target_kelvin"].clone(),
-        )
-    };
-    assert_eq!(target(1), (json!(["キッチン"]), json!(76), json!(2700)));
-    assert_eq!(target(2), (json!([]), json!(102), json!(3000)));
-    // Unreachable lights are not written to, whatever their target.
-    assert_eq!(decisions(run)[0].2, "no_response");
-    assert_eq!(decisions(run)[4].2, "no_response");
-    assert_eq!(
-        body["labels"],
-        json!([{
-            "id": kitchen["id"], "name": "キッチン",
-            "day_level": null, "night_level": 76, "cool_kelvin": null, "warm_kelvin": 2700,
-            "boosted": false,
-            "devices": [{ "id": t2["id"], "name": "キッチン", "room_name": "リビング" }],
-        }])
-    );
-
-    // "All off" writes nothing, labelled or not, though the lights stay on.
-    let (status, _) = call(&app, "POST", "/api/lights/off", None).await;
-    assert_eq!(status, StatusCode::OK);
-    commands.lock().unwrap().clear();
-    let (_, kitchen) = call(
-        &app,
-        "PATCH",
-        &format!("/api/labels/{}", kitchen["id"]),
-        Some(json!({ "night_level": 50 })),
-    )
-    .await;
-    assert_eq!(kitchen["night_level"], 50);
-    home.adjust(NIGHT + 600, "scheduled").await;
-    assert_eq!(tunings(&commands), []);
-
-    // Deleting the label returns the T2 to the schedule's values.
-    let (status, _) = call(&app, "POST", "/api/lights/on", None).await;
-    assert_eq!(status, StatusCode::OK);
-    let (status, _) = call(
-        &app,
-        "DELETE",
-        &format!("/api/labels/{}", kitchen["id"]),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-    commands.lock().unwrap().clear();
-    home.adjust(NIGHT + 1200, "scheduled").await;
-    // "All on" set the others to the wall clock's values: only the T2 is compared.
-    let sent: Vec<_> = sent_values(&commands)
-        .into_iter()
-        .map(|v| v.2)
-        .take(2)
-        .collect();
-    assert_eq!(sent, [json!(102), json!(333)]);
-}
-
-#[tokio::test]
 async fn labels_support_create_list_update_assign_and_delete() {
     let (app, sql) = ledger_app();
     let room = create_room(&app, "リビング").await;
@@ -1052,22 +977,21 @@ async fn labels_support_create_list_update_assign_and_delete() {
     .await;
     let device_uri = format!("/api/devices/{}", device["id"]);
     assert_eq!(device["labels"], json!([]));
-    assert!(device.get("min_kelvin").is_none(), "{device}");
 
     let (status, label) = call(
         &app,
         "POST",
         "/api/labels",
-        Some(json!({ "name": " ゲームPC ", "warm_kelvin": 3500 })),
+        Some(json!({ "name": " work ", "override_level": 254, "override_kelvin": 5000 })),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{label}");
     let id = label["id"].clone();
     assert_eq!(
         label,
-        json!({ "id": id, "name": "ゲームPC", "day_level": null, "night_level": null,
-                "cool_kelvin": null, "warm_kelvin": 3500, "device_count": 0, "boosted": false,
-                "dedicated": false })
+        json!({ "id": id, "name": "work", "auto": false, "override_level": 254,
+                "override_kelvin": 5000, "on": null, "schedule": [], "device_count": 0,
+                "boosted": false })
     );
 
     // Assigning and the device's view of it.
@@ -1079,28 +1003,41 @@ async fn labels_support_create_list_update_assign_and_delete() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{assigned}");
-    assert_eq!(
-        assigned["labels"],
-        json!([{ "id": id, "name": "ゲームPC" }])
-    );
+    assert_eq!(assigned["labels"], json!([{ "id": id, "name": "work" }]));
     let (_, labels) = call(&app, "GET", "/api/labels", None).await;
     assert_eq!(labels[0]["device_count"], 1);
 
-    // Updating merges; null returns a value to the schedule's.
+    // Updating merges; null takes the override away; a schedule replaces the last.
     let uri = format!("/api/labels/{id}");
     let (status, label) = call(
         &app,
         "PATCH",
         &uri,
-        Some(json!({ "night_level": 64, "warm_kelvin": null })),
+        Some(json!({ "override_level": null, "override_kelvin": null, "auto": true,
+                     "schedule": [{ "time": "05:00", "on": false }, { "time": "00:00", "on": true }] })),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{label}");
     assert_eq!(
-        (&label["night_level"], &label["warm_kelvin"]),
-        (&json!(64), &Value::Null)
+        (
+            &label["name"],
+            &label["auto"],
+            &label["override_level"],
+            &label["override_kelvin"]
+        ),
+        (&json!("work"), &json!(true), &Value::Null, &Value::Null)
     );
-    assert_eq!(label["name"], "ゲームPC");
+    assert_eq!(
+        label["schedule"],
+        json!([{ "time": "00:00", "on": true }, { "time": "05:00", "on": false }])
+    );
+    let (_, label) = call(&app, "PATCH", &uri, Some(json!({ "name": "room" }))).await;
+    assert_eq!(
+        (&label["auto"], label["schedule"].as_array().unwrap().len()),
+        (&json!(true), 2)
+    );
+    let (_, label) = call(&app, "PATCH", &uri, Some(json!({ "schedule": [] }))).await;
+    assert_eq!(label["schedule"], json!([]));
 
     // Deleting a label in use unassigns its devices.
     let (status, _) = call(&app, "DELETE", &uri, None).await;
@@ -1115,7 +1052,7 @@ async fn labels_support_create_list_update_assign_and_delete() {
     let (_, labels) = call(&app, "GET", "/api/labels", None).await;
     assert_eq!(labels, json!([]));
 
-    // Unassigning with null.
+    // Unassigning with an empty list.
     let (_, label) = call(&app, "POST", "/api/labels", Some(json!({ "name": "夜" }))).await;
     call(
         &app,
@@ -1129,7 +1066,7 @@ async fn labels_support_create_list_update_assign_and_delete() {
 }
 
 #[tokio::test]
-async fn label_values_names_and_assignments_are_validated() {
+async fn label_traits_names_and_assignments_are_validated() {
     let (app, sql) = ledger_app();
     let room = create_room(&app, "リビング").await;
     let device = add_device(
@@ -1139,22 +1076,29 @@ async fn label_values_names_and_assignments_are_validated() {
     )
     .await;
     let device_uri = format!("/api/devices/{}", device["id"]);
-    let (_, label) = call(
-        &app,
-        "POST",
-        "/api/labels",
-        Some(json!({ "name": "ゲームPC" })),
-    )
-    .await;
+    let (_, label) = call(&app, "POST", "/api/labels", Some(json!({ "name": "game" }))).await;
     let uri = format!("/api/labels/{}", label["id"]);
     for bad in [
-        json!({ "name": "x", "day_level": 0 }),
-        json!({ "name": "x", "night_level": 255 }),
-        json!({ "name": "x", "night_level": 300 }),
-        json!({ "name": "x", "warm_kelvin": 999 }),
-        json!({ "name": "x", "cool_kelvin": 10001 }),
-        json!({ "name": "x", "warm_kelvin": 4000, "cool_kelvin": 3500 }),
-        json!({ "name": "x", "floor": 1 }),
+        json!({ "name": "x", "override_level": 0, "override_kelvin": 5000 }),
+        json!({ "name": "x", "override_level": 255, "override_kelvin": 5000 }),
+        json!({ "name": "x", "override_level": 254, "override_kelvin": 999 }),
+        json!({ "name": "x", "override_level": 254, "override_kelvin": 10001 }),
+        // Both or neither.
+        json!({ "name": "x", "override_level": 254 }),
+        json!({ "name": "x", "override_kelvin": 5000 }),
+        // An override holds its lights out of the adjustment, so it is not also auto.
+        json!({ "name": "x", "auto": true, "override_level": 254, "override_kelvin": 5000 }),
+        json!({ "name": "x", "auto": "yes" }),
+        json!({ "name": "x", "schedule": [{ "time": "24:00", "on": true }] }),
+        json!({ "name": "x", "schedule": [{ "time": "5:00", "on": true }] }),
+        json!({ "name": "x", "schedule": [{ "time": "05:60", "on": true }] }),
+        json!({ "name": "x", "schedule": [{ "time": "05:00" }] }),
+        json!({ "name": "x", "schedule": [{ "time": "05:00", "on": true }, { "time": "05:00", "on": false }] }),
+        json!({ "name": "x", "schedule": { "time": "05:00", "on": true } }),
+        // The values of each label and being dedicated are gone; the state is switched, not set.
+        json!({ "name": "x", "night_level": 76 }),
+        json!({ "name": "x", "dedicated": true }),
+        json!({ "name": "x", "on": true }),
     ] {
         let (status, error) = call(&app, "POST", "/api/labels", Some(bad.clone())).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
@@ -1169,18 +1113,12 @@ async fn label_values_names_and_assignments_are_validated() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
         assert_eq!(error["error"], "invalid_label_name");
     }
-    let (status, error) = call(
-        &app,
-        "POST",
-        "/api/labels",
-        Some(json!({ "name": "ゲームPC" })),
-    )
-    .await;
+    let (status, error) = call(&app, "POST", "/api/labels", Some(json!({ "name": "game" }))).await;
     assert_eq!(
         (status, &error["error"]),
         (StatusCode::CONFLICT, &json!("duplicate_label_name"))
     );
-    let (status, _) = call(&app, "PATCH", &uri, Some(json!({ "cool_kelvin": 900 }))).await;
+    let (status, _) = call(&app, "PATCH", &uri, Some(json!({ "override_level": 900 }))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let (status, error) = call(
         &app,
@@ -1197,13 +1135,12 @@ async fn label_values_names_and_assignments_are_validated() {
     let (status, error) = call(&app, "PATCH", &device_uri, Some(json!({}))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(error["error"], "invalid_device_update");
-    // The floor is gone: only labels set a light's warm white. One label per light is gone too.
     for bad in [
         json!({ "min_kelvin": 3500 }),
         json!({ "label_id": label["id"] }),
         json!({ "label_ids": null }),
         json!({ "label_ids": label["id"] }),
-        json!({ "label_ids": ["ゲームPC"] }),
+        json!({ "label_ids": ["game"] }),
     ] {
         let (status, error) = call(&app, "PATCH", &device_uri, Some(bad.clone())).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
@@ -1219,15 +1156,38 @@ async fn label_values_names_and_assignments_are_validated() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
-/// A label row: id, name, warm and cool kelvin, day and night level.
-type LabelRow = (
-    i64,
-    String,
-    Option<u16>,
-    Option<u16>,
-    Option<u8>,
-    Option<u8>,
-);
+/// A label row: id, name, auto, override level and kelvin.
+type LabelRow = (i64, String, bool, Option<u8>, Option<u16>);
+
+/// Each device with the ids of its labels.
+fn assignments(db: &rusqlite::Connection) -> Vec<(i64, Vec<i64>)> {
+    db.prepare(
+        "SELECT devices.id, json_group_array(label_id) FILTER (WHERE label_id IS NOT NULL)
+         FROM devices LEFT JOIN device_labels ON device_id = devices.id
+         GROUP BY devices.id ORDER BY devices.id",
+    )
+    .unwrap()
+    .query_map([], |r| {
+        let ids: String = r.get(1)?;
+        let mut ids: Vec<i64> = serde_json::from_str(&ids).unwrap();
+        ids.sort_unstable();
+        Ok((r.get(0)?, ids))
+    })
+    .unwrap()
+    .collect::<Result<_, _>>()
+    .unwrap()
+}
+
+fn label_rows(db: &rusqlite::Connection) -> Vec<LabelRow> {
+    db.prepare("SELECT id, name, auto, override_level, override_kelvin FROM labels ORDER BY id")
+        .unwrap()
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
 
 #[test]
 fn opening_a_ledger_with_floors_moves_them_to_labels() {
@@ -1238,6 +1198,7 @@ fn opening_a_ledger_with_floors_moves_them_to_labels() {
         let old = home_link::open_db(path.to_str().unwrap()).unwrap();
         old.execute_batch(
             "PRAGMA user_version = 0;
+            DROP TABLE label_schedules;
             DROP TABLE device_labels;
             DROP TABLE devices;
             DROP TABLE labels;
@@ -1264,38 +1225,24 @@ fn opening_a_ledger_with_floors_moves_them_to_labels() {
     }
     for _ in 0..2 {
         let db = home_link::open_db(path.to_str().unwrap()).unwrap();
-        let labels: Vec<LabelRow> = db
-            .prepare("SELECT id, name, warm_kelvin, cool_kelvin, day_level, night_level FROM labels ORDER BY id")
-            .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
+        // Each label became one that lights at the day's values, and every light the
+        // schedule adjusted is under the new auto label.
         assert_eq!(
-            labels,
+            label_rows(&db),
             [
-                (1, "夜3500K".into(), Some(3500), None, None, None),
-                (2, "夜4000K".into(), Some(4000), None, None, None),
+                (1, "夜3500K".into(), false, Some(203), Some(5000)),
+                (2, "夜4000K".into(), false, Some(203), Some(5000)),
+                (3, "自動調光".into(), true, None, None),
             ]
         );
-        let assigned: Vec<(i64, Option<i64>)> = db
-            .prepare(
-                "SELECT devices.id, label_id FROM devices
-                 LEFT JOIN device_labels ON device_id = devices.id ORDER BY devices.id",
-            )
-            .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
         assert_eq!(
-            assigned,
+            assignments(&db),
             [
-                (3, Some(1)),
-                (4, Some(1)),
-                (14, Some(1)),
-                (15, Some(2)),
-                (20, None)
+                (3, vec![1, 3]),
+                (4, vec![1, 3]),
+                (14, vec![1, 3]),
+                (15, vec![2, 3]),
+                (20, vec![3])
             ]
         );
         let has_floor: bool = db
@@ -1313,12 +1260,9 @@ fn opening_a_ledger_with_floors_moves_them_to_labels() {
 #[tokio::test]
 async fn adjustment_is_off_until_the_user_enables_it() {
     let (addr, commands, _) = fake_light_server(tuning_nodes(), Fake::default()).await;
-    let home = home_link::Home::new(
-        home_link::open_db(":memory:").unwrap(),
-        Some(format!("ws://{addr}/ws")),
-    );
+    let (home, app, _) = auto_home(addr, None).await;
     home.adjust(NIGHT, "scheduled").await;
-    let (_, body) = call(&home.router(), "GET", "/api/lights/schedule", None).await;
+    let (_, body) = call(&app, "GET", "/api/lights/schedule", None).await;
     assert_eq!(body["settings"]["enabled"], false);
     assert_eq!(body["runs"][0]["commands"], 0);
     assert!(
@@ -1330,7 +1274,8 @@ async fn adjustment_is_off_until_the_user_enables_it() {
 }
 
 #[tokio::test]
-async fn all_off_stops_adjustment_until_all_on_across_restarts() {
+#[allow(clippy::too_many_lines)]
+async fn an_auto_labels_off_stops_its_adjustment_until_it_is_on_across_restarts() {
     let fake = Fake {
         ignore_off: true,
         ..Fake::default()
@@ -1340,20 +1285,43 @@ async fn all_off_stops_adjustment_until_all_on_across_restarts() {
     let path = std::env::temp_dir().join(format!("home-link-intent-{}.db", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let db_path = path.to_str().unwrap();
-    {
+    let room = {
         let home = home_link::Home::new(home_link::open_db(db_path).unwrap(), url.clone());
         let app = home.router();
+        let sql = home_link::open_db(db_path).unwrap();
         enable(&app).await;
-        let (status, _) = call(&app, "POST", "/api/lights/off", None).await;
-        assert_eq!(status, StatusCode::OK);
+        let room = create_label(&app, json!({ "name": "room", "auto": true })).await;
+        for (vendor, serial) in TUNING_LIGHTS {
+            let device = add_device(
+                &app,
+                &sql,
+                json!({ "vendor": vendor, "serial_number": serial }),
+            )
+            .await;
+            assert_eq!(assign(&app, &device, &[&room]).await.0, StatusCode::OK);
+        }
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("/api/labels/{}/off", room["id"]),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            (&body["action"], &body["on"]),
+            (&json!("off"), &json!(false))
+        );
+        commands.lock().unwrap().clear();
         home.adjust(NIGHT, "scheduled").await;
-    }
+        room
+    };
     // Lights on again by other means (1/3 and 5/1) are left alone too.
     assert_eq!(tunings(&commands), []);
     assert_eq!(reads(&commands), []);
 
-    // A restart keeps "all off".
-    let home = home_link::Home::new(home_link::open_db(db_path).unwrap(), url);
+    // A restart keeps the label off.
+    let home = home_link::Home::new(home_link::open_db(db_path).unwrap(), url.clone());
     let app = home.router();
     // Every ten-minute run through the night and the next day sends nothing.
     for step in 1..=24 * 6 {
@@ -1362,20 +1330,26 @@ async fn all_off_stops_adjustment_until_all_on_across_restarts() {
     assert_eq!(tunings(&commands), []);
     assert_eq!(reads(&commands), []);
     let (_, body) = call(&app, "GET", "/api/lights/schedule", None).await;
-    assert_eq!(body["intent"]["action"], "off");
-    assert_eq!(body["settings"]["enabled"], true);
+    assert!(body.get("intent").is_none(), "{body}");
+    assert_eq!(body["labels"][0]["on"], false);
     let run = &body["runs"][0];
     assert_eq!(run["at"], "2026-10-06T23:00:00+09:00");
     assert_eq!(run["commands"], 0);
     assert!(decisions(run).iter().all(|(_, _, d)| d == "all_off"));
 
-    // "All on" lights them at the current values and resumes the adjustment.
+    // Its on lights its lights at the current values and resumes the adjustment.
     commands.lock().unwrap().clear();
-    let (status, _) = call(&app, "POST", "/api/lights/on", None).await;
-    assert_eq!(status, StatusCode::OK);
+    let (status, body) = call(
+        &app,
+        "POST",
+        &format!("/api/labels/{}/on", room["id"]),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!((&body["action"], &body["on"]), (&json!("on"), &json!(true)));
     let (_, body) = call(&app, "GET", "/api/lights/schedule", None).await;
-    assert_eq!(body["intent"]["action"], "on");
-    assert_eq!(body["runs"][0]["trigger"], "lights_on");
+    assert_eq!(body["runs"][0]["trigger"], "label_on");
     let tuned: Vec<_> = tunings(&commands)
         .into_iter()
         .map(|(node, endpoint, cluster, _, _)| (node, endpoint, cluster))
@@ -1391,6 +1365,28 @@ async fn all_off_stops_adjustment_until_all_on_across_restarts() {
             (json!(6), json!(1), json!(768)),
         ]
     );
+
+    // "All off" and "all on", until the app moves to labels, do the same to every label.
+    assert_eq!(
+        call(&app, "POST", "/api/lights/off", None).await.0,
+        StatusCode::OK
+    );
+    commands.lock().unwrap().clear();
+    home.adjust(NIGHT + 600, "scheduled").await;
+    assert_eq!(tunings(&commands), []);
+    drop((home, app));
+    let home = home_link::Home::new(home_link::open_db(db_path).unwrap(), url);
+    let app = home.router();
+    home.adjust(NIGHT + 1200, "scheduled").await;
+    assert_eq!(tunings(&commands), []);
+    assert_eq!(
+        call(&app, "POST", "/api/lights/on", None).await.0,
+        StatusCode::OK
+    );
+    let (_, body) = call(&app, "GET", "/api/lights/schedule", None).await;
+    assert_eq!(body["runs"][0]["trigger"], "lights_on");
+    assert_eq!(body["labels"][0]["on"], true);
+    assert_eq!(tunings(&commands).len(), 6);
     let _ = std::fs::remove_file(&path);
 }
 
@@ -1402,11 +1398,7 @@ async fn all_on_writes_the_current_values_to_lights_whose_on_is_reported_late() 
         ..Fake::default()
     };
     let (addr, commands, _) = fake_light_server(tuning_nodes(), fake).await;
-    let home = home_link::Home::new(
-        home_link::open_db(":memory:").unwrap(),
-        Some(format!("ws://{addr}/ws")),
-    );
-    let app = home.router();
+    let (home, app, _) = auto_home(addr, None).await;
     enable(&app).await;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1460,12 +1452,7 @@ const AFTER_MIDNIGHT: i64 = NIGHT + 90 * 60;
 #[tokio::test]
 async fn after_midnight_the_schedule_and_all_on_write_half_the_night_level() {
     let (addr, commands, _) = fake_light_server(tuning_nodes(), Fake::default()).await;
-    let home = home_link::Home::new(
-        home_link::open_db(":memory:").unwrap(),
-        Some(format!("ws://{addr}/ws")),
-    )
-    .with_clock(|| AFTER_MIDNIGHT);
-    let app = home.router();
+    let (home, app, _) = auto_home(addr, Some(|| AFTER_MIDNIGHT)).await;
     enable(&app).await;
 
     home.adjust(AFTER_MIDNIGHT, "scheduled").await;
@@ -1524,7 +1511,7 @@ async fn schedule_settings_merge_and_are_validated() {
                 "morning_end_minute": 600, "day_level": 203, "night_level": 102,
                 "warm_kelvin": 3000, "cool_kelvin": 5000, "late_night_percent": 50 })
     );
-    assert_eq!(body["intent"], Value::Null);
+    assert!(body.get("intent").is_none(), "{body}");
     assert_eq!(body["runs"], json!([]));
 
     let (status, body) = call(
@@ -2783,21 +2770,24 @@ async fn opening_a_v0_1_30_ledger_keeps_its_lights_connected_with_their_labels()
         let db = home_link::open_db(path.to_str().unwrap()).unwrap();
         let rows: Vec<Value> = db
             .prepare(
-                "SELECT json_array(devices.id, room_id, name, ignored, label_id, vendor_id, product_id)
-                 FROM devices LEFT JOIN device_labels ON device_id = devices.id ORDER BY devices.id",
+                "SELECT json_array(devices.id, room_id, name, ignored, vendor_id, product_id)
+                 FROM devices ORDER BY devices.id",
             )
             .unwrap()
-            .query_map([], |r| Ok(serde_json::from_str(&r.get::<_, String>(0)?).unwrap()))
+            .query_map([], |r| {
+                Ok(serde_json::from_str(&r.get::<_, String>(0)?).unwrap())
+            })
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(
             rows,
             [
-                json!([3, 1, "キッチン1", 0, 1, null, null]),
-                json!([4, 1, "書斎", 1, null, 0xFFF1, 0x8000]),
+                json!([3, 1, "キッチン1", 0, null, null]),
+                json!([4, 1, "書斎", 1, 0xFFF1, 0x8000]),
             ]
         );
+        assert_eq!(assignments(&db), [(3, vec![1, 2]), (4, vec![2])]);
     }
 
     let (addr, _, nodes) =
@@ -3009,18 +2999,10 @@ async fn ignored_lights_get_no_switch_and_are_not_counted() {
 #[tokio::test]
 async fn ignored_lights_get_no_adjustment() {
     let (addr, commands, _) = fake_light_server(tuning_nodes(), Fake::default()).await;
-    let (db, sql) = ledger();
-    let home = home_link::Home::new(db, Some(format!("ws://{addr}/ws")));
-    let app = home.router();
+    let (home, app, _) = auto_home(addr, None).await;
     enable(&app).await;
-    let room = create_room(&app, "寝室").await;
-    let tapo = add_device(
-        &app,
-        &sql,
-        json!({ "room_id": room, "vendor": "Tapo", "serial_number": TAPO }),
-    )
-    .await;
-    ignore(&app, &[tapo["id"].as_i64().unwrap()]).await;
+    // The Tapo, third in the ledger.
+    ignore(&app, &[3]).await;
 
     home.adjust(NIGHT, "scheduled").await;
     let (_, body) = call(&app, "GET", "/api/lights/schedule", None).await;
@@ -3053,6 +3035,7 @@ fn opening_a_version_4_ledger_moves_each_lights_label_to_its_labels() {
         let old = home_link::open_db(path.to_str().unwrap()).unwrap();
         old.execute_batch(
             "PRAGMA foreign_keys = OFF;
+            DROP TABLE label_schedules;
             DROP TABLE device_labels;
             DROP TABLE devices;
             DROP TABLE labels;
@@ -3090,17 +3073,10 @@ fn opening_a_version_4_ledger_moves_each_lights_label_to_its_labels() {
     }
     for _ in 0..2 {
         let db = home_link::open_db(path.to_str().unwrap()).unwrap();
-        let assigned: Vec<(i64, Option<i64>)> = db
-            .prepare(
-                "SELECT devices.id, label_id FROM devices
-                 LEFT JOIN device_labels ON device_id = devices.id ORDER BY devices.id",
-            )
-            .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        assert_eq!(assigned, [(3, Some(1)), (4, Some(2)), (5, None)]);
+        assert_eq!(
+            assignments(&db),
+            [(3, vec![1, 3]), (4, vec![2, 3]), (5, vec![3])]
+        );
         let kept: Vec<(String, Option<String>, bool)> = db
             .prepare("SELECT name, mac, ignored FROM devices ORDER BY id")
             .unwrap()
@@ -3138,7 +3114,8 @@ fn opening_a_version_4_ledger_moves_each_lights_label_to_its_labels() {
     }
     let db = home_link::open_db(path.to_str().unwrap()).unwrap();
     db.execute("DELETE FROM devices WHERE id = 3", []).unwrap();
-    db.execute("DELETE FROM labels WHERE id = 2", []).unwrap();
+    db.execute("DELETE FROM labels WHERE id IN (2, 3)", [])
+        .unwrap();
     let left: i64 = db
         .query_row("SELECT count(*) FROM device_labels", [], |r| r.get(0))
         .unwrap();
@@ -3164,7 +3141,7 @@ async fn assign(app: &Router, device: &Value, labels: &[&Value]) -> (StatusCode,
 }
 
 #[tokio::test]
-async fn a_light_takes_several_labels_unless_two_set_the_same_value() {
+async fn a_light_takes_several_labels_of_any_traits() {
     let (app, sql) = ledger_app();
     let room = create_room(&app, "リビング").await;
     let t2 = add_device(
@@ -3173,22 +3150,23 @@ async fn a_light_takes_several_labels_unless_two_set_the_same_value() {
         json!({ "room_id": room, "vendor": "Aqara", "serial_number": "t2-b", "name": "キッチン1" }),
     )
     .await;
+    let room_label = create_label(&app, json!({ "name": "room", "auto": true })).await;
+    let living = create_label(&app, json!({ "name": "living", "auto": true })).await;
     let kitchen = create_label(
         &app,
-        json!({ "name": "キッチン", "night_level": 76, "warm_kelvin": 2700 }),
+        json!({ "name": "kitchen", "override_level": 203, "override_kelvin": 5000 }),
     )
     .await;
-    let work = create_label(&app, json!({ "name": "作業" })).await;
-    let game_pc = create_label(&app, json!({ "name": "ゲームPC", "warm_kelvin": 3500 })).await;
 
-    // A label without values stacks on any other; the order given does not matter.
-    let (status, device) = assign(&app, &t2, &[&work, &kitchen, &work]).await;
+    // The order given does not matter, nor a label given twice.
+    let (status, device) = assign(&app, &t2, &[&kitchen, &room_label, &living, &kitchen]).await;
     assert_eq!(status, StatusCode::OK, "{device}");
     assert_eq!(
         device["labels"],
         json!([
-            { "id": kitchen["id"], "name": "キッチン" },
-            { "id": work["id"], "name": "作業" },
+            { "id": room_label["id"], "name": "room" },
+            { "id": living["id"], "name": "living" },
+            { "id": kitchen["id"], "name": "kitchen" },
         ])
     );
     let (_, labels) = call(&app, "GET", "/api/labels", None).await;
@@ -3198,87 +3176,19 @@ async fn a_light_takes_several_labels_unless_two_set_the_same_value() {
         .iter()
         .map(|l| l["device_count"].clone())
         .collect();
-    assert_eq!(counts, [json!(1), json!(1), json!(0)]);
+    assert_eq!(counts, [json!(1), json!(1), json!(1)]);
 
-    // Two labels with the same value are refused, and the assignment stays.
-    let (status, error) = assign(&app, &t2, &[&kitchen, &game_pc]).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
-    assert_eq!(error["error"], "conflicting_labels");
-    assert_eq!(
-        error["message"],
-        "labelの「キッチン」と「ゲームPC」がどちらもwarm_kelvinを持つため、同じ電球に付けられません"
-    );
-    let (_, device) = call(&app, "GET", &format!("/api/devices/{}", t2["id"]), None).await;
-    assert_eq!(device["labels"].as_array().unwrap().len(), 2);
-
-    // So is giving a label a value another label of its lights already sets.
-    let (status, error) = call(
-        &app,
-        "PATCH",
-        &format!("/api/labels/{}", work["id"]),
-        Some(json!({ "night_level": 200 })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
-    assert_eq!(error["error"], "conflicting_labels");
-    let (status, label) = call(
-        &app,
-        "PATCH",
-        &format!("/api/labels/{}", work["id"]),
-        Some(json!({ "day_level": 254 })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{label}");
-    assert_eq!(label["day_level"], 254);
-
-    // Deleting one label keeps the other.
+    // Deleting one label keeps the others.
     let (status, _) = call(
         &app,
         "DELETE",
-        &format!("/api/labels/{}", kitchen["id"]),
+        &format!("/api/labels/{}", living["id"]),
         None,
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     let (_, device) = call(&app, "GET", &format!("/api/devices/{}", t2["id"]), None).await;
-    assert_eq!(
-        device["labels"],
-        json!([{ "id": work["id"], "name": "作業" }])
-    );
-    let (status, device) = assign(&app, &t2, &[&work, &game_pc]).await;
-    assert_eq!(status, StatusCode::OK, "{device}");
-}
-
-#[tokio::test]
-async fn several_labels_stack_their_values_in_the_adjustment() {
-    let (addr, commands, _) = fake_light_server(tuning_nodes(), Fake::default()).await;
-    let (db, sql) = ledger();
-    let home = home_link::Home::new(db, Some(format!("ws://{addr}/ws")));
-    let app = home.router();
-    enable(&app).await;
-    let room = create_room(&app, "リビング").await;
-    let t2 = add_device(
-        &app,
-        &sql,
-        json!({ "room_id": room, "vendor": "Aqara", "serial_number": "t2-b", "name": "キッチン1" }),
-    )
-    .await;
-    let dim = create_label(&app, json!({ "name": "暗め", "night_level": 76 })).await;
-    let warm = create_label(&app, json!({ "name": "電球色", "warm_kelvin": 2700 })).await;
-    assert_eq!(assign(&app, &t2, &[&dim, &warm]).await.0, StatusCode::OK);
-
-    home.adjust(NIGHT, "scheduled").await;
-    let t2_values: Vec<_> = sent_values(&commands)
-        .into_iter()
-        .filter(|(node, ..)| node == &json!(1))
-        .map(|v| v.2)
-        .collect();
-    assert_eq!(t2_values, [json!(76), json!(370)]);
-    let (_, body) = call(&app, "GET", "/api/lights/schedule", None).await;
-    assert_eq!(
-        body["runs"][0]["lights"][1]["labels"],
-        json!(["暗め", "電球色"])
-    );
+    assert_eq!(device["labels"].as_array().unwrap().len(), 2);
 }
 
 /// `(node_id, endpoint, command_name)` of every On/Off command.
@@ -3346,50 +3256,6 @@ fn tunings_of(
         .collect()
 }
 
-/// A home whose T2 (1/3, on) carries "キッチン" and "作業", whose second Tapo
-/// (6/1, off) carries "作業" and whose first Tapo (5/1, on) carries "ゲームPC".
-async fn boost_home(
-    (db, sql): (rusqlite::Connection, rusqlite::Connection),
-    addr: SocketAddr,
-) -> (home_link::Home, Router, Vec<Value>) {
-    let home =
-        home_link::Home::new(db, Some(format!("ws://{addr}/ws"))).with_clock(|| AFTER_MIDNIGHT);
-    let app = home.router();
-    enable(&app).await;
-    let room = create_room(&app, "リビング").await;
-    let mut devices = Vec::new();
-    for (vendor, serial, name) in [
-        ("Aqara", "t2-b", "キッチン1"),
-        ("Tapo", TAPO, "ゲームPC1"),
-        ("Tapo", "tapo-desk", "デスク"),
-    ] {
-        let device = add_device(
-            &app,
-            &sql,
-            json!({ "room_id": room, "vendor": vendor, "serial_number": serial, "name": name }),
-        )
-        .await;
-        devices.push(device);
-    }
-    let kitchen = create_label(
-        &app,
-        json!({ "name": "キッチン", "night_level": 76, "warm_kelvin": 2700, "day_level": 230 }),
-    )
-    .await;
-    let work = create_label(&app, json!({ "name": "作業" })).await;
-    let game_pc = create_label(&app, json!({ "name": "ゲームPC", "warm_kelvin": 3500 })).await;
-    assert_eq!(
-        assign(&app, &devices[0], &[&kitchen, &work]).await.0,
-        StatusCode::OK
-    );
-    assert_eq!(
-        assign(&app, &devices[1], &[&game_pc]).await.0,
-        StatusCode::OK
-    );
-    assert_eq!(assign(&app, &devices[2], &[&work]).await.0, StatusCode::OK);
-    (home, app, devices)
-}
-
 fn boosted(labels: &Value) -> Vec<(Value, Value)> {
     labels
         .as_array()
@@ -3397,397 +3263,6 @@ fn boosted(labels: &Value) -> Vec<(Value, Value)> {
         .iter()
         .map(|l| (l["name"].clone(), l["boosted"].clone()))
         .collect()
-}
-
-#[tokio::test]
-#[allow(clippy::too_many_lines)]
-async fn boosting_a_label_lights_only_its_lights_at_the_days_values_until_pressed_again() {
-    let (addr, commands, _) = fake_light_server(tuning_nodes(), Fake::default()).await;
-    let path = std::env::temp_dir().join(format!("home-link-boost-{}.db", std::process::id()));
-    let _ = std::fs::remove_file(&path);
-    let db_path = path.to_str().unwrap();
-    let (home, app, _) = boost_home(
-        (
-            home_link::open_db(db_path).unwrap(),
-            home_link::open_db(db_path).unwrap(),
-        ),
-        addr,
-    )
-    .await;
-    home.adjust(NIGHT, "scheduled").await;
-
-    commands.lock().unwrap().clear();
-    let (status, body) = boost(&app, "作業").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(
-        (&body["label"], &body["action"], &body["boosted"]),
-        (&json!("作業"), &json!("boost"), &json!(true))
-    );
-    assert_eq!(
-        (
-            &body["switched"],
-            &body["no_response"],
-            &body["failed"],
-            &body["missing"]
-        ),
-        (&json!(2), &json!(0), &json!(0), &json!(0))
-    );
-    assert_eq!(
-        results(&body, "result"),
-        [
-            (json!(1), json!(3), json!("キッチン1"), json!("switched")),
-            (json!(6), json!(1), json!("デスク"), json!("switched")),
-        ]
-    );
-    // Their On/Off is read first, then they are switched on, the one that was off too,
-    // and set at once to the day's values: the T2 with キッチン's day level.
-    assert_eq!(
-        reads(&commands),
-        [(json!(1), json!(["3/6/0"])), (json!(6), json!(["1/6/0"]))]
-    );
-    assert_eq!(
-        switches(&commands),
-        [
-            (json!(1), json!(3), json!("On")),
-            (json!(6), json!(1), json!("On"))
-        ]
-    );
-    assert_eq!(
-        tunings_of(&commands, 1, 3),
-        [
-            at_once("MoveToLevelWithOnOff", 8, 230),
-            at_once("MoveToColorTemperature", 768, 200)
-        ]
-    );
-    assert_eq!(
-        tunings_of(&commands, 6, 1),
-        [
-            at_once("MoveToLevelWithOnOff", 8, 203),
-            at_once("MoveToColorTemperature", 768, 200)
-        ]
-    );
-    assert_eq!(tunings_of(&commands, 5, 1), []);
-    let (_, labels) = call(&app, "GET", "/api/labels", None).await;
-    assert_eq!(
-        boosted(&labels),
-        [
-            (json!("キッチン"), json!(false)),
-            (json!("作業"), json!(true)),
-            (json!("ゲームPC"), json!(false))
-        ]
-    );
-
-    // The schedule leaves them at the day's values, after midnight too,
-    // while the other light gets half the night's level.
-    commands.lock().unwrap().clear();
-    home.adjust(NIGHT + 600, "scheduled").await;
-    home.adjust(AFTER_MIDNIGHT, "scheduled").await;
-    assert_eq!(tunings_of(&commands, 1, 3), []);
-    assert_eq!(tunings_of(&commands, 6, 1), []);
-    assert_eq!(sent_values(&commands), [(json!(5), json!(1), json!(51))]);
-    let (_, body) = call(&app, "GET", "/api/lights/schedule", None).await;
-    let t2 = &body["runs"][0]["lights"][1];
-    assert_eq!(
-        (&t2["target_level"], &t2["target_kelvin"]),
-        (&json!(230), &json!(5000))
-    );
-
-    // So does "all on", which lights the others at the clock's values.
-    commands.lock().unwrap().clear();
-    assert_eq!(
-        call(&app, "POST", "/api/lights/on", None).await.0,
-        StatusCode::OK
-    );
-    let levels: Vec<_> = tunings(&commands)
-        .into_iter()
-        .filter(|(_, _, cluster, ..)| cluster == &json!(8))
-        .map(|(node, _, _, _, payload)| (node, payload["level"].clone()))
-        .collect();
-    assert_eq!(
-        levels,
-        [
-            (json!(1), json!(230)),
-            (json!(5), json!(51)),
-            (json!(6), json!(203))
-        ]
-    );
-
-    // A restart keeps the boost.
-    drop((home, app));
-    let home = home_link::Home::new(
-        home_link::open_db(db_path).unwrap(),
-        Some(format!("ws://{addr}/ws")),
-    )
-    .with_clock(|| AFTER_MIDNIGHT);
-    let app = home.router();
-    let (_, labels) = call(&app, "GET", "/api/labels", None).await;
-    assert_eq!(boosted(&labels)[1], (json!("作業"), json!(true)));
-    commands.lock().unwrap().clear();
-    home.adjust(AFTER_MIDNIGHT + 600, "scheduled").await;
-    let t2: Vec<_> = sent_values(&commands)
-        .into_iter()
-        .filter(|(node, ..)| node == &json!(1))
-        .map(|v| v.2)
-        .collect();
-    assert_eq!(t2, [json!(230), json!(200)]);
-
-    // Pressed again: the light that was off goes off, the one that was on
-    // returns at once, without ExecuteIfOff, to the clock's values
-    // (キッチン's half night level, 2700 K).
-    commands.lock().unwrap().clear();
-    let (status, body) = boost(&app, "作業").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(
-        (&body["action"], &body["boosted"], &body["switched"]),
-        (&json!("release"), &json!(false), &json!(2))
-    );
-    assert_eq!(switches(&commands), [(json!(6), json!(1), json!("Off"))]);
-    assert_eq!(tunings_of(&commands, 1, 3), released(38, 370));
-    assert_eq!(tunings_of(&commands, 5, 1), []);
-    let (_, labels) = call(&app, "GET", "/api/labels", None).await;
-    assert!(boosted(&labels).iter().all(|(_, b)| b == false));
-    let _ = std::fs::remove_file(&path);
-}
-
-#[tokio::test]
-async fn a_light_under_two_boosted_labels_stays_bright_until_both_are_released() {
-    let (addr, commands, _) = fake_light_server(tuning_nodes(), Fake::default()).await;
-    let (_, app, _) = boost_home(ledger(), addr).await;
-    assert_eq!(boost(&app, "作業").await.1["boosted"], true);
-    assert_eq!(boost(&app, "キッチン").await.1["boosted"], true);
-
-    // Releasing 作業 turns its desk light off and leaves the T2 to キッチン.
-    commands.lock().unwrap().clear();
-    let (_, body) = boost(&app, "作業").await;
-    assert_eq!(body["boosted"], false);
-    assert_eq!(switches(&commands), [(json!(6), json!(1), json!("Off"))]);
-    assert_eq!(tunings(&commands), []);
-
-    // The T2 was on when キッチン was boosted, so it returns to the clock's values.
-    commands.lock().unwrap().clear();
-    let (_, body) = boost(&app, "キッチン").await;
-    assert_eq!(body["boosted"], false);
-    assert_eq!(switches(&commands), []);
-    assert_eq!(tunings_of(&commands, 1, 3), released(38, 370));
-}
-
-#[tokio::test]
-async fn all_off_releases_every_boost() {
-    let (addr, commands, _) = fake_light_server(tuning_nodes(), Fake::default()).await;
-    let (home, app, _) = boost_home(ledger(), addr).await;
-    assert_eq!(boost(&app, "作業").await.1["boosted"], true);
-    assert_eq!(boost(&app, "ゲームPC").await.1["boosted"], true);
-
-    commands.lock().unwrap().clear();
-    assert_eq!(
-        call(&app, "POST", "/api/lights/off", None).await.0,
-        StatusCode::OK
-    );
-    let (_, labels) = call(&app, "GET", "/api/labels", None).await;
-    assert!(boosted(&labels).iter().all(|(_, b)| b == false));
-    let off: Vec<_> = switches(&commands).into_iter().map(|s| s.2).collect();
-    assert!(off.iter().all(|c| c == "Off") && off.len() == 4, "{off:?}");
-    home.adjust(AFTER_MIDNIGHT, "scheduled").await;
-
-    // The next press boosts again rather than releasing.
-    let (_, body) = boost(&app, "作業").await;
-    assert_eq!(body["boosted"], true);
-}
-
-#[tokio::test]
-async fn boosting_needs_a_known_label_with_lights() {
-    let (addr, commands, _) = fake_light_server(tuning_nodes(), Fake::default()).await;
-    let (_, app, devices) = boost_home(ledger(), addr).await;
-    let (status, error) = boost(&app, "仕事用デスク").await;
-    assert_eq!(
-        (status, &error["error"]),
-        (StatusCode::NOT_FOUND, &json!("label_not_found"))
-    );
-    create_label(&app, json!({ "name": "仕事用デスク" })).await;
-    let (status, error) = boost(&app, "仕事用デスク").await;
-    assert_eq!(
-        (status, &error["error"]),
-        (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            &json!("label_has_no_lights")
-        )
-    );
-    // Ignored lights do not count.
-    ignore(&app, &[devices[1]["id"].as_i64().unwrap()]).await;
-    let (status, error) = boost(&app, "ゲームPC").await;
-    assert_eq!(
-        (status, &error["error"]),
-        (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            &json!("label_has_no_lights")
-        )
-    );
-    for bad in [
-        json!({}),
-        json!({ "label": 1 }),
-        json!({ "label": "作業", "on": true }),
-    ] {
-        let (status, error) = call(&app, "POST", "/api/lights/boost", Some(bad.clone())).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
-        assert_eq!(error["error"], "invalid_boost", "{bad}");
-    }
-    // Nothing was sent.
-    assert!(
-        commands
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|c| c["cluster_id"].is_null())
-    );
-    let (_, labels) = call(&app, "GET", "/api/labels", None).await;
-    assert!(boosted(&labels).iter().all(|(_, b)| b == false));
-}
-
-#[tokio::test]
-async fn a_boost_that_reaches_no_light_is_not_kept() {
-    let fake = Fake {
-        silent: vec![(1, 3), (6, 1)],
-        ..Fake::default()
-    };
-    let (addr, _, _) = fake_light_server(tuning_nodes(), fake).await;
-    let (_, app, _) = boost_home(ledger(), addr).await;
-    let (status, body) = boost(&app, "作業").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(
-        (
-            &body["action"],
-            &body["boosted"],
-            &body["switched"],
-            &body["no_response"]
-        ),
-        (&json!("boost"), &json!(false), &json!(0), &json!(2))
-    );
-    let (_, labels) = call(&app, "GET", "/api/labels", None).await;
-    assert_eq!(boosted(&labels)[1], (json!("作業"), json!(false)));
-}
-
-/// `boost_home` whose desk light (6/1) also carries the dedicated "仕事用デスク"
-/// (100%, 5000 K), served by matterjs-server from `nodes`.
-async fn dedicated_home(nodes: Value) -> (home_link::Home, Router, Arc<Mutex<Vec<Value>>>) {
-    let (addr, commands, _) = fake_light_server(nodes, Fake::default()).await;
-    let (home, app, devices) = boost_home(ledger(), addr).await;
-    let desk = create_label(
-        &app,
-        json!({ "name": "仕事用デスク", "dedicated": true, "day_level": 254, "cool_kelvin": 5000 }),
-    )
-    .await;
-    assert_eq!(desk["dedicated"], true);
-    let (_, labels) = call(&app, "GET", "/api/labels", None).await;
-    let work = labels.as_array().unwrap()[1].clone();
-    assert_eq!(work["dedicated"], false);
-    assert_eq!(
-        assign(&app, &devices[2], &[&work, &desk]).await.0,
-        StatusCode::OK
-    );
-    (home, app, commands)
-}
-
-#[tokio::test]
-async fn a_dedicated_labels_lights_light_only_while_it_is_boosted() {
-    let (home, app, commands) = dedicated_home(tuning_nodes()).await;
-
-    // "All on" leaves the desk light off without counting it as failed.
-    let (status, body) = call(&app, "POST", "/api/lights/on", None).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(!switches(&commands).contains(&(json!(6), json!(1), json!("On"))));
-    assert_eq!(tunings_of(&commands, 6, 1), []);
-    assert_eq!(body["failed"], 0);
-    let desk = results(&body, "result")
-        .into_iter()
-        .find(|(node, ..)| node == &json!(6))
-        .unwrap();
-    assert_eq!(desk.3, json!("dedicated"));
-
-    // Boosting 作業, which is not dedicated, lights the T2 but not the desk light.
-    commands.lock().unwrap().clear();
-    let (_, body) = boost(&app, "作業").await;
-    assert_eq!(
-        (&body["boosted"], &body["switched"]),
-        (&json!(true), &json!(1))
-    );
-    assert_eq!(switches(&commands), [(json!(1), json!(3), json!("On"))]);
-    assert_eq!(tunings_of(&commands, 6, 1), []);
-    assert_eq!(boost(&app, "作業").await.1["boosted"], false);
-
-    // Boosting the dedicated label lights it at the day's values: 100%, 5000 K.
-    commands.lock().unwrap().clear();
-    let (_, body) = boost(&app, "仕事用デスク").await;
-    assert_eq!(
-        (&body["boosted"], &body["switched"]),
-        (&json!(true), &json!(1))
-    );
-    assert_eq!(switches(&commands), [(json!(6), json!(1), json!("On"))]);
-    assert_eq!(
-        tunings_of(&commands, 6, 1),
-        [
-            at_once("MoveToLevelWithOnOff", 8, 254),
-            at_once("MoveToColorTemperature", 768, 200)
-        ]
-    );
-    commands.lock().unwrap().clear();
-    home.adjust(AFTER_MIDNIGHT, "scheduled").await;
-    assert_eq!(tunings_of(&commands, 6, 1), []);
-
-    // Released, it goes off.
-    commands.lock().unwrap().clear();
-    let (_, body) = boost(&app, "仕事用デスク").await;
-    assert_eq!(
-        (&body["boosted"], &body["switched"]),
-        (&json!(false), &json!(1))
-    );
-    assert_eq!(switches(&commands), [(json!(6), json!(1), json!("Off"))]);
-}
-
-#[tokio::test]
-async fn a_dedicated_light_left_on_keeps_the_days_values_and_goes_off_on_release() {
-    let mut nodes = tuning_nodes();
-    nodes[2]["attributes"]["1/6/0"] = json!(true);
-    let (home, app, commands) = dedicated_home(nodes).await;
-
-    // After midnight the schedule writes the day's values, not half the night's.
-    home.adjust(AFTER_MIDNIGHT, "scheduled").await;
-    let desk: Vec<_> = sent_values(&commands)
-        .into_iter()
-        .filter(|(node, ..)| node == &json!(6))
-        .map(|v| v.2)
-        .collect();
-    assert_eq!(desk, [json!(254), json!(200)]);
-
-    // Boosted while on and then released, it goes off all the same.
-    assert_eq!(boost(&app, "仕事用デスク").await.1["boosted"], true);
-    commands.lock().unwrap().clear();
-    let (_, body) = boost(&app, "仕事用デスク").await;
-    assert_eq!(
-        (&body["boosted"], &body["switched"]),
-        (&json!(false), &json!(1))
-    );
-    assert_eq!(switches(&commands), [(json!(6), json!(1), json!("Off"))]);
-    assert_eq!(tunings_of(&commands, 6, 1), []);
-}
-
-#[tokio::test]
-async fn dedicated_is_a_label_flag_set_by_post_and_patch() {
-    let app = app();
-    let label = create_label(&app, json!({ "name": "仕事用デスク" })).await;
-    assert_eq!(label["dedicated"], false);
-    let uri = format!("/api/labels/{}", label["id"]);
-    let (status, body) = call(&app, "PATCH", &uri, Some(json!({ "dedicated": true }))).await;
-    assert_eq!((status, &body["dedicated"]), (StatusCode::OK, &json!(true)));
-    // Other changes keep it.
-    let (_, body) = call(&app, "PATCH", &uri, Some(json!({ "day_level": 254 }))).await;
-    assert_eq!(body["dedicated"], true);
-    for bad in [json!({ "dedicated": "yes" }), json!({ "dedicated": null })] {
-        let (status, error) = call(&app, "PATCH", &uri, Some(bad.clone())).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
-        assert_eq!(error["error"], "invalid_label", "{bad}");
-    }
-    let (_, labels) = call(&app, "GET", "/api/labels", None).await;
-    assert_eq!(labels[0]["dedicated"], true);
 }
 
 const SESAME_UUID: &str = "3DE4DE72-AAF9-25C1-8D0F-C9E019BB060C";
@@ -4552,4 +4027,944 @@ async fn plugs_get_their_kind_and_are_switched_one_at_a_time() {
         .collect();
     assert!(!touched.is_empty());
     assert!(touched.iter().all(|node| *node == 5), "{touched:?}");
+}
+
+async fn label_op(app: &Router, label: &Value, op: &str) -> (StatusCode, Value) {
+    call(
+        app,
+        "POST",
+        &format!("/api/labels/{}/{op}", label["id"]),
+        None,
+    )
+    .await
+}
+
+fn device_results(body: &Value) -> Vec<(Value, Value, Value)> {
+    body["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            (
+                d["node_id"].clone(),
+                d["endpoint"].clone(),
+                d["result"].clone(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn a_labels_on_off_and_toggle_reach_its_lights_and_plugs() {
+    let (addr, commands, _) = fake_light_server(plug_nodes(), Fake::default()).await;
+    let (db, sql) = ledger();
+    let app = home_link::app(db, Some(format!("ws://{addr}/ws")));
+    let mut devices = Vec::new();
+    for (vendor, serial) in [
+        ("Tapo", TAPO),
+        ("Plugco", "plug-a"),
+        ("Plugco", "plug-b"),
+        ("Hubco", "plug-e"),
+        ("Hubco", "sensor"),
+        ("Plugco", "gone"),
+    ] {
+        devices.push(
+            add_device(
+                &app,
+                &sql,
+                json!({ "vendor": vendor, "serial_number": serial }),
+            )
+            .await,
+        );
+    }
+    let mixed = create_label(&app, json!({ "name": "mixed" })).await;
+    let razor = create_label(&app, json!({ "name": "razor" })).await;
+    for device in [&devices[0], &devices[3], &devices[4], &devices[5]] {
+        assert_eq!(assign(&app, device, &[&mixed]).await.0, StatusCode::OK);
+    }
+    assert_eq!(assign(&app, &devices[1], &[&razor]).await.0, StatusCode::OK);
+
+    // The light and the bridged plug; the sensor has no On/Off, the other plugs are not under it.
+    let (status, body) = label_op(&app, &mixed, "on").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        (
+            &body["label"],
+            &body["action"],
+            &body["on"],
+            &body["boosted"]
+        ),
+        (&json!("mixed"), &json!("on"), &json!(true), &json!(false))
+    );
+    assert_eq!(
+        (
+            &body["switched"],
+            &body["no_response"],
+            &body["failed"],
+            &body["missing"]
+        ),
+        (&json!(2), &json!(0), &json!(0), &json!(1))
+    );
+    assert_eq!(
+        device_results(&body),
+        [
+            (json!(5), json!(1), json!("switched")),
+            (json!(30), json!(2), json!("switched")),
+        ]
+    );
+    assert_eq!(body["missing_devices"][0]["id"], devices[5]["id"]);
+    assert_eq!(
+        switches(&commands),
+        [
+            (json!(5), json!(1), json!("On")),
+            (json!(30), json!(2), json!("On"))
+        ]
+    );
+
+    commands.lock().unwrap().clear();
+    let (_, body) = label_op(&app, &mixed, "off").await;
+    assert_eq!(
+        (&body["action"], &body["on"]),
+        (&json!("off"), &json!(false))
+    );
+    assert_eq!(
+        switches(&commands),
+        [
+            (json!(5), json!(1), json!("Off")),
+            (json!(30), json!(2), json!("Off"))
+        ]
+    );
+
+    // A toggle switches to the other state.
+    for (action, command) in [("on", "On"), ("off", "Off")] {
+        commands.lock().unwrap().clear();
+        let (status, body) = label_op(&app, &mixed, "toggle").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["action"], action);
+        assert_eq!(
+            switches(&commands),
+            [
+                (json!(5), json!(1), json!(command)),
+                (json!(30), json!(2), json!(command))
+            ]
+        );
+    }
+    commands.lock().unwrap().clear();
+    let (_, body) = label_op(&app, &razor, "toggle").await;
+    assert_eq!(
+        (&body["action"], &body["switched"]),
+        (&json!("on"), &json!(1))
+    );
+    assert_eq!(switches(&commands), [(json!(20), json!(1), json!("On"))]);
+    let (_, labels) = call(&app, "GET", "/api/labels", None).await;
+    let label_states: Vec<_> = labels
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["on"].clone())
+        .collect();
+    assert_eq!(label_states, [json!(false), json!(true)]);
+
+    // Unknown labels, labels without devices and with only ignored ones.
+    commands.lock().unwrap().clear();
+    let (status, error) = call(&app, "POST", "/api/labels/999/on", None).await;
+    assert_eq!(
+        (status, &error["error"]),
+        (StatusCode::NOT_FOUND, &json!("label_not_found"))
+    );
+    let empty = create_label(&app, json!({ "name": "empty" })).await;
+    for op in ["on", "off", "toggle"] {
+        let (status, error) = label_op(&app, &empty, op).await;
+        assert_eq!(
+            (status, &error["error"]),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &json!("label_has_no_devices")
+            )
+        );
+    }
+    ignore(&app, &[devices[1]["id"].as_i64().unwrap()]).await;
+    let (status, _) = label_op(&app, &razor, "off").await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        commands
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c["cluster_id"] == 6)
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn only_the_lights_of_an_auto_label_are_adjusted() {
+    let (addr, commands, _) = fake_light_server(tuning_nodes(), Fake::default()).await;
+    let (db, sql) = ledger();
+    let home = home_link::Home::new(db, Some(format!("ws://{addr}/ws")));
+    let app = home.router();
+    enable(&app).await;
+    let room = create_label(&app, json!({ "name": "room", "auto": true })).await;
+    let manual = create_label(&app, json!({ "name": "hallway" })).await;
+    let game = create_label(
+        &app,
+        json!({ "name": "game", "override_level": 203, "override_kelvin": 5000 }),
+    )
+    .await;
+    let mut devices = Vec::new();
+    for (vendor, serial) in TUNING_LIGHTS {
+        devices.push(
+            add_device(
+                &app,
+                &sql,
+                json!({ "vendor": vendor, "serial_number": serial }),
+            )
+            .await,
+        );
+    }
+    // The T2 that is on under room and game; the Tapo that is on under the label
+    // without auto; the plain light unlabelled.
+    assert_eq!(
+        assign(&app, &devices[1], &[&room, &game]).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        assign(&app, &devices[2], &[&manual]).await.0,
+        StatusCode::OK
+    );
+
+    home.adjust(NIGHT, "scheduled").await;
+    assert_eq!(reads(&commands), [(json!(1), json!(["3/6/0"]))]);
+    assert_eq!(
+        sent_values(&commands),
+        [
+            (json!(1), json!(3), json!(102)),
+            (json!(1), json!(3), json!(333))
+        ]
+    );
+    let (_, body) = call(&app, "GET", "/api/lights/schedule", None).await;
+    assert_eq!(
+        decisions(&body["runs"][0]),
+        [
+            (json!(1), json!(2), json!("manual")),
+            (json!(1), json!(3), json!("sent")),
+            (json!(5), json!(1), json!("manual")),
+            (json!(6), json!(1), json!("manual")),
+            (json!(16), json!(1), json!("manual")),
+            (json!(30), json!(1), json!("manual")),
+        ]
+    );
+    assert_eq!(
+        body["runs"][0]["lights"][1]["labels"],
+        json!(["room", "game"])
+    );
+}
+
+/// A home over `tuning_nodes` at `clock`: the T2 (1/3, on) under the auto "room" and
+/// "game" (80%, 5000 K), the first Tapo (5/1, on) under "game" alone and the desk Tapo
+/// (6/1, off) under "work" (100%, 5000 K).
+async fn override_home(
+    addr: SocketAddr,
+    clock: fn() -> i64,
+) -> (home_link::Home, Router, [Value; 3]) {
+    let (db, sql) = ledger();
+    let home = home_link::Home::new(db, Some(format!("ws://{addr}/ws"))).with_clock(clock);
+    let app = home.router();
+    enable(&app).await;
+    let room = create_label(&app, json!({ "name": "room", "auto": true })).await;
+    let game = create_label(
+        &app,
+        json!({ "name": "game", "override_level": 203, "override_kelvin": 5000 }),
+    )
+    .await;
+    let work = create_label(
+        &app,
+        json!({ "name": "work", "override_level": 254, "override_kelvin": 5000 }),
+    )
+    .await;
+    for (serial, labels) in [
+        ("t2-b", vec![&room, &game]),
+        (TAPO, vec![&game]),
+        ("tapo-desk", vec![&work]),
+    ] {
+        let vendor = if serial == "t2-b" { "Aqara" } else { "Tapo" };
+        let device = add_device(
+            &app,
+            &sql,
+            json!({ "vendor": vendor, "serial_number": serial }),
+        )
+        .await;
+        assert_eq!(assign(&app, &device, &labels).await.0, StatusCode::OK);
+    }
+    (home, app, [room, game, work])
+}
+
+#[tokio::test]
+async fn an_override_label_lights_at_its_values_and_is_not_adjusted() {
+    let (addr, commands, _) = fake_light_server(tuning_nodes(), Fake::default()).await;
+    let (home, app, [_, _, work]) = override_home(addr, || AFTER_MIDNIGHT).await;
+
+    let (status, body) = label_op(&app, &work, "on").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        (
+            &body["action"],
+            &body["on"],
+            &body["boosted"],
+            &body["switched"]
+        ),
+        (&json!("on"), &json!(true), &json!(true), &json!(1))
+    );
+    assert_eq!(switches(&commands), [(json!(6), json!(1), json!("On"))]);
+    assert_eq!(
+        tunings_of(&commands, 6, 1),
+        [
+            at_once("MoveToLevelWithOnOff", 8, 254),
+            at_once("MoveToColorTemperature", 768, 200)
+        ]
+    );
+
+    // The schedule leaves it at 100% after midnight; "all on" leaves it to its label.
+    commands.lock().unwrap().clear();
+    home.adjust(AFTER_MIDNIGHT, "scheduled").await;
+    assert_eq!(tunings_of(&commands, 6, 1), []);
+    let (_, body) = call(&app, "GET", "/api/lights/schedule", None).await;
+    assert_eq!(decisions(&body["runs"][0])[3].2, "override");
+    let (_, body) = call(&app, "POST", "/api/lights/on", None).await;
+    assert!(!switches(&commands).contains(&(json!(6), json!(1), json!("On"))));
+    assert_eq!(body["failed"], 0);
+    assert_eq!(body["lights"][3]["result"], "override");
+
+    // Pressed again it stops overriding; under no other label, the light goes off.
+    commands.lock().unwrap().clear();
+    let (_, body) = label_op(&app, &work, "toggle").await;
+    assert_eq!(
+        (
+            &body["action"],
+            &body["on"],
+            &body["boosted"],
+            &body["switched"]
+        ),
+        (&json!("release"), &json!(false), &json!(false), &json!(1))
+    );
+    assert_eq!(switches(&commands), [(json!(6), json!(1), json!("Off"))]);
+    assert_eq!(tunings_of(&commands, 6, 1), []);
+
+    // Its off goes off too, and "all on" still leaves it.
+    label_op(&app, &work, "toggle").await;
+    commands.lock().unwrap().clear();
+    let (_, body) = label_op(&app, &work, "off").await;
+    assert_eq!(
+        (&body["action"], &body["boosted"]),
+        (&json!("off"), &json!(false))
+    );
+    assert_eq!(switches(&commands), [(json!(6), json!(1), json!("Off"))]);
+    let (_, body) = call(&app, "POST", "/api/lights/on", None).await;
+    assert_eq!(body["lights"][3]["result"], "override");
+}
+
+#[tokio::test]
+async fn a_released_override_returns_each_light_to_what_its_other_labels_say() {
+    let (addr, commands, _) = fake_light_server(tuning_nodes(), Fake::default()).await;
+    let (home, app, [room, game, _]) = override_home(addr, || AFTER_MIDNIGHT).await;
+
+    let (_, body) = label_op(&app, &game, "toggle").await;
+    assert_eq!(
+        (&body["action"], &body["boosted"]),
+        (&json!("on"), &json!(true))
+    );
+    for (node, endpoint) in [(1, 3), (5, 1)] {
+        assert_eq!(
+            tunings_of(&commands, node, endpoint),
+            [
+                at_once("MoveToLevelWithOnOff", 8, 203),
+                at_once("MoveToColorTemperature", 768, 200)
+            ]
+        );
+    }
+    commands.lock().unwrap().clear();
+    home.adjust(AFTER_MIDNIGHT, "scheduled").await;
+    assert_eq!(tunings(&commands), []);
+
+    // The T2 is under room, which is on: back at once to half the night's level.
+    // The Tapo is under no other label: off.
+    let (_, body) = label_op(&app, &game, "toggle").await;
+    assert_eq!(
+        (&body["action"], &body["boosted"], &body["switched"]),
+        (&json!("release"), &json!(false), &json!(2))
+    );
+    assert_eq!(switches(&commands), [(json!(5), json!(1), json!("Off"))]);
+    assert_eq!(tunings_of(&commands, 1, 3), released(51, 333));
+
+    // Room's off ends game's override of the T2 too.
+    label_op(&app, &game, "on").await;
+    commands.lock().unwrap().clear();
+    let (_, body) = label_op(&app, &room, "off").await;
+    assert_eq!(body["switched"], 1);
+    assert_eq!(switches(&commands), [(json!(1), json!(3), json!("Off"))]);
+    let (_, labels) = call(&app, "GET", "/api/labels", None).await;
+    assert_eq!(boosted(&labels)[1], (json!("game"), json!(false)));
+
+    // With room off, a released T2 goes off.
+    label_op(&app, &game, "on").await;
+    commands.lock().unwrap().clear();
+    label_op(&app, &game, "toggle").await;
+    let off: Vec<_> = switches(&commands)
+        .into_iter()
+        .map(|s| (s.0, s.2))
+        .collect();
+    assert_eq!(off, [(json!(1), json!("Off")), (json!(5), json!("Off"))]);
+}
+
+#[tokio::test]
+async fn an_override_that_reaches_no_light_is_not_kept() {
+    let fake = Fake {
+        silent: vec![(6, 1)],
+        ..Fake::default()
+    };
+    let (addr, _, _) = fake_light_server(tuning_nodes(), fake).await;
+    let (_, app, [_, _, work]) = override_home(addr, || NIGHT).await;
+    let (status, body) = label_op(&app, &work, "on").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        (
+            &body["on"],
+            &body["boosted"],
+            &body["switched"],
+            &body["no_response"]
+        ),
+        (&Value::Null, &json!(false), &json!(0), &json!(1))
+    );
+}
+
+/// 2026-10-06 00:00 in Tokyo.
+const MIDNIGHT: i64 = NIGHT + 3600;
+
+#[tokio::test]
+async fn schedules_switch_a_label_at_their_times_across_midnight() {
+    let (addr, commands, _) = fake_light_server(plug_nodes(), Fake::default()).await;
+    let (db, sql) = ledger();
+    let home = home_link::Home::new(db, Some(format!("ws://{addr}/ws")));
+    let app = home.router();
+    let razor = create_label(
+        &app,
+        json!({ "name": "razor", "schedule": [{ "time": "00:00", "on": true }, { "time": "05:00", "on": false }] }),
+    )
+    .await;
+    let night = create_label(
+        &app,
+        json!({ "name": "night", "schedule": [{ "time": "23:30", "on": true }, { "time": "01:00", "on": false }] }),
+    )
+    .await;
+    for (vendor, serial, label) in [("Plugco", "plug-a", &razor), ("Tapo", TAPO, &night)] {
+        let device = add_device(
+            &app,
+            &sql,
+            json!({ "vendor": vendor, "serial_number": serial }),
+        )
+        .await;
+        assert_eq!(assign(&app, &device, &[label]).await.0, StatusCode::OK);
+    }
+
+    let minute = |h: i64, m: i64| MIDNIGHT + h * 3600 + m * 60 - if h >= 12 { 86_400 } else { 0 };
+    for (at, sent) in [
+        (minute(23, 0), vec![]),
+        (minute(23, 29), vec![]),
+        (minute(23, 30), vec![(json!(5), json!(1), json!("On"))]),
+        (minute(0, 0), vec![(json!(20), json!(1), json!("On"))]),
+        (minute(0, 30), vec![]),
+        (minute(1, 0), vec![(json!(5), json!(1), json!("Off"))]),
+        (minute(4, 59), vec![]),
+        (minute(5, 0), vec![(json!(20), json!(1), json!("Off"))]),
+        (minute(5, 0) + 30, vec![]),
+        (minute(12, 0) + 86_400, vec![]),
+    ] {
+        commands.lock().unwrap().clear();
+        home.run_schedules(at).await;
+        assert_eq!(switches(&commands), sent, "{}", at - MIDNIGHT);
+    }
+    let (_, labels) = call(&app, "GET", "/api/labels", None).await;
+    assert_eq!(labels[0]["on"], false);
+}
+
+#[test]
+fn opening_a_v0_1_36_ledger_keeps_its_labels_and_how_its_lights_behave() {
+    let path = std::env::temp_dir().join(format!("home-link-v8-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    v0_1_36_ledger(&path);
+    for _ in 0..2 {
+        let db = home_link::open_db(path.to_str().unwrap()).unwrap();
+        // Each label lights at its day's values, the dedicated one at its own;
+        // every light outside a dedicated label is under the new auto label.
+        assert_eq!(
+            label_rows(&db),
+            [
+                (1, "キッチン".into(), false, Some(203), Some(5000)),
+                (2, "作業".into(), false, Some(230), Some(5000)),
+                (3, "仕事用デスク".into(), false, Some(254), Some(5000)),
+                (4, "自動調光".into(), true, None, None),
+            ]
+        );
+        assert_eq!(
+            assignments(&db),
+            [(1, vec![1, 2, 4]), (2, vec![4]), (3, vec![3]), (4, vec![4])]
+        );
+        let states: Vec<Option<bool>> = db
+            .prepare("SELECT \"on\" FROM labels ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        // 作業 was boosted; "all on" was pressed last.
+        assert_eq!(states, [None, Some(true), None, Some(true)]);
+        let intent: i64 = db
+            .query_row(
+                "SELECT count(*) FROM settings WHERE key = 'lights_intent'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(intent, 0);
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A v0.1.36 (`user_version` 8) ledger with the schedule on and "all on" pressed last:
+/// the T2 (t2-b) under キッチン (night 76, 2700 K) and the boosted 作業 (day 230),
+/// the Tapo unlabelled, the desk Tapo under the dedicated 仕事用デスク (254, 5000 K)
+/// and a plug unlabelled.
+fn v0_1_36_ledger(path: &std::path::Path) {
+    let old = rusqlite::Connection::open(path).unwrap();
+    old.execute_batch(&format!(
+        "CREATE TABLE rooms (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+        CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE labels (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            day_level INTEGER,
+            night_level INTEGER,
+            cool_kelvin INTEGER,
+            warm_kelvin INTEGER
+        , boost TEXT, dedicated INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE device_labels (
+            device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+            label_id INTEGER NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
+            PRIMARY KEY (device_id, label_id)
+        );
+        CREATE TABLE wifi_networks (
+            id INTEGER PRIMARY KEY,
+            ssid TEXT NOT NULL UNIQUE,
+            password TEXT NOT NULL,
+            for_devices INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE \"devices\" (
+            id INTEGER PRIMARY KEY,
+            room_id INTEGER REFERENCES rooms(id) ON DELETE RESTRICT,
+            qr_payload TEXT UNIQUE,
+            vendor TEXT,
+            serial_number TEXT,
+            mac TEXT UNIQUE,
+            name TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+            ignored INTEGER NOT NULL DEFAULT 0,
+            vendor_id INTEGER,
+            product_id INTEGER,
+            UNIQUE (vendor, serial_number),
+            CHECK (qr_payload IS NOT NULL OR serial_number IS NOT NULL)
+        );
+        PRAGMA user_version = 8;
+        INSERT INTO settings VALUES ('light_schedule', '{{\"enabled\":true}}'),
+            ('lights_intent', '{{\"action\":\"on\",\"at\":\"2026-10-05T21:00:00+09:00\"}}');
+        INSERT INTO labels (id, name, night_level, warm_kelvin, day_level, boost, dedicated) VALUES
+            (1, 'キッチン', 76, 2700, NULL, NULL, 0),
+            (2, '作業', NULL, NULL, 230, '[]', 0),
+            (3, '仕事用デスク', NULL, NULL, 254, NULL, 1);
+        UPDATE labels SET cool_kelvin = 5000 WHERE id = 3;
+        INSERT INTO devices (id, vendor, serial_number, name) VALUES
+            (1, 'Aqara', 't2-b', 'キッチン1'), (2, 'Tapo', '{TAPO}', '読書灯'),
+            (3, 'Tapo', 'tapo-desk', 'デスク'), (4, 'Plugco', 'plug-a', '');
+        INSERT INTO device_labels VALUES (1, 1), (1, 2), (3, 3);"
+    ))
+    .unwrap();
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn after_the_update_the_v0_1_36_widgets_and_lights_behave_as_before() {
+    let path = std::env::temp_dir().join(format!("home-link-v8-app-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    v0_1_36_ledger(&path);
+    let (addr, commands, _) = fake_light_server(tuning_nodes(), Fake::default()).await;
+    let home = home_link::Home::new(
+        home_link::open_db(path.to_str().unwrap()).unwrap(),
+        Some(format!("ws://{addr}/ws")),
+    )
+    .with_clock(|| NIGHT);
+    let app = home.router();
+
+    // What the widget reads: each label's name and whether it is boosted.
+    let (status, body) = call(&app, "GET", "/api/lights/schedule", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        boosted(&body["labels"]),
+        [
+            (json!("キッチン"), json!(false)),
+            (json!("作業"), json!(true)),
+            (json!("仕事用デスク"), json!(false)),
+            (json!("自動調光"), json!(false)),
+        ]
+    );
+    let (_, labels) = call(&app, "GET", "/api/labels", None).await;
+    assert_eq!(labels[2]["name"], "仕事用デスク");
+
+    // The schedule still adjusts the Tapo; the T2 stays at 作業's values; the desk is left.
+    home.adjust(NIGHT, "scheduled").await;
+    assert_eq!(
+        sent_values(&commands),
+        [
+            (json!(5), json!(1), json!(102)),
+            (json!(5), json!(1), json!(333))
+        ]
+    );
+    assert!(!reads(&commands).contains(&(json!(6), json!(["1/6/0"]))));
+
+    // "All on" leaves the desk off and is not a failure; the plug is never touched.
+    commands.lock().unwrap().clear();
+    let (status, body) = call(&app, "POST", "/api/lights/on", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!((&body["failed"], &body["switched"]), (&json!(0), &json!(3)));
+    assert!(!switches(&commands).contains(&(json!(6), json!(1), json!("On"))));
+
+    // 仕事 lights the desk at 100% and 5000 K, and puts it out again.
+    commands.lock().unwrap().clear();
+    let (status, body) = boost(&app, "仕事用デスク").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        (
+            &body["label"],
+            &body["action"],
+            &body["boosted"],
+            &body["switched"]
+        ),
+        (
+            &json!("仕事用デスク"),
+            &json!("boost"),
+            &json!(true),
+            &json!(1)
+        )
+    );
+    assert_eq!(switches(&commands), [(json!(6), json!(1), json!("On"))]);
+    assert_eq!(
+        tunings_of(&commands, 6, 1),
+        [
+            at_once("MoveToLevelWithOnOff", 8, 254),
+            at_once("MoveToColorTemperature", 768, 200)
+        ]
+    );
+    commands.lock().unwrap().clear();
+    home.adjust(AFTER_MIDNIGHT, "scheduled").await;
+    assert_eq!(tunings_of(&commands, 6, 1), []);
+    commands.lock().unwrap().clear();
+    let (_, body) = boost(&app, "仕事用デスク").await;
+    assert_eq!(
+        (&body["action"], &body["boosted"]),
+        (&json!("release"), &json!(false))
+    );
+    assert_eq!(switches(&commands), [(json!(6), json!(1), json!("Off"))]);
+
+    // 作業 releases the T2 to the clock's values, as it is on under 自動調光.
+    commands.lock().unwrap().clear();
+    let (_, body) = boost(&app, "作業").await;
+    assert_eq!(
+        (&body["action"], &body["boosted"]),
+        (&json!("release"), &json!(false))
+    );
+    assert_eq!(switches(&commands), []);
+    assert_eq!(tunings_of(&commands, 1, 3), released(102, 333));
+    commands.lock().unwrap().clear();
+    let (_, body) = boost(&app, "作業").await;
+    assert_eq!(
+        (&body["action"], &body["boosted"]),
+        (&json!("boost"), &json!(true))
+    );
+    assert_eq!(
+        tunings_of(&commands, 1, 3),
+        [
+            at_once("MoveToLevelWithOnOff", 8, 230),
+            at_once("MoveToColorTemperature", 768, 200)
+        ]
+    );
+
+    // "All off" puts every light out, ends every boost and the adjustment.
+    commands.lock().unwrap().clear();
+    let (status, body) = call(&app, "POST", "/api/lights/off", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        switches(&commands)
+            .iter()
+            .all(|s| s.2 == "Off" && s.0 != 20)
+    );
+    let (_, body) = call(&app, "GET", "/api/lights/schedule", None).await;
+    assert!(boosted(&body["labels"]).iter().all(|(_, b)| b == false));
+    commands.lock().unwrap().clear();
+    home.adjust(NIGHT + 600, "scheduled").await;
+    assert_eq!(tunings(&commands), []);
+
+    // Unknown labels and bodies are refused as before.
+    let (status, error) = boost(&app, "なし").await;
+    assert_eq!(
+        (status, &error["error"]),
+        (StatusCode::NOT_FOUND, &json!("label_not_found"))
+    );
+    for bad in [
+        json!({}),
+        json!({ "label": 1 }),
+        json!({ "label": "作業", "on": true }),
+    ] {
+        let (status, error) = call(&app, "POST", "/api/lights/boost", Some(bad.clone())).await;
+        assert_eq!(
+            (status, &error["error"]),
+            (StatusCode::BAD_REQUEST, &json!("invalid_boost")),
+            "{bad}"
+        );
+    }
+    let empty = create_label(&app, json!({ "name": "空" })).await;
+    assert_eq!(empty["boosted"], false);
+    let (status, error) = boost(&app, "空").await;
+    assert_eq!(
+        (status, &error["error"]),
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &json!("label_has_no_lights")
+        )
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Posts one JSON-RPC message to the MCP endpoint at `base`.
+async fn mcp(client: &reqwest::Client, base: &str, message: Value) -> (u16, Value) {
+    let response = client
+        .post(format!("{base}/mcp"))
+        .header("accept", "application/json, text/event-stream")
+        .header("content-type", "application/json")
+        .body(message.to_string())
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let text = response.text().await.unwrap();
+    (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+}
+
+/// The JSON text a tool call answered, and whether it was an error.
+fn tool_result(reply: &Value) -> (Value, bool) {
+    let result = &reply["result"];
+    let text = result["content"][0]["text"].as_str().unwrap();
+    (
+        serde_json::from_str(text).unwrap(),
+        result["isError"] == true,
+    )
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn mcp_tools_manage_and_switch_labels_over_http() {
+    let (addr, commands, _) = fake_light_server(plug_nodes(), Fake::default()).await;
+    let (db, sql) = ledger();
+    let home = home_link::Home::new(db, Some(format!("ws://{addr}/ws")));
+    let plug = add_device(
+        &home.router(),
+        &sql,
+        json!({ "vendor": "Plugco", "serial_number": "plug-a" }),
+    )
+    .await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let router = home.router();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let client = reqwest::Client::new();
+
+    let (status, reply) = mcp(
+        &client,
+        &base,
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {},
+            "clientInfo": { "name": "test", "version": "1" } } }),
+    )
+    .await;
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["id"], 1);
+    assert_eq!(reply["result"]["protocolVersion"], "2025-06-18");
+    assert_eq!(reply["result"]["serverInfo"]["name"], "home-link");
+    assert!(reply["result"]["capabilities"]["tools"].is_object());
+    let (status, _) = mcp(
+        &client,
+        &base,
+        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+    )
+    .await;
+    assert_eq!(status, 202);
+
+    let (_, reply) = mcp(
+        &client,
+        &base,
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+    )
+    .await;
+    let mut names: Vec<_> = reply["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| {
+            assert_eq!(t["inputSchema"]["type"], "object", "{t}");
+            t["name"].as_str().unwrap().to_owned()
+        })
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "create_label",
+            "delete_label",
+            "label_off",
+            "label_on",
+            "label_toggle",
+            "list_devices",
+            "list_labels",
+            "set_device_labels",
+            "update_label",
+        ]
+    );
+
+    let call_tool = |id: u64, name: &str, arguments: Value| {
+        json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": { "name": name, "arguments": arguments } })
+    };
+    let (_, reply) = mcp(
+        &client,
+        &base,
+        call_tool(
+            3,
+            "create_label",
+            json!({ "name": "razor",
+            "schedule": [{ "time": "00:00", "on": true }, { "time": "05:00", "on": false }] }),
+        ),
+    )
+    .await;
+    let (label, error) = tool_result(&reply);
+    assert!(!error, "{label}");
+    assert_eq!(
+        label["schedule"][1],
+        json!({ "time": "05:00", "on": false })
+    );
+    let (_, reply) = mcp(
+        &client,
+        &base,
+        call_tool(
+            4,
+            "set_device_labels",
+            json!({ "id": plug["id"], "label_ids": [label["id"]] }),
+        ),
+    )
+    .await;
+    let (device, error) = tool_result(&reply);
+    assert!(!error, "{device}");
+    assert_eq!(device["labels"][0]["name"], "razor");
+    let (_, reply) = mcp(
+        &client,
+        &base,
+        call_tool(
+            5,
+            "update_label",
+            json!({ "id": label["id"], "name": "shaver" }),
+        ),
+    )
+    .await;
+    assert_eq!(tool_result(&reply).0["name"], "shaver");
+    let (_, reply) = mcp(&client, &base, call_tool(6, "list_devices", json!({}))).await;
+    assert_eq!(tool_result(&reply).0[0]["kind"], "plug");
+
+    let (_, reply) = mcp(
+        &client,
+        &base,
+        call_tool(7, "label_on", json!({ "id": label["id"] })),
+    )
+    .await;
+    let (body, error) = tool_result(&reply);
+    assert!(!error, "{body}");
+    assert_eq!(body["switched"], 1);
+    assert_eq!(switches(&commands), [(json!(20), json!(1), json!("On"))]);
+    for (id, tool, command) in [(8, "label_toggle", "Off"), (9, "label_off", "Off")] {
+        commands.lock().unwrap().clear();
+        let (_, reply) = mcp(
+            &client,
+            &base,
+            call_tool(id, tool, json!({ "id": label["id"] })),
+        )
+        .await;
+        assert!(!tool_result(&reply).1);
+        assert_eq!(switches(&commands), [(json!(20), json!(1), json!(command))]);
+    }
+    let (_, reply) = mcp(&client, &base, call_tool(10, "list_labels", json!({}))).await;
+    assert_eq!(tool_result(&reply).0[0]["on"], false);
+
+    // API errors come back as tool errors with the API's body.
+    let (_, reply) = mcp(
+        &client,
+        &base,
+        call_tool(11, "label_on", json!({ "id": 999 })),
+    )
+    .await;
+    let (body, error) = tool_result(&reply);
+    assert!(error);
+    assert_eq!(body["error"], "label_not_found");
+    let (_, reply) = mcp(
+        &client,
+        &base,
+        call_tool(12, "delete_label", json!({ "id": label["id"] })),
+    )
+    .await;
+    assert!(!tool_result(&reply).1);
+    let (_, reply) = mcp(&client, &base, call_tool(13, "list_labels", json!({}))).await;
+    assert_eq!(tool_result(&reply).0, json!([]));
+
+    // Protocol errors.
+    let (_, reply) = mcp(&client, &base, call_tool(14, "unlock_door", json!({}))).await;
+    assert_eq!(reply["error"]["code"], -32602, "{reply}");
+    let (_, reply) = mcp(&client, &base, call_tool(15, "label_on", json!({}))).await;
+    assert_eq!(reply["error"]["code"], -32602, "{reply}");
+    let (_, reply) = mcp(
+        &client,
+        &base,
+        json!({ "jsonrpc": "2.0", "id": 16, "method": "resources/list" }),
+    )
+    .await;
+    assert_eq!(reply["error"]["code"], -32601);
+    let (_, reply) = mcp(
+        &client,
+        &base,
+        json!({ "jsonrpc": "2.0", "id": 17, "method": "ping" }),
+    )
+    .await;
+    assert_eq!(reply["result"], json!({}));
+    let response = client
+        .post(format!("{base}/mcp"))
+        .body("{")
+        .header("content-type", "application/json")
+        .send()
+        .await
+        .unwrap();
+    let reply: Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+    assert_eq!(reply["error"]["code"], -32700);
+    let response = client.get(format!("{base}/mcp")).send().await.unwrap();
+    assert_eq!(response.status().as_u16(), 405);
 }

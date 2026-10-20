@@ -1,5 +1,6 @@
 pub mod commission;
 pub mod matter;
+mod mcp;
 pub mod onboarding;
 pub mod schedule;
 pub mod sesame;
@@ -231,7 +232,87 @@ pub fn open_db(path: &str) -> rusqlite::Result<Connection> {
             PRAGMA foreign_keys = ON;",
         )?;
     }
+    if version < 9 {
+        migrate_to_labels_alone(&db)?;
+    }
     Ok(db)
+}
+
+/// Version 9 makes labels the one way to switch, hold and adjust lights, keeping how
+/// they behave: each label lights at its day's values while on, as boosting did, and
+/// boosted labels stay on; a dedicated one lights at its own. Every device outside a
+/// dedicated label, which the schedule adjusted, goes under a new auto label that is
+/// off only when "all off" was pressed last. Each label's own values, being dedicated
+/// and the last "all on" or "all off" go.
+fn migrate_to_labels_alone(db: &Connection) -> rusqlite::Result<()> {
+    let settings = load::<schedule::Settings>(db, SCHEDULE)?;
+    let intent = load::<Option<serde_json::Value>>(db, "lights_intent")?
+        .map(|intent| intent["action"] != "off");
+    db.execute_batch("PRAGMA foreign_keys = OFF; BEGIN;")?;
+    db.execute_batch(
+        "CREATE TABLE labels_v9 (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            auto INTEGER NOT NULL DEFAULT 0,
+            override_level INTEGER,
+            override_kelvin INTEGER,
+            \"on\" INTEGER
+        );
+        CREATE TABLE label_schedules (
+            label_id INTEGER NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
+            minute INTEGER NOT NULL,
+            \"on\" INTEGER NOT NULL,
+            PRIMARY KEY (label_id, minute)
+        );",
+    )?;
+    db.execute(
+        "INSERT INTO labels_v9 (id, name, override_level, override_kelvin, \"on\")
+            SELECT id, name, coalesce(day_level, ?1), coalesce(cool_kelvin, ?2),
+                CASE WHEN boost IS NOT NULL THEN 1 END
+            FROM labels",
+        params![settings.day_level, settings.cool_kelvin],
+    )?;
+    let adjusted: Vec<i64> = db
+        .prepare(
+            "SELECT id FROM devices WHERE id NOT IN (SELECT device_id FROM device_labels
+                JOIN labels ON labels.id = label_id WHERE dedicated) ORDER BY id",
+        )?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    db.execute_batch(
+        "DROP TABLE labels;
+        ALTER TABLE labels_v9 RENAME TO labels;",
+    )?;
+    if !adjusted.is_empty() {
+        let taken = |name: &str| -> rusqlite::Result<bool> {
+            db.query_row(
+                "SELECT EXISTS (SELECT 1 FROM labels WHERE name = ?1)",
+                [name],
+                |row| row.get(0),
+            )
+        };
+        let mut name = String::from("自動調光");
+        while taken(&name)? {
+            name.push('_');
+        }
+        db.execute(
+            "INSERT INTO labels (name, auto, \"on\") VALUES (?1, 1, ?2)",
+            params![name, intent],
+        )?;
+        let label = db.last_insert_rowid();
+        for device in adjusted {
+            db.execute(
+                "INSERT INTO device_labels (device_id, label_id) VALUES (?1, ?2)",
+                [device, label],
+            )?;
+        }
+    }
+    db.execute_batch(
+        "DELETE FROM settings WHERE key = 'lights_intent';
+        PRAGMA user_version = 9;
+        COMMIT;
+        PRAGMA foreign_keys = ON;",
+    )
 }
 
 struct AppState {
@@ -248,6 +329,8 @@ struct AppState {
     clock: fn() -> i64,
     /// The front door's SESAME, or why it cannot be unlocked or locked.
     sesame: Result<sesame::Config, &'static str>,
+    /// The minute, in Unix minutes, whose label schedules last ran.
+    last_schedule: Mutex<Option<i64>>,
 }
 
 const COMMISSION_TIMEOUT: Duration = Duration::from_mins(5);
@@ -278,6 +361,7 @@ impl Home {
             wifi_move: commission::MOVE_TIMES,
             clock: now,
             sesame: sesame::Config::new(None, None, None, sesame::API_URL),
+            last_schedule: Mutex::new(None),
         }))
     }
 
@@ -338,6 +422,20 @@ impl Home {
         adjust(&self.0, unix, trigger, &[]).await;
     }
 
+    /// Switches the labels whose schedules fall on `unix`'s minute in Asia/Tokyo, once.
+    pub async fn run_schedules(&self, unix: i64) {
+        run_schedules(&self.0, unix).await;
+    }
+
+    /// Runs the label schedules at the start of every minute, forever.
+    pub async fn every_minute(self) {
+        loop {
+            let wait = 60 - now().rem_euclid(60);
+            tokio::time::sleep(Duration::from_secs(wait.unsigned_abs())).await;
+            self.run_schedules(now()).await;
+        }
+    }
+
     /// Adjusts the lights every ten minutes on the clock, forever.
     pub async fn every_ten_minutes(self) {
         loop {
@@ -379,6 +477,9 @@ fn router(state: Db) -> Router {
             "/labels/{id}",
             axum::routing::patch(update_label).delete(delete_label),
         )
+        .route("/labels/{id}/on", axum::routing::post(label_on))
+        .route("/labels/{id}/off", axum::routing::post(label_off))
+        .route("/labels/{id}/toggle", axum::routing::post(label_toggle))
         .route("/wifi", get(list_wifi).post(save_wifi))
         .route("/wifi/devices", axum::routing::put(choose_wifi))
         .route("/wifi/{id}", axum::routing::delete(delete_wifi))
@@ -395,10 +496,15 @@ fn router(state: Db) -> Router {
         .fallback(not_found)
         // ponytail: one connection behind a global lock; a pool if writes ever contend.
         .with_state(state);
+    let tools = Router::new().nest("/api", api.clone());
 
     Router::new()
         .route("/healthz", get(healthz))
         .nest("/api", api)
+        .route(
+            "/mcp",
+            axum::routing::post(move |body: axum::body::Bytes| mcp::handle(tools.clone(), body)),
+        )
         .layer(TraceLayer::new_for_http())
 }
 
@@ -1045,11 +1151,9 @@ async fn update_device(
         if let Some(mut ids) = label_ids {
             ids.sort_unstable();
             ids.dedup();
-            let given = ids
-                .iter()
-                .map(|label| find_label(&db, *label))
-                .collect::<ApiResult<Vec<_>>>()?;
-            no_overlap(&given.iter().collect::<Vec<_>>())?;
+            for label in &ids {
+                find_label(&db, *label)?;
+            }
             db.execute("DELETE FROM device_labels WHERE device_id = ?1", [id])?;
             for label in ids {
                 db.execute(
@@ -1081,59 +1185,55 @@ async fn update_device(
     Ok(Json(observed(&state, device).await))
 }
 
-/// A label and its values; `null` values are the schedule's.
-#[derive(Serialize)]
+/// A label: what it does to its devices, its daily switches and its state.
+#[derive(Clone, Serialize)]
 struct Label {
     id: i64,
     name: String,
     #[serde(flatten)]
-    values: schedule::Label,
+    traits: schedule::Label,
+    schedule: Vec<Switch>,
     device_count: i64,
-    /// Its lights are lit only while it is boosted, then at the day's values.
-    dedicated: bool,
-    /// Its lights are held at the day's values.
+    /// Holding its lights at its override: what the 0.1.36 widget reads as boosted.
     boosted: bool,
-    /// While boosted, the ledger devices that were off before.
-    #[serde(skip)]
-    was_off: Option<Vec<i64>>,
 }
 
-const LABEL_SELECT: &str = "SELECT id, name, day_level, night_level, cool_kelvin, warm_kelvin,
-    (SELECT count(*) FROM device_labels WHERE label_id = labels.id), boost, dedicated FROM labels";
+/// A daily switch of a label at `time`, `HH:MM` in Asia/Tokyo.
+#[derive(Clone, Serialize)]
+struct Switch {
+    time: String,
+    on: bool,
+}
+
+const LABEL_SELECT: &str = "SELECT id, name, auto, override_level, override_kelvin, \"on\",
+    (SELECT count(*) FROM device_labels WHERE label_id = labels.id),
+    (SELECT json_group_array(json_array(minute, \"on\")) FROM
+        (SELECT minute, \"on\" FROM label_schedules WHERE label_id = labels.id ORDER BY minute))
+    FROM labels";
 
 fn label_row(row: &rusqlite::Row) -> rusqlite::Result<Label> {
+    let traits = schedule::Label {
+        auto: row.get(2)?,
+        override_level: row.get(3)?,
+        override_kelvin: row.get(4)?,
+        on: row.get(5)?,
+    };
+    let schedule: Vec<(u32, u8)> =
+        serde_json::from_str(&row.get::<_, String>(7)?).unwrap_or_default();
     Ok(Label {
         id: row.get(0)?,
         name: row.get(1)?,
-        values: schedule::Label {
-            day_level: row.get(2)?,
-            night_level: row.get(3)?,
-            cool_kelvin: row.get(4)?,
-            warm_kelvin: row.get(5)?,
-        },
+        boosted: traits.overriding().is_some(),
+        traits,
+        schedule: schedule
+            .into_iter()
+            .map(|(minute, on)| Switch {
+                time: schedule::clock(minute),
+                on: on != 0,
+            })
+            .collect(),
         device_count: row.get(6)?,
-        dedicated: row.get(8)?,
-        boosted: row.get::<_, Option<String>>(7)?.is_some(),
-        was_off: row
-            .get::<_, Option<String>>(7)?
-            .map(|ids| serde_json::from_str(&ids).unwrap_or_default()),
     })
-}
-
-/// Refuses `labels` for one light when two of them set the same value.
-fn no_overlap(labels: &[&Label]) -> ApiResult<()> {
-    let named: Vec<_> = labels
-        .iter()
-        .map(|l| (l.name.as_str(), &l.values))
-        .collect();
-    match schedule::overlap(&named) {
-        Some(message) => Err(ApiError(
-            StatusCode::BAD_REQUEST,
-            "conflicting_labels",
-            message,
-        )),
-        None => Ok(()),
-    }
 }
 
 fn labels(db: &Connection) -> rusqlite::Result<Vec<Label>> {
@@ -1155,17 +1255,36 @@ fn find_label(db: &Connection, id: i64) -> ApiResult<Label> {
         .ok_or_else(label_not_found)
 }
 
-/// The name, values and dedication in `input`, checked over the schedule's current settings.
-fn label_input(
-    db: &Connection,
-    mut input: serde_json::Value,
-) -> ApiResult<(String, schedule::Label, bool)> {
-    let invalid = |message: String| ApiError(StatusCode::BAD_REQUEST, "invalid_label", message);
+/// What a label is made of: its name, traits and daily switches by minute.
+struct LabelInput {
+    name: String,
+    traits: schedule::Label,
+    schedule: Vec<(u32, bool)>,
+}
+
+/// The label in `input`, checked.
+fn label_input(input: &serde_json::Value) -> ApiResult<LabelInput> {
+    let invalid =
+        |message: &str| ApiError(StatusCode::BAD_REQUEST, "invalid_label", message.into());
     let fields = input
-        .as_object_mut()
-        .ok_or_else(|| invalid("labelはJSONのオブジェクトで送ってください".into()))?;
+        .as_object()
+        .ok_or_else(|| invalid("labelはJSONのオブジェクトで送ってください"))?;
+    if let Some(key) = fields.keys().find(|key| {
+        ![
+            "name",
+            "auto",
+            "override_level",
+            "override_kelvin",
+            "schedule",
+        ]
+        .contains(&key.as_str())
+    }) {
+        return Err(invalid(&format!(
+            "{key}は使えません。name・auto・override_level・override_kelvin・scheduleを送ってください"
+        )));
+    }
     let name = fields
-        .remove("name")
+        .get("name")
         .and_then(|name| clean_name(name.as_str()?, false))
         .ok_or_else(|| {
             ApiError(
@@ -1174,56 +1293,108 @@ fn label_input(
                 format!("label名は1〜{MAX_NAME_CHARS}文字で入力してください"),
             )
         })?;
-    let dedicated = match fields.remove("dedicated") {
+    let auto = match fields.get("auto") {
         None => false,
-        Some(serde_json::Value::Bool(dedicated)) => dedicated,
-        Some(_) => return Err(invalid("dedicatedはtrueかfalseで送ってください".into())),
+        Some(serde_json::Value::Bool(auto)) => *auto,
+        Some(_) => return Err(invalid("autoはtrueかfalseで送ってください")),
     };
-    let values: schedule::Label =
-        serde_json::from_value(input).map_err(|e| invalid(e.to_string()))?;
-    if let Some(message) = load::<schedule::Settings>(db, SCHEDULE)?
-        .with(&values)
-        .invalid()
-    {
-        return Err(invalid(message.into()));
+    let number = |key: &str, range: std::ops::RangeInclusive<u64>| match fields.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .filter(|v| range.contains(v))
+            .map(Some)
+            .ok_or_else(|| {
+                invalid("override_levelは1〜254、override_kelvinは1000〜10000で送ってください")
+            }),
+    };
+    let (level, kelvin) = (
+        number("override_level", 1..=254)?,
+        number("override_kelvin", 1000..=10000)?,
+    );
+    if level.is_some() != kelvin.is_some() {
+        return Err(invalid(
+            "override_levelとoverride_kelvinは両方を送るか、両方をnullにしてください",
+        ));
     }
-    Ok((name, values, dedicated))
+    if auto && level.is_some() {
+        return Err(invalid("上書きの値を持つlabelは自動調光に連動できません"));
+    }
+    let bad_schedule = || {
+        invalid(
+            "scheduleは [{\"time\": \"00:00\", \"on\": true}, …] の形で、時刻を重ねずに送ってください",
+        )
+    };
+    let mut schedule = Vec::new();
+    for entry in fields
+        .get("schedule")
+        .map(|s| s.as_array().ok_or_else(bad_schedule))
+        .transpose()?
+        .into_iter()
+        .flatten()
+    {
+        let minute = entry["time"].as_str().and_then(schedule::minute_of);
+        let (Some(minute), Some(on), Some(2)) = (
+            minute,
+            entry["on"].as_bool(),
+            entry.as_object().map(serde_json::Map::len),
+        ) else {
+            return Err(bad_schedule());
+        };
+        if schedule.iter().any(|(m, _)| *m == minute) {
+            return Err(bad_schedule());
+        }
+        schedule.push((minute, on));
+    }
+    Ok(LabelInput {
+        name,
+        traits: schedule::Label {
+            auto,
+            override_level: level.and_then(|v| u8::try_from(v).ok()),
+            override_kelvin: kelvin.and_then(|v| u16::try_from(v).ok()),
+            on: None,
+        },
+        schedule,
+    })
 }
 
-fn save_label(
-    db: &Connection,
-    id: Option<i64>,
-    name: &str,
-    values: &schedule::Label,
-    dedicated: bool,
-) -> ApiResult<i64> {
+/// Saves the label at `id`, or a new one, keeping its state.
+fn save_label(db: &Connection, id: Option<i64>, input: &LabelInput) -> ApiResult<i64> {
+    let traits = &input.traits;
     let result = db.execute(
-        "INSERT INTO labels (id, name, day_level, night_level, cool_kelvin, warm_kelvin, dedicated)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-         ON CONFLICT (id) DO UPDATE SET name = excluded.name, day_level = excluded.day_level,
-            night_level = excluded.night_level, cool_kelvin = excluded.cool_kelvin,
-            warm_kelvin = excluded.warm_kelvin, dedicated = excluded.dedicated",
+        "INSERT INTO labels (id, name, auto, override_level, override_kelvin)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT (id) DO UPDATE SET name = excluded.name, auto = excluded.auto,
+            override_level = excluded.override_level, override_kelvin = excluded.override_kelvin",
         params![
             id,
-            name,
-            values.day_level,
-            values.night_level,
-            values.cool_kelvin,
-            values.warm_kelvin,
-            dedicated
+            input.name,
+            traits.auto,
+            traits.override_level,
+            traits.override_kelvin
         ],
     );
-    match result {
-        Err(error) if is_unique_violation(&error) => Err(ApiError(
-            StatusCode::CONFLICT,
-            "duplicate_label_name",
-            "同じ名前のlabelがあります".into(),
-        )),
+    let id = match result {
+        Err(error) if is_unique_violation(&error) => {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                "duplicate_label_name",
+                "同じ名前のlabelがあります".into(),
+            ));
+        }
         result => {
             result?;
-            Ok(id.unwrap_or_else(|| db.last_insert_rowid()))
+            id.unwrap_or_else(|| db.last_insert_rowid())
         }
+    };
+    db.execute("DELETE FROM label_schedules WHERE label_id = ?1", [id])?;
+    for (minute, on) in &input.schedule {
+        db.execute(
+            "INSERT INTO label_schedules (label_id, minute, \"on\") VALUES (?1, ?2, ?3)",
+            params![id, minute, on],
+        )?;
     }
+    Ok(id)
 }
 
 async fn list_labels(State(db): State<Db>) -> ApiResult<Json<Vec<Label>>> {
@@ -1234,13 +1405,13 @@ async fn create_label(
     State(db): State<Db>,
     Json(input): Json<serde_json::Value>,
 ) -> ApiResult<(StatusCode, Json<Label>)> {
+    let input = label_input(&input)?;
     let db = db.db.lock().unwrap();
-    let (name, values, dedicated) = label_input(&db, input)?;
-    let id = save_label(&db, None, &name, &values, dedicated)?;
+    let id = save_label(&db, None, &input)?;
     Ok((StatusCode::CREATED, Json(find_label(&db, id)?)))
 }
 
-/// Merges the given fields into the label; a `null` value returns to the schedule's.
+/// Merges the given fields into the label; `null` takes its override away.
 async fn update_label(
     State(db): State<Db>,
     Path(id): Path<i64>,
@@ -1248,9 +1419,12 @@ async fn update_label(
 ) -> ApiResult<Json<Label>> {
     let db = db.db.lock().unwrap();
     let label = find_label(&db, id)?;
-    let mut merged = json!(label.values);
+    let mut merged = json!(label.traits);
     merged["name"] = json!(label.name);
-    merged["dedicated"] = json!(label.dedicated);
+    merged["schedule"] = json!(label.schedule);
+    if let Some(map) = merged.as_object_mut() {
+        map.remove("on");
+    }
     if let Some(fields) = input.as_object() {
         for (key, value) in fields {
             merged[key] = value.clone();
@@ -1258,28 +1432,11 @@ async fn update_label(
     } else {
         merged = input;
     }
-    let (name, values, dedicated) = label_input(&db, merged)?;
-    let changed = Label {
-        name: name.clone(),
-        values: values.clone(),
-        ..label
-    };
-    let others = labels(&db)?;
-    for device in ledger(&db)? {
-        if device.labels.iter().any(|l| l.id == id) {
-            let stacked: Vec<_> = others
-                .iter()
-                .filter(|l| l.id != id && device.labels.iter().any(|r| r.id == l.id))
-                .chain([&changed])
-                .collect();
-            no_overlap(&stacked)?;
-        }
-    }
-    save_label(&db, Some(id), &name, &values, dedicated)?;
+    save_label(&db, Some(id), &label_input(&merged)?)?;
     Ok(Json(find_label(&db, id)?))
 }
 
-/// Deletes the label; its lights return to the schedule's values.
+/// Deletes the label; its devices keep their other labels.
 async fn delete_label(State(db): State<Db>, Path(id): Path<i64>) -> ApiResult<StatusCode> {
     let db = db.db.lock().unwrap();
     find_label(&db, id)?;
@@ -1930,7 +2087,9 @@ async fn light_states(State(state): State<Db>) -> ApiResult<Json<serde_json::Val
     })))
 }
 
-/// Switches every light on and, when the schedule is on, brings them to the current values.
+/// Switches every light on, as the app's "all on" did until it moves to labels: each label
+/// without an override is on, and a light under override labels alone is left to them.
+/// When the schedule is on, the lights are brought to the current values.
 async fn lights_on(State(state): State<Db>) -> ApiResult<Json<serde_json::Value>> {
     let (response, switched) = switch_lights(&state, true).await?;
     if load::<schedule::Settings>(&state.db.lock().unwrap(), SCHEDULE)?.enabled {
@@ -1939,6 +2098,7 @@ async fn lights_on(State(state): State<Db>) -> ApiResult<Json<serde_json::Value>
     Ok(response)
 }
 
+/// Switches every light off and every label with it, as the app's "all off" did.
 async fn lights_off(State(state): State<Db>) -> ApiResult<Json<serde_json::Value>> {
     Ok(switch_lights(&state, false).await?.0)
 }
@@ -1950,11 +2110,8 @@ struct BoostInput {
     label: String,
 }
 
-/// Toggles the named label's boost. Boosting switches its lights on at the day's values,
-/// those that were off too, and holds them there; releasing switches off those that were
-/// off and returns the others at once to the clock's values. A light still under another boosted
-/// label is left as it is. A boost that switched no light is not kept.
-#[allow(clippy::too_many_lines)]
+/// Toggles the label named in the body, for the 0.1.36 widget's 仕事 and 作業:
+/// `boost` when it switched it on, `release` otherwise.
 async fn boost(
     State(state): State<Db>,
     Json(input): Json<serde_json::Value>,
@@ -1968,7 +2125,100 @@ async fn boost(
             )
         })?
         .label;
-    let url = matter_url(&state)?;
+    let id = labels(&state.db.lock().unwrap())?
+        .into_iter()
+        .find(|l| l.name == name.trim())
+        .ok_or_else(label_not_found)?
+        .id;
+    let mut body = switch_label(&state, id, Op::Toggle)
+        .await
+        .map_err(|error| match error.1 {
+            "label_has_no_devices" => ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "label_has_no_lights",
+                format!("labelの「{}」に照明が割り当てられていません", name.trim()),
+            ),
+            _ => error,
+        })?;
+    body["action"] = json!(if body["action"] == "on" {
+        "boost"
+    } else {
+        "release"
+    });
+    Ok(Json(body))
+}
+
+/// What to do to a label's devices.
+#[derive(Clone, Copy)]
+enum Op {
+    On,
+    Off,
+    Toggle,
+}
+
+async fn label_on(
+    State(state): State<Db>,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<serde_json::Value>> {
+    switch_label(&state, id, Op::On).await.map(Json)
+}
+
+async fn label_off(
+    State(state): State<Db>,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<serde_json::Value>> {
+    switch_label(&state, id, Op::Off).await.map(Json)
+}
+
+async fn label_toggle(
+    State(state): State<Db>,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<serde_json::Value>> {
+    switch_label(&state, id, Op::Toggle).await.map(Json)
+}
+
+/// Runs the label switches due at `unix`'s minute, once per minute.
+async fn run_schedules(state: &AppState, unix: i64) {
+    let minute = unix.div_euclid(60);
+    if state.last_schedule.lock().unwrap().replace(minute) == Some(minute) {
+        return;
+    }
+    let (_, at) = schedule::local(unix);
+    let due = state
+        .db
+        .lock()
+        .unwrap()
+        .prepare("SELECT label_id, \"on\" FROM label_schedules WHERE minute = ?1 ORDER BY label_id")
+        .and_then(|mut statement| {
+            statement
+                .query_map([at], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        });
+    for (label, on) in due.unwrap_or_else(|error| {
+        tracing::warn!(%error, "label schedules unreadable");
+        Vec::new()
+    }) {
+        // ponytail: one try at the minute; retry a device that did not answer if one misses its time.
+        match switch_label(state, label, if on { Op::On } else { Op::Off }).await {
+            Ok(body) => {
+                tracing::info!(label, on, switched = %body["switched"], "label switched on schedule");
+            }
+            Err(error) => tracing::warn!(label, on, error = error.1, "label schedule failed"),
+        }
+    }
+}
+
+/// Switches label `id`'s devices, lights and plugs, but those ignored.
+///
+/// On switches them on, lights under an override at its values, and keeps the label on
+/// when one of them switched; when one is adjusted, the schedule then runs. Off switches
+/// them off and ends every override of theirs. A toggle turns an override label that is
+/// on back to what its lights' other labels say: held by another override, adjusted
+/// under an auto label that is on, else off; any other label that is on, off; else on.
+#[allow(clippy::too_many_lines)]
+async fn switch_label(state: &AppState, id: i64, op: Op) -> ApiResult<serde_json::Value> {
     let (settings, devices, labels) = {
         let db = state.db.lock().unwrap();
         (
@@ -1979,155 +2229,199 @@ async fn boost(
     };
     let label = labels
         .iter()
-        .find(|l| l.name == name.trim())
-        .ok_or_else(label_not_found)?;
+        .find(|l| l.id == id)
+        .ok_or_else(label_not_found)?
+        .clone();
     let members: Vec<&Device> = devices
         .iter()
-        .filter(|d| !d.ignored && d.labels.iter().any(|r| r.id == label.id))
+        .filter(|d| !d.ignored && d.labels.iter().any(|r| r.id == id))
         .collect();
     if members.is_empty() {
         return Err(ApiError(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "label_has_no_lights",
-            format!("labelの「{}」に照明が割り当てられていません", label.name),
+            "label_has_no_devices",
+            format!("labelの「{}」に機器が割り当てられていません", label.name),
         ));
     }
-    // A dedicated light is left to its dedicated labels.
-    let of_label = |nodes: &[serde_json::Value], light: &matter::Light| {
-        let mine = labels_of(&devices, nodes, light, &labels);
-        !is_ignored(&devices, nodes, light)
-            && mine.iter().any(|l| l.id == label.id)
-            && (label.dedicated || !is_dedicated(&mine))
+    let url = matter_url(state)?;
+    let fixed = label.traits.override_level.is_some();
+    let action = match op {
+        Op::On => "on",
+        Op::Toggle if label.traits.on != Some(true) => "on",
+        Op::Toggle if fixed => "release",
+        Op::Off | Op::Toggle => "off",
+    };
+    let is_member = |device: &Device| members.iter().any(|m| m.id == device.id);
+    let targets = |nodes: &[serde_json::Value]| {
+        let mut targets: Vec<matter::Light> = matter::lights(nodes)
+            .into_iter()
+            .filter(|light| devices_of(&devices, nodes, light).any(is_member))
+            .chain(members.iter().filter_map(|device| {
+                let (node, endpoint) = place(device, nodes)?;
+                matter::outlet(nodes, node, endpoint)
+            }))
+            .collect();
+        targets.sort_by_key(|t| (t.node_id, t.endpoint));
+        targets.dedup_by_key(|t| (t.node_id, t.endpoint));
+        targets
     };
     let key = |light: &matter::Light| (light.node_id, light.endpoint);
-    let result = |decision: matter::Decision| match decision {
-        matter::Decision::NoResponse => "no_response",
-        matter::Decision::Failed => "failed",
-        _ => "switched",
-    };
     let outcome = |outcome: matter::Outcome| match outcome {
         matter::Outcome::NoResponse => "no_response",
         matter::Outcome::Failed => "failed",
         _ => "switched",
     };
-    let (boosted, tuned, results) = if let Some(was_off) = &label.was_off {
-        let labels = {
-            let db = state.db.lock().unwrap();
-            db.execute("UPDATE labels SET boost = NULL WHERE id = ?1", [label.id])?;
-            self::labels(&db)?
-        };
-        let held = |nodes: &[serde_json::Value], light: &matter::Light| {
-            labels_of(&devices, nodes, light, &labels)
-                .iter()
-                .any(|l| l.boosted)
-        };
-        let off = |nodes: &[serde_json::Value], light: &matter::Light| {
-            devices_of(&devices, nodes, light).any(|d| was_off.contains(&d.id))
-                || is_dedicated(&labels_of(&devices, nodes, light, &labels))
-        };
-        let (_, switched) = matter::switch(url, false, |nodes, light| {
-            !(of_label(nodes, light) && !held(nodes, light) && off(nodes, light))
-        })
-        .await
-        .map_err(matter_unreachable)?;
-        let (day, minute) = schedule::local((state.clock)());
-        let sun = schedule::sun_times(day, settings.latitude, settings.longitude);
-        let tuned = matter::tune(url, &[], 0, |nodes, light| {
-            if of_label(nodes, light) && !held(nodes, light) && !off(nodes, light) {
-                let labels = labels_of(&devices, nodes, light, &labels);
-                let (level, kelvin) = light_goal(&settings, minute, sun, &labels);
-                Ok(schedule::fit(level, kelvin, light))
-            } else {
-                Err(schedule::Skip::Unchanged)
-            }
-        })
-        .await
-        .map_err(matter_unreachable)?;
-        let results: Vec<_> = tuned
-            .lights
-            .iter()
-            .filter(|(light, _)| of_label(&tuned.nodes, light))
-            .map(|(light, decision)| {
-                let done = if held(&tuned.nodes, light) {
-                    "switched"
-                } else if off(&tuned.nodes, light) {
-                    switched
-                        .iter()
-                        .find(|(l, _)| key(l) == key(light))
-                        .map_or("no_response", |(_, o)| outcome(*o))
-                } else {
-                    result(*decision)
-                };
-                (light.clone(), done)
-            })
-            .collect();
-        (false, tuned, results)
-    } else {
-        let (nodes, read) = matter::read_on(url, of_label)
-            .await
-            .map_err(matter_unreachable)?;
-        let was_off: Vec<i64> = read
-            .iter()
-            .filter(|(_, on)| *on == Some(false))
-            .flat_map(|(light, _)| devices_of(&devices, &nodes, light))
-            .filter(|d| members.iter().any(|m| m.id == d.id))
-            .map(|d| d.id)
-            .collect();
-        let (_, switched) = matter::switch(url, true, |nodes, light| !of_label(nodes, light))
-            .await
-            .map_err(matter_unreachable)?;
-        let on: Vec<_> = switched
-            .iter()
-            .filter(|(_, o)| *o == matter::Outcome::Switched)
-            .map(|(light, _)| key(light))
-            .collect();
-        let tuned = matter::tune(url, &on, matter::TRANSITION, |nodes, light| {
-            if of_label(nodes, light) {
-                let labels = labels_of(&devices, nodes, light, &labels);
-                let (level, kelvin) = settings.with_all(labels.iter().map(|l| &l.values)).day();
-                Ok(schedule::fit(level, kelvin, light))
-            } else {
-                Err(schedule::Skip::Unchanged)
-            }
-        })
-        .await
-        .map_err(matter_unreachable)?;
-        let results: Vec<_> = switched
-            .into_iter()
-            .filter(|(light, _)| of_label(&tuned.nodes, light))
-            .map(|(light, switch)| {
-                let decision = tuned
-                    .lights
-                    .iter()
-                    .find(|(l, _)| key(l) == key(&light))
-                    .map_or(matter::Decision::NoResponse, |(_, d)| *d);
-                let done = match outcome(switch) {
-                    "switched" => result(decision),
-                    other => other,
-                };
-                (light, done)
-            })
-            .collect();
-        let boosted = results.iter().any(|(_, r)| *r == "switched");
-        if boosted {
-            state.db.lock().unwrap().execute(
-                "UPDATE labels SET boost = ?1 WHERE id = ?2",
-                params![json!(was_off).to_string(), label.id],
-            )?;
-        }
-        (boosted, tuned, results)
+    let decision = |decision: matter::Decision| match decision {
+        matter::Decision::NoResponse => "no_response",
+        matter::Decision::Failed => "failed",
+        _ => "switched",
     };
-    {
+    let rule_of = |nodes: &[serde_json::Value], light: &matter::Light, labels: &[Label]| {
+        schedule::rule(
+            labels_of(&devices, nodes, light, labels)
+                .iter()
+                .map(|l| &l.traits),
+        )
+    };
+    let (nodes, results, tuned) = match action {
+        "on" => {
+            let mut after = labels.clone();
+            for l in after.iter_mut().filter(|l| l.id == id) {
+                l.traits.on = Some(true);
+            }
+            let (nodes, switched) = matter::switch_among(url, true, targets, |_, _| false)
+                .await
+                .map_err(matter_unreachable)?;
+            let on: Vec<_> = switched
+                .iter()
+                .filter(|(_, o)| *o == matter::Outcome::Switched)
+                .map(|(light, _)| key(light))
+                .collect();
+            let tuned = matter::tune(url, &on, matter::TRANSITION, |nodes, light| {
+                match rule_of(nodes, light, &after) {
+                    schedule::Rule::Fixed(level, kelvin) if on.contains(&key(light)) => {
+                        Ok(schedule::fit(level, kelvin, light))
+                    }
+                    _ => Err(schedule::Skip::Unchanged),
+                }
+            })
+            .await
+            .map_err(matter_unreachable)?;
+            let results: Vec<_> = switched
+                .into_iter()
+                .map(|(light, switch)| {
+                    let tune = tuned
+                        .lights
+                        .iter()
+                        .find(|(l, _)| key(l) == key(&light))
+                        .map_or("switched", |(_, d)| decision(*d));
+                    let done = match outcome(switch) {
+                        "switched" => tune,
+                        other => other,
+                    };
+                    (light, done)
+                })
+                .collect();
+            if !on.is_empty() {
+                state
+                    .db
+                    .lock()
+                    .unwrap()
+                    .execute("UPDATE labels SET \"on\" = 1 WHERE id = ?1", [id])?;
+                let adjusted = results.iter().any(|(light, _)| {
+                    on.contains(&key(light))
+                        && rule_of(&nodes, light, &after) == schedule::Rule::Auto
+                });
+                if adjusted && settings.enabled {
+                    adjust(state, (state.clock)(), "label_on", &on).await;
+                }
+            }
+            (nodes, results, Some(tuned))
+        }
+        "off" => {
+            {
+                let db = state.db.lock().unwrap();
+                db.execute("UPDATE labels SET \"on\" = 0 WHERE id = ?1", [id])?;
+                for device in &members {
+                    db.execute(
+                        "UPDATE labels SET \"on\" = 0 WHERE override_level IS NOT NULL
+                            AND id IN (SELECT label_id FROM device_labels WHERE device_id = ?1)",
+                        [device.id],
+                    )?;
+                }
+            }
+            let (nodes, switched) = matter::switch_among(url, false, targets, |_, _| false)
+                .await
+                .map_err(matter_unreachable)?;
+            let results = switched
+                .into_iter()
+                .map(|(light, o)| (light, outcome(o)))
+                .collect();
+            (nodes, results, None)
+        }
+        _ => {
+            let after = {
+                let db = state.db.lock().unwrap();
+                db.execute("UPDATE labels SET \"on\" = 0 WHERE id = ?1", [id])?;
+                self::labels(&db)?
+            };
+            let stays = |nodes: &[serde_json::Value], light: &matter::Light| {
+                matches!(
+                    rule_of(nodes, light, &after),
+                    schedule::Rule::Fixed(..) | schedule::Rule::Auto
+                )
+            };
+            let (nodes, switched) = matter::switch_among(url, false, targets, stays)
+                .await
+                .map_err(matter_unreachable)?;
+            let mine: Vec<_> = switched.iter().map(|(light, _)| key(light)).collect();
+            let (day, minute) = schedule::local((state.clock)());
+            let goal = schedule::target(
+                minute,
+                schedule::sun_times(day, settings.latitude, settings.longitude),
+                &settings,
+            );
+            let tuned = matter::tune(url, &[], 0, |nodes, light| {
+                if mine.contains(&key(light))
+                    && rule_of(nodes, light, &after) == schedule::Rule::Auto
+                {
+                    Ok(schedule::fit(goal.0, goal.1, light))
+                } else {
+                    Err(schedule::Skip::Unchanged)
+                }
+            })
+            .await
+            .map_err(matter_unreachable)?;
+            let results = switched
+                .into_iter()
+                .map(|(light, o)| {
+                    let done = match rule_of(&nodes, &light, &after) {
+                        schedule::Rule::Fixed(..) => "switched",
+                        schedule::Rule::Auto => tuned
+                            .lights
+                            .iter()
+                            .find(|(l, _)| key(l) == key(&light))
+                            .map_or("switched", |(_, d)| decision(*d)),
+                        _ => outcome(o),
+                    };
+                    (light, done)
+                })
+                .collect();
+            (nodes, results, Some(tuned))
+        }
+    };
+    if let Some(tuned) = &tuned {
         let mut memory = state.sent.lock().unwrap();
         for (light, decision) in &tuned.lights {
             decide(&mut memory, light, *decision, &mut json!({}));
         }
     }
+    let label = find_label(&state.db.lock().unwrap(), id)?;
     let (lights, outcomes): (Vec<_>, Vec<_>) = results.into_iter().unzip();
-    let (names, _) = match_ledger(&devices, &tuned.nodes, &lights);
+    let (names, _) = match_ledger(&devices, &nodes, &lights);
     let missing: Vec<_> = members
         .iter()
-        .filter(|d| is_missing(d, &tuned.nodes))
+        .filter(|d| is_missing(d, &nodes))
         .map(|d| MissingDevice {
             id: d.id,
             name: d.name.clone(),
@@ -2136,51 +2430,53 @@ async fn boost(
         .collect();
     tracing::info!(
         label = label.name,
-        boosted,
+        action,
         switched = count(&outcomes, "switched"),
-        lights = lights.len(),
-        "label boost toggled"
+        devices = lights.len(),
+        "label switched"
     );
-    Ok(Json(json!({
+    Ok(json!({
         "label": label.name,
-        "action": if label.was_off.is_some() { "release" } else { "boost" },
-        "boosted": boosted,
+        "action": action,
+        "on": label.traits.on,
+        "boosted": label.boosted,
         "switched": count(&outcomes, "switched"),
         "no_response": count(&outcomes, "no_response"),
         "failed": count(&outcomes, "failed"),
         "missing": missing.len(),
-        "lights": light_entries(&lights, names, &outcomes, "result"),
+        "devices": light_entries(&lights, names, &outcomes, "result"),
         "missing_devices": missing,
-    })))
+    }))
 }
 
-/// Records "all on" or "all off" as the user's intent, switches every light
-/// matterjs-server serves and reports each light's result, with the node and
-/// endpoint of the switched ones.
+/// Switches every light matterjs-server serves on or off and reports each light's
+/// result, with the node and endpoint of the switched ones: "all on" turns every label
+/// without an override on, "all off" every label off. Plugs are left alone.
 /// Only a light whose command was accepted counts as switched.
 async fn switch_lights(
     state: &AppState,
     on: bool,
 ) -> ApiResult<(Json<serde_json::Value>, Vec<(u64, u16)>)> {
     let url = matter_url(state)?;
-    let intent = Intent {
-        action: if on { "on" } else { "off" }.into(),
-        at: schedule::timestamp((state.clock)()),
-    };
     let (devices, labels) = {
         let db = state.db.lock().unwrap();
-        store(&db, INTENT, &intent)?;
-        if !on {
-            db.execute("UPDATE labels SET boost = NULL", [])?;
+        if on {
+            db.execute(
+                "UPDATE labels SET \"on\" = 1 WHERE override_level IS NULL",
+                [],
+            )?;
+        } else {
+            db.execute("UPDATE labels SET \"on\" = 0", [])?;
         }
         (ledger(&db)?, labels(&db)?)
     };
-    // "All on" leaves dedicated lights to their labels' boost.
-    let dedicated = |nodes: &[serde_json::Value], light: &matter::Light| {
-        on && is_dedicated(&labels_of(&devices, nodes, light, &labels))
+    // "All on" leaves a light under override labels alone to them.
+    let held = |nodes: &[serde_json::Value], light: &matter::Light| {
+        let mine = labels_of(&devices, nodes, light, &labels);
+        on && !mine.is_empty() && mine.iter().all(|l| l.traits.override_level.is_some())
     };
     let (nodes, results) = matter::switch(url, on, |nodes, light| {
-        is_ignored(&devices, nodes, light) || dedicated(nodes, light)
+        is_ignored(&devices, nodes, light) || held(nodes, light)
     })
     .await
     .map_err(matter_unreachable)?;
@@ -2199,7 +2495,7 @@ async fn switch_lights(
             matter::Outcome::NoResponse => "no_response",
             matter::Outcome::Failed => "failed",
             matter::Outcome::Ignored if is_ignored(&devices, &nodes, light) => "ignored",
-            matter::Outcome::Ignored => "dedicated",
+            matter::Outcome::Ignored => "override",
         })
         .collect();
     let (names, missing) = match_ledger(&devices, &nodes, &lights);
@@ -2221,15 +2517,7 @@ async fn switch_lights(
     Ok((response, switched))
 }
 
-const INTENT: &str = "lights_intent";
 const SCHEDULE: &str = "light_schedule";
-
-/// The last "all on" or "all off" pressed: the only light state kept across restarts.
-#[derive(Serialize, Deserialize)]
-struct Intent {
-    action: String,
-    at: String,
-}
 
 fn load<T: DeserializeOwned + Default>(db: &Connection, key: &str) -> rusqlite::Result<T> {
     let value: Option<String> = db
@@ -2251,31 +2539,25 @@ fn store<T: Serialize>(db: &Connection, key: &str, value: &T) -> rusqlite::Resul
     Ok(())
 }
 
-/// Adjusts every light that is on to the values for `unix`, its label's in
-/// place of the schedule's, and records the run: nothing is written while
-/// "all off" is in force or the schedule is disabled, nor what was already sent
-/// unless `switched_on` holds the light: just switched on, it gets all values.
+/// Adjusts every light that is on under an auto label that is not off to the values
+/// for `unix`, and records the run: nothing is written to a light held by an override,
+/// under no auto label or only under auto labels that are off, nor while the schedule
+/// is disabled, nor what was already sent unless `switched_on` holds the light: just
+/// switched on, it gets all values.
 async fn adjust(state: &AppState, unix: i64, trigger: &'static str, switched_on: &[(u64, u16)]) {
     let loaded = {
         let db = state.db.lock().unwrap();
-        load::<schedule::Settings>(&db, SCHEDULE).and_then(|settings| {
-            Ok((
-                settings,
-                load::<Option<Intent>>(&db, INTENT)?,
-                ledger(&db)?,
-                labels(&db)?,
-            ))
-        })
+        load::<schedule::Settings>(&db, SCHEDULE)
+            .and_then(|settings| Ok((settings, ledger(&db)?, labels(&db)?)))
     };
     let (day, minute) = schedule::local(unix);
     let mut run = json!({ "at": schedule::timestamp(unix), "trigger": trigger, "commands": 0 });
     let result = match (&loaded, &state.matter_url) {
         (Err(error), _) => Err(error.to_string()),
         (_, None) => Err("MATTER_SERVER_URL is not set".into()),
-        (Ok((settings, intent, devices, labels)), Some(url)) => {
+        (Ok((settings, devices, labels)), Some(url)) => {
             let sun = schedule::sun_times(day, settings.latitude, settings.longitude);
             let goal = schedule::target(minute, sun, settings);
-            let all_off = intent.as_ref().is_some_and(|i| i.action == "off");
             run["sunrise"] = json!(schedule::clock(sun.0));
             run["sunset"] = json!(schedule::clock(sun.1));
             run["level"] = json!(goal.0);
@@ -2283,9 +2565,13 @@ async fn adjust(state: &AppState, unix: i64, trigger: &'static str, switched_on:
             let sent = state.sent.lock().unwrap().clone();
             let goal_of = |nodes: &[serde_json::Value], light: &matter::Light| {
                 let labels = labels_of(devices, nodes, light, labels);
-                let goal = light_goal(settings, minute, sun, &labels);
+                let rule = schedule::rule(labels.iter().map(|l| &l.traits));
                 let names: Vec<_> = labels.iter().map(|l| l.name.clone()).collect();
-                (names, goal)
+                let target = match rule {
+                    schedule::Rule::Fixed(level, kelvin) => (level, kelvin),
+                    _ => goal,
+                };
+                (names, rule, target)
             };
             matter::tune(url, switched_on, matter::TRANSITION, |nodes, light| {
                 if is_ignored(devices, nodes, light) {
@@ -2296,7 +2582,12 @@ async fn adjust(state: &AppState, unix: i64, trigger: &'static str, switched_on:
                     .get(&key)
                     .copied()
                     .filter(|_| !switched_on.contains(&key));
-                schedule::plan(light, all_off, settings, goal_of(nodes, light).1, last)
+                match goal_of(nodes, light).1 {
+                    schedule::Rule::Fixed(..) => Err(schedule::Skip::Overridden),
+                    schedule::Rule::AutoOff => Err(schedule::Skip::AllOff),
+                    schedule::Rule::Manual => Err(schedule::Skip::Manual),
+                    schedule::Rule::Auto => schedule::plan(light, settings, goal, last),
+                }
             })
             .await
             .map(|tuned| {
@@ -2312,7 +2603,7 @@ async fn adjust(state: &AppState, unix: i64, trigger: &'static str, switched_on:
     match result {
         Ok((tuned, goals)) => {
             let lights: Vec<_> = tuned.lights.iter().map(|(l, _)| l.clone()).collect();
-            let devices = loaded.map(|(_, _, devices, _)| devices).unwrap_or_default();
+            let devices = loaded.map(|(_, devices, _)| devices).unwrap_or_default();
             let (names, _) = match_ledger(&devices, &tuned.nodes, &lights);
             let mut memory = state.sent.lock().unwrap();
             let entries: Vec<_> = tuned
@@ -2321,7 +2612,7 @@ async fn adjust(state: &AppState, unix: i64, trigger: &'static str, switched_on:
                 .zip(names)
                 .zip(goals)
                 .map(
-                    |(((light, decision), (name, room_name, _)), (labels, goal))| {
+                    |(((light, decision), (name, room_name, _)), (labels, _, goal))| {
                         let mut entry = json!({
                             "node_id": light.node_id,
                             "endpoint": light.endpoint,
@@ -2352,7 +2643,7 @@ async fn adjust(state: &AppState, unix: i64, trigger: &'static str, switched_on:
     runs.truncate(RUNS_KEPT);
 }
 
-/// The labels of `light`'s ledger device among `labels`.
+/// The labels of `light`'s ledger device among `labels`, in their order.
 fn labels_of<'a>(
     devices: &[Device],
     nodes: &[serde_json::Value],
@@ -2368,27 +2659,6 @@ fn labels_of<'a>(
                 .collect()
         })
         .unwrap_or_default()
-}
-
-/// Whether a light with `labels` is lit only while one of its dedicated labels is boosted.
-fn is_dedicated(labels: &[&Label]) -> bool {
-    labels.iter().any(|l| l.dedicated)
-}
-
-/// The level and kelvin at `minute` for a light with `labels`: the day's while one is
-/// boosted or dedicated.
-fn light_goal(
-    settings: &schedule::Settings,
-    minute: u32,
-    sun: (u32, u32),
-    labels: &[&Label],
-) -> (u8, u16) {
-    let stacked = settings.with_all(labels.iter().map(|l| &l.values));
-    if is_dedicated(labels) || labels.iter().any(|l| l.boosted) {
-        stacked.day()
-    } else {
-        schedule::target(minute, sun, &stacked)
-    }
 }
 
 /// `decision` for the run's `entry`, remembering what was sent `light`.
@@ -2424,19 +2694,15 @@ struct LabelledDevice {
     room_name: Option<String>,
 }
 
-/// The schedule's settings, each label's values and devices, the user's last
-/// "all on"/"all off" and the latest runs.
+/// The schedule's settings, each label with its devices and the latest runs.
 async fn get_schedule(State(state): State<Db>) -> ApiResult<Json<serde_json::Value>> {
-    let (settings, intent, labels) = {
+    let (settings, labels) = {
         let db = state.db.lock().unwrap();
         let devices = ledger(&db)?;
         let labels: Vec<_> = labels(&db)?
             .into_iter()
             .map(|label| {
-                let mut entry = json!(label.values);
-                entry["id"] = json!(label.id);
-                entry["name"] = json!(label.name);
-                entry["boosted"] = json!(label.boosted);
+                let mut entry = json!(label);
                 entry["devices"] = json!(
                     devices
                         .iter()
@@ -2451,17 +2717,12 @@ async fn get_schedule(State(state): State<Db>) -> ApiResult<Json<serde_json::Val
                 entry
             })
             .collect();
-        (
-            load::<schedule::Settings>(&db, SCHEDULE)?,
-            load::<Option<Intent>>(&db, INTENT)?,
-            labels,
-        )
+        (load::<schedule::Settings>(&db, SCHEDULE)?, labels)
     };
     let runs: Vec<_> = state.runs.lock().unwrap().iter().cloned().collect();
     Ok(Json(json!({
         "settings": settings,
         "labels": labels,
-        "intent": intent,
         "runs": runs,
     })))
 }

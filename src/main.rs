@@ -35,6 +35,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let home = home_link::Home::new(db, matter_url.clone()).with_sesame(sesame);
     if matter_url.is_some() {
         tokio::spawn(home.clone().every_ten_minutes());
+        tokio::spawn(home.clone().every_minute());
     }
 
     axum::serve(

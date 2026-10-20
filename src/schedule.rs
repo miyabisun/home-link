@@ -71,37 +71,7 @@ impl Settings {
     }
 }
 
-/// A label's own values for its lights; `None` keeps the schedule's.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Label {
-    pub day_level: Option<u8>,
-    pub night_level: Option<u8>,
-    pub cool_kelvin: Option<u16>,
-    pub warm_kelvin: Option<u16>,
-}
-
 impl Settings {
-    /// These settings with `label`'s values in place of the schedule's.
-    #[must_use]
-    pub fn with(&self, label: &Label) -> Self {
-        Self {
-            day_level: label.day_level.unwrap_or(self.day_level),
-            night_level: label.night_level.unwrap_or(self.night_level),
-            cool_kelvin: label.cool_kelvin.unwrap_or(self.cool_kelvin),
-            warm_kelvin: label.warm_kelvin.unwrap_or(self.warm_kelvin),
-            ..self.clone()
-        }
-    }
-
-    /// These settings with every one of a light's `labels` stacked; they share no value.
-    #[must_use]
-    pub fn with_all<'a>(&self, labels: impl IntoIterator<Item = &'a Label>) -> Self {
-        labels
-            .into_iter()
-            .fold(self.clone(), |settings, label| settings.with(label))
-    }
-
     /// The day's level and colour temperature in kelvin.
     #[must_use]
     pub fn day(&self) -> (u8, u16) {
@@ -109,31 +79,65 @@ impl Settings {
     }
 }
 
+/// What a label does to its lights besides switching them.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct Label {
+    /// Its lights follow the adjustment while it is not off.
+    pub auto: bool,
+    /// While it is on, its lights are held at this level and colour temperature.
+    pub override_level: Option<u8>,
+    pub override_kelvin: Option<u16>,
+    /// Last switched on or off; `None` until it is.
+    pub on: Option<bool>,
+}
+
 impl Label {
-    /// The names of the values this label sets.
-    fn set(&self) -> impl Iterator<Item = &'static str> {
-        [
-            ("day_level", self.day_level.is_some()),
-            ("night_level", self.night_level.is_some()),
-            ("cool_kelvin", self.cool_kelvin.is_some()),
-            ("warm_kelvin", self.warm_kelvin.is_some()),
-        ]
-        .into_iter()
-        .filter_map(|(name, set)| set.then_some(name))
+    /// The level and kelvin its lights are held at, while it holds them.
+    #[must_use]
+    pub fn overriding(&self) -> Option<(u8, u16)> {
+        self.override_level
+            .zip(self.override_kelvin)
+            .filter(|_| self.on == Some(true))
     }
 }
 
-/// Why the named `labels` cannot share one light: two of them set the same value.
+/// What decides a light's level and colour temperature, by its labels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rule {
+    /// The first of its labels that overrides, in the order given, holds it here.
+    Fixed(u8, u16),
+    /// One of its auto labels is not off: the adjustment sets it.
+    Auto,
+    /// All of its auto labels are off: nothing is written.
+    AutoOff,
+    /// Under no auto label: nothing is written.
+    Manual,
+}
+
+/// The rule for a light under `labels`.
+pub fn rule<'a>(labels: impl IntoIterator<Item = &'a Label>) -> Rule {
+    let labels: Vec<_> = labels.into_iter().collect();
+    if let Some((level, kelvin)) = labels.iter().find_map(|l| l.overriding()) {
+        Rule::Fixed(level, kelvin)
+    } else if labels.iter().any(|l| l.auto && l.on != Some(false)) {
+        Rule::Auto
+    } else if labels.iter().any(|l| l.auto) {
+        Rule::AutoOff
+    } else {
+        Rule::Manual
+    }
+}
+
+/// `HH:MM` as minutes after midnight; `00:00` to `23:59` only.
 #[must_use]
-pub fn overlap(labels: &[(&str, &Label)]) -> Option<String> {
-    labels.iter().enumerate().find_map(|(i, (a, first))| {
-        labels[i + 1..].iter().find_map(|(b, second)| {
-            let value = first.set().find(|v| second.set().any(|w| w == *v))?;
-            Some(format!(
-                "labelの「{a}」と「{b}」がどちらも{value}を持つため、同じ電球に付けられません"
-            ))
-        })
-    })
+pub fn minute_of(clock: &str) -> Option<u32> {
+    let (hour, minute) = clock.split_once(':')?;
+    let digits = |part: &str| part.len() == 2 && part.bytes().all(|b| b.is_ascii_digit());
+    if !digits(hour) || !digits(minute) {
+        return None;
+    }
+    let (hour, minute): (u32, u32) = (hour.parse().ok()?, minute.parse().ok()?);
+    (hour < 24 && minute < 60).then_some(hour * 60 + minute)
 }
 
 /// The day of the year (1-based) and the minute of the day in Asia/Tokyo at `unix` seconds.
@@ -281,8 +285,13 @@ pub fn fit(level: u8, kelvin: u16, light: &Light) -> Target {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Skip {
-    /// "All off" was pressed last; nothing is written until "all on".
+    /// Every auto label of the light is off; nothing is written until one is on.
     AllOff,
+    /// Under no auto label.
+    Manual,
+    /// Held at a label's override.
+    #[serde(rename = "override")]
+    Overridden,
     Disabled,
     NoResponse,
     /// Supports neither level nor colour temperature.
@@ -300,7 +309,6 @@ pub enum Skip {
 /// The reason the light is left alone.
 pub fn plan(
     light: &Light,
-    all_off: bool,
     settings: &Settings,
     goal: (u8, u16),
     last: Option<Target>,
@@ -314,9 +322,7 @@ pub fn plan(
         level: target.level.filter(|v| last.level != Some(*v)),
         mireds: target.mireds.filter(|v| last.mireds != Some(*v)),
     };
-    if all_off {
-        Err(Skip::AllOff)
-    } else if !settings.enabled {
+    if !settings.enabled {
         Err(Skip::Disabled)
     } else if !light.reachable {
         Err(Skip::NoResponse)
@@ -503,17 +509,11 @@ mod tests {
     }
 
     #[test]
-    fn all_off_and_disabled_leave_every_light_alone() {
+    fn disabled_unreachable_and_unsupported_lights_are_left_alone() {
         let t2 = bulb(Some((1, 254)), Some((153, 370)));
         let night = (102, 3000);
-        assert_eq!(plan(&t2, true, &on(), night, None), Err(Skip::AllOff));
-        // "All off" wins over disabled, so the status shows why nothing was sent.
         assert_eq!(
-            plan(&t2, true, &Settings::default(), night, None),
-            Err(Skip::AllOff)
-        );
-        assert_eq!(
-            plan(&t2, false, &Settings::default(), night, None),
+            plan(&t2, &Settings::default(), night, None),
             Err(Skip::Disabled)
         );
         let unreachable = Light {
@@ -521,15 +521,15 @@ mod tests {
             ..t2.clone()
         };
         assert_eq!(
-            plan(&unreachable, false, &on(), night, None),
+            plan(&unreachable, &on(), night, None),
             Err(Skip::NoResponse)
         );
         assert_eq!(
-            plan(&bulb(None, None), false, &on(), night, None),
+            plan(&bulb(None, None), &on(), night, None),
             Err(Skip::Unsupported)
         );
         assert_eq!(
-            plan(&t2, false, &on(), night, None),
+            plan(&t2, &on(), night, None),
             Ok(Target {
                 level: Some(102),
                 mireds: Some(333)
@@ -545,78 +545,23 @@ mod tests {
             mireds: Some(333),
         };
         assert_eq!(
-            plan(&t2, false, &on(), (102, 3000), Some(sent)),
+            plan(&t2, &on(), (102, 3000), Some(sent)),
             Err(Skip::Unchanged)
         );
         assert_eq!(
-            plan(&t2, false, &on(), (105, 3000), Some(sent)),
+            plan(&t2, &on(), (105, 3000), Some(sent)),
             Ok(Target {
                 level: Some(105),
                 mireds: None
             })
         );
         assert_eq!(
-            plan(&t2, false, &on(), (102, 3100), Some(sent)),
+            plan(&t2, &on(), (102, 3100), Some(sent)),
             Ok(Target {
                 level: None,
                 mireds: Some(323)
             })
         );
-    }
-
-    fn kitchen() -> Label {
-        Label {
-            night_level: Some(76),
-            warm_kelvin: Some(2700),
-            ..Label::default()
-        }
-    }
-
-    #[test]
-    fn a_labels_values_replace_the_schedules_and_nulls_keep_them() {
-        let s = day();
-        assert_eq!(s.with(&Label::default()), s);
-        let merged = s.with(&kitchen());
-        assert_eq!((merged.day_level, merged.night_level), (s.day_level, 76));
-        assert_eq!(
-            (merged.cool_kelvin, merged.warm_kelvin),
-            (s.cool_kelvin, 2700)
-        );
-        let all = Label {
-            day_level: Some(150),
-            night_level: Some(50),
-            cool_kelvin: Some(4500),
-            warm_kelvin: Some(3500),
-        };
-        let merged = s.with(&all);
-        assert_eq!(
-            (
-                merged.day_level,
-                merged.night_level,
-                merged.cool_kelvin,
-                merged.warm_kelvin
-            ),
-            (150, 50, 4500, 3500)
-        );
-        // The times stay the schedule's.
-        assert_eq!(merged.morning_end_minute, s.morning_end_minute);
-        assert_eq!((merged.latitude, merged.enabled), (s.latitude, s.enabled));
-    }
-
-    #[test]
-    fn a_label_follows_the_schedules_curve_with_its_own_values() {
-        let s = day().with(&kitchen());
-        let sun = (at(6, 0), at(18, 0));
-        // Night from 22:00 until sunrise, the day's values from the morning end.
-        assert_eq!(target(at(22, 0), sun, &s), (76, 2700));
-        assert_eq!(target(at(5, 59), sun, &s), (38, 2700));
-        assert_eq!(target(at(6, 0), sun, &s), (76, 2700));
-        assert_eq!(target(at(10, 0), sun, &s), (203, 5000));
-        // Halfway through the morning and the evening.
-        assert_eq!(target(at(8, 0), sun, &s), (140, 3850));
-        assert_eq!(target(at(20, 0), sun, &s), (140, 3850));
-        // A minute before 22:00 is a 240th of the way back up.
-        assert_eq!(target(at(21, 59), sun, &s).0, 77);
     }
 
     #[test]
@@ -627,19 +572,8 @@ mod tests {
             ..day()
         };
         let sun = (at(5, 39), at(17, 24));
-        let hallway = Label {
-            night_level: Some(64),
-            ..Label::default()
-        };
-        let game_pc = Label {
-            warm_kelvin: Some(3500),
-            ..Label::default()
-        };
-        assert_eq!(target(at(1, 0), sun, &s.with(&kitchen())), (38, 2700));
-        assert_eq!(target(at(1, 0), sun, &s.with(&hallway)), (32, 2700));
         // 25.5 rounds up.
         assert_eq!(target(at(1, 0), sun, &s), (26, 2700));
-        assert_eq!(target(at(1, 0), sun, &s.with(&game_pc)), (26, 3500));
         // 100% leaves the night as it is; the lowest level sent stays 1.
         let full = Settings {
             late_night_percent: 100,
@@ -654,99 +588,54 @@ mod tests {
         assert_eq!(target(at(1, 0), sun, &faint), (1, 2700));
     }
 
-    #[test]
-    fn a_lights_labels_stack_and_its_day_is_their_day_level_and_cool_white() {
-        let s = day();
-        let work = Label::default();
-        let game_pc = Label {
-            warm_kelvin: Some(3500),
-            ..Label::default()
-        };
-        let bright = Label {
-            day_level: Some(254),
-            cool_kelvin: Some(6000),
-            ..Label::default()
-        };
-        assert_eq!(s.with_all([&work, &kitchen()]), s.with(&kitchen()));
-        let merged = s.with_all([&kitchen(), &bright, &work]);
-        assert_eq!(
-            (
-                merged.day_level,
-                merged.night_level,
-                merged.cool_kelvin,
-                merged.warm_kelvin
-            ),
-            (254, 76, 6000, 2700)
-        );
-        assert_eq!(merged.day(), (254, 6000));
-        assert_eq!(s.with_all([]).day(), (203, 5000));
-        assert_eq!(s.with(&game_pc).day(), (203, 5000));
+    fn label(auto: bool, fixed: Option<(u8, u16)>, on: Option<bool>) -> Label {
+        Label {
+            auto,
+            override_level: fixed.map(|f| f.0),
+            override_kelvin: fixed.map(|f| f.1),
+            on,
+        }
     }
 
     #[test]
-    fn labels_setting_the_same_value_cannot_share_a_light() {
-        let work = Label::default();
-        let game_pc = Label {
-            warm_kelvin: Some(3500),
+    fn a_lights_labels_decide_whether_it_is_held_adjusted_or_left() {
+        let room = label(true, None, None);
+        let room_off = label(true, None, Some(false));
+        let living = label(true, None, Some(true));
+        let game = label(false, Some((203, 5000)), Some(true));
+        let game_released = label(false, Some((203, 5000)), Some(false));
+        let work = label(false, Some((254, 5000)), Some(true));
+        let hallway = label(false, None, Some(true));
+        // An override on wins over everything; the first one given wins over another.
+        assert_eq!(rule([&room, &game]), Rule::Fixed(203, 5000));
+        assert_eq!(rule([&work, &game]), Rule::Fixed(254, 5000));
+        assert_eq!(rule([&room_off, &game]), Rule::Fixed(203, 5000));
+        // An auto label never switched, or on, adjusts; all auto labels off do not.
+        assert_eq!(rule([&room, &game_released]), Rule::Auto);
+        assert_eq!(rule([&room_off, &living]), Rule::Auto);
+        assert_eq!(rule([&room_off]), Rule::AutoOff);
+        // Without an auto label nothing is adjusted.
+        assert_eq!(rule([&hallway, &game_released]), Rule::Manual);
+        assert_eq!(rule([]), Rule::Manual);
+        // An override never switched on or without both values holds nothing.
+        assert_eq!(rule([&label(false, Some((1, 1000)), None)]), Rule::Manual);
+        let half = Label {
+            override_level: Some(10),
+            on: Some(true),
             ..Label::default()
         };
-        assert_eq!(
-            overlap(&[
-                ("作業", &work),
-                ("キッチン", &kitchen()),
-                ("ゲームPC", &work)
-            ]),
-            None
-        );
-        assert_eq!(
-            overlap(&[("作業", &work), ("キッチン", &kitchen()), ("ゲームPC", &game_pc)]),
-            Some("labelの「キッチン」と「ゲームPC」がどちらもwarm_kelvinを持つため、同じ電球に付けられません".into())
-        );
-        let dim = Label {
-            night_level: Some(50),
-            day_level: Some(100),
-            ..Label::default()
-        };
-        assert_eq!(
-            overlap(&[("暗め", &dim), ("キッチン", &kitchen())]),
-            Some("labelの「暗め」と「キッチン」がどちらもnight_levelを持つため、同じ電球に付けられません".into())
-        );
-        assert_eq!(overlap(&[]), None);
+        assert_eq!(half.overriding(), None);
     }
 
     #[test]
-    fn labels_out_of_range_or_warmer_than_cool_are_rejected() {
-        let s = day();
-        assert_eq!(s.with(&kitchen()).invalid(), None);
+    fn schedule_times_are_two_digit_hours_and_minutes() {
+        assert_eq!(minute_of("00:00"), Some(0));
+        assert_eq!(minute_of("05:00"), Some(300));
+        assert_eq!(minute_of("23:59"), Some(1439));
         for bad in [
-            Label {
-                day_level: Some(0),
-                ..Label::default()
-            },
-            Label {
-                night_level: Some(255),
-                ..Label::default()
-            },
-            Label {
-                warm_kelvin: Some(999),
-                ..Label::default()
-            },
-            Label {
-                cool_kelvin: Some(10001),
-                ..Label::default()
-            },
-            Label {
-                warm_kelvin: Some(4000),
-                cool_kelvin: Some(3500),
-                ..Label::default()
-            },
-            // Warmer than the schedule's cool white.
-            Label {
-                warm_kelvin: Some(5500),
-                ..Label::default()
-            },
+            "24:00", "5:00", "05:60", "0500", "05:0", "-1:00", "aa:bb", "05:00 ", "",
         ] {
-            assert!(s.with(&bad).invalid().is_some(), "{bad:?}");
+            assert_eq!(minute_of(bad), None, "{bad}");
         }
     }
 

@@ -122,6 +122,27 @@ pub fn kind(nodes: &[Value], node_id: u64, endpoint: u16) -> Option<(Kind, Optio
     Some((kind, on_off))
 }
 
+/// The On/Off endpoint of the device `locate` found when it is not a light, such as a
+/// plug, in the shape of a light that neither dims nor changes colour.
+#[must_use]
+pub fn outlet(nodes: &[Value], node_id: u64, endpoint: u16) -> Option<Light> {
+    let (Kind::Plug | Kind::Other, Some((switch, on))) = kind(nodes, node_id, endpoint)? else {
+        return None;
+    };
+    let node = nodes.iter().find(|n| n["node_id"] == node_id)?;
+    let (reachable, product) = describe(nodes, node_id, endpoint);
+    Some(Light {
+        node_id,
+        endpoint: switch,
+        bridged: bridged(node["attributes"].as_object()?, switch),
+        reachable,
+        on,
+        product,
+        levels: None,
+        mireds: None,
+    })
+}
+
 /// A light endpoint served by matterjs-server.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Light {
@@ -261,11 +282,27 @@ pub async fn switch(
     on: bool,
     ignored: impl Fn(&[Value], &Light) -> bool,
 ) -> Result<(Vec<Value>, Vec<(Light, Outcome)>), String> {
+    switch_among(url, on, lights, ignored).await
+}
+
+/// `switch` over the endpoints `targets` picks from the nodes, lights or not.
+///
+/// # Errors
+/// As `switch`.
+pub async fn switch_among(
+    url: &str,
+    on: bool,
+    targets: impl Fn(&[Value]) -> Vec<Light>,
+    ignored: impl Fn(&[Value], &Light) -> bool,
+) -> Result<(Vec<Value>, Vec<(Light, Outcome)>), String> {
     let deadline = Instant::now() + TIMEOUT;
     let mut ws = connect(url).await?;
     loop {
-        let result =
-            tokio::time::timeout_at(deadline, switch_once(&mut ws, on, deadline, &ignored)).await;
+        let result = tokio::time::timeout_at(
+            deadline,
+            switch_once(&mut ws, on, deadline, &targets, &ignored),
+        )
+        .await;
         let _ = ws.close(None).await;
         let Dropped(error) = match result {
             Err(_) => return Err("timed out".into()),
@@ -297,10 +334,11 @@ async fn switch_once(
     ws: &mut Socket,
     on: bool,
     deadline: Instant,
+    targets: &impl Fn(&[Value]) -> Vec<Light>,
     ignored: &impl Fn(&[Value], &Light) -> bool,
 ) -> Result<(Vec<Value>, Vec<(Light, Outcome)>), Dropped> {
     let mut nodes = get_nodes(ws).await?;
-    let mut results: Vec<_> = lights(&nodes)
+    let mut results: Vec<_> = targets(&nodes)
         .into_iter()
         .map(|light| {
             let outcome = if ignored(&nodes, &light) {
@@ -320,7 +358,7 @@ async fn switch_once(
             }
             tokio::time::sleep(RETRY_DELAY).await;
             nodes = get_nodes(ws).await?;
-            for light in lights(&nodes) {
+            for light in targets(&nodes) {
                 let key = (light.node_id, light.endpoint);
                 if let Some((known, _)) = results
                     .iter_mut()
