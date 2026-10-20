@@ -44,7 +44,16 @@ fn setup_key(passcode: u32, short_discriminator: u32) -> Option<SetupKey> {
     })
 }
 
-fn qr_key(segment: &str) -> Option<SetupKey> {
+/// The vendor and product IDs of a QR payload's first device; a manual code carries none.
+#[must_use]
+pub fn ids(code: &str) -> Option<(u16, u16)> {
+    let bits = qr_bits(code.strip_prefix("MT:")?.split('*').next()?)?;
+    let field = |shift: u32| u16::try_from(bits >> shift & 0xFFFF).ok();
+    field(3).zip(field(19))
+}
+
+/// The fixed fields of one QR payload, version 0 only.
+fn qr_bits(segment: &str) -> Option<u128> {
     let bytes = decode(segment)?;
     let mut le = [0u8; 16];
     le[..11].copy_from_slice(bytes.get(..11)?);
@@ -52,6 +61,11 @@ fn qr_key(segment: &str) -> Option<SetupKey> {
     if bits & 0b111 != 0 {
         return None;
     }
+    Some(bits)
+}
+
+fn qr_key(segment: &str) -> Option<SetupKey> {
+    let bits = qr_bits(segment)?;
     let field = |shift: u32, mask: u128| u32::try_from(bits >> shift & mask).ok();
     // The manual code carries only the top 4 of the 12 discriminator bits.
     setup_key(field(57, 0x7FF_FFFF)?, field(45, 0xFFF)? >> 8)
@@ -128,7 +142,7 @@ fn decode(text: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ALPHABET, SetupKey, is_valid, keys, normalize_manual, verhoeff_ok};
+    use super::{ALPHABET, SetupKey, ids, is_valid, keys, normalize_manual, verhoeff_ok};
 
     // Matter specification example: vendor 0xFFF1, product 0x8000,
     // discriminator 3840, passcode 20202021.
@@ -267,6 +281,17 @@ mod tests {
         assert_ne!(keys(&encode(0, 20_202_022)), Some(vec![key]));
         assert_eq!(keys("MT:abc"), None);
         assert_eq!(keys("34970112331"), None);
+    }
+
+    #[test]
+    fn a_qr_payload_names_its_vendor_and_product_but_a_manual_code_does_not() {
+        assert_eq!(ids(SPEC_EXAMPLE), Some((0xFFF1, 0x8000)));
+        assert_eq!(
+            ids("MT:-24J042C00PE0648G00*Y.K9042C00KA0648G00"),
+            Some((0xFFF1, 0x8001))
+        );
+        assert_eq!(ids("34970112332"), None);
+        assert_eq!(ids("MT:abc"), None);
     }
 
     /// Builds an 11-digit manual code from its fields.

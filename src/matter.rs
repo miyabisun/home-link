@@ -34,6 +34,28 @@ pub fn locate(nodes: &[Value], vendor: &str, serial: &str) -> Option<(u64, u16)>
     })
 }
 
+/// Whether the node is available and, behind a bridge, the bridge reaches the device on `endpoint`.
+fn reachable(node: &Value, endpoint: u16) -> bool {
+    node["available"] != false
+        && node["attributes"][format!("{endpoint}/57/17")] != Value::Bool(false)
+}
+
+/// Whether the device `locate` found answers, and its product name: Basic
+/// Information on the root endpoint, Bridged Device Basic Information behind a bridge.
+#[must_use]
+pub fn describe(nodes: &[Value], node_id: u64, endpoint: u16) -> (bool, Option<String>) {
+    let Some(node) = nodes.iter().find(|n| n["node_id"] == node_id) else {
+        return (false, None);
+    };
+    let product = if endpoint == 0 {
+        "0/40/3".to_owned()
+    } else {
+        format!("{endpoint}/57/3")
+    };
+    let name = node["attributes"][product].as_str().map(str::to_owned);
+    (reachable(node, endpoint), name)
+}
+
 /// On/Off, Dimmable, Color Temperature and Extended Color Light device types.
 const LIGHT_TYPES: [u64; 4] = [0x0100, 0x0101, 0x010C, 0x010D];
 
@@ -87,8 +109,7 @@ pub fn lights(nodes: &[Value]) -> Vec<Light> {
             }
             let bridged = attributes.contains_key(&format!("{endpoint}/57/3"))
                 || attributes.contains_key(&format!("{endpoint}/57/17"));
-            let reachable = node["available"] != false
-                && attributes.get(&format!("{endpoint}/57/17")) != Some(&Value::Bool(false));
+            let reachable = reachable(node, endpoint);
             let product = if bridged {
                 format!("{endpoint}/57/3")
             } else {

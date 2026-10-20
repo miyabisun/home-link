@@ -195,19 +195,21 @@ matterjs-serverにdatasetが入ると、アプリを変えずに登録できる�
 | `POST /api/rooms` | 部屋の作成。本文は `{"name": "寝室"}` | 400 `invalid_room_name`、409 `duplicate_room_name` |
 | `PATCH /api/rooms/{id}` | 部屋の名前の変更。本文は作成と同じ | 404 `room_not_found`、409 `duplicate_room_name` |
 | `DELETE /api/rooms/{id}` | 部屋の削除。機器が残っている部屋は削除しません | 404 `room_not_found`、409 `room_has_devices` |
-| `GET /api/devices` | 機器の一覧。コードは含みません | |
-| `GET /api/devices/{id}` | 機器1台。登録したコードの全文 `qr_payload` または `manual_code` を含みます | 404 `device_not_found` |
-| `PATCH /api/devices/{id}` | labelの割り当てと無視の設定。本文は送った項目だけを変えます。`{"label_ids": [1, 2]}`（割り当てを置き換え、`[]` で外す）、`{"ignored": true}`（`false` で戻す） | 400 `invalid_device_update`・`conflicting_labels`、404 `device_not_found`・`label_not_found` |
+| `GET /api/devices` | 機器の一覧。接続の状態 `state`（`unconnected`・`connected`・`no_response`）と製品の情報を含み、コードは含みません | |
+| `POST /api/devices` | QRコードか11桁のコードだけで機器を台帳に入れます。本文は `{"qr_payload": "MT:…"}` か `{"manual_code": "…"}`。新しい行は201、同じ機器の行があれば作らずに200で返します（`registered`） | 400 `missing_setup_code`・`invalid_qr_payload`・`invalid_manual_code` |
+| `GET /api/devices/{id}` | 機器1台。一覧の項目に、登録したコードの全文 `qr_payload` または `manual_code` を加えます | 404 `device_not_found` |
+| `PATCH /api/devices/{id}` | 機器の名前・部屋・labelの割り当て・無視の設定。本文は送った項目だけを変えます。`{"name": "押入れ1"}`、`{"room_id": 2}`（`null` で部屋から外す）、`{"label_ids": [1, 2]}`（割り当てを置き換え、`[]` で外す）、`{"ignored": true}`（`false` で戻す） | 400 `invalid_device_update`・`invalid_device_name`・`conflicting_labels`、404 `device_not_found`・`room_not_found`・`label_not_found` |
+| `POST /api/devices/{id}/commission` | 台帳の機器を、記録したコードでmatterjs-serverへBluetoothで登録（commissioning）し、その行に識別子を補います。本文は要りません | 404 `device_not_found`、409 `no_setup_code`、422 `device_not_found`・`wrong_code`・`wifi_failed`・`thread_failed`・`commission_failed`、504 `commission_timeout`、502 `matter_server_unreachable`、503 `matter_server_not_configured`・`bluetooth_unavailable` |
 | `DELETE /api/devices/{id}` | 機器の削除 | 404 `device_not_found` |
 | `GET /api/labels` | labelの一覧（値と割り当てた機器の台数、専用か `dedicated`、明るくしている最中か `boosted` つき） | |
 | `POST /api/labels` | labelの作成。本文は `{"name": "キッチン", "night_level": 76, "warm_kelvin": 2700}`。`"dedicated": true` で専用にします（既定は `false`） | 400 `invalid_label_name`・`invalid_label`、409 `duplicate_label_name` |
 | `PATCH /api/labels/{id}` | labelの名前・値・`dedicated` のうち、送った項目だけを変更します。`null` の値は全体の設定に戻ります（`dedicated` は `true` か `false` だけ） | 400 `invalid_label_name`・`invalid_label`・`conflicting_labels`、404 `label_not_found`、409 `duplicate_label_name` |
 | `DELETE /api/labels/{id}` | labelの削除。割り当てた機器はlabel無しに戻ります | 404 `label_not_found` |
-| `GET /api/wifi` | 保存したWi-Fiの一覧（`id`・`ssid`・電球に渡すものか `for_devices`）。パスワードは返しません | |
-| `POST /api/wifi` | Wi-Fiの保存。本文は `{"ssid": "home-2g", "password": "…"}`。同じSSIDならパスワードを置き換えます。最初の1つ、または `"for_devices": true` で送ったものを電球に渡します | 400 `invalid_wifi` |
-| `PUT /api/wifi/devices` | 電球に渡すWi-Fiの指定。本文は `{"id": 2}` | 404 `wifi_not_found` |
-| `DELETE /api/wifi/{id}` | Wi-Fiの削除。電球に渡すものを消すと、残りの最初のものを渡します | 404 `wifi_not_found` |
-| `POST /api/commission` | 機器をmatterjs-serverへBluetoothで登録（commissioning）し、台帳に登録 | 400 `missing_setup_code`・`invalid_qr_payload`・`invalid_manual_code`・`invalid_network`・`invalid_device_name`、404 `room_not_found`、409 `wifi_not_set`、422 `device_not_found`・`wrong_code`・`wifi_failed`・`thread_failed`・`commission_failed`、504 `commission_timeout`、502 `matter_server_unreachable`、503 `matter_server_not_configured`・`bluetooth_unavailable`・`thread_not_ready` |
+| `GET /api/wifi` | 保存したWi-Fiの一覧（`id`・`ssid`・機器に渡すものか `for_devices`）。パスワードは返しません | |
+| `POST /api/wifi` | Wi-Fiの保存。本文は `{"ssid": "home-2g", "password": "…"}`。同じSSIDならパスワードを置き換えます。最初の1つ、または `"for_devices": true` で送ったものを機器に渡します | 400 `invalid_wifi` |
+| `PUT /api/wifi/devices` | 機器に渡すWi-Fiの指定。本文は `{"id": 2}` | 404 `wifi_not_found` |
+| `DELETE /api/wifi/{id}` | Wi-Fiの削除。機器に渡すものを消すと、残りの最初のものを渡します | 404 `wifi_not_found` |
+| `POST /api/commission` | 0.1.32までのアプリの登録。部屋とWi-FiかThreadかを指定して機器をmatterjs-serverへBluetoothで登録（commissioning）し、台帳に登録 | 400 `missing_setup_code`・`invalid_qr_payload`・`invalid_manual_code`・`invalid_network`・`invalid_device_name`、404 `room_not_found`、409 `wifi_not_set`、422 `device_not_found`・`wrong_code`・`wifi_failed`・`thread_failed`・`commission_failed`、504 `commission_timeout`、502 `matter_server_unreachable`、503 `matter_server_not_configured`・`bluetooth_unavailable`・`thread_not_ready` |
 | `GET /api/thread` | Thread電球を登録できるか（matterjs-serverがThread網のdatasetを持つか）を `{"ready": true}` で返します | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `GET /api/status` | 台帳の機器ごとに、matterjs-serverで見えるか（`visible`）と今の `node_id`・`endpoint` | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `GET /api/lights` | 照明ごとの今の状態（`on`・`off`・`no_response`・`ignored`）と、無視の照明を除いた件数 | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
@@ -222,6 +224,29 @@ matterjs-serverにdatasetが入ると、アプリを変えずに登録できる�
 | `GET /healthz` | 稼働確認（`ok`） | |
 
 部屋の名前は前後の空白を除いて1〜100文字、機器名は0〜100文字です。
+
+### QRコードを読んだ時点で台帳に入れ、後から接続する
+
+機器は、QRコード（または11桁のコード）を読んだ時点で `POST /api/devices` で台帳に入ります。部屋と名前は無くてよく、
+後から `PATCH /api/devices/{id}` で付けます。QRコードからはVendor ID・Product ID（`vendor_id`・`product_id`）を読んで持ちます。
+11桁のコードには入っていないので、その場合は `null` です。製品名（`product_name`）は、接続した機器がmatterjs-serverへ報告したものです。
+同じ機器かどうかは、登録と同じくsetup passcodeとdiscriminatorの上位4ビットで判定します。
+例えば3個の電球のQRコードを先に読んでおき、後から1台ずつ接続できます。
+
+機器の一覧と1台の取得は、そのたびにmatterjs-serverの全nodeを読み、識別子から接続の状態 `state` を求めます。
+`unconnected` は接続していない（またはmatterjs-serverにもう無い）、`connected` は接続済み、`no_response` はnodeがあるが応答しない機器です。
+matterjs-serverの接続先が無い・接続できないときは `null` です。人が直す状態の欄はありません。
+接続していない機器は識別子が無いので、照明の `missing_devices` には入りません。
+
+`POST /api/devices/{id}/commission` は、行に記録したコードで `commission_with_code`（`network_only: false`）を送ります。
+機器に渡すWi-Fi（`for_devices`）を保存していれば、先に `set_wifi_credentials` で渡します。保存が無ければWi-Fiは渡しません。
+Wi-FiかThreadかは指定せず、機器の申告からmatterjs-serverが決めます（Thread網のdatasetはmatterjs-serverが持つものを使います）。
+接続できたら、その行にVendorName・SerialNumber・Wi-FiのMACアドレスを補い、`{"node_id": …, "device": {…}}` を200で返します。
+失敗の分類と打ち切りの時間は `POST /api/commission` と同じです。失敗した行はそのまま残り、`unconnected` のままです。
+同じ識別子の機器が台帳の別の行にあれば（初期化して読み直した機器など）、その行を残し、読んだ行のコード、
+その行に無い名前と部屋を移して、読んだ行を消します。labelと無視の設定は残した行のものです。
+
+`POST /api/commission` は、0.1.32までのアプリのために残しています。台帳の行を作らずに登録し、登録できたら行を作ります。
 QRコードは `MT:` で始まるMatterのセットアップコードとして検証し、前後の空白は除いて保存します。
 手動ペアリングコードは空白とハイフンを除いた11桁の数字にして、チェック数字とsetup passcodeを検証して保存します。
 QRコードと手動ペアリングコードは、setup passcodeとdiscriminatorの上位4ビットが一致すれば同じ機器として扱います。
@@ -398,11 +423,16 @@ curl -X PATCH http://home-link.example:5011/api/labels/3 -H 'content-type: appli
 curl -X POST http://home-link.example:5011/api/rooms -H 'content-type: application/json' -d '{"name":"寝室"}'
 # {"id":1,"name":"寝室","device_count":0}
 
-curl -X POST http://home-link.example:5011/api/commission -H 'content-type: application/json' \
-  -d '{"room_id":2,"qr_payload":"MT:Y.K9042C00KA0648G00","name":"押入れ1","wifi_ssid":"home-2g","wifi_password":"…"}'
-# 201 {"node_id":17,"registered":true,"device":{"id":9,"room_id":2,"room_name":"押入れ","name":"押入れ1","vendor":"Tapo",
-#      "serial_number":"AABBCCDDEEFF","mac":"AABBCCDDEEFF","labels":[],"created_at":"2026-10-06T03:30:00Z"}}
+curl -X POST http://home-link.example:5011/api/devices -H 'content-type: application/json' \
+  -d '{"qr_payload":"MT:Y.K9042C00KA0648G00"}'
+# 201 {"registered":true,"device":{"id":9,"room_id":null,"room_name":null,"name":"","vendor":null,"serial_number":null,"mac":null,
+#      "vendor_id":65521,"product_id":32768,"state":"unconnected","product_name":null,"labels":[],"ignored":false,"created_at":"2026-10-21T03:30:00Z"}}
+
+curl -X POST http://home-link.example:5011/api/devices/9/commission
+# 200 {"node_id":17,"device":{"id":9,…,"vendor":"Tapo","serial_number":"AABBCCDDEEFF","mac":"AABBCCDDEEFF","state":"connected","product_name":"Smart Bulb",…}}
 # 422 {"error":"wifi_failed","message":"機器がWi-Fi「home-2g」に接続できませんでした"}
+
+curl -X PATCH http://home-link.example:5011/api/devices/9 -H 'content-type: application/json' -d '{"name":"押入れ1","room_id":2}'
 
 curl http://home-link.example:5011/api/status
 # {"devices":[{"endpoint":null,"id":1,"name":"天井灯","node_id":null,"room_name":"寝室","visible":false},{"endpoint":0,"id":2,"name":"読書灯","node_id":5,"room_name":"寝室","visible":true}],"version":"0.1.4"}

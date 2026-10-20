@@ -158,17 +158,6 @@ async fn room_names_must_be_present_and_unique() {
 }
 
 #[tokio::test]
-async fn devices_enter_the_ledger_only_by_commissioning() {
-    let app = app();
-    let room = create_room(&app, "寝室").await;
-    let body = json!({ "room_id": room, "qr_payload": QR });
-    let (status, _) = call(&app, "POST", "/api/devices", Some(body)).await;
-    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
-    let (_, devices) = call(&app, "GET", "/api/devices", None).await;
-    assert_eq!(devices, json!([]));
-}
-
-#[tokio::test]
 async fn rooms_with_devices_cannot_be_deleted() {
     let (app, sql) = ledger_app();
     let room = create_room(&app, "寝室").await;
@@ -374,7 +363,7 @@ struct Fake {
     failing: Vec<(u64, u64)>,
     /// `(node_id, endpoint)` never answered.
     silent: Vec<(u64, u64)>,
-    /// Close the first connection when its first command arrives.
+    /// Close the connection when the first command to a light arrives.
     drop_first: bool,
     /// `(node_id, endpoint)` read as off although `get_nodes` serves it on.
     read_off: Vec<(u64, u64)>,
@@ -400,15 +389,12 @@ async fn fake_light_server(
     let nodes = Arc::new(Mutex::new(nodes));
     let (seen, count) = (commands.clone(), connections.clone());
     let answered = Arc::new(Mutex::new(Vec::new()));
+    let dropped = std::sync::atomic::AtomicBool::new(false);
     tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-            let first = {
-                let mut count = count.lock().unwrap();
-                *count += 1;
-                *count == 1
-            };
+            *count.lock().unwrap() += 1;
             let info = json!({ "fabric_id": 1, "schema_version": 13 });
             ws.send(Message::text(info.to_string())).await.unwrap();
             while let Some(Ok(Message::Text(text))) = ws.next().await {
@@ -438,7 +424,7 @@ async fn fake_light_server(
                     }
                     "device_command" => {
                         seen.lock().unwrap().push(command["args"].clone());
-                        if fake.drop_first && first {
+                        if fake.drop_first && !dropped.swap(true, Ordering::Relaxed) {
                             break;
                         }
                         let args = &command["args"];
@@ -668,6 +654,8 @@ async fn switching_reconnects_when_the_connection_drops() {
     };
     let (addr, commands, connections) = fake_light_server(home_nodes(), fake).await;
     let (app, _) = light_app(addr).await;
+    // Recording the ledger reads the nodes too.
+    let before = *connections.lock().unwrap();
 
     let (status, body) = call(&app, "POST", "/api/lights/on", None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -675,7 +663,7 @@ async fn switching_reconnects_when_the_connection_drops() {
         (&body["switched"], &body["no_response"]),
         (&json!(2), &json!(2))
     );
-    assert_eq!(*connections.lock().unwrap(), 2);
+    assert_eq!(*connections.lock().unwrap() - before, 2);
     // On is absolute, so the light commanded before the drop is commanded again.
     assert_eq!(commands.lock().unwrap().len(), 3);
 }
@@ -1594,6 +1582,19 @@ async fn fake_commissioner(
     commission: Commission,
     read: Value,
 ) -> (SocketAddr, Arc<Mutex<Vec<Value>>>) {
+    let (addr, commands, _) = fake_matter(info, commission, read).await;
+    (addr, commands)
+}
+
+/// `fake_commissioner` that also answers `get_nodes` with its nodes, which a
+/// commissioned node joins; the test may change them.
+async fn fake_matter(
+    info: Value,
+    commission: Commission,
+    read: Value,
+) -> (SocketAddr, Arc<Mutex<Vec<Value>>>, Arc<Mutex<Vec<Value>>>) {
+    let nodes = Arc::new(Mutex::new(Vec::new()));
+    let served = nodes.clone();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let commands = Arc::new(Mutex::new(Vec::new()));
@@ -1609,7 +1610,11 @@ async fn fake_commissioner(
                 let id = command["message_id"].clone();
                 let reply = match (command["command"].as_str().unwrap(), &commission) {
                     ("set_wifi_credentials", _) => json!({ "message_id": id, "result": {} }),
+                    ("get_nodes", _) => {
+                        json!({ "message_id": id, "result": served.lock().unwrap().clone() })
+                    }
                     ("commission_with_code", Commission::Node(node)) => {
+                        served.lock().unwrap().push(node.clone());
                         let event = json!({ "event": "node_added", "data": node });
                         ws.send(Message::text(event.to_string())).await.unwrap();
                         json!({ "message_id": id, "result": node })
@@ -1625,7 +1630,7 @@ async fn fake_commissioner(
             }
         }
     });
-    (addr, commands)
+    (addr, commands, nodes)
 }
 
 const PASSWORD: &str = "kakushi-pass-7f3a";
@@ -2253,6 +2258,556 @@ async fn thread_readiness_follows_the_matter_server() {
         (status, error["error"].as_str().unwrap()),
         (StatusCode::BAD_GATEWAY, "matter_server_unreachable")
     );
+}
+
+// Three made-up devices of the test vendor 0xFFF1, products 0x8001 to 0x8003.
+const QRS: [&str; 3] = [
+    "MT:-24J042C00PE0648G00",
+    "MT:06PS042C00GV0648G00",
+    "MT:2980142C007A1648G00",
+];
+
+async fn scan(app: &Router, body: Value) -> (StatusCode, Value) {
+    call(app, "POST", "/api/devices", Some(body)).await
+}
+
+async fn connect(app: &Router, id: &Value) -> (StatusCode, Value) {
+    call(app, "POST", &format!("/api/devices/{id}/commission"), None).await
+}
+
+fn states(list: &Value) -> Vec<Value> {
+    list.as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["state"].clone())
+        .collect()
+}
+
+/// The commands sent to matterjs-server but reading its nodes.
+fn sent(commands: &Arc<Mutex<Vec<Value>>>) -> Vec<Value> {
+    commands
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c["command"] != "get_nodes")
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+async fn a_code_alone_enters_the_ledger_once() {
+    let (addr, commands, _) =
+        fake_matter(server_info(true, false), Commission::Silent, json!({})).await;
+    let app = wifiless_app(addr, home_link::open_db(":memory:").unwrap());
+
+    let (status, body) = scan(&app, json!({ "qr_payload": QRS[0] })).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["registered"], true);
+    let device = &body["device"];
+    assert_eq!(
+        (
+            &device["room_id"],
+            &device["room_name"],
+            &device["name"],
+            &device["state"],
+            &device["vendor_id"],
+            &device["product_id"],
+        ),
+        (
+            &Value::Null,
+            &Value::Null,
+            &json!(""),
+            &json!("unconnected"),
+            &json!(0xFFF1),
+            &json!(0x8001),
+        )
+    );
+    let (status, again) = scan(&app, json!({ "qr_payload": format!(" {} ", QRS[0]) })).await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(
+        (&again["registered"], &again["device"]["id"]),
+        (&json!(false), &device["id"])
+    );
+
+    // A manual code carries no vendor or product; the device's QR adds them.
+    let (status, manual) = scan(&app, json!({ "manual_code": "3497-0112-332" })).await;
+    assert_eq!(status, StatusCode::CREATED, "{manual}");
+    assert_eq!(
+        (
+            &manual["device"]["vendor_id"],
+            &manual["device"]["product_id"]
+        ),
+        (&Value::Null, &Value::Null)
+    );
+    let (status, qr) = scan(&app, json!({ "qr_payload": QR })).await;
+    assert_eq!(status, StatusCode::OK, "{qr}");
+    assert_eq!(qr["device"]["id"], manual["device"]["id"]);
+    assert_eq!(
+        (&qr["device"]["vendor_id"], &qr["device"]["product_id"]),
+        (&json!(0xFFF1), &json!(0x8000))
+    );
+    let (_, list) = call(&app, "GET", "/api/devices", None).await;
+    assert_eq!(list.as_array().unwrap().len(), 2);
+    assert!(!list.to_string().contains("042C00"), "{list}");
+    let id = manual["device"]["id"].as_i64().unwrap();
+    let (_, stored) = call(&app, "GET", &format!("/api/devices/{id}"), None).await;
+    assert_eq!(stored["manual_code"], MANUAL);
+
+    for (body, code) in [
+        (json!({}), "missing_setup_code"),
+        (
+            json!({ "qr_payload": "https://example.com" }),
+            "invalid_qr_payload",
+        ),
+        (
+            json!({ "manual_code": "34970112331" }),
+            "invalid_manual_code",
+        ),
+    ] {
+        let (status, error) = scan(&app, body).await;
+        assert_eq!(
+            (status, error["error"].as_str().unwrap()),
+            (StatusCode::BAD_REQUEST, code)
+        );
+    }
+    // Recording only reads matterjs-server's nodes.
+    assert_eq!(sent(&commands), Vec::<Value>::new());
+}
+
+#[tokio::test]
+async fn three_codes_scanned_first_then_connecting_one_connects_only_that_row() {
+    let (logs, _guard) = capture_logs();
+    let (addr, commands, nodes) = fake_matter(
+        server_info(true, false),
+        Commission::Node(tapo_node()),
+        json!({}),
+    )
+    .await;
+    let app = commissioning_app(addr, home_link::open_db(":memory:").unwrap());
+    let mut ids = Vec::new();
+    for qr in QRS {
+        let (status, body) = scan(&app, json!({ "qr_payload": qr })).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        ids.push(body["device"]["id"].clone());
+    }
+    let (_, list) = call(&app, "GET", "/api/devices", None).await;
+    assert_eq!(states(&list), vec![json!("unconnected"); 3]);
+    // Devices never connected are not lights gone missing.
+    let (status, lights) = call(&app, "GET", "/api/lights", None).await;
+    assert_eq!(status, StatusCode::OK, "{lights}");
+    assert_eq!(lights["missing"], 0);
+
+    let (status, body) = connect(&app, &ids[1]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["node_id"], 17);
+    let device = &body["device"];
+    assert_eq!(
+        (
+            &device["id"],
+            &device["state"],
+            &device["vendor"],
+            &device["serial_number"],
+            &device["mac"],
+            &device["product_name"],
+        ),
+        (
+            &ids[1],
+            &json!("connected"),
+            &json!("Tapo"),
+            &json!(TAPO),
+            &json!(TAPO),
+            &json!("Smart Bulb"),
+        )
+    );
+    let commands = sent(&commands);
+    assert_eq!(
+        commands.iter().map(|c| &c["command"]).collect::<Vec<_>>(),
+        ["set_wifi_credentials", "commission_with_code"]
+    );
+    assert_eq!(
+        commands[0]["args"],
+        json!({ "ssid": "home-2g", "credentials": PASSWORD })
+    );
+    assert_eq!(
+        commands[1]["args"],
+        json!({ "code": QRS[1], "network_only": false })
+    );
+    let (_, list) = call(&app, "GET", "/api/devices", None).await;
+    assert_eq!(
+        states(&list),
+        [
+            json!("unconnected"),
+            json!("connected"),
+            json!("unconnected")
+        ]
+    );
+
+    // The state follows matterjs-server's nodes.
+    let uri = format!("/api/devices/{}", ids[1]);
+    nodes.lock().unwrap()[0]["available"] = json!(false);
+    let (_, device) = call(&app, "GET", &uri, None).await;
+    assert_eq!(device["state"], "no_response");
+    nodes.lock().unwrap().clear();
+    let (_, device) = call(&app, "GET", &uri, None).await;
+    assert_eq!(
+        (&device["state"], &device["product_name"]),
+        (&json!("unconnected"), &Value::Null)
+    );
+    let (_, lights) = call(&app, "GET", "/api/lights", None).await;
+    assert_eq!(lights["missing"], 1);
+
+    let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("device commissioned"), "{logs}");
+    for text in [body.to_string(), list.to_string(), logs] {
+        assert!(!text.contains(PASSWORD), "{text}");
+    }
+}
+
+#[tokio::test]
+async fn connecting_a_row_without_a_saved_wifi_leaves_the_network_to_the_device() {
+    let (addr, commands, _) = fake_matter(
+        server_info(true, true),
+        Commission::Node(t2_node()),
+        json!({}),
+    )
+    .await;
+    let app = wifiless_app(addr, home_link::open_db(":memory:").unwrap());
+    let (_, body) = scan(&app, json!({ "manual_code": MANUAL })).await;
+    let (status, body) = connect(&app, &body["device"]["id"]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        (
+            &body["device"]["serial_number"],
+            &body["device"]["mac"],
+            &body["device"]["state"]
+        ),
+        (&json!("T2-0001"), &Value::Null, &json!("connected"))
+    );
+    assert_eq!(
+        sent(&commands),
+        [
+            json!({ "message_id": "commission", "command": "commission_with_code",
+                 "args": { "code": MANUAL, "network_only": false } })
+        ]
+    );
+}
+
+#[tokio::test]
+async fn connecting_a_row_tells_failures_apart_and_leaves_it_unconnected() {
+    let cases = [
+        (
+            Commission::Error(
+                "Commission failed: commissioning discovery failed: No commissionable device was discovered",
+            ),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "device_not_found",
+        ),
+        (
+            Commission::Error(
+                "Commission failed: commissioning discovery failed: No device could be commissioned (1 of 1 started attempt(s) failed, 1 discovered)",
+            ),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "wrong_code",
+        ),
+        (
+            Commission::Error(
+                "Commission failed: Commissionee failed to connect to WiFi network \"home-2g\": AuthFail",
+            ),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "wifi_failed",
+        ),
+        (
+            Commission::Error(
+                "Commission failed: Commissionee failed to connect to Thread network \"home\": NetworkNotFound",
+            ),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "thread_failed",
+        ),
+        (
+            Commission::Silent,
+            StatusCode::GATEWAY_TIMEOUT,
+            "commission_timeout",
+        ),
+        (
+            Commission::Error(
+                "Commission failed: commissioning discovery failed: No device could be commissioned (1 of 1 started attempt(s) failed, 1 discovered)\nCause #0: [ble] No connected BLE proxy client owns peripheral 00:00:5E:00:53:01",
+            ),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "commission_failed",
+        ),
+    ];
+    for (commission, status, code) in cases {
+        let (addr, _, _) = fake_matter(server_info(true, false), commission, json!({})).await;
+        let app = commissioning_app(addr, home_link::open_db(":memory:").unwrap());
+        let (_, body) = scan(&app, json!({ "qr_payload": QR })).await;
+        let id = &body["device"]["id"];
+        let (got, error) = connect(&app, id).await;
+        assert_eq!(
+            (got, error["error"].as_str().unwrap()),
+            (status, code),
+            "{error}"
+        );
+        assert!(!error.to_string().contains(PASSWORD));
+        let (_, device) = call(&app, "GET", &format!("/api/devices/{id}"), None).await;
+        assert_eq!(
+            (&device["serial_number"], &device["state"]),
+            (&Value::Null, &json!("unconnected")),
+            "{code}"
+        );
+    }
+
+    let (addr, commands, _) = fake_matter(
+        server_info(false, false),
+        Commission::Node(tapo_node()),
+        json!({}),
+    )
+    .await;
+    let app = commissioning_app(addr, home_link::open_db(":memory:").unwrap());
+    let (_, body) = scan(&app, json!({ "qr_payload": QR })).await;
+    let (status, error) = connect(&app, &body["device"]["id"]).await;
+    assert_eq!(
+        (status, error["error"].as_str().unwrap()),
+        (StatusCode::SERVICE_UNAVAILABLE, "bluetooth_unavailable")
+    );
+    let (status, error) = connect(&app, &json!(999)).await;
+    assert_eq!(
+        (status, error["error"].as_str().unwrap()),
+        (StatusCode::NOT_FOUND, "device_not_found")
+    );
+    assert_eq!(sent(&commands), Vec::<Value>::new());
+
+    let unset = home_link::app(home_link::open_db(":memory:").unwrap(), None);
+    let (_, body) = scan(&unset, json!({ "qr_payload": QR })).await;
+    assert_eq!(body["device"]["state"], Value::Null);
+    let (status, error) = connect(&unset, &body["device"]["id"]).await;
+    assert_eq!(
+        (status, error["error"].as_str().unwrap()),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "matter_server_not_configured"
+        )
+    );
+}
+
+#[tokio::test]
+async fn connecting_a_device_the_ledger_already_holds_keeps_that_row() {
+    let (addr, _, _) = fake_matter(
+        server_info(true, false),
+        Commission::Node(tapo_node()),
+        json!({}),
+    )
+    .await;
+    let (db, sql) = ledger();
+    let app = commissioning_app(addr, db);
+    let room = create_room(&app, "寝室").await;
+    let old = add_device(
+        &app,
+        &sql,
+        json!({ "room_id": room, "vendor": "Tapo", "serial_number": TAPO, "name": "読書灯" }),
+    )
+    .await;
+    let label = create_label(&app, json!({ "name": "夜" })).await;
+    assign(&app, &old, &[&label]).await;
+    ignore(&app, &[old["id"].as_i64().unwrap()]).await;
+
+    // Reset and scanned again, the device is connected onto its old row.
+    let (_, scanned) = scan(&app, json!({ "qr_payload": QR })).await;
+    let (status, body) = connect(&app, &scanned["device"]["id"]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let device = &body["device"];
+    assert_eq!(
+        (
+            &device["id"],
+            &device["name"],
+            &device["room_name"],
+            &device["ignored"],
+            &device["labels"][0]["name"],
+            &device["state"],
+        ),
+        (
+            &old["id"],
+            &json!("読書灯"),
+            &json!("寝室"),
+            &json!(true),
+            &json!("夜"),
+            &json!("connected"),
+        )
+    );
+    let (_, list) = call(&app, "GET", "/api/devices", None).await;
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    let (_, stored) = call(&app, "GET", &format!("/api/devices/{}", old["id"]), None).await;
+    assert_eq!(stored["qr_payload"], QR);
+}
+
+#[tokio::test]
+async fn devices_are_named_and_placed_by_patch() {
+    let (app, _) = ledger_app();
+    let closet = create_room(&app, "押入れ").await;
+    let bedroom = create_room(&app, "寝室").await;
+    let (_, body) = scan(&app, json!({ "qr_payload": QR })).await;
+    let uri = format!("/api/devices/{}", body["device"]["id"]);
+    let placed = |device: &Value| {
+        (
+            device["name"].clone(),
+            device["room_id"].clone(),
+            device["room_name"].clone(),
+        )
+    };
+
+    let (status, device) = call(
+        &app,
+        "PATCH",
+        &uri,
+        Some(json!({ "name": " 押入れ1 ", "room_id": closet })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{device}");
+    assert_eq!(
+        placed(&device),
+        (json!("押入れ1"), json!(closet), json!("押入れ"))
+    );
+    let (_, rooms) = call(&app, "GET", "/api/rooms", None).await;
+    assert_eq!(rooms[0]["device_count"], 1);
+    let (_, device) = call(&app, "PATCH", &uri, Some(json!({ "room_id": bedroom }))).await;
+    assert_eq!(
+        placed(&device),
+        (json!("押入れ1"), json!(bedroom), json!("寝室"))
+    );
+    let (_, device) = call(&app, "PATCH", &uri, Some(json!({ "room_id": null }))).await;
+    assert_eq!(
+        placed(&device),
+        (json!("押入れ1"), Value::Null, Value::Null)
+    );
+    let (status, device) = call(&app, "PATCH", &uri, Some(json!({ "name": "" }))).await;
+    assert_eq!(status, StatusCode::OK, "{device}");
+
+    for (body, status, code) in [
+        (
+            json!({ "name": "x".repeat(101) }),
+            StatusCode::BAD_REQUEST,
+            "invalid_device_name",
+        ),
+        (
+            json!({ "room_id": 999, "name": "y" }),
+            StatusCode::NOT_FOUND,
+            "room_not_found",
+        ),
+        (
+            json!({ "name": null }),
+            StatusCode::BAD_REQUEST,
+            "invalid_device_update",
+        ),
+        (
+            json!({ "room_id": "1" }),
+            StatusCode::BAD_REQUEST,
+            "invalid_device_update",
+        ),
+        (json!({}), StatusCode::BAD_REQUEST, "invalid_device_update"),
+        (
+            json!({ "name": "y", "color": 1 }),
+            StatusCode::BAD_REQUEST,
+            "invalid_device_update",
+        ),
+    ] {
+        let (got, error) = call(&app, "PATCH", &uri, Some(body.clone())).await;
+        assert_eq!(
+            (got, error["error"].as_str().unwrap()),
+            (status, code),
+            "{body}"
+        );
+    }
+    let (_, device) = call(&app, "GET", &uri, None).await;
+    assert_eq!(placed(&device), (json!(""), Value::Null, Value::Null));
+}
+
+#[tokio::test]
+async fn opening_a_v0_1_30_ledger_keeps_its_lights_connected_with_their_labels() {
+    let path = std::env::temp_dir().join(format!("home-link-v6-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        // The schema of v0.1.30 (user_version 6).
+        let old = rusqlite::Connection::open(&path).unwrap();
+        old.execute_batch(&format!(
+            "CREATE TABLE rooms (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+            CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE labels (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                day_level INTEGER,
+                night_level INTEGER,
+                cool_kelvin INTEGER,
+                warm_kelvin INTEGER
+            , boost TEXT, dedicated INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE device_labels (
+                device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+                label_id INTEGER NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
+                PRIMARY KEY (device_id, label_id)
+            );
+            CREATE TABLE \"devices\" (
+                id INTEGER PRIMARY KEY,
+                room_id INTEGER NOT NULL REFERENCES rooms(id) ON DELETE RESTRICT,
+                qr_payload TEXT UNIQUE,
+                vendor TEXT,
+                serial_number TEXT,
+                mac TEXT UNIQUE,
+                name TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                ignored INTEGER NOT NULL DEFAULT 0,
+                UNIQUE (vendor, serial_number),
+                CHECK (qr_payload IS NOT NULL OR serial_number IS NOT NULL)
+            );
+            PRAGMA user_version = 6;
+            INSERT INTO rooms (name) VALUES ('リビング');
+            INSERT INTO labels (name, warm_kelvin) VALUES ('夜', 2700);
+            INSERT INTO devices (id, room_id, qr_payload, vendor, serial_number, mac, name, ignored) VALUES
+                (3, 1, '{MANUAL}', 'Aqara', 'SERIAL-A', NULL, 'キッチン1', 0),
+                (4, 1, '{QR}', 'Tapo', '{TAPO}', '{TAPO}', '書斎', 1);
+            INSERT INTO device_labels VALUES (3, 1);"
+        ))
+        .unwrap();
+    }
+    for _ in 0..2 {
+        let db = home_link::open_db(path.to_str().unwrap()).unwrap();
+        let rows: Vec<Value> = db
+            .prepare(
+                "SELECT json_array(devices.id, room_id, name, ignored, label_id, vendor_id, product_id)
+                 FROM devices LEFT JOIN device_labels ON device_id = devices.id ORDER BY devices.id",
+            )
+            .unwrap()
+            .query_map([], |r| Ok(serde_json::from_str(&r.get::<_, String>(0)?).unwrap()))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            [
+                json!([3, 1, "キッチン1", 0, 1, null, null]),
+                json!([4, 1, "書斎", 1, null, 0xFFF1, 0x8000]),
+            ]
+        );
+    }
+
+    let (addr, _, nodes) =
+        fake_matter(server_info(true, false), Commission::Silent, json!({})).await;
+    nodes.lock().unwrap().extend([
+        json!({ "node_id": 2, "available": true, "attributes": {
+            "0/40/1": "Aqara", "0/40/15": "SERIAL-A", "0/40/3": "Light Bulb T2" }}),
+        tapo_node(),
+    ]);
+    let app = wifiless_app(addr, home_link::open_db(path.to_str().unwrap()).unwrap());
+    let (_, list) = call(&app, "GET", "/api/devices", None).await;
+    assert_eq!(states(&list), vec![json!("connected"); 2]);
+    assert_eq!(
+        (
+            &list[0]["room_name"],
+            &list[0]["labels"][0]["name"],
+            &list[1]["ignored"]
+        ),
+        (&json!("リビング"), &json!("夜"), &json!(true))
+    );
+    let (status, body) = scan(&app, json!({ "qr_payload": QRS[0] })).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let _ = std::fs::remove_file(&path);
 }
 
 #[tokio::test]
@@ -3306,6 +3861,11 @@ fn capture_logs() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard) {
             Ok(())
         }
     }
+    // While one scoped dispatcher is alive, tracing-core asks only the registering
+    // thread's, so a callsite first hit on another test's thread would never log;
+    // a second one kept alive makes it ask every live dispatcher.
+    static SECOND: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    SECOND.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
     let logs = Arc::new(Mutex::new(Vec::new()));
     let writer = Logs(logs.clone());
     let subscriber = tracing_subscriber::fmt()

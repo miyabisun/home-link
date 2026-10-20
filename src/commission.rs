@@ -32,6 +32,9 @@ pub enum Network<'a> {
     Wifi { ssid: &'a str, password: &'a str },
     /// Thread, with the dataset matterjs-server already holds.
     Thread,
+    /// Whichever the device reports to matterjs-server: Wi-Fi credentials,
+    /// when there are some, are handed over first, and Thread uses the dataset.
+    Any(Option<(&'a str, &'a str)>),
 }
 
 /// Hands matterjs-server the Wi-Fi credentials (for Wi-Fi), then has it
@@ -82,21 +85,23 @@ async fn session(
     if info["bluetooth_enabled"] == false {
         return Err(Error::Failed(Failure::BluetoothDisabled));
     }
-    match network {
+    let wifi = match network {
         Network::Thread if info["thread_credentials_set"] != true => {
             return Err(Error::Failed(Failure::ThreadNotReady));
         }
-        Network::Thread => {}
-        Network::Wifi { ssid, password } => {
-            let wifi = json!({
-                "message_id": "wifi",
-                "command": "set_wifi_credentials",
-                "args": { "ssid": ssid, "credentials": password },
-            });
-            let reply = call(ws, &wifi, deadline).await?;
-            if let Some(details) = error(&reply) {
-                return Err(Error::Failed(Failure::Other(details)));
-            }
+        Network::Thread => None,
+        Network::Wifi { ssid, password } => Some((*ssid, *password)),
+        Network::Any(wifi) => *wifi,
+    };
+    if let Some((ssid, password)) = wifi {
+        let wifi = json!({
+            "message_id": "wifi",
+            "command": "set_wifi_credentials",
+            "args": { "ssid": ssid, "credentials": password },
+        });
+        let reply = call(ws, &wifi, deadline).await?;
+        if let Some(details) = error(&reply) {
+            return Err(Error::Failed(Failure::Other(details)));
         }
     }
     let request = json!({
