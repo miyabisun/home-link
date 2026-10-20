@@ -169,6 +169,20 @@ pub fn open_db(path: &str) -> rusqlite::Result<Connection> {
             COMMIT;",
         )?;
     }
+    if version < 7 {
+        // Version 7 keeps the Wi-Fi networks handed to devices, and which one they get.
+        db.execute_batch(
+            "BEGIN;
+            CREATE TABLE IF NOT EXISTS wifi_networks (
+                id INTEGER PRIMARY KEY,
+                ssid TEXT NOT NULL UNIQUE,
+                password TEXT NOT NULL,
+                for_devices INTEGER NOT NULL DEFAULT 0
+            );
+            PRAGMA user_version = 7;
+            COMMIT;",
+        )?;
+    }
     Ok(db)
 }
 
@@ -295,6 +309,11 @@ fn router(state: Db) -> Router {
         .route(
             "/labels/{id}",
             axum::routing::patch(update_label).delete(delete_label),
+        )
+        .route("/wifi", get(list_wifi).post(save_wifi))
+        .route(
+            "/wifi/{id}",
+            axum::routing::patch(choose_wifi).delete(delete_wifi),
         )
         .route("/commission", axum::routing::post(commission))
         .route("/thread", get(thread))
@@ -961,8 +980,168 @@ async fn delete_device(State(db): State<Db>, Path(id): Path<i64>) -> ApiResult<S
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// A new device to commission over the phone's Bluetooth and record. The Wi-Fi
-/// password is handed to matterjs-server and kept nowhere else.
+/// A saved Wi-Fi network; its password is write-only and never leaves the ledger but to matterjs-server.
+#[derive(Serialize)]
+struct Wifi {
+    id: i64,
+    ssid: String,
+    for_devices: bool,
+}
+
+#[derive(Deserialize)]
+struct WifiInput {
+    ssid: String,
+    password: String,
+    #[serde(default)]
+    for_devices: bool,
+}
+
+#[derive(Deserialize)]
+struct WifiChoice {
+    for_devices: bool,
+}
+
+fn find_wifi(db: &Connection, id: i64) -> ApiResult<Wifi> {
+    db.query_row(
+        "SELECT id, ssid, for_devices FROM wifi_networks WHERE id = ?1",
+        [id],
+        |row| {
+            Ok(Wifi {
+                id: row.get(0)?,
+                ssid: row.get(1)?,
+                for_devices: row.get(2)?,
+            })
+        },
+    )
+    .optional()?
+    .ok_or_else(|| {
+        ApiError(
+            StatusCode::NOT_FOUND,
+            "wifi_not_found",
+            "Wi-Fiが見つかりません".into(),
+        )
+    })
+}
+
+/// Makes `id` the network handed to devices, the only one.
+fn hand_to_devices(db: &Connection, id: i64) -> rusqlite::Result<()> {
+    db.execute("UPDATE wifi_networks SET for_devices = (id = ?1)", [id])
+        .map(|_| ())
+}
+
+async fn list_wifi(State(db): State<Db>) -> ApiResult<Json<Vec<Wifi>>> {
+    let db = db.db.lock().unwrap();
+    let mut statement = db.prepare("SELECT id FROM wifi_networks ORDER BY id")?;
+    let ids = statement
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<i64>>>()?;
+    Ok(Json(
+        ids.into_iter()
+            .map(|id| find_wifi(&db, id))
+            .collect::<ApiResult<_>>()?,
+    ))
+}
+
+/// Saves a network, replacing the password of one with the same name. The first
+/// network, or one sent `for_devices`, becomes the one handed to devices.
+async fn save_wifi(
+    State(db): State<Db>,
+    Json(input): Json<WifiInput>,
+) -> ApiResult<(StatusCode, Json<Wifi>)> {
+    // SSIDs are up to 32 bytes; WPA passphrases 8–63 characters or 64 hex digits.
+    if !(1..=32).contains(&input.ssid.len()) || !(1..=64).contains(&input.password.chars().count())
+    {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_wifi",
+            "Wi-Fiの名前（32バイト以内）とパスワード（64文字以内）を送ってください".into(),
+        ));
+    }
+    let db = db.db.lock().unwrap();
+    let existing: Option<i64> = db
+        .query_row(
+            "SELECT id FROM wifi_networks WHERE ssid = ?1",
+            [&input.ssid],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let id = if let Some(id) = existing {
+        db.execute(
+            "UPDATE wifi_networks SET password = ?1 WHERE id = ?2",
+            params![input.password, id],
+        )?;
+        id
+    } else {
+        db.execute(
+            "INSERT INTO wifi_networks (ssid, password) VALUES (?1, ?2)",
+            params![input.ssid, input.password],
+        )?;
+        db.last_insert_rowid()
+    };
+    let none: bool = db.query_row(
+        "SELECT NOT EXISTS (SELECT 1 FROM wifi_networks WHERE for_devices = 1)",
+        [],
+        |row| row.get(0),
+    )?;
+    if input.for_devices || none {
+        hand_to_devices(&db, id)?;
+    }
+    let status = if existing.is_some() {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    Ok((status, Json(find_wifi(&db, id)?)))
+}
+
+/// Makes the network the one handed to devices.
+async fn choose_wifi(
+    State(db): State<Db>,
+    Path(id): Path<i64>,
+    Json(input): Json<WifiChoice>,
+) -> ApiResult<Json<Wifi>> {
+    let db = db.db.lock().unwrap();
+    find_wifi(&db, id)?;
+    if input.for_devices {
+        hand_to_devices(&db, id)?;
+    }
+    Ok(Json(find_wifi(&db, id)?))
+}
+
+/// Deletes the network; devices then get the first one left.
+async fn delete_wifi(State(db): State<Db>, Path(id): Path<i64>) -> ApiResult<StatusCode> {
+    let db = db.db.lock().unwrap();
+    let wifi = find_wifi(&db, id)?;
+    db.execute("DELETE FROM wifi_networks WHERE id = ?1", [id])?;
+    if wifi.for_devices
+        && let Some(first) = db.query_row("SELECT min(id) FROM wifi_networks", [], |row| {
+            row.get::<_, Option<i64>>(0)
+        })?
+    {
+        hand_to_devices(&db, first)?;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The SSID and password handed to devices, if one is chosen.
+fn wifi_for_devices(db: &Connection) -> ApiResult<(String, String)> {
+    db.query_row(
+        "SELECT ssid, password FROM wifi_networks WHERE for_devices = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()?
+    .ok_or_else(|| {
+        ApiError(
+            StatusCode::CONFLICT,
+            "wifi_not_set",
+            "電球に渡すWi-Fiが未登録です".into(),
+        )
+    })
+}
+
+/// A new device to commission over the phone's Bluetooth and record, onto the
+/// Wi-Fi saved for devices or onto Thread.
 #[derive(Deserialize)]
 struct CommissionInput {
     room_id: i64,
@@ -972,26 +1151,19 @@ struct CommissionInput {
     name: String,
     /// `wifi` (the default) or `thread`.
     network: Option<String>,
-    #[serde(default)]
-    wifi_ssid: String,
-    #[serde(default)]
-    wifi_password: String,
 }
 
 /// Has matterjs-server commission the device over the BLE proxy the phone holds
-/// open, onto the given Wi-Fi, then records it: a device already in the ledger
+/// open, onto the Wi-Fi for devices, then records it: a device already in the ledger
 /// (by identifiers, else by code) keeps its entry and gains missing identifiers.
 async fn commission(
     State(state): State<Db>,
     Json(input): Json<CommissionInput>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     let code = setup_code(input.qr_payload.as_ref(), input.manual_code.as_ref())?;
-    let network = match input.network.as_deref() {
-        None | Some("wifi") => commission::Network::Wifi {
-            ssid: &input.wifi_ssid,
-            password: &input.wifi_password,
-        },
-        Some("thread") => commission::Network::Thread,
+    let thread = match input.network.as_deref() {
+        None | Some("wifi") => false,
+        Some("thread") => true,
         Some(_) => {
             return Err(ApiError(
                 StatusCode::BAD_REQUEST,
@@ -1000,24 +1172,30 @@ async fn commission(
             ));
         }
     };
-    // SSIDs are up to 32 bytes; WPA passphrases 8–63 characters or 64 hex digits.
-    if let commission::Network::Wifi { ssid, password } = network
-        && (!(1..=32).contains(&ssid.len()) || !(1..=64).contains(&password.len()))
-    {
-        return Err(ApiError(
-            StatusCode::BAD_REQUEST,
-            "invalid_wifi",
-            "Wi-Fiの名前（32バイト以内）とパスワード（64文字以内）を送ってください".into(),
-        ));
-    }
     let name = device_name(&input.name)?;
-    find_room(&state.db.lock().unwrap(), input.room_id)?.ok_or_else(room_not_found)?;
     let url = matter_url(&state)?;
+    let (ssid, password) = {
+        let db = state.db.lock().unwrap();
+        find_room(&db, input.room_id)?.ok_or_else(room_not_found)?;
+        if thread {
+            Default::default()
+        } else {
+            wifi_for_devices(&db)?
+        }
+    };
+    let network = if thread {
+        commission::Network::Thread
+    } else {
+        commission::Network::Wifi {
+            ssid: &ssid,
+            password: &password,
+        }
+    };
     let commissioned = commission::commission(url, &code, &network, state.commission_timeout)
         .await
         .map_err(|error| match error {
             commission::Error::Unreachable(error) => matter_unreachable(error),
-            commission::Error::Failed(failure) => commission_failed(failure, &input.wifi_ssid),
+            commission::Error::Failed(failure) => commission_failed(failure, &ssid),
         })?;
     let db = state.db.lock().unwrap();
     let (registered, device) = record(&db, input.room_id, &name, &code, &commissioned)?;

@@ -1631,8 +1631,7 @@ async fn fake_commissioner(
 const PASSWORD: &str = "kakushi-pass-7f3a";
 
 fn commission_body(room: i64) -> Value {
-    json!({ "room_id": room, "qr_payload": QR, "name": "押入れ1",
-            "wifi_ssid": "home-2g", "wifi_password": PASSWORD })
+    json!({ "room_id": room, "qr_payload": QR, "name": "押入れ1" })
 }
 
 /// A Tapo bulb as matterjs-server returns it right after commissioning.
@@ -1643,26 +1642,149 @@ fn tapo_node() -> Value {
     }})
 }
 
+/// An app on `db` with "home-2g" saved as the Wi-Fi for devices.
 fn commissioning_app(addr: SocketAddr, db: rusqlite::Connection) -> Router {
+    db.execute(
+        "INSERT INTO wifi_networks (ssid, password, for_devices) VALUES ('home-2g', ?1, 1)",
+        [PASSWORD],
+    )
+    .unwrap();
+    wifiless_app(addr, db)
+}
+
+fn wifiless_app(addr: SocketAddr, db: rusqlite::Connection) -> Router {
     home_link::Home::new(db, Some(format!("ws://{addr}/ws")))
         .with_commission_timeout(std::time::Duration::from_millis(500))
         .router()
 }
 
+const IOT_PASSWORD: &str = "iot-himitsu-91c2";
+
 #[tokio::test]
-async fn commissioning_hands_over_wifi_then_registers_the_new_node() {
+async fn wifi_networks_are_saved_listed_chosen_and_deleted_without_their_passwords() {
+    let (logs, _guard) = capture_logs();
+    let app = app();
+    let (status, list) = call(&app, "GET", "/api/wifi", None).await;
+    assert_eq!((status, list), (StatusCode::OK, json!([])));
+
+    // The first network saved is the one handed to devices.
+    let (status, home) = call(
+        &app,
+        "POST",
+        "/api/wifi",
+        Some(json!({ "ssid": "home-2g", "password": PASSWORD })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{home}");
+    assert_eq!(
+        (&home["ssid"], &home["for_devices"]),
+        (&json!("home-2g"), &json!(true))
+    );
+    let (status, iot) = call(
+        &app,
+        "POST",
+        "/api/wifi",
+        Some(json!({ "ssid": "iot-2g", "password": IOT_PASSWORD })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{iot}");
+    assert_eq!(iot["for_devices"], false);
+    let ids = |list: &Value| -> Vec<(Value, Value)> {
+        list.as_array()
+            .unwrap()
+            .iter()
+            .map(|w| (w["ssid"].clone(), w["for_devices"].clone()))
+            .collect()
+    };
+
+    let uri = format!("/api/wifi/{}", iot["id"]);
+    let (status, chosen) = call(&app, "PATCH", &uri, Some(json!({ "for_devices": true }))).await;
+    assert_eq!(status, StatusCode::OK, "{chosen}");
+    let (_, list) = call(&app, "GET", "/api/wifi", None).await;
+    assert_eq!(
+        ids(&list),
+        [
+            (json!("home-2g"), json!(false)),
+            (json!("iot-2g"), json!(true))
+        ]
+    );
+
+    // The same name replaces the password in place and keeps the choice.
+    let (status, again) = call(
+        &app,
+        "POST",
+        "/api/wifi",
+        Some(json!({ "ssid": "home-2g", "password": "kawatta-pass-55" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(
+        (&again["id"], &again["for_devices"]),
+        (&home["id"], &json!(false))
+    );
+    let (_, list) = call(&app, "GET", "/api/wifi", None).await;
+    assert_eq!(list.as_array().unwrap().len(), 2);
+
+    for body in [
+        json!({ "ssid": "", "password": PASSWORD }),
+        json!({ "ssid": "x".repeat(33), "password": PASSWORD }),
+        json!({ "ssid": "home-2g", "password": "" }),
+        json!({ "ssid": "home-2g", "password": "x".repeat(65) }),
+    ] {
+        let (status, error) = call(&app, "POST", "/api/wifi", Some(body)).await;
+        assert_eq!(
+            (status, error["error"].as_str().unwrap()),
+            (StatusCode::BAD_REQUEST, "invalid_wifi")
+        );
+    }
+    for (method, body) in [
+        ("PATCH", Some(json!({ "for_devices": true }))),
+        ("DELETE", None),
+    ] {
+        let (status, error) = call(&app, method, "/api/wifi/999", body).await;
+        assert_eq!(
+            (status, error["error"].as_str().unwrap()),
+            (StatusCode::NOT_FOUND, "wifi_not_found")
+        );
+    }
+
+    // Deleting the network for devices hands devices the one left.
+    let (status, _) = call(&app, "DELETE", &uri, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, list) = call(&app, "GET", "/api/wifi", None).await;
+    assert_eq!(ids(&list), [(json!("home-2g"), json!(true))]);
+
+    let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("/api/wifi"), "logs were not captured: {logs}");
+    for secret in [PASSWORD, IOT_PASSWORD, "kawatta-pass-55"] {
+        assert!(!list.to_string().contains(secret));
+        assert!(!home.to_string().contains(secret) && !again.to_string().contains(secret));
+        assert!(!logs.contains(secret), "password in logs: {logs}");
+    }
+}
+
+#[tokio::test]
+async fn commissioning_hands_over_the_wifi_for_devices_then_registers_the_new_node() {
+    let (logs, _guard) = capture_logs();
     let (addr, commands) = fake_commissioner(
         server_info(true, false),
         Commission::Node(tapo_node()),
         json!({}),
     )
     .await;
-    let path = std::env::temp_dir().join(format!("home-link-commission-{}.db", std::process::id()));
-    let _ = std::fs::remove_file(&path);
-    let app = commissioning_app(addr, home_link::open_db(path.to_str().unwrap()).unwrap());
+    let app = wifiless_app(addr, home_link::open_db(":memory:").unwrap());
     let room = create_room(&app, "押入れ").await;
+    for (ssid, password) in [("home-2g", PASSWORD), ("iot-2g", IOT_PASSWORD)] {
+        let body = json!({ "ssid": ssid, "password": password, "for_devices": true });
+        let (status, _) = call(&app, "POST", "/api/wifi", Some(body)).await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
 
-    let (status, body) = call(&app, "POST", "/api/commission", Some(commission_body(room))).await;
+    // The phone sends no Wi-Fi; any it sends is ignored.
+    let mut body = commission_body(room);
+    body["wifi_ssid"] = json!("phone-wifi");
+    body["wifi_password"] = json!("phone-pass-0000");
+    let (status, body) = call(&app, "POST", "/api/commission", Some(body)).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     assert_eq!(body["node_id"], 17);
     assert_eq!(body["registered"], true);
@@ -1693,33 +1815,45 @@ async fn commissioning_hands_over_wifi_then_registers_the_new_node() {
     );
     assert_eq!(
         commands[0]["args"],
-        json!({ "ssid": "home-2g", "credentials": PASSWORD })
+        json!({ "ssid": "iot-2g", "credentials": IOT_PASSWORD })
     );
     assert_eq!(
         commands[1]["args"],
         json!({ "code": QR, "network_only": false })
     );
 
-    // The ledger keeps the code but never the Wi-Fi password.
     let id = device["id"].as_i64().unwrap();
     let (_, stored) = call(&app, "GET", &format!("/api/devices/{id}"), None).await;
     assert_eq!(stored["qr_payload"], QR);
-    assert!(!body.to_string().contains(PASSWORD));
     let (_, all) = call(&app, "GET", "/api/devices", None).await;
-    assert!(!all.to_string().contains(PASSWORD));
-    drop(app);
-    for suffix in ["", "-wal", "-shm"] {
-        let file = format!("{}{suffix}", path.display());
-        if let Ok(bytes) = std::fs::read(&file) {
-            assert!(
-                !bytes
-                    .windows(PASSWORD.len())
-                    .any(|w| w == PASSWORD.as_bytes()),
-                "{file} holds the password"
-            );
-        }
-        let _ = std::fs::remove_file(&file);
+    let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert!(
+        logs.contains("device commissioned"),
+        "logs were not captured: {logs}"
+    );
+    for secret in [PASSWORD, IOT_PASSWORD] {
+        assert!(!body.to_string().contains(secret));
+        assert!(!all.to_string().contains(secret));
+        assert!(!logs.contains(secret), "password in logs: {logs}");
     }
+}
+
+#[tokio::test]
+async fn commissioning_onto_wifi_needs_a_wifi_for_devices() {
+    let (addr, commands) = fake_commissioner(
+        server_info(true, false),
+        Commission::Node(tapo_node()),
+        json!({}),
+    )
+    .await;
+    let app = wifiless_app(addr, home_link::open_db(":memory:").unwrap());
+    let room = create_room(&app, "押入れ").await;
+    let (status, error) = call(&app, "POST", "/api/commission", Some(commission_body(room))).await;
+    assert_eq!(
+        (status, error["error"].as_str().unwrap()),
+        (StatusCode::CONFLICT, "wifi_not_set")
+    );
+    assert_eq!(commands.lock().unwrap().len(), 0);
 }
 
 #[tokio::test]
@@ -1730,8 +1864,7 @@ async fn commissioning_reads_identifiers_missing_from_the_new_node() {
         fake_commissioner(server_info(true, false), Commission::Node(node), read).await;
     let app = commissioning_app(addr, home_link::open_db(":memory:").unwrap());
     let room = create_room(&app, "押入れ").await;
-    let body = json!({ "room_id": room, "manual_code": "3497-011-2332",
-                       "wifi_ssid": "home-2g", "wifi_password": PASSWORD });
+    let body = json!({ "room_id": room, "manual_code": "3497-011-2332" });
     let (status, body) = call(&app, "POST", "/api/commission", Some(body)).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     assert_eq!(body["device"]["vendor"], "Uascent");
@@ -1889,8 +2022,7 @@ async fn commissioning_checks_its_input_before_reaching_the_matter_server() {
             "invalid_qr_payload",
         ),
         (
-            json!({ "room_id": room, "manual_code": "34970112331", "name": "押入れ1",
-                    "wifi_ssid": "home-2g", "wifi_password": PASSWORD }),
+            json!({ "room_id": room, "manual_code": "34970112331", "name": "押入れ1" }),
             StatusCode::BAD_REQUEST,
             "invalid_manual_code",
         ),
@@ -1898,26 +2030,6 @@ async fn commissioning_checks_its_input_before_reaching_the_matter_server() {
             with("manual_code", json!(MANUAL)),
             StatusCode::BAD_REQUEST,
             "missing_setup_code",
-        ),
-        (
-            with("wifi_ssid", json!("")),
-            StatusCode::BAD_REQUEST,
-            "invalid_wifi",
-        ),
-        (
-            with("wifi_ssid", json!("x".repeat(33))),
-            StatusCode::BAD_REQUEST,
-            "invalid_wifi",
-        ),
-        (
-            with("wifi_password", json!("")),
-            StatusCode::BAD_REQUEST,
-            "invalid_wifi",
-        ),
-        (
-            with("wifi_password", json!("x".repeat(65))),
-            StatusCode::BAD_REQUEST,
-            "invalid_wifi",
         ),
         (
             with("name", json!("x".repeat(101))),
@@ -2075,13 +2187,15 @@ async fn thread_commissioning_checks_the_network_and_ignores_wifi_fields() {
     );
     assert_eq!(commands.lock().unwrap().len(), 0);
 
-    // Wi-Fi stays the default and still needs its credentials.
+    // Wi-Fi stays the default and needs a Wi-Fi for devices.
+    let app = wifiless_app(addr, home_link::open_db(":memory:").unwrap());
+    let room = create_room(&app, "寝室").await;
     let mut body = thread_body(room);
     body.as_object_mut().unwrap().remove("network");
     let (status, error) = call(&app, "POST", "/api/commission", Some(body)).await;
     assert_eq!(
         (status, error["error"].as_str().unwrap()),
-        (StatusCode::BAD_REQUEST, "invalid_wifi")
+        (StatusCode::CONFLICT, "wifi_not_set")
     );
 }
 
