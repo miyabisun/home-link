@@ -476,7 +476,11 @@ class RegisterScreenTest {
                 hasLabel(it, "接続先が未設定です。home-linkのURLを設定してください")
             }
             capture(screen, "no-endpoints")
-            screen.onActivity { button(it, "照明オン").performClick() }
+            screen.onActivity { activity ->
+                button(activity, "ラベルを追加").performClick()
+                field(activity, "新しいラベルの名前").setText("room")
+                button(activity, "追加").performClick()
+            }
             eventually(screen) { hasLabel(it, "接続先が未設定です。アプリの「接続先の設定」でhome-linkのURLを入れてください") }
             screen.onActivity { button(it, "接続先を設定").performClick() }
             assertEquals(1, settings.hits)
@@ -522,50 +526,231 @@ class RegisterScreenTest {
         }
     }
 
-    @Test fun switchAllLightsAndShowTheResult() {
+    @Test fun labelsAreListedSwitchedAndAddedFromTheTop() {
+        api.labels += listOf(Label(1, "room", auto = true, on = true), Label(2, "work", override = Override(254, 5000)),
+            Label(3, "リビングと続きの和室（南側・大きな窓のある部屋）", on = false))
+        val opened = InstrumentationRegistry.getInstrumentation().addMonitor(LabelActivity::class.java.name, null, true)
         ActivityScenario.launch(MainActivity::class.java).use { screen ->
-            eventually(screen) { hasLabel(it, "まだ読み取っていません") }
+            // The labels lead the screen, each with its switch; the old light buttons are gone.
+            eventually(screen) { switch(it, "room 入") != null && switch(it, "work 切") != null }
             screen.onActivity { activity ->
-                // Offered until a widget is placed, when the launcher can pin one.
-                val manager = AppWidgetManager.getInstance(activity)
-                val placed = manager.getAppWidgetIds(ComponentName(activity, LightsWidget::class.java)).isNotEmpty()
-                assertEquals(manager.isRequestPinAppWidgetSupported && !placed,
-                    views(activity).any { it is Button && it.isShown && it.text == "ホーム画面にボタンを置く" })
+                assertTrue(hasLabel(activity, "ラベル"))
+                for (gone in listOf("照明オン", "照明オフ", "ホーム画面にボタンを置く")) assertFalse(gone, hasLabel(activity, gone))
+                assertTrue(button(activity, "リビングと続きの和室（南側・大きな窓のある部屋）").isShown)
             }
-            capture(screen, "lights")
+            capture(screen, "labels")
 
+            // Pressed once, the switch waits for home-link and then shows the label's state.
             val gate = CountDownLatch(1)
-            api.gate = gate
-            api.lights = ApiResult.Ok(LightsResult(11, 0, 0, emptyList()))
-            screen.onActivity { button(it, "照明オン").performClick() }
-            eventually(screen) { hasLabel(it, "照明をオンにしています…") }
-            screen.onActivity { activity ->
-                assertFalse(button(activity, "照明オン").isEnabled)
-                assertFalse(button(activity, "照明オフ").isEnabled)
-            }
-            capture(screen, "lights-busy")
+            api.labelGate = gate
+            screen.onActivity { switch(it, "work 切")!!.performClick() }
+            eventually(screen) { !switch(it, "work 切")!!.isEnabled }
+            capture(screen, "label-busy")
             gate.countDown()
-            eventually(screen) { hasLabel(it, "照明を11台オンにしました") }
-            screen.onActivity { assertTrue(button(it, "照明オフ").isEnabled) }
-            assertEquals(listOf(true), api.switches)
-            capture(screen, "lights-on")
+            api.labelGate = null
+            eventually(screen) { switch(it, "work 入")?.isEnabled == true }
+            screen.onActivity { switch(it, "room 入")!!.performClick() }
+            eventually(screen) { switch(it, "room 切") != null }
+            assertEquals(listOf(2L to LabelOp.TOGGLE, 1L to LabelOp.TOGGLE), api.labelSwitches.toList())
+            // Success says nothing more.
+            screen.onActivity { activity ->
+                assertFalse(views(activity).filterIsInstance<TextView>().any { it.isShown && "できませんでした" in it.text })
+            }
 
-            api.lights = ApiResult.Ok(LightsResult(8, 2, 1, listOf("キッチン側の天井灯（リビング・南の窓寄り）", "通路")))
-            screen.onActivity { button(it, "照明オフ").performClick() }
-            val partial = "照明を8台オフにしました。応答なし2台・失敗1台・見つからない2台（キッチン側の天井灯（リビング・南の窓寄り）、通路）"
+            // Devices left behind are counted, and the line survives recreation.
+            api.labelCounts = SwitchResult(1, 2, 0, listOf("通路"))
+            screen.onActivity { switch(it, "room 切")!!.performClick() }
+            val partial = "roomの一部の機器をオンにできませんでした。応答なし2台・見つからない1台（通路）"
             eventually(screen) { hasLabel(it, partial) }
-            assertEquals(listOf(true, false), api.switches)
-            capture(screen, "lights-partial")
+            capture(screen, "label-partial")
             screen.recreate()
             eventually(screen) { hasLabel(it, partial) }
+            api.labelCounts = null
 
-            api.lights = ApiResult.Failed(ApiError.UNREACHABLE)
-            screen.onActivity { button(it, "照明オン").performClick() }
-            eventually(screen) { hasLabel(it, "home-link（home-link.example:5011）に接続できません。接続先の設定と通信を確かめてください") }
-            capture(screen, "lights-unreachable")
+            // A label is added in place and its screen opens.
+            screen.onActivity { activity ->
+                button(activity, "ラベルを追加").performClick()
+                field(activity, "新しいラベルの名前").setText("room")
+            }
+            capture(screen, "add-label")
+            screen.onActivity { button(it, "追加").performClick() }
+            eventually(screen) { hasLabel(it, "同じ名前のラベルがあります") }
+            screen.onActivity { activity ->
+                field(activity, "新しいラベルの名前").setText("razor")
+                button(activity, "追加").performClick()
+            }
+            eventually(screen) { opened.hits == 1 && switch(it, "razor 切") != null }
+            screen.onActivity { button(it, "work").performClick() }
+            assertEquals(2, opened.hits)
+        }
+        InstrumentationRegistry.getInstrumentation().removeMonitor(opened)
+    }
+
+    @Test fun aLabelsScreenSendsEachChangeAsItIsMade() {
+        api.labels += listOf(Label(1, "room", auto = true), Label(2, "razor", schedule = listOf(ScheduleEntry(0, true))))
+        api.ledger += Device(1, "天井1", null, setOf(1), DeviceState.CONNECTED, qrs[0], kind = DeviceKind.LIGHT)
+        api.ledger += Device(2, "", null, emptySet(), DeviceState.CONNECTED, qrs[1], kind = DeviceKind.PLUG, productName = "Mini Plug")
+        api.ledger += Device(3, "温湿度計", null, emptySet(), DeviceState.CONNECTED, qrs[2], kind = DeviceKind.OTHER)
+        api.ledger += Device(4, "", null, emptySet(), DeviceState.UNCONNECTED, qr)
+        var times = mutableListOf<Int>()
+        LabelActivity.timePicker = { _, _, picked -> picked(times.removeAt(0)) }
+        try {
+            ActivityScenario.launch<LabelActivity>(LabelActivity.intent(context, 2)).use { screen ->
+                eventually(screen) { field(it, "名前").text.toString() == "razor" && hasLabel(it, "00:00") }
+                screen.onActivity { activity ->
+                    // Lights and plugs only, each unticked; nothing is sent by drawing.
+                    assertEquals(listOf("天井1", "Mini Plug"), checkBoxes(activity).map { it.text.toString() })
+                    assertTrue(checkBoxes(activity).none { it.isChecked })
+                    assertEquals("なし", spinner(activity, "調光").selectedItem)
+                    assertFalse(field(activity, "明るさ（%）").isShown)
+                }
+                assertTrue(api.labelUpdates.isEmpty() && api.updates.isEmpty())
+                capture(screen, "label")
+
+                screen.onActivity { activity ->
+                    field(activity, "名前").setText("ひげ剃り")
+                    field(activity, "名前").onEditorAction(EditorInfo.IME_ACTION_DONE)
+                    checkBox(activity, "Mini Plug").performClick()
+                }
+                eventually(screen) { api.ledger.first { it.id == 2L }.labelIds == setOf(2L) && api.labels[1].name == "ひげ剃り" }
+                screen.onActivity { activity ->
+                    field(activity, "名前").setText("room")
+                    field(activity, "名前").onEditorAction(EditorInfo.IME_ACTION_DONE)
+                }
+                eventually(screen) { hasLabel(it, "同じ名前のラベルがあります") }
+                screen.onActivity { activity ->
+                    field(activity, "名前").setText("ひげ剃り")
+                    field(activity, "名前").onEditorAction(EditorInfo.IME_ACTION_DONE)
+                }
+                eventually(screen) { !hasLabel(it, "同じ名前のラベルがあります") }
+
+                // The schedule: added at a picked time, switched off, moved, refused on a clash, removed.
+                times = mutableListOf(300)
+                screen.onActivity { button(it, "追加").performClick() }
+                eventually(screen) { hasLabel(it, "05:00") }
+                screen.onActivity { switch(it, "05:00 オン")!!.performClick() }
+                eventually(screen) { switch(it, "05:00 オフ") != null }
+                times = mutableListOf(0)
+                screen.onActivity { button(it, "05:00").performClick() }
+                eventually(screen) { hasLabel(it, "同じ時刻があります") }
+                times = mutableListOf(330)
+                screen.onActivity { button(it, "05:00").performClick() }
+                eventually(screen) { hasLabel(it, "05:30") && !hasLabel(it, "同じ時刻があります") }
+                capture(screen, "label-schedule")
+                screen.onActivity { activity -> views(activity).first { it.isShown && it.contentDescription == "00:00を削除" }.performClick() }
+                eventually(screen) { !hasLabel(it, "00:00") }
+                assertEquals(listOf(
+                    listOf(ScheduleEntry(0, true), ScheduleEntry(300, true)),
+                    listOf(ScheduleEntry(0, true), ScheduleEntry(300, false)),
+                    listOf(ScheduleEntry(0, true), ScheduleEntry(330, false)),
+                    listOf(ScheduleEntry(330, false)),
+                ), api.labelUpdates.map { it.second }.filterIsInstance<LabelUpdate.Schedule>().map { it.entries })
+
+                // Dimming: following the schedule, then held at the day's values, then at typed ones.
+                screen.onActivity { spinner(it, "調光").setSelection(1) }
+                eventually(screen) { api.labels[1].auto }
+                screen.onActivity { spinner(it, "調光").setSelection(2) }
+                eventually(screen) { api.labels[1].override == Override(203, 5000) }
+                screen.onActivity { activity ->
+                    assertEquals("80", field(activity, "明るさ（%）").text.toString())
+                    assertEquals("5000", field(activity, "色温度（K）").text.toString())
+                    field(activity, "明るさ（%）").setText("0")
+                    field(activity, "色温度（K）").setText("12000")
+                    field(activity, "色温度（K）").onEditorAction(EditorInfo.IME_ACTION_DONE)
+                }
+                eventually(screen) { hasLabel(it, "1〜100で入力してください") && hasLabel(it, "1000〜10000で入力してください") }
+                capture(screen, "label-fixed-invalid")
+                screen.onActivity { activity ->
+                    field(activity, "明るさ（%）").setText("100")
+                    field(activity, "色温度（K）").setText("5000")
+                    field(activity, "明るさ（%）").onEditorAction(EditorInfo.IME_ACTION_DONE)
+                }
+                eventually(screen) { api.labels[1].override == Override(254, 5000) && !hasLabel(it, "1〜100で入力してください") }
+                screen.onActivity { spinner(it, "調光").setSelection(0) }
+                eventually(screen) { api.labels[1].override == null }
+                assertEquals(listOf(LabelUpdate.Dimming(true, null), LabelUpdate.Dimming(false, Override(203, 5000)),
+                    LabelUpdate.Dimming(false, Override(254, 5000)), LabelUpdate.Dimming(false, null)),
+                    api.labelUpdates.map { it.second }.filterIsInstance<LabelUpdate.Dimming>())
+                screen.onActivity { spinner(it, "調光").setSelection(2) }
+                eventually(screen) { api.labels[1].override == Override(254, 5000) }
+                capture(screen, "label-fixed")
+
+                // A recreated screen shows the label as home-link has it.
+                screen.recreate()
+                eventually(screen) { field(it, "名前").text.toString() == "ひげ剃り" && hasLabel(it, "05:30") }
+                screen.onActivity { activity ->
+                    assertEquals("固定", spinner(activity, "調光").selectedItem)
+                    assertEquals("100", field(activity, "明るさ（%）").text.toString())
+                    assertTrue(checkBox(activity, "Mini Plug").isChecked)
+                }
+
+                screen.onActivity { button(it, "このラベルを削除").performClick() }
+                eventually(screen) { api.labelDeletes == listOf(2L) }
+            }
+        } finally {
+            LabelActivity.timePicker = null
         }
     }
 
+    @Test fun aLabelsScreenThatCannotReadHomeLinkOffersReconnect() {
+        api.labels += Label(1, "room")
+        api.labelsFailure = ApiError.UNREACHABLE
+        ActivityScenario.launch<LabelActivity>(LabelActivity.intent(context, 1)).use { screen ->
+            eventually(screen) { hasLabel(it, "home-link（home-link.example:5011）に接続できません。接続先の設定と通信を確かめてください") }
+            capture(screen, "label-unreachable")
+            api.labelsFailure = null
+            screen.onActivity { button(it, "再接続").performClick() }
+            eventually(screen) { field(it, "名前").text.toString() == "room" && !hasLabel(it, "再接続") }
+        }
+    }
+
+    @Test fun aWidgetIsSetUpWithItsLabelAndNameAndAgainLater() {
+        api.labels += listOf(Label(1, "room"), Label(2, "game", override = Override(203, 5000)))
+        shell("appwidget grantbind --package ${context.packageName} --user 0")
+        val host = android.appwidget.AppWidgetHost(context, 7)
+        val widget = host.allocateAppWidgetId()
+        try {
+            assertTrue(AppWidgetManager.getInstance(context).bindAppWidgetIdIfAllowed(widget,
+                ComponentName(context, LabelToggleWidget::class.java)))
+            val setup = android.content.Intent(context, WidgetConfigActivity::class.java)
+                .putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, widget)
+            ActivityScenario.launchActivityForResult<WidgetConfigActivity>(setup).use { screen ->
+                // Named after the first label until another is picked or a name typed.
+                eventually(screen) { field(it, "名前").text.toString() == "room" }
+                capture(screen, "widget-setup")
+                screen.onActivity { spinner(it, "ラベル").setSelection(1) }
+                eventually(screen) { field(it, "名前").text.toString() == "game" }
+                screen.onActivity { activity ->
+                    field(activity, "名前").setText("ゲーム")
+                    button(activity, "保存").performClick()
+                }
+                assertEquals(Activity.RESULT_OK, screen.result.resultCode)
+            }
+            assertEquals(WidgetConfig(2, "ゲーム"), LabelWidget.config(context, widget))
+            // Set up again from the widget, it shows what was chosen.
+            ActivityScenario.launchActivityForResult<WidgetConfigActivity>(setup).use { screen ->
+                eventually(screen) { spinner(it, "ラベル").selectedItem == "game" && field(it, "名前").text.toString() == "ゲーム" }
+                screen.onActivity { activity ->
+                    field(activity, "名前").setText("")
+                    button(activity, "保存").performClick()
+                }
+            }
+            assertEquals(WidgetConfig(2, "game"), LabelWidget.config(context, widget))
+
+            // Without labels nothing can be saved; another app's widget is never set up here.
+            api.labels.clear()
+            ActivityScenario.launchActivityForResult<WidgetConfigActivity>(setup).use { screen ->
+                eventually(screen) { hasLabel(it, "ラベルがありません") }
+                screen.onActivity { assertFalse(button(it, "保存").isEnabled) }
+                capture(screen, "widget-no-labels")
+            }
+            ActivityScenario.launchActivityForResult<WidgetConfigActivity>(
+                android.content.Intent(context, WidgetConfigActivity::class.java).putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, widget + 1000),
+            ).use { screen -> assertEquals(Activity.RESULT_CANCELED, screen.result.resultCode) }
+        } finally {
+            host.deleteAppWidgetId(widget)
+        }
+    }
 
     @Test fun theWifiForDevicesIsSavedChosenAndDeletedInTheSettings() {
         val home = SavedNetwork(1, "home-2g", forDevices = false)
@@ -961,6 +1146,7 @@ class RegisterScreenTest {
         val list = (heading.parent as ViewGroup).getChildAt(1) as ViewGroup
         return (0 until list.childCount).map { (list.getChildAt(it) as Button).text.toString() }
     }
+    private fun checkBoxes(activity: Activity) = views(activity).filterIsInstance<android.widget.CheckBox>().filter { it.isShown }
     private fun checkBox(activity: Activity, text: String) =
         views(activity).filterIsInstance<android.widget.CheckBox>().first { it.isShown && it.text.toString() == text }
 }
@@ -968,9 +1154,7 @@ class RegisterScreenTest {
 private class FakeApi : HomeLinkApi {
     val rooms: MutableList<Room> = Collections.synchronizedList(mutableListOf())
     @Volatile var roomsFailure: ApiError? = null
-    @Volatile var lights: ApiResult<LightsResult> = ApiResult.Ok(LightsResult(0, 0, 0, emptyList()))
     @Volatile var gate: CountDownLatch? = null
-    val switches: MutableList<Boolean> = Collections.synchronizedList(mutableListOf())
 
     override fun rooms(): ApiResult<List<Room>> =
         roomsFailure?.let { ApiResult.Failed(it) } ?: ApiResult.Ok(rooms.toList())
@@ -980,14 +1164,6 @@ private class FakeApi : HomeLinkApi {
         return Room(rooms.size + 1L, name).also { rooms += it }.let { ApiResult.Ok(it) }
     }
 
-    override fun switchLights(on: Boolean): ApiResult<LightsResult> {
-        gate?.await()
-        switches += on
-        return lights
-    }
-
-    override fun toggleBoost(label: String): ApiResult<BoostResult> = ApiResult.Failed(ApiError.SERVER)
-    override fun boostedLabels(): ApiResult<Set<String>> = ApiResult.Failed(ApiError.SERVER)
     override fun door(command: DoorCommand): ApiResult<Unit> = ApiResult.Failed(ApiError.SERVER)
 
     /** home-link's ledger, codes included, kept the way home-link keeps it. */
@@ -1025,7 +1201,58 @@ private class FakeApi : HomeLinkApi {
         ApiResult.Ok(ledger[index].copy(code = null))
     }
 
-    override fun labels(): ApiResult<List<Label>> = ApiResult.Ok(labels.toList())
+    override fun labels(): ApiResult<List<Label>> = labelsFailure?.let { ApiResult.Failed(it) } ?: ApiResult.Ok(labels.toList())
+
+    @Volatile var labelsFailure: ApiError? = null
+    val labelUpdates: MutableList<Pair<Long, LabelUpdate>> = Collections.synchronizedList(mutableListOf())
+    val labelDeletes: MutableList<Long> = Collections.synchronizedList(mutableListOf())
+    val labelSwitches: MutableList<Pair<Long, LabelOp>> = Collections.synchronizedList(mutableListOf())
+    @Volatile var labelGate: CountDownLatch? = null
+    /** What a label switch reports; null switches every device. */
+    @Volatile var labelCounts: SwitchResult? = null
+
+    override fun createLabel(name: String): ApiResult<Label> = synchronized(labels) {
+        if (labels.any { it.name == name }) return ApiResult.Failed(ApiError.DUPLICATE_LABEL)
+        Label((labels.maxOfOrNull { it.id } ?: 0) + 1, name).also { labels += it }.let { ApiResult.Ok(it) }
+    }
+
+    override fun updateLabel(id: Long, update: LabelUpdate): ApiResult<Label> = synchronized(labels) {
+        labelUpdates += id to update
+        val index = labels.indexOfFirst { it.id == id }
+        if (index < 0) return ApiResult.Failed(ApiError.LABEL_NOT_FOUND)
+        val label = labels[index]
+        labels[index] = when (update) {
+            is LabelUpdate.Name -> if (labels.any { it.id != id && it.name == update.name }) return ApiResult.Failed(ApiError.DUPLICATE_LABEL)
+                else label.copy(name = update.name)
+            is LabelUpdate.Dimming -> label.copy(auto = update.auto, override = update.override)
+            is LabelUpdate.Schedule -> label.copy(schedule = update.entries.sortedBy { it.minute })
+        }
+        ApiResult.Ok(labels[index])
+    }
+
+    override fun deleteLabel(id: Long): ApiResult<Unit> = synchronized(labels) {
+        labelDeletes += id
+        labels.removeAll { it.id == id }
+        ApiResult.Ok(Unit)
+    }
+
+    override fun switchLabel(id: Long, op: LabelOp): ApiResult<LabelResult> {
+        labelGate?.await()
+        labelSwitches += id to op
+        return synchronized(labels) {
+            val index = labels.indexOfFirst { it.id == id }
+            if (index < 0) return ApiResult.Failed(ApiError.LABEL_NOT_FOUND)
+            val label = labels[index]
+            val on = when (op) {
+                LabelOp.ON -> true
+                LabelOp.OFF -> false
+                LabelOp.TOGGLE -> label.on != true
+            }
+            val action = if (on) "on" else if (label.override != null) "release" else "off"
+            labels[index] = label.copy(on = on)
+            ApiResult.Ok(LabelResult(action, on, labelCounts ?: SwitchResult(3, 0, 0, emptyList())))
+        }
+    }
 
     val commissionings: MutableList<Long> = Collections.synchronizedList(mutableListOf())
     @Volatile var failure: ApiError? = null

@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.res.ColorStateList
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.LayerDrawable
 import android.graphics.drawable.RippleDrawable
 import android.graphics.drawable.StateListDrawable
 import android.text.Editable
@@ -13,11 +14,14 @@ import android.text.TextWatcher
 import android.view.Gravity
 import android.view.View
 import android.view.WindowInsets
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.Spinner
 import android.widget.TextView
 
 // The screens' shared parts, built from Android's standard views with the product's tokens.
@@ -166,3 +170,49 @@ internal fun Activity.button(parent: LinearLayout, value: String, primary: Boole
 }
 
 internal fun Activity.dp(value: Int) = (value * resources.displayMetrics.density).toInt()
+
+/** A select box: the input surface with an expand arrow, so it reads apart from buttons. */
+internal fun Activity.select(parent: LinearLayout, items: ArrayAdapter<String>, description: String,
+                             selected: (Int) -> Unit): Spinner = Spinner(this).apply {
+    adapter = items
+    contentDescription = description
+    minimumHeight = dp(48)
+    background = LayerDrawable(arrayOf(surface(R.color.background), getDrawable(R.drawable.ic_expand))).apply {
+        setLayerGravity(1, Gravity.END or Gravity.CENTER_VERTICAL)
+        setLayerInsetEnd(1, dp(12))
+    }
+    setPaddingRelative(0, 0, dp(40), 0)
+    onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+        override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) = selected(position)
+        override fun onNothingSelected(parent: AdapterView<*>?) {}
+    }
+    parent.addView(this, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+}
+
+/** Puts [names] in the adapter only when they changed, so an open drop-down is not reset. */
+internal fun fill(adapter: ArrayAdapter<String>, names: List<String>) {
+    if (adapter.count != names.size || (0 until adapter.count).any { adapter.getItem(it) != names[it] }) {
+        adapter.clear()
+        adapter.addAll(names)
+    }
+}
+
+/**
+ * Draws a switch: on in the accent surface, off in the usual one, unanswered (`failed`) with the failure icon;
+ * [icon] leads the words unless it is 0.
+ */
+internal fun Activity.paintSwitch(button: Button, text: String, on: Boolean, failed: Boolean = false, icon: Int = R.drawable.ic_power) {
+    button.text = text
+    button.background = RippleDrawable(ColorStateList.valueOf(getColor(R.color.border)),
+        if (on) surface(R.color.accent).apply { setStroke(0, 0) } else surface(R.color.surface), null)
+    val color = getColor(when {
+        !button.isEnabled -> R.color.muted
+        on -> R.color.on_accent
+        failed -> R.color.danger
+        else -> R.color.text
+    })
+    button.setTextColor(color)
+    button.setCompoundDrawablesRelativeWithIntrinsicBounds(if (failed) R.drawable.ic_error else icon, 0, 0, 0)
+    button.compoundDrawablePadding = dp(8)
+    button.compoundDrawableTintList = if (failed) null else ColorStateList.valueOf(color)
+}

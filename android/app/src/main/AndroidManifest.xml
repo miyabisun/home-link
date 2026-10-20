@@ -27,13 +27,46 @@
         </activity>
         <activity android:name=".SettingsActivity" android:exported="false"
             android:windowSoftInputMode="adjustResize" />
-        <receiver android:name=".LightsWidget" android:exported="false"
-            android:label="@string/widget_name">
+        <activity android:name=".LabelActivity" android:exported="false"
+            android:windowSoftInputMode="adjustResize" />
+        <!-- The launcher opens it when a label widget is placed or set up again. -->
+        <activity android:name=".WidgetConfigActivity" android:exported="true"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_CONFIGURE" />
+            </intent-filter>
+        </activity>
+        <receiver android:name=".LabelSwitchWidget" android:exported="false"
+            android:label="@string/label_switch_widget_name">
             <intent-filter>
                 <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
             </intent-filter>
             <meta-data android:name="android.appwidget.provider"
-                android:resource="@xml/lights_widget_info" />
+                android:resource="@xml/label_switch_widget_info" />
+        </receiver>
+        <receiver android:name=".LabelOnWidget" android:exported="false"
+            android:label="@string/label_on">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data android:name="android.appwidget.provider"
+                android:resource="@xml/label_on_widget_info" />
+        </receiver>
+        <receiver android:name=".LabelOffWidget" android:exported="false"
+            android:label="@string/label_off">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data android:name="android.appwidget.provider"
+                android:resource="@xml/label_off_widget_info" />
+        </receiver>
+        <receiver android:name=".LabelToggleWidget" android:exported="false"
+            android:label="@string/label_toggle">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data android:name="android.appwidget.provider"
+                android:resource="@xml/label_toggle_widget_info" />
         </receiver>
         <receiver android:name=".DoorWidget" android:exported="false"
             android:label="@string/door_widget_name">

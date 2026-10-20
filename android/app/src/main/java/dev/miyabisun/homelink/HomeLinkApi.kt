@@ -16,7 +16,8 @@ data class Room(val id: Long, val name: String)
 enum class ApiError { NOT_CONFIGURED, UNREACHABLE, TIMEOUT, ROOM_NOT_FOUND, DUPLICATE_ROOM, INVALID_QR, INVALID_MANUAL, INVALID_NAME,
     MATTER_UNREACHABLE, MATTER_NOT_CONFIGURED, SERVER,
     DEVICE_NOT_FOUND, WRONG_CODE, WIFI_FAILED, COMMISSION_TIMEOUT, COMMISSION_FAILED, BLUETOOTH_UNAVAILABLE, INVALID_WIFI,
-    THREAD_FAILED, WIFI_NOT_SET, WIFI_NOT_FOUND, LABEL_NOT_FOUND, LABEL_HAS_NO_LIGHTS, WIFI_REVERTED, WIFI_REVERTING, NOT_ON_WIFI,
+    THREAD_FAILED, WIFI_NOT_SET, WIFI_NOT_FOUND, LABEL_NOT_FOUND, LABEL_HAS_NO_DEVICES, DUPLICATE_LABEL, INVALID_LABEL,
+    WIFI_REVERTED, WIFI_REVERTING, NOT_ON_WIFI,
     SESAME_NOT_CONFIGURED, SESAME_REJECTED, SESAME_UNREACHABLE, SWITCH_FAILED }
 
 /** A Wi-Fi network to save on home-link for new devices. */
@@ -51,7 +52,8 @@ data class Device(val id: Long, val name: String, val roomId: Long?, val labelId
                   val code: String?, val wifiSsid: String? = null, val kind: DeviceKind? = null, val on: Boolean? = null,
                   val productName: String? = null)
 
-data class Label(val id: Long, val name: String)
+/** How a device reads in lists: its name, else its product, else its printed code. */
+val Device.title: String get() = name.ifEmpty { productName ?: code?.let { ManualCode.label(it) ?: it } ?: "機器" }
 
 /** One field of a device to change. */
 sealed interface DeviceUpdate {
@@ -70,18 +72,17 @@ sealed interface ApiResult<out T> {
 interface HomeLinkApi {
     fun rooms(): ApiResult<List<Room>>
     fun createRoom(name: String): ApiResult<Room>
-    /** Switches every light matterjs-server serves on or off. */
-    fun switchLights(on: Boolean): ApiResult<LightsResult>
-    /** Boosts the lights of the label named `label` to the day's values, or releases them if boosted. */
-    fun toggleBoost(label: String): ApiResult<BoostResult>
-    /** The names of the labels whose lights are boosted now. */
-    fun boostedLabels(): ApiResult<Set<String>>
     fun devices(): ApiResult<List<Device>>
     fun device(id: Long): ApiResult<Device>
     /** Enters the device behind `payload` (a QR payload, `MT:`, or a manual code's digits), or returns the one entered. */
     fun addDevice(payload: String): ApiResult<Device>
     fun updateDevice(id: Long, update: DeviceUpdate): ApiResult<Device>
     fun labels(): ApiResult<List<Label>>
+    fun createLabel(name: String): ApiResult<Label>
+    fun updateLabel(id: Long, update: LabelUpdate): ApiResult<Label>
+    fun deleteLabel(id: Long): ApiResult<Unit>
+    /** Switches label `id`'s lights and plugs on or off, or toggles them. */
+    fun switchLabel(id: Long, op: LabelOp): ApiResult<LabelResult>
     /**
      * Has matterjs-server commission ledger device `id` by its code over the BLE proxy this phone holds open;
      * home-link hands over its Wi-Fi for devices, and matterjs-server picks Wi-Fi or Thread. Takes up to minutes.
@@ -140,9 +141,49 @@ class HttpHomeLinkApi(private val baseUrl: () -> String?) : HomeLinkApi {
         return call("PATCH", "/api/devices/$id", body) { device(JSONObject(it)) }
     }
 
-    override fun labels(): ApiResult<List<Label>> = call("GET", "/api/labels", null) { body ->
+    // A short wait: a widget reads this within the time a broadcast receiver may run.
+    override fun labels(): ApiResult<List<Label>> = call("GET", "/api/labels", null, readTimeout = 3_000) { body ->
         val array = JSONArray(body)
-        (0 until array.length()).map { array.getJSONObject(it).let { label -> Label(label.getLong("id"), label.getString("name")) } }
+        (0 until array.length()).map { label(array.getJSONObject(it)) }
+    }
+
+    override fun createLabel(name: String): ApiResult<Label> =
+        call("POST", "/api/labels", JSONObject().put("name", name)) { label(JSONObject(it)) }
+
+    override fun updateLabel(id: Long, update: LabelUpdate): ApiResult<Label> {
+        val body = when (update) {
+            is LabelUpdate.Name -> JSONObject().put("name", update.name)
+            is LabelUpdate.Dimming -> JSONObject().put("auto", update.auto)
+                .put("override_level", update.override?.level ?: JSONObject.NULL)
+                .put("override_kelvin", update.override?.kelvin ?: JSONObject.NULL)
+            is LabelUpdate.Schedule -> JSONObject().put("schedule", JSONArray(update.entries.sortedBy { it.minute }.map {
+                JSONObject().put("time", clock(it.minute)).put("on", it.on)
+            }))
+        }
+        return call("PATCH", "/api/labels/$id", body) { label(JSONObject(it)) }
+    }
+
+    override fun deleteLabel(id: Long): ApiResult<Unit> = call("DELETE", "/api/labels/$id", null) { }
+
+    override fun switchLabel(id: Long, op: LabelOp): ApiResult<LabelResult> =
+        call("POST", "/api/labels/$id/${op.path}", null) { body ->
+            val json = JSONObject(body)
+            LabelResult(json.getString("action"), if (json.isNull("on")) null else json.getBoolean("on"), counts(json))
+        }
+
+    private fun label(json: JSONObject): Label {
+        val schedule = json.optJSONArray("schedule") ?: JSONArray()
+        val level = json.optInt("override_level").takeUnless { json.isNull("override_level") }
+        val kelvin = json.optInt("override_kelvin").takeUnless { json.isNull("override_kelvin") }
+        return Label(
+            json.getLong("id"), json.getString("name"), json.optBoolean("auto"),
+            if (level != null && kelvin != null) Override(level, kelvin) else null,
+            if (json.isNull("on")) null else json.optBoolean("on"),
+            (0 until schedule.length()).mapNotNull { index ->
+                val entry = schedule.getJSONObject(index)
+                minuteOf(entry.getString("time"))?.let { ScheduleEntry(it, entry.getBoolean("on")) }
+            },
+        )
     }
 
     // matterjs-server may take minutes: Bluetooth discovery, PASE, the network join and CASE.
@@ -198,25 +239,9 @@ class HttpHomeLinkApi(private val baseUrl: () -> String?) : HomeLinkApi {
     override fun door(command: DoorCommand): ApiResult<Unit> =
         call("POST", "/api/door/${command.path}", null, connectTimeout = 15_000, timedOut = ApiError.TIMEOUT) { }
 
-    override fun switchLights(on: Boolean): ApiResult<LightsResult> =
-        call("POST", if (on) "/api/lights/on" else "/api/lights/off", null) { lights(JSONObject(it)) }
-
-    override fun toggleBoost(label: String): ApiResult<BoostResult> =
-        call("POST", "/api/lights/boost", JSONObject().put("label", label)) { body ->
-            val json = JSONObject(body)
-            BoostResult(json.getString("action") == "boost", lights(json))
-        }
-
-    // A short wait: the widget reads this within the time a broadcast receiver may run.
-    override fun boostedLabels(): ApiResult<Set<String>> = call("GET", "/api/lights/schedule", null, readTimeout = 3_000) { body ->
-        val labels = JSONObject(body).getJSONArray("labels")
-        (0 until labels.length()).map { labels.getJSONObject(it) }.filter { it.getBoolean("boosted") }
-            .map { it.getString("name") }.toSet()
-    }
-
-    private fun lights(json: JSONObject): LightsResult {
+    private fun counts(json: JSONObject): SwitchResult {
         val missing = json.getJSONArray("missing_devices")
-        return LightsResult(
+        return SwitchResult(
             json.getInt("switched"), json.getInt("no_response"), json.getInt("failed"),
             (0 until missing.length()).map { index ->
                 val device = missing.getJSONObject(index)
@@ -239,7 +264,7 @@ class HttpHomeLinkApi(private val baseUrl: () -> String?) : HomeLinkApi {
             return ApiResult.Failed(ApiError.UNREACHABLE)
         }
         val client = CLIENT.newBuilder().connectTimeout(connectTimeout.toLong(), TimeUnit.MILLISECONDS)
-            // Switching lights waits up to 10 s for every light's answer.
+            // Switching a label waits up to 10 s for every device's answer.
             .readTimeout(readTimeout.toLong(), TimeUnit.MILLISECONDS).build()
         return try {
             client.newCall(request).execute().use { response ->
@@ -262,7 +287,7 @@ class HttpHomeLinkApi(private val baseUrl: () -> String?) : HomeLinkApi {
             "duplicate_room_name" -> ApiError.DUPLICATE_ROOM
             "invalid_qr_payload" -> ApiError.INVALID_QR
             "invalid_manual_code" -> ApiError.INVALID_MANUAL
-            "invalid_room_name", "invalid_device_name" -> ApiError.INVALID_NAME
+            "invalid_room_name", "invalid_device_name", "invalid_label_name" -> ApiError.INVALID_NAME
             "matter_server_unreachable" -> ApiError.MATTER_UNREACHABLE
             "matter_server_not_configured" -> ApiError.MATTER_NOT_CONFIGURED
             "device_not_found" -> ApiError.DEVICE_NOT_FOUND
@@ -276,7 +301,9 @@ class HttpHomeLinkApi(private val baseUrl: () -> String?) : HomeLinkApi {
             "wifi_not_set" -> ApiError.WIFI_NOT_SET
             "wifi_not_found" -> ApiError.WIFI_NOT_FOUND
             "label_not_found" -> ApiError.LABEL_NOT_FOUND
-            "label_has_no_lights" -> ApiError.LABEL_HAS_NO_LIGHTS
+            "label_has_no_devices" -> ApiError.LABEL_HAS_NO_DEVICES
+            "duplicate_label_name" -> ApiError.DUPLICATE_LABEL
+            "invalid_label" -> ApiError.INVALID_LABEL
             "sesame_not_configured" -> ApiError.SESAME_NOT_CONFIGURED
             "sesame_rejected" -> ApiError.SESAME_REJECTED
             "sesame_unreachable" -> ApiError.SESAME_UNREACHABLE

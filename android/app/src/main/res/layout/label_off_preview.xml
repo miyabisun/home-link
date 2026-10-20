@@ -1,0 +1,6 @@
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@android:id/background" style="@style/WidgetFrame">
+    <FrameLayout style="@style/WidgetButton" android:layout_width="match_parent">
+        <TextView style="@style/WidgetButtonText" android:text="@string/label_off" android:drawableTop="@drawable/ic_light_off" />
+    </FrameLayout>
+</FrameLayout>

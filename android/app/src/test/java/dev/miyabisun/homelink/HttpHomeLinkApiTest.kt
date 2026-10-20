@@ -95,10 +95,73 @@ class HttpHomeLinkApiTest {
         }
     }
 
-    @Test fun listsTheLabels() {
-        respond("/api/labels", 200, """[{"id":1,"name":"作業","night_level":null,"device_count":2,"dedicated":false,
-            "boosted":false},{"id":3,"name":"夜","device_count":0,"dedicated":true,"boosted":true}]""")
-        assertEquals(ApiResult.Ok(listOf(Label(1, "作業"), Label(3, "夜"))), api.labels())
+    @Test fun listsTheLabelsWithTheirTraitsAndSchedules() {
+        respond("/api/labels", 200, """[{"id":1,"name":"room","auto":true,"override_level":null,"override_kelvin":null,"on":null,
+            "schedule":[],"device_count":12,"boosted":false},{"id":3,"name":"razor","auto":false,"override_level":null,
+            "override_kelvin":null,"on":false,"schedule":[{"time":"00:00","on":true},{"time":"05:00","on":false}],"device_count":1,
+            "boosted":false},{"id":4,"name":"work","auto":false,"override_level":254,"override_kelvin":5000,"on":true,"schedule":[],
+            "device_count":1,"boosted":true}]""")
+        assertEquals(ApiResult.Ok(listOf(
+            Label(1, "room", auto = true),
+            Label(3, "razor", on = false, schedule = listOf(ScheduleEntry(0, true), ScheduleEntry(300, false))),
+            Label(4, "work", override = Override(254, 5000), on = true),
+        )), api.labels())
+    }
+
+    @Test fun createsChangesAndDeletesALabel() {
+        val work = """{"id":4,"name":"work","auto":false,"override_level":254,"override_kelvin":5000,"on":null,"schedule":[],
+            "device_count":0,"boosted":false}"""
+        respond("/api/labels", 201, work)
+        assertEquals(ApiResult.Ok(Label(4, "work", override = Override(254, 5000))), api.createLabel("work"))
+        assertEquals("""POST /api/labels {"name":"work"}""", requests.removeAt(0))
+        respond("/api/labels/4", 200, work)
+        api.updateLabel(4, LabelUpdate.Name("仕事"))
+        api.updateLabel(4, LabelUpdate.Dimming(auto = false, override = Override(254, 5000)))
+        api.updateLabel(4, LabelUpdate.Dimming(auto = true, override = null))
+        api.updateLabel(4, LabelUpdate.Schedule(listOf(ScheduleEntry(1320, false), ScheduleEntry(0, true))))
+        val sent = listOf(
+            """{"name":"仕事"}""",
+            """{"auto":false,"override_level":254,"override_kelvin":5000}""",
+            """{"auto":true,"override_level":null,"override_kelvin":null}""",
+            """{"schedule":[{"time":"00:00","on":true},{"time":"22:00","on":false}]}""",
+        )
+        assertEquals(4, requests.size)
+        for ((request, body) in requests.zip(sent)) {
+            assertEquals("PATCH /api/labels/4", request.substringBefore(" {"))
+            // JSONObject keeps no key order, so the bodies compare field by field.
+            assertEquals(request, fields(body), fields(request.substringAfter("/api/labels/4 ")))
+        }
+        requests.clear()
+        respond("/api/labels/9", 404, """{"error":"label_not_found"}""")
+        assertEquals(ApiResult.Failed(ApiError.LABEL_NOT_FOUND), api.deleteLabel(9))
+        assertEquals("DELETE /api/labels/9", requests.single())
+    }
+
+    private fun fields(json: String) = JSONObject(json).let { obj -> obj.keys().asSequence().associateWith { obj.get(it).toString() } }
+
+    @Test fun mapsLabelEditFailures() {
+        val cases = listOf(
+            Triple(409, "duplicate_label_name", ApiError.DUPLICATE_LABEL),
+            Triple(400, "invalid_label_name", ApiError.INVALID_NAME),
+            Triple(400, "invalid_label", ApiError.INVALID_LABEL),
+        )
+        for ((status, code, expected) in cases) {
+            respond("/api/labels", status, """{"error":"$code"}""")
+            assertEquals("$status $code", ApiResult.Failed(expected), api.createLabel("room"))
+        }
+    }
+
+    @Test fun switchesALabelAndCountsEachResult() {
+        respond("/api/labels/2/toggle", 200, """{"label":"game","action":"release","on":false,"boosted":false,"switched":2,
+            "no_response":1,"failed":0,"missing":1,"devices":[],"missing_devices":[{"id":3,"name":"","room_name":"寝室"}]}""")
+        assertEquals(ApiResult.Ok(LabelResult("release", false, SwitchResult(2, 1, 0, listOf("寝室の機器")))),
+            api.switchLabel(2, LabelOp.TOGGLE))
+        respond("/api/labels/2/on", 200, """{"label":"game","action":"on","on":true,"boosted":true,"switched":3,"no_response":0,
+            "failed":0,"missing":0,"devices":[],"missing_devices":[]}""")
+        assertEquals(ApiResult.Ok(LabelResult("on", true, SwitchResult(3, 0, 0, emptyList()))), api.switchLabel(2, LabelOp.ON))
+        respond("/api/labels/2/off", 422, """{"error":"label_has_no_devices"}""")
+        assertEquals(ApiResult.Failed(ApiError.LABEL_HAS_NO_DEVICES), api.switchLabel(2, LabelOp.OFF))
+        assertEquals(listOf("POST /api/labels/2/toggle", "POST /api/labels/2/on", "POST /api/labels/2/off"), requests)
     }
 
     @Test fun connectsALedgerRowWithoutABody() {
@@ -193,63 +256,11 @@ class HttpHomeLinkApiTest {
         }
     }
 
-    @Test fun switchesLightsAndCountsEachResult() {
-        respond("/api/lights/on", 200, """{"action":"on","switched":7,"no_response":2,"failed":1,"missing":2,
-            "lights":[],"missing_devices":[{"id":3,"name":"台所","room_name":"居間"},{"id":4,"name":"","room_name":"寝室"}]}""")
-        assertEquals(ApiResult.Ok(LightsResult(7, 2, 1, listOf("台所", "寝室の機器"))), api.switchLights(true))
-        assertEquals("POST /api/lights/on", requests.single())
-        respond("/api/lights/off", 200, """{"action":"off","switched":3,"no_response":0,"failed":0,"missing":0,"lights":[],"missing_devices":[]}""")
-        assertEquals(ApiResult.Ok(LightsResult(3, 0, 0, emptyList())), api.switchLights(false))
-    }
-
-    @Test fun mapsLightFailures() {
-        val cases = listOf(
-            Triple(502, "matter_server_unreachable", ApiError.MATTER_UNREACHABLE),
-            Triple(503, "matter_server_not_configured", ApiError.MATTER_NOT_CONFIGURED),
-            Triple(500, "internal", ApiError.SERVER),
-        )
-        for ((status, code, expected) in cases) {
-            respond("/api/lights/off", status, """{"error":"$code"}""")
-            assertEquals("$status $code", ApiResult.Failed(expected), api.switchLights(false))
-        }
-    }
-
-    @Test fun togglesALabelsBoostAndCountsEachResult() {
-        respond("/api/lights/boost", 200, """{"label":"作業","action":"boost","boosted":true,"switched":2,"no_response":1,
-            "failed":0,"missing":1,"lights":[],"missing_devices":[{"id":3,"name":"デスク","room_name":"寝室"}]}""")
-        assertEquals(ApiResult.Ok(BoostResult(boost = true, LightsResult(2, 1, 0, listOf("デスク")))), api.toggleBoost("作業"))
-        assertEquals("作業", JSONObject(requests.single().substringAfter("/api/lights/boost ")).getString("label"))
-        respond("/api/lights/boost", 200, """{"label":"作業","action":"release","boosted":false,"switched":2,"no_response":0,
-            "failed":0,"missing":0,"lights":[],"missing_devices":[]}""")
-        assertEquals(ApiResult.Ok(BoostResult(boost = false, LightsResult(2, 0, 0, emptyList()))), api.toggleBoost("作業"))
-    }
-
-    @Test fun readsWhichLabelsAreBoosted() {
-        respond("/api/lights/schedule", 200, """{"settings":{},"intent":null,"runs":[],"labels":[
-            {"id":1,"name":"仕事用デスク","boosted":false,"devices":[]},{"id":2,"name":"作業","boosted":true,"devices":[]}]}""")
-        assertEquals(ApiResult.Ok(setOf("作業")), api.boostedLabels())
-        assertEquals("GET /api/lights/schedule", requests.single())
-        respond("/api/lights/schedule", 500, """{"error":"internal"}""")
-        assertEquals(ApiResult.Failed(ApiError.SERVER), api.boostedLabels())
-    }
-
-    @Test fun mapsBoostFailures() {
-        val cases = listOf(
-            Triple(404, "label_not_found", ApiError.LABEL_NOT_FOUND),
-            Triple(422, "label_has_no_lights", ApiError.LABEL_HAS_NO_LIGHTS),
-            Triple(502, "matter_server_unreachable", ApiError.MATTER_UNREACHABLE),
-        )
-        for ((status, code, expected) in cases) {
-            respond("/api/lights/boost", status, """{"error":"$code"}""")
-            assertEquals("$status $code", ApiResult.Failed(expected), api.toggleBoost("仕事用デスク"))
-        }
-    }
-
     @Test fun reportsAnUnreachableServer() {
         val port = ServerSocket(0).use { it.localPort }
         val offline = HttpHomeLinkApi("http://127.0.0.1:$port")
         assertEquals(ApiResult.Failed(ApiError.UNREACHABLE), offline.rooms())
-        assertEquals(ApiResult.Failed(ApiError.UNREACHABLE), offline.switchLights(true))
+        assertEquals(ApiResult.Failed(ApiError.UNREACHABLE), offline.switchLabel(1, LabelOp.ON))
         assertEquals(ApiResult.Failed(ApiError.UNREACHABLE), offline.commission(1))
     }
 

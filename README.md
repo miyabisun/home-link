@@ -109,25 +109,50 @@ adb -s DEVICE_SERIAL push home-link.yaml /sdcard/Android/data/dev.miyabisun.home
 アプリは要求を送るたびにこのファイルを読むので、書き換えた後に再起動は要りません。
 アプリを入れ直すとファイルも消えます。
 
-### 照明を全部オン・全部オフにする
+### labelを入り切りする
 
-アプリの上部にある「照明オン」「照明オフ」を押すと、matterjs-serverに登録された照明を全部切り替えます。
-結果は切り替えた台数と、応答のなかった照明・失敗した照明・台帳にあるのに見つからない機器の台数で示します。
-1台でも切り替えられなかった照明があれば、失敗の色で表示します。
-無視の対象にした照明（下の「二度と応答しない照明を無視する」）は、切り替えず、台数にも数えません。
-上書きの値を持つlabelだけが付いた照明（仕事用のデスクライトなど）は、照明オンでは点けず、台数にも数えません。照明オフでは消します。
+アプリの最初の「ラベル」に、labelが並びます（labelについては下の「label」）。
+横のボタンは今の状態（「入」「切」）を示し、押すとlabelを切り替えます（`POST /api/labels/{id}/toggle`）。
+上書きの値を持つlabelは、入れるとその値で点け、切るとほかのlabelで決まる状態へ戻します。
+すべての機器を切り替えられたときは、ボタンの状態だけが変わります。応答のなかった機器・失敗した機器・台帳にあるのに見つからない機器があれば、その台数を失敗の色で示します。
 
-「ホーム画面にボタンを置く」を押すと、同じ2つのボタンに「仕事」「作業」を加えた4つのボタンのウィジェットをホーム画面へ置けます。
-「仕事」はlabel「仕事用デスク」、「作業」はlabel「作業」を切り替えます（`POST /api/lights/boost`）。
-上書きの値を持つlabelなら、その値で点け、もう一度押すと上書きをやめます（下の「label」）。labelはAPIかMCPで作って照明に割り当てます。
-ウィジェットは横4マス・縦1段で置かれ、横は約240dp（電話で3マス程度）まで縮められます。
-1段では、押したボタンの文字が数秒だけ結果（「オン完了」「解除完了」「一部失敗」「接続不可」「ラベルなし」「照明なし」など）に変わります。
-縦に広げると、ボタンの下に直前の結果を表示します。ウィジェットは台数を示さず、成功か、切り替えられなかった照明があるかだけを示します。
+「ラベルを追加」で名前を入れて「追加」を押すと、labelを作り、そのlabelの画面を開きます。
+
+### labelの画面
+
+「ラベル」のlabelの名前を押すと開きます。変えた値はその場でhome-linkへ送ります。保存ボタンはありません。
+
+| 項目 | 内容 |
+| --- | --- |
+| 名前 | labelの名前。入力を確定するか、ほかの項目へ移ると送ります |
+| 機器 | 照明とプラグの一覧。チェックを付けた機器にlabelを割り当てます |
+| 調光 | 「なし」「自動調光」「固定」。自動調光は明るさと色温度の自動調整に従い、固定はONの間「明るさ（%）」と「色温度（K）」の値で点けます。固定に切り替えると、80%・5000Kから始まります |
+| スケジュール | 毎日の時刻と、その時刻にオンにするかオフにするか。「追加」で時刻を選んで足し、時刻を押すと選び直し、「オン」「オフ」を押すと切り替え、×で消します。同じ時刻は2つ置けません |
+
+「このラベルを削除」でlabelを消します。割り当てた機器は、ほかのlabelだけになります。
+
+### labelのウィジェットを置く
+
+ホーム画面のウィジェットの一覧から、home-linkの次の4つを置けます。置くときに、送り先のlabelとウィジェットに出す名前を決める画面が開きます。
+名前の既定はlabelの名前です。空欄にするとlabelの名前を使います。置いた後も、ウィジェットの長押しの設定から変えられます。
+
+| ウィジェット | 大きさ | 押すと |
+| --- | --- | --- |
+| オン/オフ | 横2マス | 左の「<名前>オン」でlabelをON、右の「<名前>オフ」でOFF |
+| オン | 1マス | labelをON |
+| オフ | 1マス | labelをOFF |
+| 切り替え | 1マス | labelを切り替え（`/toggle`）。labelがONの間は「<名前>中」とアクセントの面で示します |
+
+例えば、label「work」の切り替えに「仕事」、label「game」の切り替えに「ゲーム」と名前を付けて置きます。
+押したボタンの文字は「送信中…」のあと、数秒だけ結果（「オン完了」「オフ完了」「一部失敗」「失敗」「接続不可」「ラベルなし」「機器なし」など）に変わります。
+切り替えは、すべての機器を切り替えられたときは新しい状態をすぐに示します。切り替えの状態は、置いたとき、押した後、30分ごとにhome-linkから読み直します。
+
+0.1.37までの照明のウィジェット（照明オン・照明オフ・仕事・作業）は、アプリを更新するとホーム画面から消えます。上のウィジェットを置き直してください。
 
 ### 玄関を解錠・施錠する
 
 ホーム画面のウィジェットの一覧から、home-linkの「玄関の解錠」と「玄関の施錠」（どちらも1×1マス）を置きます。
-照明のウィジェットとは別にしてあり、照明のボタンを押し間違えて玄関が開くことはありません。
+labelのウィジェットとは別にしてあり、labelのボタンを押し間違えて玄関が開くことはありません。
 ボタンを押すと、home-linkを通じてCANDY HOUSEのWeb APIへ解錠または施錠を送ります。
 SESAMEアプリの履歴には `home-link` の名前で記録されます。
 
@@ -230,9 +255,9 @@ Thread網の資格情報（dataset）は、matterjs-serverに `set_thread_datase
 | `GET /api/thread` | Threadの機器を登録できるか（matterjs-serverがThread網のdatasetを持つか）を `{"ready": true}` で返します | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `GET /api/status` | 台帳の機器ごとに、matterjs-serverで見えるか（`visible`）と今の `node_id`・`endpoint` | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `GET /api/lights` | 照明ごとの今の状態（`on`・`off`・`no_response`・`ignored`）と、無視の照明を除いた件数 | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
-| `POST /api/lights/on` | 0.1.36までのアプリの照明オン。上書きの値を持たないlabelをすべてONにし、無視の照明と、上書きの値を持つlabelだけが付いた照明を除く全部の照明をオンにします。照明ごとの結果（`switched`・`no_response`・`failed`・`ignored`・`override`）と、それらを除いた件数を返します。プラグは切り替えません | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
-| `POST /api/lights/off` | 0.1.36までのアプリの照明オフ。すべてのlabelをOFFにし（上書きもやめます）、全部の照明をオフにします。応答は `on` と同じ形です | 同上 |
-| `POST /api/lights/boost` | 0.1.36までのウィジェットの「仕事」「作業」。本文 `{"label": "作業"}` の名前のlabelを `/toggle` と同じく切り替えます。応答は `/toggle` と同じ形で、`action` はONにしたとき `boost`、それ以外は `release` です | 400 `invalid_boost`、404 `label_not_found`、422 `label_has_no_lights`、503 `matter_server_not_configured`、502 `matter_server_unreachable` |
+| `POST /api/lights/on` | 0.1.37までのアプリの照明オン。上書きの値を持たないlabelをすべてONにし、無視の照明と、上書きの値を持つlabelだけが付いた照明を除く全部の照明をオンにします。照明ごとの結果（`switched`・`no_response`・`failed`・`ignored`・`override`）と、それらを除いた件数を返します。プラグは切り替えません | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
+| `POST /api/lights/off` | 0.1.37までのアプリの照明オフ。すべてのlabelをOFFにし（上書きもやめます）、全部の照明をオフにします。応答は `on` と同じ形です | 同上 |
+| `POST /api/lights/boost` | 0.1.37までのウィジェットの「仕事」「作業」。本文 `{"label": "作業"}` の名前のlabelを `/toggle` と同じく切り替えます。応答は `/toggle` と同じ形で、`action` はONにしたとき `boost`、それ以外は `release` です | 400 `invalid_boost`、404 `label_not_found`、422 `label_has_no_lights`、503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `GET /api/lights/schedule` | 明るさと色温度の自動調整の設定（`settings`）、labelと割り当てた機器（`labels`）、直近の調整の記録（`runs`、新しい順に144回分） | |
 | `PUT /api/lights/schedule` | 自動調整の設定のうち、送った項目だけを変更します。応答は `GET` と同じ形です | 400 `invalid_schedule` |
 | `POST /api/door/unlock` | 玄関のSESAMEの解錠をCANDY HOUSEのWeb APIへ送り、受け付けられたら `{"status":"accepted"}` を返します | 503 `sesame_not_configured`、502 `sesame_rejected`（CANDY HOUSEのHTTPステータスを `message` に含みます）・`sesame_unreachable` |
@@ -447,7 +472,7 @@ curl http://home-link.example:5011/api/lights/schedule
   「自動調光」は、最後に押されたのが「照明オフ」ならOFF、「照明オン」ならONで始まります。
   プラグもこのlabelに入るため、「自動調光」のON・OFFはプラグも切り替えます。labelを付け替えたら、このlabelは消してかまいません。
 - labelごとの値は使われなくなり、全体の設定だけで調整します。台帳に無い照明は自動調整されなくなります。
-- `GET /api/lights/schedule` の `intent` はなくなりました。0.1.36のアプリが読む `labels` の `name`・`boosted` は残ります。
+- `GET /api/lights/schedule` の `intent` はなくなりました。0.1.37までのアプリが読む `labels` の `name`・`boosted` は残ります。
 - `POST /api/labels`・`PATCH /api/labels/{id}` に `day_level` などの値や `dedicated` を送ると400 `invalid_label` です。
 
 ### MCP

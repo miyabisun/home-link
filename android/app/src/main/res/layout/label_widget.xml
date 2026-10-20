@@ -1,0 +1,8 @@
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@android:id/background" style="@style/WidgetFrame">
+    <FrameLayout android:id="@+id/label_button" style="@style/WidgetButton"
+        android:layout_width="match_parent" android:contentDescription="@string/label_toggle">
+        <TextView android:id="@+id/label_button_text" style="@style/WidgetButtonText"
+            android:text="@string/label_toggle" android:drawableTop="@drawable/ic_power" />
+    </FrameLayout>
+</FrameLayout>
