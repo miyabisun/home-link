@@ -730,8 +730,9 @@ class MainActivity : Activity() {
         val scannedQr = payload?.startsWith("MT:") == true
         qrState.text = when {
             payload == null -> "まだ読み取っていません"
-            scannedQr -> "読み取り済み：${preview(payload)}"
-            else -> "入力済み：${preview(payload)}"
+            scannedQr -> ManualCode.label(payload)?.let { "読み取り済み：$it" }
+                ?: "読み取り済み（ラベルの数字に直せないコード）：$payload"
+            else -> "入力済み：${ManualCode.label(payload)}"
         }
         qrState.setTextColor(getColor(if (payload == null) R.color.muted else R.color.text))
         scanButton.text = if (scannedQr) "読み取り直す" else "QRを読み取る"
@@ -812,7 +813,8 @@ class MainActivity : Activity() {
                 ApiError.WIFI_FAILED -> "電球がWi-Fi「$ssid」につながりませんでした。Wi-Fiの名前とパスワードを確かめてください。" +
                     "2.4GHzにしか対応しない電球もあります"
                 ApiError.COMMISSION_TIMEOUT -> "時間内に登録が終わりませんでした。電球をペアリング待ちにし直して、もう一度お試しください"
-                ApiError.COMMISSION_FAILED -> "電球を登録できませんでした。電球を初期化してから、もう一度お試しください"
+                ApiError.COMMISSION_FAILED -> "登録が途中で止まりました。電話を電球の近くに置いて、「登録」を押し直してください。" +
+                    "電球の登録待ちが終わっていたら、電球の電源を1回入れ直してから押し直してください"
                 ApiError.BLUETOOTH_UNAVAILABLE -> "matterjs-serverでBluetoothの中継が有効になっていません。サーバーの設定を確かめてください"
                 ApiError.INVALID_WIFI -> "Wi-Fiの名前かパスワードが長すぎます。「Wi-Fiを追加」から入力し直してください"
                 ApiError.THREAD_NOT_READY -> "Thread網が未準備です。homeserverでThread網を用意してから登録してください"
@@ -909,10 +911,5 @@ class MainActivity : Activity() {
     }
 
     private fun panel() = panel(content)
-
-    /** Shows only the start of the code: both forms carry the setup passcode. */
-    private fun preview(payload: String) =
-        if (payload.startsWith("MT:")) payload.take(8) + "…" else payload.take(4) + " …"
-
 
 }

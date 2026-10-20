@@ -2,6 +2,7 @@ package dev.miyabisun.homelink
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -47,5 +48,29 @@ class ManualCodeTest {
         assertEquals(6, ManualCode.cursor("3497 011 2", 5))
         assertEquals(10, ManualCode.cursor("3497 011 2", 8))
         assertEquals(10, ManualCode.cursor("3497 011 2", 11))
+    }
+
+    @Test fun derivesTheManualCodeFromAQrPayload() {
+        // The Matter specification's example pair.
+        assertEquals("34970112332", ManualCode.fromQr("MT:Y.K9042C00KA0648G00"))
+        // A made-up pair: discriminator 2770, passcode 61842907.
+        assertEquals("24245937741", ManualCode.fromQr("MT:634J0KQS02MEGE2PB10"))
+    }
+
+    @Test fun derivesNothingFromPayloadsItCannotDecode() {
+        for (payload in listOf(
+            "", "MT:", "Y.K9042C00KA0648G00", "MT:Y.K9042C00KA0648G0", "MT:Y.K9042C00KA0648G0a",
+            "MT:Y.K9042C00KA0648G00*Y.K9042C00KA0648G00",
+            // A custom commissioning flow needs the 21-digit code.
+            "MT:634J0CKV02MEGE2PB10",
+            // Version 1 is not defined.
+            "MT:734J0KQS02MEGE2PB10",
+        )) assertNull(payload, ManualCode.fromQr(payload))
+    }
+
+    @Test fun labelsBothFormsLikeTheDevice() {
+        assertEquals("3497-011-2332", ManualCode.label("MT:Y.K9042C00KA0648G00"))
+        assertEquals("2424-593-7741", ManualCode.label("24245937741"))
+        assertNull(ManualCode.label("MT:Y.K9042C00KA0648G0"))
     }
 }

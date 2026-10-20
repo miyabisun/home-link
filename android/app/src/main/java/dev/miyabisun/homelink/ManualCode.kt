@@ -40,4 +40,52 @@ object ManualCode {
     /** Whether `digits` has the full length and a matching Verhoeff check digit. */
     fun isValid(digits: String): Boolean =
         digits.length == LENGTH && digits.reversed().foldIndexed(0) { i, c, digit -> D[c][P[i % 8][digit - '0']] } == 0
+
+    /** The code as printed on the device's label: 11 digits grouped 4-3-4 with hyphens, or null for an undecodable QR payload. */
+    fun label(payload: String): String? =
+        (if (payload.startsWith("MT:")) fromQr(payload) else payload)?.let { format(it).replace(' ', '-') }
+
+    /**
+     * The 11-digit code for a scanned `MT:` payload, as the Matter specification derives it from the
+     * discriminator's upper 4 bits and the passcode; null unless it is a version 0 payload for the standard flow.
+     */
+    fun fromQr(payload: String): String? {
+        val bytes = base38(payload.removePrefix("MT:").takeIf { payload.startsWith("MT:") } ?: return null)
+        if (bytes == null || bytes.size < 11) return null
+        var at = 0
+        fun bits(n: Int): Int {
+            var value = 0
+            for (i in 0 until n) value = value or ((bytes[(at + i) / 8].toInt() shr ((at + i) % 8) and 1) shl i)
+            at += n
+            return value
+        }
+        val version = bits(3)
+        bits(16 + 16) // vendor and product ids
+        val flow = bits(2)
+        bits(8) // rendezvous
+        val short = bits(12) shr 8
+        val passcode = bits(27)
+        if (version != 0 || flow != 0) return null
+        val digits = "%d%05d%04d".format(short shr 2, (short and 3) shl 14 or (passcode and 0x3FFF), passcode shr 14)
+        return digits + ('0'..'9').first { isValid(digits + it) }
+    }
+
+    private const val BASE38 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-."
+
+    /** Base38 chunks of 5, 4 or 2 characters carry 3, 2 or 1 little-endian bytes. */
+    private fun base38(text: String): ByteArray? {
+        val out = mutableListOf<Byte>()
+        for (chunk in text.chunked(5)) {
+            val size = when (chunk.length) { 5 -> 3; 4 -> 2; 2 -> 1; else -> return null }
+            var value = 0L
+            for (c in chunk.reversed()) {
+                val digit = BASE38.indexOf(c)
+                if (digit < 0) return null
+                value = value * 38 + digit
+            }
+            if (value >= 1L shl (8 * size)) return null
+            repeat(size) { out += (value shr (8 * it)).toByte() }
+        }
+        return out.toByteArray()
+    }
 }

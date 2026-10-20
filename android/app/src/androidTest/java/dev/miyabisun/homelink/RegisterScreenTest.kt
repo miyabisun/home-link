@@ -97,8 +97,7 @@ class RegisterScreenTest {
             scanner.next = ScanResult.Read(qr)
             screen.onActivity { activity ->
                 button(activity, "QRを読み取る").performClick()
-                assertTrue(hasLabel(activity, "読み取り済み：MT:Y.K90…"))
-                assertFalse(views(activity).filterIsInstance<TextView>().any { qr in it.text })
+                assertTrue(hasLabel(activity, "読み取り済み：3497-011-2332"))
                 field(activity, "機器名（任意）").setText("天井灯")
                 assertTrue(button(activity, "登録").isEnabled)
             }
@@ -115,11 +114,15 @@ class RegisterScreenTest {
             capture(screen, "registered")
 
             // The name is optional: a second bulb in the same room needs only a scan.
+            // A payload for several devices has no single printed code, so it shows whole.
             scanner.next = ScanResult.Read("MT:Y.K9042C00KA0648G00*Y.K9042C00KA0648G00")
             screen.onActivity { activity ->
                 button(activity, "QRを読み取る").performClick()
-                button(activity, "登録").performClick()
+                assertTrue(hasLabel(activity,
+                    "読み取り済み（ラベルの数字に直せないコード）：MT:Y.K9042C00KA0648G00*Y.K9042C00KA0648G00"))
             }
+            capture(screen, "qr-undecodable")
+            screen.onActivity { button(it, "登録").performClick() }
             eventually(screen) { hasLabel(it, "寝室に機器を登録しました") }
             assertEquals("", api.registrations.last().name)
         }
@@ -159,7 +162,7 @@ class RegisterScreenTest {
                     spinner(activity, "部屋").selectedItem == "居間"
             }
             screen.onActivity { activity ->
-                assertTrue(hasLabel(activity, "読み取り済み：MT:Y.K90…"))
+                assertTrue(hasLabel(activity, "読み取り済み：3497-011-2332"))
                 assertEquals("天井灯", field(activity, "機器名（任意）").text.toString())
             }
             capture(screen, "room-missing")
@@ -168,7 +171,7 @@ class RegisterScreenTest {
             screen.onActivity { activity ->
                 button(activity, "読み取り直す").performClick()
                 assertTrue(hasLabel(activity, "MatterのQRコードではありません。QRコードが無い機器は「数字で入力」を使ってください"))
-                assertTrue(hasLabel(activity, "読み取り済み：MT:Y.K90…"))
+                assertTrue(hasLabel(activity, "読み取り済み：3497-011-2332"))
             }
             capture(screen, "not-matter")
 
@@ -221,11 +224,10 @@ class RegisterScreenTest {
             }
             instrumentation.waitForIdleSync()
             instrumentation.sendStringSync("2")
-            eventually(screen) { hasLabel(it, "入力済み：3497 …") }
+            eventually(screen) { hasLabel(it, "入力済み：3497-011-2332") }
             screen.onActivity { activity ->
                 assertFalse(field(activity, "11桁の数字").isShown)
                 assertTrue(button(activity, "数字を入力し直す").isShown)
-                assertFalse(views(activity).filterIsInstance<TextView>().any { "2332" in it.text })
                 field(activity, "機器名（任意）").setText("電球")
             }
             capture(screen, "manual-ready")
@@ -245,7 +247,7 @@ class RegisterScreenTest {
                 button(activity, "登録").performClick()
             }
             eventually(screen) { hasLabel(it, "この機器は登録済みです") }
-            screen.onActivity { assertTrue(hasLabel(it, "入力済み：3497 …")) }
+            screen.onActivity { assertTrue(hasLabel(it, "入力済み：3497-011-2332")) }
         }
     }
 
@@ -339,7 +341,7 @@ class RegisterScreenTest {
             screen.recreate()
             eventually(screen) { spinner(it, "部屋").selectedItem == "居間" }
             screen.onActivity { activity ->
-                assertTrue(hasLabel(activity, "読み取り済み：MT:Y.K90…"))
+                assertTrue(hasLabel(activity, "読み取り済み：3497-011-2332"))
                 assertEquals("天井灯", field(activity, "機器名（任意）").text.toString())
                 button(activity, "登録").performClick()
             }
@@ -477,7 +479,8 @@ class RegisterScreenTest {
                 ApiError.WRONG_CODE to "電球がコードを受け付けませんでした。電球のコードを読み取り直すか、入力し直してください",
                 ApiError.WIFI_FAILED to "電球がWi-Fi「home-2g」につながりませんでした。Wi-Fiの名前とパスワードを確かめてください。2.4GHzにしか対応しない電球もあります",
                 ApiError.COMMISSION_TIMEOUT to "時間内に登録が終わりませんでした。電球をペアリング待ちにし直して、もう一度お試しください",
-                ApiError.COMMISSION_FAILED to "電球を登録できませんでした。電球を初期化してから、もう一度お試しください",
+                ApiError.COMMISSION_FAILED to "登録が途中で止まりました。電話を電球の近くに置いて、「登録」を押し直してください。" +
+                    "電球の登録待ちが終わっていたら、電球の電源を1回入れ直してから押し直してください",
                 ApiError.BLUETOOTH_UNAVAILABLE to "matterjs-serverでBluetoothの中継が有効になっていません。サーバーの設定を確かめてください",
             )
             for ((error, text) in cases) {
@@ -485,7 +488,7 @@ class RegisterScreenTest {
                 screen.onActivity { button(it, "登録").performClick() }
                 eventually(screen) { hasLabel(it, text) }
                 assertInputsKept(screen, "押入れ1", "押入れ")
-                if (error == ApiError.DEVICE_NOT_FOUND || error == ApiError.WIFI_FAILED) capture(screen, "bt-${error.name.lowercase()}")
+                if (error in listOf(ApiError.DEVICE_NOT_FOUND, ApiError.WIFI_FAILED, ApiError.COMMISSION_FAILED)) capture(screen, "bt-${error.name.lowercase()}")
             }
 
             Endpoints.save(context, Endpoints("http://home-link.example:5011", ""))
@@ -757,7 +760,7 @@ class RegisterScreenTest {
             screen.onActivity { activity ->
                 assertTrue(hasLabel(activity, notReady))
                 assertFalse(button(activity, "登録").isEnabled)
-                assertTrue(hasLabel(activity, "読み取り済み：MT:Y.K90…"))
+                assertTrue(hasLabel(activity, "読み取り済み：3497-011-2332"))
                 assertEquals("寝室T2", field(activity, "機器名（任意）").text.toString())
             }
             capture(screen, "thread-refused")
@@ -787,7 +790,7 @@ class RegisterScreenTest {
 
     private fun assertInputsKept(screen: ActivityScenario<MainActivity>, name: String = "天井灯", room: String = "寝室") =
         screen.onActivity { activity ->
-            assertTrue(hasLabel(activity, "読み取り済み：MT:Y.K90…"))
+            assertTrue(hasLabel(activity, "読み取り済み：3497-011-2332"))
             assertEquals(name, field(activity, "機器名（任意）").text.toString())
             assertEquals(room, spinner(activity, "部屋").selectedItem)
             assertTrue(button(activity, "登録").isEnabled)
