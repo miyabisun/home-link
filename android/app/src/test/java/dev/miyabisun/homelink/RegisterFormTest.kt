@@ -250,4 +250,40 @@ class RegisterFormTest {
         assertEquals(Status.Failed(ApiError.WIFI_REVERTED), form.status)
         assertEquals("iot-2g", form.device?.wifiSsid)
     }
+
+    @Test fun connectedDevicesAreListedInTheLedgersOrder() {
+        val form = RegisterForm()
+        form.devicesRead(ApiResult.Ok(listOf(device(1), device(2, DeviceState.CONNECTED), device(3, DeviceState.NO_RESPONSE),
+            device(4, null), device(5, DeviceState.CONNECTED))))
+        assertEquals(listOf(2L, 3L, 5L), form.connected.map { it.id })
+    }
+
+    @Test fun aPlugSwitchesToTheOtherSideAndShowsItsAnswer() {
+        val form = RegisterForm()
+        val plug = device(1, DeviceState.CONNECTED).copy(kind = DeviceKind.PLUG, on = false)
+        form.devicesRead(ApiResult.Ok(listOf(plug)))
+        form.opened(plug)
+        assertTrue(form.nextOn(plug))
+        assertTrue(form.nextOn(plug.copy(on = null)))
+        assertFalse(form.nextOn(plug.copy(on = true)))
+
+        form.switchStarted(1)
+        assertEquals(setOf(1L), form.switching)
+        form.switched(1, ApiResult.Ok(true))
+        assertEquals(plug.copy(on = true), form.device)
+        assertEquals(listOf(plug.copy(on = true)), form.connected)
+        assertEquals(emptySet<Long>(), form.switching)
+
+        // No answer keeps the last On/Off read; an answer again brings the plug back.
+        form.switched(1, ApiResult.Ok(null))
+        assertEquals(plug.copy(on = true, state = DeviceState.NO_RESPONSE), form.device)
+        form.switched(1, ApiResult.Ok(false))
+        assertEquals(plug, form.device)
+
+        form.switchStarted(1)
+        form.switched(1, ApiResult.Failed(ApiError.UNREACHABLE))
+        assertEquals(Status.Failed(ApiError.UNREACHABLE), form.status)
+        assertEquals(plug, form.device)
+        assertEquals(emptySet<Long>(), form.switching)
+    }
 }

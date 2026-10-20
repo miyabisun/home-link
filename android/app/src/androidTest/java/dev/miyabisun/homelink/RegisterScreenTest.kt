@@ -573,19 +573,19 @@ class RegisterScreenTest {
         api.wifi += listOf(home, annex)
         ActivityScenario.launch(SettingsActivity::class.java).use { screen ->
             // The network for devices is chosen already.
-            eventually(screen) { spinner(it, "電球に渡すWi-Fi").isShown }
+            eventually(screen) { spinner(it, "機器に渡すWi-Fi").isShown }
             screen.onActivity { activity ->
-                val choice = spinner(activity, "電球に渡すWi-Fi")
+                val choice = spinner(activity, "機器に渡すWi-Fi")
                 assertEquals(annex.ssid, choice.selectedItem)
                 assertEquals(listOf(home.ssid, annex.ssid), (0 until choice.count).map { choice.getItemAtPosition(it) })
             }
             capture(screen, "wifi-list")
 
             // Choosing another network makes it the one for devices, also across a recreated screen.
-            screen.onActivity { spinner(it, "電球に渡すWi-Fi").setSelection(0) }
+            screen.onActivity { spinner(it, "機器に渡すWi-Fi").setSelection(0) }
             eventually(screen) { api.wifi.single { w -> w.forDevices }.ssid == home.ssid }
             screen.recreate()
-            eventually(screen) { spinner(it, "電球に渡すWi-Fi").selectedItem == home.ssid }
+            eventually(screen) { spinner(it, "機器に渡すWi-Fi").selectedItem == home.ssid }
 
             // The adder fills in the network the phone is on; only the password is left.
             reader.next = CurrentWifi("home-2g", 2437)
@@ -605,9 +605,9 @@ class RegisterScreenTest {
             screen.onActivity { button(it, "Wi-Fiを追加").performClick() }
             screen.onActivity { activity ->
                 assertEquals("home-5g", field(activity, "Wi-Fiの名前（SSID）").text.toString())
-                assertTrue(hasLabel(activity, "今つながっている「home-5g」は5GHzです。電球は2.4GHzにしかつながりません。" +
+                assertTrue(hasLabel(activity, "今つながっている「home-5g」は5GHzです。2.4GHzにしかつながらない機器があります。" +
                     "ルーターが2.4GHzを別の名前で出している場合は、その名前に直してください"))
-                assertFalse(spinner(activity, "電球に渡すWi-Fi").isShown)
+                assertFalse(spinner(activity, "機器に渡すWi-Fi").isShown)
             }
             capture(screen, "wifi-5ghz")
             // The adder survives a recreated screen with the typed name but never the password.
@@ -624,13 +624,13 @@ class RegisterScreenTest {
                 field(activity, "Wi-Fiのパスワード").setText("new-pass")
                 wifiSave(activity).performClick()
             }
-            eventually(screen) { !field(it, "Wi-Fiのパスワード").isShown && spinner(it, "電球に渡すWi-Fi").isShown }
+            eventually(screen) { !field(it, "Wi-Fiのパスワード").isShown && spinner(it, "機器に渡すWi-Fi").isShown }
             assertEquals(WifiNetwork("home-2g", "new-pass"), api.wifiSaves.last())
-            screen.onActivity { assertEquals(2, spinner(it, "電球に渡すWi-Fi").count) }
+            screen.onActivity { assertEquals(2, spinner(it, "機器に渡すWi-Fi").count) }
 
             // Without the name of the network, the adder says why and leaves the name to type.
             for ((current, text) in listOf(
-                    null to "Wi-Fiにつながっていません。電球に渡すWi-Fiの名前を入力してください",
+                    null to "Wi-Fiにつながっていません。機器に渡すWi-Fiの名前を入力してください",
                     CurrentWifi(null, 2437) to "今つながっているWi-Fiの名前を読めませんでした。位置情報がオンか確かめるか、名前を入力してください")) {
                 reader.next = current
                 screen.onActivity { activity ->
@@ -639,7 +639,7 @@ class RegisterScreenTest {
                     assertEquals("", field(activity, "Wi-Fiの名前（SSID）").text.toString())
                     assertFalse(wifiSave(activity).isEnabled)
                     button(activity, "やめる").performClick()
-                    assertTrue(spinner(activity, "電球に渡すWi-Fi").isShown)
+                    assertTrue(spinner(activity, "機器に渡すWi-Fi").isShown)
                 }
             }
 
@@ -658,15 +658,15 @@ class RegisterScreenTest {
             screen.onActivity { button(it, "やめる").performClick() }
 
             // Deleting the network for devices hands devices the one left, then none.
-            eventually(screen) { spinner(it, "電球に渡すWi-Fi").isShown }
+            eventually(screen) { spinner(it, "機器に渡すWi-Fi").isShown }
             screen.onActivity { button(it, "このWi-Fiを削除").performClick() }
-            eventually(screen) { hasLabel(it, "「home-2g」を削除しました") && spinner(it, "電球に渡すWi-Fi").count == 1 }
-            screen.onActivity { assertEquals(annex.ssid, spinner(it, "電球に渡すWi-Fi").selectedItem) }
+            eventually(screen) { hasLabel(it, "「home-2g」を削除しました") && spinner(it, "機器に渡すWi-Fi").count == 1 }
+            screen.onActivity { assertEquals(annex.ssid, spinner(it, "機器に渡すWi-Fi").selectedItem) }
             capture(screen, "wifi-deleted")
             screen.onActivity { button(it, "このWi-Fiを削除").performClick() }
             eventually(screen) { hasLabel(it, "まだ保存していません") }
             screen.onActivity { activity ->
-                assertFalse(spinner(activity, "電球に渡すWi-Fi").isShown)
+                assertFalse(spinner(activity, "機器に渡すWi-Fi").isShown)
                 assertFalse(views(activity).filterIsInstance<Button>().any { it.isShown && it.text == "このWi-Fiを削除" })
             }
             assertEquals(emptyList<SavedNetwork>(), api.wifi.toList())
@@ -779,9 +779,80 @@ class RegisterScreenTest {
         }
     }
 
+    @Test fun plugsAreListedAndSwitchedFromTheListAndTheirPane() {
+        api.ledger += Device(1, "冷蔵庫", null, emptySet(), DeviceState.CONNECTED, qrs[0], kind = DeviceKind.PLUG, on = true)
+        api.ledger += Device(2, "天井1", null, emptySet(), DeviceState.CONNECTED, qrs[1], kind = DeviceKind.LIGHT)
+        api.ledger += Device(3, "", null, emptySet(), DeviceState.CONNECTED, qrs[2], kind = DeviceKind.PLUG, on = false,
+            productName = "Mini Plug")
+        api.ledger += Device(4, "", null, emptySet(), DeviceState.UNCONNECTED, qr)
+        ActivityScenario.launch(MainActivity::class.java).use { screen ->
+            // Connected devices in the ledger's order, a switch beside each plug only.
+            eventually(screen) { switch(it, "冷蔵庫 入") != null && switch(it, "Mini Plug 切") != null }
+            screen.onActivity { activity ->
+                assertTrue(hasLabel(activity, "機器"))
+                assertTrue(button(activity, "天井1").isShown)
+                assertTrue(switches(activity).none { it.contentDescription.startsWith("天井1") })
+                assertEquals(listOf("3497-011-2332"), listed(activity))
+            }
+            capture(screen, "plugs")
+
+            // Pressed once, the switch waits for home-link and then shows the plug's answer.
+            val gate = CountDownLatch(1)
+            api.switchGate = gate
+            screen.onActivity { switch(it, "Mini Plug 切")!!.performClick() }
+            eventually(screen) { !switch(it, "Mini Plug 切")!!.isEnabled }
+            capture(screen, "plug-busy")
+            gate.countDown()
+            api.switchGate = null
+            eventually(screen) { switch(it, "Mini Plug 入")?.isEnabled == true }
+            screen.onActivity { switch(it, "冷蔵庫 入")!!.performClick() }
+            eventually(screen) { switch(it, "冷蔵庫 切") != null }
+            assertEquals(listOf(3L to true, 1L to false), api.deviceSwitches.toList())
+
+            // A listed device opens its pane, where a plug switches too.
+            screen.onActivity { button(it, "冷蔵庫").performClick() }
+            eventually(screen) { field(it, "機器名（任意）").text.toString() == "冷蔵庫" && hasLabel(it, "接続済み") }
+            screen.onActivity { activity -> switches(activity).last { it.contentDescription == "冷蔵庫 切" }.performClick() }
+            eventually(screen) { activity -> switches(activity).count { it.contentDescription == "冷蔵庫 入" } == 2 }
+            assertEquals(1L to true, api.deviceSwitches.last())
+            capture(screen, "plug-pane")
+
+            // No answer shows on the switch and the pane; pressing again tries once more.
+            api.silentSwitch = true
+            screen.onActivity { activity -> switches(activity).last { it.contentDescription == "冷蔵庫 入" }.performClick() }
+            eventually(screen) { activity ->
+                hasLabel(activity, "応答なし") && switches(activity).count { it.contentDescription == "冷蔵庫 応答なし" } == 2
+            }
+            capture(screen, "plug-no-response")
+            api.silentSwitch = false
+            screen.onActivity { activity -> switches(activity).last { it.contentDescription == "冷蔵庫 応答なし" }.performClick() }
+            eventually(screen) { activity -> switches(activity).count { it.contentDescription == "冷蔵庫 切" } == 2 }
+            assertEquals(listOf(1L to false, 1L to false), api.deviceSwitches.takeLast(2))
+
+            // A light's pane has no switch: lights switch all together.
+            screen.onActivity { button(it, "天井1").performClick() }
+            eventually(screen) { field(it, "機器名（任意）").text.toString() == "天井1" }
+            screen.onActivity { activity -> assertEquals(2, switches(activity).size) }
+
+            // A failure says so and keeps the plug as it was.
+            api.switchFailure = ApiError.SWITCH_FAILED
+            screen.onActivity { switch(it, "冷蔵庫 切")!!.performClick() }
+            eventually(screen) { hasLabel(it, "機器が入り切りを受け付けませんでした") && switch(it, "冷蔵庫 切")?.isEnabled == true }
+            capture(screen, "plug-failed")
+            screen.recreate()
+            eventually(screen) { switch(it, "冷蔵庫 切") != null && switch(it, "Mini Plug 入") != null }
+        }
+    }
+
+    /** The plugs' switches shown, in the list and the open pane. */
+    private fun switches(activity: Activity) =
+        views(activity).filterIsInstance<Button>().filter { it.isShown && it.contentDescription != null }
+    private fun switch(activity: Activity, description: String) =
+        switches(activity).firstOrNull { it.contentDescription == description }
+
     /** Registering neither chooses nor types a Wi-Fi. */
     private fun assertNoWifiInputs(activity: Activity) {
-        assertFalse(views(activity).any { it.isShown && it is Spinner && it.contentDescription == "電球に渡すWi-Fi" })
+        assertFalse(views(activity).any { it.isShown && it is Spinner && it.contentDescription == "機器に渡すWi-Fi" })
         assertFalse(views(activity).any { it.isShown && it is EditText && it.contentDescription.startsWith("Wi-Fi") })
     }
 
@@ -821,6 +892,8 @@ class RegisterScreenTest {
             val metrics = JSONArray()
             val minimum = (48 * activity.resources.displayMetrics.density).toInt()
             for (view in views(activity).filterIsInstance<TextView>().filter { it.isShown }) {
+                // Nothing on the screens assumes a bulb.
+                assertFalse("Bulb: ${view.text}", "電球" in view.text || "電球" in (view.contentDescription ?: ""))
                 val layout = view.layout ?: continue
                 for (line in 0 until layout.lineCount) {
                     assertEquals("Ellipsis: ${view.text}", 0, layout.getEllipsisCount(line))
@@ -882,7 +955,8 @@ class RegisterScreenTest {
     private fun listed(activity: Activity): List<String> {
         // The list's heading leads its panel; the open device's state reads the same.
         val heading = views(activity).filterIsInstance<TextView>().firstOrNull {
-            it.text == "未接続" && it.isShown && (it.parent as ViewGroup).getChildAt(0) == it
+            it.text == "未接続" && it.isShown && (it.parent as ViewGroup).getChildAt(0) == it &&
+                (it.parent as ViewGroup).getChildAt(1) is ViewGroup
         } ?: return emptyList()
         val list = (heading.parent as ViewGroup).getChildAt(1) as ViewGroup
         return (0 until list.childCount).map { (list.getChildAt(it) as Button).text.toString() }
@@ -973,6 +1047,28 @@ private class FakeApi : HomeLinkApi {
     val moves: MutableList<Long> = Collections.synchronizedList(mutableListOf())
     @Volatile var moveGate: CountDownLatch? = null
     @Volatile var moveFailure: ApiError? = null
+
+    val deviceSwitches: MutableList<Pair<Long, Boolean>> = Collections.synchronizedList(mutableListOf())
+    @Volatile var switchGate: CountDownLatch? = null
+    /** The plug does not answer. */
+    @Volatile var silentSwitch = false
+    @Volatile var switchFailure: ApiError? = null
+
+    override fun switchDevice(id: Long, on: Boolean): ApiResult<Boolean?> {
+        switchGate?.await()
+        deviceSwitches += id to on
+        switchFailure?.let { return ApiResult.Failed(it) }
+        return synchronized(ledger) {
+            val index = ledger.indexOfFirst { it.id == id }
+            if (silentSwitch) {
+                ledger[index] = ledger[index].copy(state = DeviceState.NO_RESPONSE)
+                ApiResult.Ok(null)
+            } else {
+                ledger[index] = ledger[index].copy(state = DeviceState.CONNECTED, on = on)
+                ApiResult.Ok(on)
+            }
+        }
+    }
 
     override fun moveWifi(id: Long): ApiResult<Device> {
         moveGate?.await()

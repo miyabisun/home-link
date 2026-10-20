@@ -139,12 +139,12 @@ class SettingsActivity : Activity() {
 
     private fun buildWifi(content: LinearLayout) {
         val panel = panel(content).apply { (layoutParams as LinearLayout.LayoutParams).topMargin = dp(24) }
-        label(panel, "電球に渡すWi-Fi", 18, bold = true)
+        label(panel, "機器に渡すWi-Fi", 18, bold = true)
         wifiState = label(panel, "", 16, muted = true)
         wifiAdapter = ArrayAdapter<String>(this, R.layout.select_item)
         wifiSpinner = Spinner(this).apply {
             adapter = wifiAdapter
-            contentDescription = "電球に渡すWi-Fi"
+            contentDescription = "機器に渡すWi-Fi"
             minimumHeight = dp(48)
             background = LayerDrawable(arrayOf(surface(R.color.background), getDrawable(R.drawable.ic_expand))).apply {
                 setLayerGravity(1, Gravity.END or Gravity.CENTER_VERTICAL)
@@ -325,7 +325,7 @@ class SettingsActivity : Activity() {
         val current = currentWifi
         wifiCurrent.text = when {
             !currentRead -> ""
-            current == null -> "Wi-Fiにつながっていません。電球に渡すWi-Fiの名前を入力してください"
+            current == null -> "Wi-Fiにつながっていません。機器に渡すWi-Fiの名前を入力してください"
             current.ssid != null -> "今つながっているWi-Fiの名前を入れました。パスワードを入力してください"
             locationDenied -> "位置情報の「正確な位置」を許可すると、今つながっているWi-Fiの名前を自動で入れます"
             else -> "今つながっているWi-Fiの名前を読めませんでした。位置情報がオンか確かめるか、名前を入力してください"
@@ -334,7 +334,7 @@ class SettingsActivity : Activity() {
         val frequency = current?.frequencyMhz
         show(wifiBand, if (frequency == null || is24GHz(frequency)) null else
             (current.ssid?.let { "今つながっている「$it」" } ?: "今つながっているWi-Fi") + "は${band(frequency)}です。" +
-            "電球は2.4GHzにしかつながりません。ルーターが2.4GHzを別の名前で出している場合は、その名前に直してください")
+            "2.4GHzにしかつながらない機器があります。ルーターが2.4GHzを別の名前で出している場合は、その名前に直してください")
         val notice = when {
             addingWifi -> null
             failed -> wifiError?.let { LightsMessage(failure(it), failed = true) }

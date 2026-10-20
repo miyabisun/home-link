@@ -2,10 +2,11 @@
 
 住まいの機器を、部屋と名前で記録するサービスです。
 家じゅうの照明を、Androidのボタン1つで全部オン・全部オフにできます。
+スマートプラグなど照明以外のMatterの機器は、1台ずつ入り切りできます。
 玄関のSESAME 5なども、ホーム画面のボタン1つで家の外から解錠・施錠できます（CANDY HOUSEのWeb API経由）。
-電球などに印刷されたMatterのQRコードをAndroidアプリで読み取り、部屋と名前を付けて登録します。
+機器に印刷されたMatterのQRコードをAndroidアプリで読み取り、部屋と名前を付けて登録します。
 QRコードが無い機器は、印字された11桁の数字（Matterの手動ペアリングコード）を入力して登録します。
-新しいWi-Fi電球とThread電球（Aqara T2など）は、電話のBluetoothで直接つなぎ、家のWi-FiかThread網とmatterjs-serverへ入れてから台帳に登録できます。
+新しいWi-FiとThreadの機器（Aqara T2など）は、電話のBluetoothで直接つなぎ、家のWi-FiかThread網とmatterjs-serverへ入れてから台帳に登録できます。
 登録した内容は、自宅サーバーで動くhome-linkのAPIがSQLiteに保存します。
 機器自身の識別子（ベンダー名とシリアル番号、Wi-Fi機器はMACアドレス）も保存でき、
 Matterのcontroller（[matterjs-server](https://github.com/matter-js/matterjs-server)）を作り直しても、
@@ -14,6 +15,8 @@ Matterのcontroller（[matterjs-server](https://github.com/matter-js/matterjs-se
 構成は、Rust（axum）のAPIサーバーと、Kotlinで作ったAndroidアプリです。
 照明の操作は、matterjs-serverに登録済みの照明を全部オン・全部オフにするものだけです。
 照明ごと・部屋ごとの操作は、現在のhome-linkにはありません。
+機器の種類（照明・プラグ・その他）は、Matterのdevice typeからhome-linkが求めます。
+プラグは照明の全部オン・全部オフと自動調整の対象にならないので、冷蔵庫などをつないでも照明の操作では切れません。
 Matterの機器登録（commissioning）はmatterjs-serverが行い、home-linkのアプリは電話のBluetoothを貸すだけです。
 
 ## 公開範囲と認証
@@ -27,7 +30,7 @@ MatterのQRコードと手動ペアリングコードには、機器のsetup pas
 APIに届く経路にいる機器なら、どれからでも玄関を開けられます。公開する範囲はこれを踏まえて決めてください。
 CANDY HOUSEのAPIキーとSESAMEの秘密鍵は、データベース・ログ・応答には出しません。
 
-電球に渡すWi-FiのSSIDとパスワードは、home-linkのデータベースに平文で保存します。
+機器に渡すWi-FiのSSIDとパスワードは、home-linkのデータベースに平文で保存します。
 データベースファイルとそのバックアップ（R2などへのコピーを含む）には、Wi-Fiのパスワードが入ります。
 APIはパスワードを書き込むだけで、一覧・応答・ログには出しません。
 matterjs-serverへは登録と差し替えのときだけ渡します。終わったら、matterjs-serverが保存した分を `remove_wifi_credentials` で消します。
@@ -66,7 +69,7 @@ Android 16以降の端末で動きます。
 接続先（home-linkのURLと、Bluetoothでの登録に使うmatterjs-serverのBLE ProxyのURL）は、アプリに埋め込まず端末に保存します。
 家の外から使うなら、電話から届くURL（VPNの中だけで引ける名前など）を設定します。
 QRの読み取りにはGoogle Playサービスのコードスキャナーを使うため、カメラの権限は求めません。
-位置情報の許可は、接続先の設定の画面で電球に渡すWi-Fiを追加するときに、今つながっているWi-FiのSSIDを読むためだけに求めます。
+位置情報の許可は、接続先の設定の画面で機器に渡すWi-Fiを追加するときに、今つながっているWi-FiのSSIDを読むためだけに求めます。
 
 [リリース](https://github.com/miyabisun/home-link/releases/latest)のAssetsから
 `home-link-vX.Y.Z.apk` をダウンロードし、端末で開いてインストールします。
@@ -156,7 +159,7 @@ Thread網の資格情報（dataset）は、matterjs-serverに `set_thread_datase
 1. 初回だけ、機器に渡すWi-Fiをhome-linkに保存します。画面に「機器に渡すWi-Fi」が出ていたら「Wi-Fiを設定」を押し、
    接続先の設定の画面で「Wi-Fiを追加」を押します。今つながっているWi-FiのSSIDが入るので、パスワードを入力して保存します。
    SSIDを読むために、Androidの仕様で位置情報（正確な位置）の許可を求めます。許可しない場合はSSIDを入力します。
-   電球の多くは2.4GHzのWi-Fiにしかつながりません。今のWi-Fiが5GHzなら、追加の画面にそう表示されます。
+   2.4GHzのWi-Fiにしかつながらない機器も多くあります。今のWi-Fiが5GHzなら、追加の画面にそう表示されます。
    Wi-Fiは複数保存でき、セレクトボックスで選んだものを機器に渡します。要らなくなったものは「このWi-Fiを削除」で消せます。
    0.1.31までの版がこの電話に保存したWi-Fiは、更新後の初回起動で一度だけhome-linkへ移し、電話からは消します。
    保存したWi-Fiは、どの電話から接続しても使われます。登録の画面ではWi-Fiを選んだり入力したりしません。
@@ -170,12 +173,18 @@ Thread網の資格情報（dataset）は、matterjs-serverに `set_thread_datase
 
 アプリを開くと、台帳のうち接続していない機器が「未接続」に並びます（名前が無い機器は印字されたコードで示します）。
 押した機器の面が開き、そのまま接続を始めます。
-例えば3個の電球のQRコードを先にすべて読んでおき、取り付けてから上から1台ずつ押して接続できます。接続できた機器は一覧から消えます。
+例えば3台の機器のQRコードを先にすべて読んでおき、取り付けてから上から1台ずつ押して接続できます。接続できた機器は一覧から消えます。
 
 接続中は、機器を探している・接続している・コードと設定を送っている、の段階を表示します。
 「キャンセル」を押すと、Bluetoothの中継を閉じてすぐに接続の前へ戻ります。後から届いた結果は表示しません。
 機器が見つからない、コードが違う、Wi-FiやThread網につながらない、時間切れ、matterjs-serverに接続できない、はそれぞれ理由と次にすることを表示します。
 接続できなかった機器は未接続のまま一覧に残るので、機器の電源を入れ直して同じ機器を押せば、アプリの再起動やQRの読み直しをせずに試し直せます。
+
+### 接続済みの機器を開き、プラグを入り切りする
+
+アプリの「機器」に、接続済みの機器が台帳の順に並びます。押すとその機器の面が開きます。
+プラグには横に入り切りのボタンがあり、今の状態（「入」「切」）を示し、押すと反対に切り替えます。
+機器の面でも、接続の状態の横に同じボタンが出ます。機器が応答しないときは「応答なし」と示し、押すと試し直します。
 
 ### 接続済みの機器を別のWi-Fiへ移す
 
@@ -197,12 +206,13 @@ Thread網の資格情報（dataset）は、matterjs-serverに `set_thread_datase
 | `POST /api/rooms` | 部屋の作成。本文は `{"name": "寝室"}` | 400 `invalid_room_name`、409 `duplicate_room_name` |
 | `PATCH /api/rooms/{id}` | 部屋の名前の変更。本文は作成と同じ | 404 `room_not_found`、409 `duplicate_room_name` |
 | `DELETE /api/rooms/{id}` | 部屋の削除。機器が残っている部屋は削除しません | 404 `room_not_found`、409 `room_has_devices` |
-| `GET /api/devices` | 機器の一覧。接続の状態 `state`（`unconnected`・`connected`・`no_response`）と製品の情報を含み、コードは含みません | |
+| `GET /api/devices` | 機器の一覧。接続の状態 `state`（`unconnected`・`connected`・`no_response`）と製品の情報を含み、コードは含みません。接続したことのある機器には、Matterのdevice typeから求めた種類 `kind`（`light`・`plug`・`other`）を付けます。照明以外で入り切りできる機器には、最後に読んだ入・切 `on`（`true`・`false`）を付けます | |
 | `POST /api/devices` | QRコードか11桁のコードだけで機器を台帳に入れます。本文は `{"qr_payload": "MT:…"}` か `{"manual_code": "…"}`。新しい行は201、同じ機器の行があれば作らずに200で返します（`registered`） | 400 `missing_setup_code`・`invalid_qr_payload`・`invalid_manual_code` |
 | `GET /api/devices/{id}` | 機器1台。一覧の項目に、登録したコードの全文 `qr_payload` または `manual_code` を加えます | 404 `device_not_found` |
 | `PATCH /api/devices/{id}` | 機器の名前・部屋・labelの割り当て・無視の設定。本文は送った項目だけを変えます。`{"name": "押入れ1"}`、`{"room_id": 2}`（`null` で部屋から外す）、`{"label_ids": [1, 2]}`（割り当てを置き換え、`[]` で外す）、`{"ignored": true}`（`false` で戻す） | 400 `invalid_device_update`・`invalid_device_name`・`conflicting_labels`、404 `device_not_found`・`room_not_found`・`label_not_found` |
 | `POST /api/devices/{id}/commission` | 台帳の機器を、記録したコードでmatterjs-serverへBluetoothで登録（commissioning）し、その行に識別子を補います。本文は要りません | 404 `device_not_found`、409 `no_setup_code`、422 `device_not_found`・`wrong_code`・`wifi_failed`・`thread_failed`・`commission_failed`、504 `commission_timeout`、502 `matter_server_unreachable`、503 `matter_server_not_configured`・`bluetooth_unavailable` |
 | `POST /api/devices/{id}/wifi` | 接続済みのWi-Fiの機器を、初期化せずに機器に渡すWi-Fi（`for_devices`）へ移します。本文は要りません。既にそのWi-Fiにいれば何も送りません。成功すると `{"device": {…}}` を200で返します | 404 `device_not_found`、409 `wifi_not_set`・`not_on_wifi`、422 `wifi_reverted`、504 `wifi_reverting`、502 `matter_server_unreachable`、503 `matter_server_not_configured` |
+| `POST /api/devices/{id}/on`・`/off` | プラグなど、照明以外で入り切りできる機器1台を入・切にします。応答は `{"state": "on"}`・`"off"`・`"no_response"`（応答しない・時間内に答えない機器） | 404 `device_not_found`、409 `not_connected`・`not_switchable`（照明と、入り切りの無い機器）、502 `switch_failed`・`matter_server_unreachable`、503 `matter_server_not_configured` |
 | `DELETE /api/devices/{id}` | 機器の削除 | 404 `device_not_found` |
 | `GET /api/labels` | labelの一覧（値と割り当てた機器の台数、専用か `dedicated`、明るくしている最中か `boosted` つき） | |
 | `POST /api/labels` | labelの作成。本文は `{"name": "キッチン", "night_level": 76, "warm_kelvin": 2700}`。`"dedicated": true` で専用にします（既定は `false`） | 400 `invalid_label_name`・`invalid_label`、409 `duplicate_label_name` |
@@ -213,7 +223,7 @@ Thread網の資格情報（dataset）は、matterjs-serverに `set_thread_datase
 | `PUT /api/wifi/devices` | 機器に渡すWi-Fiの指定。本文は `{"id": 2}` | 404 `wifi_not_found` |
 | `DELETE /api/wifi/{id}` | Wi-Fiの削除。機器に渡すものを消すと、残りの最初のものを渡します | 404 `wifi_not_found` |
 | `POST /api/commission` | 0.1.32までのアプリの登録。部屋とWi-FiかThreadかを指定して機器をmatterjs-serverへBluetoothで登録（commissioning）し、台帳に登録 | 400 `missing_setup_code`・`invalid_qr_payload`・`invalid_manual_code`・`invalid_network`・`invalid_device_name`、404 `room_not_found`、409 `wifi_not_set`、422 `device_not_found`・`wrong_code`・`wifi_failed`・`thread_failed`・`commission_failed`、504 `commission_timeout`、502 `matter_server_unreachable`、503 `matter_server_not_configured`・`bluetooth_unavailable`・`thread_not_ready` |
-| `GET /api/thread` | Thread電球を登録できるか（matterjs-serverがThread網のdatasetを持つか）を `{"ready": true}` で返します | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
+| `GET /api/thread` | Threadの機器を登録できるか（matterjs-serverがThread網のdatasetを持つか）を `{"ready": true}` で返します | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `GET /api/status` | 台帳の機器ごとに、matterjs-serverで見えるか（`visible`）と今の `node_id`・`endpoint` | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `GET /api/lights` | 照明ごとの今の状態（`on`・`off`・`no_response`・`ignored`）と、無視の照明を除いた件数 | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `POST /api/lights/on` | 無視の照明と専用のlabelの照明を除く全部の照明をオンにし、照明ごとの結果（`switched`・`no_response`・`failed`・`ignored`・`dedicated`）と、それらを除いた件数を返します | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
@@ -234,7 +244,7 @@ Thread網の資格情報（dataset）は、matterjs-serverに `set_thread_datase
 後から `PATCH /api/devices/{id}` で付けます。QRコードからはVendor ID・Product ID（`vendor_id`・`product_id`）を読んで持ちます。
 11桁のコードには入っていないので、その場合は `null` です。製品名（`product_name`）は、接続した機器がmatterjs-serverへ報告したものです。
 同じ機器かどうかは、登録と同じくsetup passcodeとdiscriminatorの上位4ビットで判定します。
-例えば3個の電球のQRコードを先に読んでおき、後から1台ずつ接続できます。
+例えば3台の機器のQRコードを先に読んでおき、後から1台ずつ接続できます。
 
 機器の一覧と1台の取得は、そのたびにmatterjs-serverの全nodeを読み、識別子から接続の状態 `state` を求めます。
 `unconnected` は接続していない（またはmatterjs-serverにもう無い）、`connected` は接続済み、`no_response` はnodeがあるが応答しない機器です。
@@ -270,9 +280,9 @@ QRコードと手動ペアリングコードは、setup passcodeとdiscriminator
 VendorNameとSerialNumberです。Aqara Hub M3配下のT2ではZigbeeのIEEEアドレス、TapoではWi-FiのMACがSerialNumberになります。
 
 `POST /api/commission` は、本文の `room_id`、`qr_payload` か `manual_code` のどちらか一方、`name`（任意）、
-`network`（`wifi` か `thread`、既定は `wifi`）を受け取ります。`wifi` では、保存したWi-Fiのうち電球に渡すもの（`for_devices`）を
+`network`（`wifi` か `thread`、既定は `wifi`）を受け取ります。`wifi` では、保存したWi-Fiのうち機器に渡すもの（`for_devices`）を
 matterjs-serverへ `set_wifi_credentials` で渡してから、`commission_with_code`（`network_only: false`）でBluetooth経由の登録を行います。
-電球に渡すWi-Fiが無ければ、登録を始めずに409 `wifi_not_set` を返します。本文のWi-Fiの項目は使いません。
+機器に渡すWi-Fiが無ければ、登録を始めずに409 `wifi_not_set` を返します。本文のWi-Fiの項目は使いません。
 `thread` ではWi-Fi情報を渡さず、matterjs-serverが持つThread網のdatasetで登録します。
 matterjs-serverの `server_info` の `thread_credentials_set` がtrueでなければ、登録を始めずに `thread_not_ready` を返します。
 Bluetoothの中継は、要求の前からmatterjs-serverの `/ble` に接続している電話などのBLE Proxyが務めます。

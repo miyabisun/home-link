@@ -168,6 +168,31 @@ class HttpHomeLinkApiTest {
         }
     }
 
+    @Test fun readsAPlugsKindAndOnOff() {
+        val plug = ledgerRow.replace("\"unconnected\"", "\"connected\"").replace("\"product_name\":null",
+            "\"product_name\":\"Mini Plug\",\"kind\":\"plug\",\"on\":true")
+        respond("/api/devices/9", 200, plug)
+        assertEquals(ApiResult.Ok(ledgerDevice.copy(state = DeviceState.CONNECTED, kind = DeviceKind.PLUG, on = true,
+            productName = "Mini Plug")), api.device(9))
+        respond("/api/devices/9", 200, ledgerRow.replace("\"product_name\":null", "\"product_name\":null,\"kind\":\"light\",\"on\":null"))
+        assertEquals(ApiResult.Ok(ledgerDevice.copy(kind = DeviceKind.LIGHT)), api.device(9))
+    }
+
+    @Test fun switchesOneDeviceAndReadsItsAnswer() {
+        respond("/api/devices/9/on", 200, """{"state":"on"}""")
+        assertEquals(ApiResult.Ok(true), api.switchDevice(9, true))
+        assertEquals("POST /api/devices/9/on", requests.last())
+        respond("/api/devices/9/off", 200, """{"state":"off"}""")
+        assertEquals(ApiResult.Ok(false), api.switchDevice(9, false))
+        assertEquals("POST /api/devices/9/off", requests.last())
+        respond("/api/devices/9/off", 200, """{"state":"no_response"}""")
+        assertEquals(ApiResult.Ok(null), api.switchDevice(9, false))
+        for ((status, code) in listOf(409 to "not_switchable", 409 to "not_connected", 502 to "switch_failed")) {
+            respond("/api/devices/9/off", status, """{"error":"$code"}""")
+            assertEquals(code, ApiResult.Failed(ApiError.SWITCH_FAILED), api.switchDevice(9, false))
+        }
+    }
+
     @Test fun switchesLightsAndCountsEachResult() {
         respond("/api/lights/on", 200, """{"action":"on","switched":7,"no_response":2,"failed":1,"missing":2,
             "lights":[],"missing_devices":[{"id":3,"name":"台所","room_name":"居間"},{"id":4,"name":"","room_name":"寝室"}]}""")

@@ -55,6 +55,32 @@ class RegisterForm {
     /** Devices still to connect, in the order they were read. */
     val unconnected get() = devices.filter { it.state == DeviceState.UNCONNECTED }
 
+    /** Devices matterjs-server serves, answering or not, in the ledger's order. */
+    val connected get() = devices.filter { it.state == DeviceState.CONNECTED || it.state == DeviceState.NO_RESPONSE }
+
+    /** The devices being switched. */
+    var switching: Set<Long> = emptySet()
+        private set
+
+    /** What pressing a plug's switch sends: the other side of its last On/Off, on when unknown. */
+    fun nextOn(device: Device) = device.on != true
+
+    fun switchStarted(id: Long) {
+        switching = switching + id
+        status = null
+    }
+
+    /** home-link's answer to switching device `id`: its On/Off, or null when it did not answer. */
+    fun switched(id: Long, result: ApiResult<Boolean?>) {
+        switching = switching - id
+        val known = devices.firstOrNull { it.id == id } ?: device?.takeIf { it.id == id } ?: return
+        when (result) {
+            is ApiResult.Ok -> put(result.value?.let { known.copy(on = it, state = DeviceState.CONNECTED) }
+                ?: known.copy(state = DeviceState.NO_RESPONSE))
+            is ApiResult.Failed -> status = Status.Failed(result.error)
+        }
+    }
+
     fun canConnect() = device?.state == DeviceState.UNCONNECTED && !busy
 
     /** The device whose Wi-Fi is being moved. */

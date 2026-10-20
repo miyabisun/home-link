@@ -9,6 +9,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.graphics.drawable.LayerDrawable
+import android.graphics.drawable.RippleDrawable
 import android.os.Build
 import android.os.Bundle
 import android.text.Editable
@@ -24,6 +25,7 @@ import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
 import java.util.concurrent.ExecutorService
@@ -75,8 +77,10 @@ class MainActivity : Activity() {
     private lateinit var lightsOffButton: Button
     private lateinit var lightsRow: ResultRow
     private lateinit var pinButton: Button
+    private lateinit var qrPanel: LinearLayout
     private lateinit var qrState: TextView
     private lateinit var deviceState: TextView
+    private lateinit var faceSwitch: Button
     private lateinit var qrMessage: TextView
     private lateinit var manualButton: Button
     private lateinit var manualPanel: LinearLayout
@@ -96,6 +100,8 @@ class MainActivity : Activity() {
     private lateinit var labelBoxes: LinearLayout
     private lateinit var unconnectedPanel: LinearLayout
     private lateinit var unconnectedList: LinearLayout
+    private lateinit var connectedPanel: LinearLayout
+    private lateinit var connectedList: LinearLayout
     private lateinit var resultRow: ResultRow
     private lateinit var reconnectButton: Button
     private lateinit var connectButton: Button
@@ -403,6 +409,27 @@ class MainActivity : Activity() {
         commission(device.id)
     }
 
+    /** A connected device picked from the list opens its pane. */
+    private fun openListed(device: Device) {
+        if (form.device?.id != device.id) {
+            saveName()
+            open(device)
+        }
+        form.status = null
+        render()
+        (content.parent as ScrollView).smoothScrollTo(0, qrPanel.top)
+    }
+
+    private fun switchDevice(device: Device) {
+        val on = form.nextOn(device)
+        form.switchStarted(device.id)
+        render()
+        background(lightsWorker, { api.switchDevice(device.id, on) }) { result ->
+            form.switched(device.id, result)
+            render()
+        }
+    }
+
     private fun cancel() {
         CommissionSession.cancel()
         form.cancelled()
@@ -482,14 +509,37 @@ class MainActivity : Activity() {
         lightsRow = ResultRow(this, lights, dp(8))
         pinButton = button(lights, "ホーム画面にボタンを置く", icon = R.drawable.ic_widget) { pinWidget() }
 
+        // Connected devices are used day to day, like the lights; their panes open from here.
+        connectedPanel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        content.addView(connectedPanel, LinearLayout.LayoutParams(-1, -2))
+        label(connectedPanel, "機器", 28, bold = true).apply {
+            (layoutParams as LinearLayout.LayoutParams).topMargin = dp(24)
+        }
+        connectedList = panel(connectedPanel)
+
         label(content, "機器を登録", 28, bold = true).apply {
             (layoutParams as LinearLayout.LayoutParams).topMargin = dp(24)
         }
 
         val qr = panel()
+        qrPanel = qr
         label(qr, "機器のコード", 18, bold = true)
         qrState = label(qr, "", 16)
-        deviceState = label(qr, "", 16).apply { compoundDrawablePadding = dp(8) }
+        // A plug's switch sits beside its state, apart from the pane's main action.
+        val stateRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            isBaselineAligned = false
+        }
+        qr.addView(stateRow, LinearLayout.LayoutParams(-1, -2))
+        deviceState = label(stateRow, "", 16).apply {
+            compoundDrawablePadding = dp(8)
+            layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
+        }
+        // Centred in the row, a top margin would push the switch past its bottom.
+        faceSwitch = button(stateRow, "") { form.device?.let(::switchDevice) }.apply {
+            layoutParams = LinearLayout.LayoutParams(-2, -2)
+        }
         qrMessage = message(qr)
         button(qr, "QRを読み取る", icon = R.drawable.ic_qr) { scan() }
         manualButton = button(qr, "数字で入力", icon = R.drawable.ic_keypad) { openManual() }
@@ -587,7 +637,8 @@ class MainActivity : Activity() {
     private fun openSettings() = startActivity(Intent(this, SettingsActivity::class.java))
 
     /** How a device reads in the list: its name, else its printed code. */
-    private fun title(device: Device) = device.name.ifEmpty { device.code?.let { ManualCode.label(it) ?: it } ?: "機器" }
+    private fun title(device: Device) =
+        device.name.ifEmpty { device.productName ?: device.code?.let { ManualCode.label(it) ?: it } ?: "機器" }
 
     private fun render() {
         endpointNotice.visibility = if (endpoints.homeLinkUrl == null) View.VISIBLE else View.GONE
@@ -630,6 +681,9 @@ class MainActivity : Activity() {
             DeviceState.NO_RESPONSE -> R.drawable.ic_error
             else -> 0
         }, 0, 0, 0)
+        val plug = device?.takeIf { it.kind == DeviceKind.PLUG && it.state != DeviceState.UNCONNECTED }
+        faceSwitch.visibility = if (plug == null) View.GONE else View.VISIBLE
+        plug?.let { renderSwitch(faceSwitch, it) }
         manualButton.visibility = if (enteringCode) View.GONE else View.VISIBLE
         manualPanel.visibility = if (enteringCode) View.VISIBLE else View.GONE
         val status = form.status
@@ -668,6 +722,7 @@ class MainActivity : Activity() {
 
         wifiPanel.visibility = if (form.wifiMissing) View.VISIBLE else View.GONE
         renderUnconnected()
+        renderConnected()
 
         val ssid = form.deviceWifi?.let { "「$it」" }.orEmpty()
         val result = when (status) {
@@ -705,6 +760,7 @@ class MainActivity : Activity() {
                     "もう一度お試しください"
                 ApiError.WIFI_REVERTED -> "${ssid}につながらず、元のWi-Fiに戻りました"
                 ApiError.WIFI_REVERTING -> "${ssid}につながらず、応答がありません。元のWi-Fiへ戻ります"
+                ApiError.SWITCH_FAILED -> "機器が入り切りを受け付けませんでした"
             }
             else -> null
         }
@@ -757,6 +813,64 @@ class MainActivity : Activity() {
             row.setOnClickListener { connectListed(device) }
             row.isEnabled = !form.busy
         }
+    }
+
+    /** A row per connected device opening its pane, with a switch for a plug. */
+    private fun renderConnected() {
+        val listed = form.connected
+        connectedPanel.visibility = if (listed.isEmpty()) View.GONE else View.VISIBLE
+        val rows = listed.map { title(it) to (it.kind == DeviceKind.PLUG) }
+        if (connectedList.childCount != listed.size || rows.withIndex().any { (i, row) ->
+                val shown = connectedList.getChildAt(i) as LinearLayout
+                (shown.getChildAt(0) as Button).text != row.first || (shown.childCount == 2) != row.second
+            }) {
+            connectedList.removeAllViews()
+            for ((title, plug) in rows) {
+                val row = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    isBaselineAligned = false
+                }
+                connectedList.addView(row, LinearLayout.LayoutParams(-1, -2))
+                button(row, title, weight = plug) { }
+                if (plug) button(row, "") { }.layoutParams = LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(8) }
+            }
+        }
+        listed.forEachIndexed { i, device ->
+            val row = connectedList.getChildAt(i) as LinearLayout
+            row.getChildAt(0).apply {
+                setOnClickListener { openListed(device) }
+                isEnabled = !form.busy
+            }
+            (row.getChildAt(1) as Button?)?.let { renderSwitch(it, device) }
+        }
+    }
+
+    /** A plug's switch: on in the accent surface, off in the usual one, unanswered with the failure icon. */
+    private fun renderSwitch(button: Button, device: Device) {
+        val on = device.state == DeviceState.CONNECTED && device.on == true
+        val text = when {
+            device.state == DeviceState.NO_RESPONSE -> "応答なし"
+            on -> "入"
+            else -> "切"
+        }
+        button.text = text
+        button.contentDescription = "${title(device)} $text"
+        button.isEnabled = device.id !in form.switching
+        button.background = RippleDrawable(ColorStateList.valueOf(getColor(R.color.border)),
+            if (on) surface(R.color.accent).apply { setStroke(0, 0) } else surface(R.color.surface), null)
+        val color = getColor(when {
+            !button.isEnabled -> R.color.muted
+            on -> R.color.on_accent
+            device.state == DeviceState.NO_RESPONSE -> R.color.danger
+            else -> R.color.text
+        })
+        button.setTextColor(color)
+        button.setCompoundDrawablesRelativeWithIntrinsicBounds(
+            if (device.state == DeviceState.NO_RESPONSE) R.drawable.ic_error else R.drawable.ic_power, 0, 0, 0)
+        button.compoundDrawablePadding = dp(8)
+        button.compoundDrawableTintList =
+            if (device.state == DeviceState.NO_RESPONSE) null else ColorStateList.valueOf(color)
+        button.setOnClickListener { switchDevice(device) }
     }
 
     private fun stageText(stage: Stage) = when (stage) {

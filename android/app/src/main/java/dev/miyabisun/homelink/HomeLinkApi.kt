@@ -17,7 +17,7 @@ enum class ApiError { NOT_CONFIGURED, UNREACHABLE, TIMEOUT, ROOM_NOT_FOUND, DUPL
     MATTER_UNREACHABLE, MATTER_NOT_CONFIGURED, SERVER,
     DEVICE_NOT_FOUND, WRONG_CODE, WIFI_FAILED, COMMISSION_TIMEOUT, COMMISSION_FAILED, BLUETOOTH_UNAVAILABLE, INVALID_WIFI,
     THREAD_FAILED, WIFI_NOT_SET, WIFI_NOT_FOUND, LABEL_NOT_FOUND, LABEL_HAS_NO_LIGHTS, WIFI_REVERTED, WIFI_REVERTING, NOT_ON_WIFI,
-    SESAME_NOT_CONFIGURED, SESAME_REJECTED, SESAME_UNREACHABLE }
+    SESAME_NOT_CONFIGURED, SESAME_REJECTED, SESAME_UNREACHABLE, SWITCH_FAILED }
 
 /** A Wi-Fi network to save on home-link for new devices. */
 data class WifiNetwork(val ssid: String, val password: String)
@@ -34,12 +34,22 @@ enum class DeviceState {
     }
 }
 
+/** What home-link tells a connected device to be by its Matter device types. */
+enum class DeviceKind {
+    LIGHT, PLUG, OTHER;
+
+    companion object {
+        fun of(value: String?): DeviceKind? = entries.firstOrNull { it.name.lowercase() == value }
+    }
+}
+
 /**
  * A ledger device; [code] is its QR payload or manual code, read only for one device at a time.
- * [wifiSsid] is the Wi-Fi it reports being on.
+ * [wifiSsid] is the Wi-Fi it reports being on; [on] the On/Off last read of a device that switches and is not a light.
  */
 data class Device(val id: Long, val name: String, val roomId: Long?, val labelIds: Set<Long>, val state: DeviceState?,
-                  val code: String?, val wifiSsid: String? = null)
+                  val code: String?, val wifiSsid: String? = null, val kind: DeviceKind? = null, val on: Boolean? = null,
+                  val productName: String? = null)
 
 data class Label(val id: Long, val name: String)
 
@@ -79,6 +89,8 @@ interface HomeLinkApi {
     fun commission(id: Long): ApiResult<Device>
     /** Moves connected device `id` onto home-link's Wi-Fi for devices without resetting it. Takes up to minutes. */
     fun moveWifi(id: Long): ApiResult<Device>
+    /** Switches device `id`, such as a plug, on or off: its On/Off, or null when it did not answer. */
+    fun switchDevice(id: Long, on: Boolean): ApiResult<Boolean?>
     fun wifiNetworks(): ApiResult<List<SavedNetwork>>
     /** Saves the network, replacing the password of one with the same name; the first becomes the one for devices. */
     fun saveWifi(network: WifiNetwork): ApiResult<SavedNetwork>
@@ -141,6 +153,15 @@ class HttpHomeLinkApi(private val baseUrl: () -> String?) : HomeLinkApi {
     override fun moveWifi(id: Long): ApiResult<Device> =
         call("POST", "/api/devices/$id/wifi", null, readTimeout = 360_000) { device(JSONObject(it).getJSONObject("device")) }
 
+    override fun switchDevice(id: Long, on: Boolean): ApiResult<Boolean?> =
+        call("POST", "/api/devices/$id/${if (on) "on" else "off"}", null) { body ->
+            when (JSONObject(body).getString("state")) {
+                "on" -> true
+                "off" -> false
+                else -> null
+            }
+        }
+
     private fun device(json: JSONObject): Device {
         val labels = json.getJSONArray("labels")
         return Device(
@@ -149,6 +170,9 @@ class HttpHomeLinkApi(private val baseUrl: () -> String?) : HomeLinkApi {
             DeviceState.of(json.optString("state").takeUnless { json.isNull("state") }),
             json.optString("qr_payload").ifEmpty { json.optString("manual_code") }.ifEmpty { null },
             json.optString("wifi_ssid").takeUnless { json.isNull("wifi_ssid") },
+            DeviceKind.of(json.optString("kind").takeUnless { json.isNull("kind") }),
+            if (json.isNull("on")) null else json.optBoolean("on"),
+            json.optString("product_name").takeUnless { json.isNull("product_name") },
         )
     }
 
@@ -259,6 +283,7 @@ class HttpHomeLinkApi(private val baseUrl: () -> String?) : HomeLinkApi {
             "wifi_reverted" -> ApiError.WIFI_REVERTED
             "wifi_reverting" -> ApiError.WIFI_REVERTING
             "not_on_wifi" -> ApiError.NOT_ON_WIFI
+            "not_switchable", "not_connected", "switch_failed" -> ApiError.SWITCH_FAILED
             else -> ApiError.SERVER
         }
     }
