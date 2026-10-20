@@ -4380,3 +4380,176 @@ async fn moving_needs_a_wifi_bulb_off_the_wifi_for_devices() {
         (StatusCode::NOT_FOUND, Some("device_not_found"))
     );
 }
+
+/// A Wi-Fi bulb, an On/Off and a Dimmable Plug-in Unit, a silent and an
+/// unavailable plug, a plug behind a bridge and a sensor.
+fn plug_nodes() -> Value {
+    json!([
+        { "node_id": 5, "available": true, "attributes": {
+            "0/40/1": "Tapo", "0/40/15": TAPO, "0/40/3": "Smart Multicolor Bulb",
+            "0/29/0": [{ "0": 22, "1": 1 }],
+            "1/29/0": [{ "0": 269, "1": 1 }], "1/6/0": true, "1/8/0": 100,
+            "1/768/65532": 16,
+        }},
+        { "node_id": 20, "available": true, "attributes": {
+            "0/40/1": "Plugco", "0/40/15": "plug-a", "0/40/3": "Mini Plug",
+            "0/29/0": [{ "0": 22, "1": 1 }],
+            "1/29/0": [{ "0": 266, "1": 1 }], "1/6/0": false,
+        }},
+        { "node_id": 21, "available": true, "attributes": {
+            "0/40/1": "Plugco", "0/40/15": "plug-b", "0/40/3": "Dimmer Plug",
+            "1/29/0": [{ "0": 267, "1": 1 }], "1/6/0": true, "1/8/0": 100,
+        }},
+        { "node_id": 22, "available": true, "attributes": {
+            "0/40/1": "Plugco", "0/40/15": "plug-c",
+            "1/29/0": [{ "0": 266, "1": 1 }], "1/6/0": true,
+        }},
+        { "node_id": 23, "available": false, "attributes": {
+            "0/40/1": "Plugco", "0/40/15": "plug-d",
+            "1/29/0": [{ "0": 266, "1": 1 }], "1/6/0": true,
+        }},
+        { "node_id": 30, "available": true, "attributes": {
+            "0/40/1": "Hubco", "0/40/15": "hub", "1/29/0": [{ "0": 14, "1": 1 }],
+            "2/29/0": [{ "0": 19, "1": 2 }, { "0": 266, "1": 1 }], "2/6/0": false,
+            "2/57/1": "Hubco", "2/57/15": "plug-e", "2/57/3": "Bridged Plug", "2/57/17": true,
+            "3/29/0": [{ "0": 19, "1": 2 }, { "0": 770, "1": 1 }],
+            "3/57/1": "Hubco", "3/57/15": "sensor", "3/57/17": true,
+        }},
+    ])
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn plugs_get_their_kind_and_are_switched_one_at_a_time() {
+    let fake = Fake {
+        silent: vec![(22, 1)],
+        ..Fake::default()
+    };
+    let (addr, commands, _) = fake_light_server(plug_nodes(), fake).await;
+    let (db, sql) = ledger();
+    let home = home_link::Home::new(db, Some(format!("ws://{addr}/ws")));
+    let app = home.router();
+    let mut ids = Vec::new();
+    for (vendor, serial) in [
+        ("Tapo", TAPO),
+        ("Plugco", "plug-a"),
+        ("Plugco", "plug-b"),
+        ("Plugco", "plug-c"),
+        ("Plugco", "plug-d"),
+        ("Hubco", "plug-e"),
+        ("Hubco", "sensor"),
+        ("Hubco", "hub"),
+    ] {
+        let device = add_device(
+            &app,
+            &sql,
+            json!({ "vendor": vendor, "serial_number": serial }),
+        )
+        .await;
+        ids.push(device["id"].clone());
+    }
+    let unconnected = add_device(&app, &sql, json!({ "manual_code": MANUAL })).await;
+
+    let (status, list) = call(&app, "GET", "/api/devices", None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let kinds: Vec<_> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| (d["kind"].clone(), d["on"].clone()))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            (json!("light"), Value::Null),
+            (json!("plug"), json!(false)),
+            (json!("plug"), json!(true)),
+            (json!("plug"), json!(true)),
+            (json!("plug"), json!(true)),
+            (json!("plug"), json!(false)),
+            (json!("other"), Value::Null),
+            (json!("other"), Value::Null),
+            (Value::Null, Value::Null),
+        ]
+    );
+    assert_eq!(unconnected["kind"], Value::Null);
+
+    let switch = |id: &Value, action: &str| format!("/api/devices/{id}/{action}");
+    // Each plug's own On/Off, behind a bridge on its endpoint.
+    for (id, action, node, endpoint, command, state) in [
+        (&ids[1], "on", 20, 1, "On", "on"),
+        (&ids[1], "off", 20, 1, "Off", "off"),
+        (&ids[2], "off", 21, 1, "Off", "off"),
+        (&ids[5], "on", 30, 2, "On", "on"),
+    ] {
+        commands.lock().unwrap().clear();
+        let (status, body) = call(&app, "POST", &switch(id, action), None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["state"], state);
+        assert_eq!(
+            sent(&commands),
+            [
+                json!({ "node_id": node, "endpoint_id": endpoint, "cluster_id": 6,
+                     "command_name": command, "payload": {} })
+            ]
+        );
+    }
+    let (_, device) = call(&app, "GET", &format!("/api/devices/{}", ids[1]), None).await;
+    assert_eq!(device["on"], false);
+    let (_, device) = call(&app, "GET", &format!("/api/devices/{}", ids[5]), None).await;
+    assert_eq!(device["on"], true);
+
+    // No answer, or unavailable and so not sent to.
+    commands.lock().unwrap().clear();
+    let (status, body) = call(&app, "POST", &switch(&ids[3], "off"), None).await;
+    assert_eq!(
+        (status, &body["state"]),
+        (StatusCode::OK, &json!("no_response"))
+    );
+    assert_eq!(sent(&commands).len(), 1);
+    commands.lock().unwrap().clear();
+    let (status, body) = call(&app, "POST", &switch(&ids[4], "off"), None).await;
+    assert_eq!(
+        (status, &body["state"]),
+        (StatusCode::OK, &json!("no_response"))
+    );
+    assert_eq!(sent(&commands), Vec::<Value>::new());
+
+    // A light, a device without On/Off and one not connected are not switched here.
+    for (id, error) in [
+        (&ids[0], "not_switchable"),
+        (&ids[6], "not_switchable"),
+        (&unconnected["id"], "not_connected"),
+    ] {
+        let (status, body) = call(&app, "POST", &switch(id, "on"), None).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::CONFLICT, Some(error)),
+            "{body}"
+        );
+    }
+    let (status, _) = call(&app, "POST", "/api/devices/999/on", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(sent(&commands), Vec::<Value>::new());
+
+    // All on, all off and the adjustment leave every plug alone.
+    enable(&app).await;
+    for action in ["on", "off"] {
+        let (status, body) = call(&app, "POST", &format!("/api/lights/{action}"), None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    home.adjust(NIGHT, "scheduled").await;
+    let touched: Vec<_> = commands
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            c["node_id"]
+                .as_u64()
+                .or(c["args"]["node_id"].as_u64())
+                .unwrap()
+        })
+        .collect();
+    assert!(!touched.is_empty());
+    assert!(touched.iter().all(|node| *node == 5), "{touched:?}");
+}

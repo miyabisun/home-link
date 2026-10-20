@@ -372,6 +372,8 @@ fn router(state: Db) -> Router {
             axum::routing::post(commission_device),
         )
         .route("/devices/{id}/wifi", axum::routing::post(move_wifi))
+        .route("/devices/{id}/on", axum::routing::post(device_on))
+        .route("/devices/{id}/off", axum::routing::post(device_off))
         .route("/labels", get(list_labels).post(create_label))
         .route(
             "/labels/{id}",
@@ -645,6 +647,10 @@ struct Device {
     state: Option<&'static str>,
     /// As the connected device reports it.
     product_name: Option<String>,
+    /// `light`, `plug` or `other` by its Matter device types; `null` until it is connected.
+    kind: Option<&'static str>,
+    /// The On/Off last read of a device that switches and is not a light.
+    on: Option<bool>,
     /// The Wi-Fi network the device is on, as it reports it.
     wifi_ssid: Option<String>,
     /// The labels whose values the schedule uses for this light.
@@ -693,6 +699,8 @@ fn device_row(row: &rusqlite::Row, with_payload: bool) -> rusqlite::Result<Devic
         product_id: row.get(12)?,
         state: None,
         product_name: None,
+        kind: None,
+        on: None,
         wifi_ssid: None,
         created_at: row.get(4)?,
         qr_payload,
@@ -751,6 +759,16 @@ async fn observe(state: &AppState, devices: &mut [Device]) {
         };
         device.state = Some(state);
         device.product_name = product;
+        if let Some((kind, on_off)) =
+            place(device, &nodes).and_then(|(node, endpoint)| matter::kind(&nodes, node, endpoint))
+        {
+            device.kind = Some(match kind {
+                matter::Kind::Light => "light",
+                matter::Kind::Plug => "plug",
+                matter::Kind::Other => "other",
+            });
+            device.on = on_off.and_then(|(_, on)| on);
+        }
         device.wifi_ssid = wifi_of(device, &nodes).map(|(_, wifi)| wifi.ssid);
     }
 }
@@ -812,6 +830,59 @@ async fn move_wifi(
     // matterjs-server may not have heard of the new network yet.
     device.wifi_ssid = Some(ssid);
     Ok(Json(json!({ "device": device })))
+}
+
+async fn device_on(state: State<Db>, id: Path<i64>) -> ApiResult<Json<serde_json::Value>> {
+    switch_device(state, id, true).await
+}
+
+async fn device_off(state: State<Db>, id: Path<i64>) -> ApiResult<Json<serde_json::Value>> {
+    switch_device(state, id, false).await
+}
+
+/// Switches one device that is not a light, such as a plug: `on`, `off` or `no_response`.
+/// Lights are left to "all on" and "all off".
+async fn switch_device(
+    State(state): State<Db>,
+    Path(id): Path<i64>,
+    on: bool,
+) -> ApiResult<Json<serde_json::Value>> {
+    let device = find_device(&state.db.lock().unwrap(), id, false)?;
+    let url = matter_url(&state)?;
+    let nodes = matter::fetch_nodes(url).await.map_err(matter_unreachable)?;
+    let (node_id, endpoint) = place(&device, &nodes).ok_or_else(|| {
+        ApiError(
+            StatusCode::CONFLICT,
+            "not_connected",
+            "機器がつながっていません".into(),
+        )
+    })?;
+    let Some((matter::Kind::Plug | matter::Kind::Other, Some((switch, _)))) =
+        matter::kind(&nodes, node_id, endpoint)
+    else {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "not_switchable",
+            "入り切りできない機器です".into(),
+        ));
+    };
+    let answered = if matter::describe(&nodes, node_id, endpoint).0 {
+        matter::switch_one(url, node_id, switch, on)
+            .await
+            .map_err(matter_unreachable)?
+    } else {
+        None
+    };
+    tracing::info!(device = id, on, ?answered, "device switched");
+    match answered {
+        None => Ok(Json(json!({ "state": "no_response" }))),
+        Some(true) => Ok(Json(json!({ "state": if on { "on" } else { "off" } }))),
+        Some(false) => Err(ApiError(
+            StatusCode::BAD_GATEWAY,
+            "switch_failed",
+            "機器が入り切りを受け付けませんでした".into(),
+        )),
+    }
 }
 
 async fn observed(state: &AppState, mut device: Device) -> Device {

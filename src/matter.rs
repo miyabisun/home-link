@@ -58,6 +58,69 @@ pub fn describe(nodes: &[Value], node_id: u64, endpoint: u16) -> (bool, Option<S
 
 /// On/Off, Dimmable, Color Temperature and Extended Color Light device types.
 const LIGHT_TYPES: [u64; 4] = [0x0100, 0x0101, 0x010C, 0x010D];
+/// On/Off and Dimmable Plug-in Unit device types.
+const PLUG_TYPES: [u64; 2] = [0x010A, 0x010B];
+
+/// What a device is, by the Matter device types of its endpoints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Light,
+    Plug,
+    Other,
+}
+
+/// The endpoint carrying a device's On/Off, and the On/Off last read.
+pub type OnOff = (u16, Option<bool>);
+
+/// Whether `endpoint` is a device behind a bridge, by its Bridged Device Basic Information.
+fn bridged(attributes: &serde_json::Map<String, Value>, endpoint: u16) -> bool {
+    attributes.contains_key(&format!("{endpoint}/57/3"))
+        || attributes.contains_key(&format!("{endpoint}/57/17"))
+}
+
+fn has_type(types: &Value, wanted: &[u64]) -> bool {
+    types.as_array().is_some_and(|types| {
+        types
+            .iter()
+            .any(|t| t["0"].as_u64().is_some_and(|t| wanted.contains(&t)))
+    })
+}
+
+/// The kind of the device `locate` found and, unless it is a light, the endpoint
+/// carrying its On/Off with the On/Off last read: its own endpoint behind a
+/// bridge, else the first of its node's endpoints not behind a bridge.
+// ponytail: one On/Off per device; a power strip's other outlets wait for a ledger row per endpoint.
+#[must_use]
+pub fn kind(nodes: &[Value], node_id: u64, endpoint: u16) -> Option<(Kind, Option<OnOff>)> {
+    let node = nodes.iter().find(|n| n["node_id"] == node_id)?;
+    let attributes = node["attributes"].as_object()?;
+    let mut parts: Vec<(u16, &Value)> = attributes
+        .iter()
+        .filter_map(|(path, types)| {
+            let part = path.strip_suffix("/29/0")?.parse().ok()?;
+            let own = if endpoint == 0 {
+                !bridged(attributes, part)
+            } else {
+                part == endpoint
+            };
+            own.then_some((part, types))
+        })
+        .collect();
+    parts.sort_by_key(|(part, _)| *part);
+    if parts.iter().any(|(_, types)| has_type(types, &LIGHT_TYPES)) {
+        return Some((Kind::Light, None));
+    }
+    let kind = if parts.iter().any(|(_, types)| has_type(types, &PLUG_TYPES)) {
+        Kind::Plug
+    } else {
+        Kind::Other
+    };
+    let on_off = parts.iter().find_map(|(part, _)| {
+        let on = attributes.get(&format!("{part}/6/0"))?;
+        Some((*part, on.as_bool()))
+    });
+    Some((kind, on_off))
+}
 
 /// A light endpoint served by matterjs-server.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,19 +159,14 @@ pub fn lights(nodes: &[Value]) -> Vec<Light> {
             else {
                 continue;
             };
-            let is_light = types.as_array().is_some_and(|types| {
-                types
-                    .iter()
-                    .any(|t| t["0"].as_u64().is_some_and(|t| LIGHT_TYPES.contains(&t)))
-            });
+            let is_light = has_type(types, &LIGHT_TYPES);
             let Some(on) = attributes.get(&format!("{endpoint}/6/0")) else {
                 continue;
             };
             if !is_light {
                 continue;
             }
-            let bridged = attributes.contains_key(&format!("{endpoint}/57/3"))
-                || attributes.contains_key(&format!("{endpoint}/57/17"));
+            let bridged = bridged(attributes, endpoint);
             let reachable = reachable(node, endpoint);
             let product = if bridged {
                 format!("{endpoint}/57/3")
@@ -323,6 +381,33 @@ async fn switch_once(
 const ATTEMPTS: usize = 3;
 const ATTEMPT_WAIT: Duration = Duration::from_secs(2);
 const RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// Sends On or Off to one device's `endpoint`: `Some(true)` once accepted,
+/// `Some(false)` on an error and `None` without an answer in time.
+///
+/// # Errors
+/// Fails when the server cannot be reached or drops the connection.
+pub async fn switch_one(
+    url: &str,
+    node_id: u64,
+    endpoint: u16,
+    on: bool,
+) -> Result<Option<bool>, String> {
+    let mut ws = connect(url).await?;
+    let command = json!({
+        "command": "device_command",
+        "args": {
+            "node_id": node_id,
+            "endpoint_id": endpoint,
+            "cluster_id": 6,
+            "command_name": if on { "On" } else { "Off" },
+            "payload": {},
+        },
+    });
+    let reply = request(&mut ws, command).await.map_err(|e| e.0);
+    let _ = ws.close(None).await;
+    Ok(reply?.map(|reply| reply.get("error_code").is_none()))
+}
 
 /// What became of one light in an adjustment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
