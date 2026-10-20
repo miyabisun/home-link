@@ -37,12 +37,14 @@ WebSocketサーバーを立て、全部オン・全部オフ、エラーや無�
 `src/commission.rs` はmatterjs-serverへ保存した電球用のWi-Fi情報を渡して（Threadでは渡さず、Thread網の有無を確かめて）
 `commission_with_code` で機器を登録する処理と、
 失敗の文言（matter.jsの例外の文）を見つからない・コード違い・Wi-Fi・Thread・時間切れに分ける処理、
-登録した機器のBasic InformationとWi-FiのMACアドレスの取り出しと、それらの単体テストを持ちます。
+登録した機器のBasic InformationとWi-FiのMACアドレスの取り出し、接続済みの機器のWi-Fiの差し替え（fail-safeの下での付け替えと確定・戻り）と、それらの単体テストを持ちます。
 機器登録APIのテストは、`tests/api.rs` の中で `set_wifi_credentials`・`commission_with_code`・`read_attribute` に応答するmockを立て、
 成功・各失敗・時間切れ・台帳の重複・入力の検証を検証します。
 Wi-FiのAPIは、保存・一覧・電球に渡すものの指定・削除と、一覧・応答・ログにパスワードが出ないこと、登録が電球に渡すWi-Fiを `set_wifi_credentials` で送ることを検証します。
 mockの `server_info` の `thread_credentials_set` を切り替え、Threadでの登録の成功（Wi-Fi情報を送らないこと）、
 Thread網が未準備のときの拒否と `GET /api/thread` も検証します。
+Wi-Fiの差し替えは、`device_command` を機器のように受けるmockで、成功・ConnectNetworkの応答が届かない場合・新しいWi-Fiを拒んだ場合・
+fail-safeの後に元のWi-Fiで応答する場合・応答が無い場合を検証し、パスワードが応答・ログ・Wi-Fiの表以外のDBに残らないことも確かめます。
 `src/schedule.rs` は自動調整の目標値（日の出・日の入り、朝・昼・夕・夜の境界と線形の補間、照明ごとの下限と範囲への丸め）と、
 照明ごとに送るか・送らない理由（前回と同じ値を含む）を決める純粋な処理と、そのテストを持ちます。
 自動調整のテストは、同じmockに `read_attribute` と明るさ・色温度の命令を受けさせ、点いている照明だけに書き込むこと、
@@ -92,6 +94,7 @@ QRコードや11桁の数字を読むと台帳に入り機器の面が開くこ�
 Bluetoothでの接続は、BLEの中継をfakeに置き換え、機器に渡すWi-Fiが無いときの設定への入口、段階の表示、画面の再生成をまたいだ進行、成功、
 各失敗（機器が見つからない・コード違い・Wi-Fi・Thread網・時間切れ・matterjs-serverに接続できないなど）の後も機器が一覧に残り、
 アプリを再起動せずにもう一度押して接続できること、取り消しと、取り消した後に届いた結果を表示しないことを扱います。
+接続済みの機器のWi-Fiの差し替えは、機器の面のボタン、画面の再生成をまたいだ進行、成功、元のWi-Fiに戻った場合と応答が無い場合を扱います。
 PATCHがAndroidのOkHttpから送られることは、ローカルのfakeのhome-linkで確かめます。
 電球に渡すWi-Fiは、接続先の設定の画面で、今つながっているWi-Fiの読み取りをfakeにして、選択・追加・同じ名前の上書き・削除・保存と読み込みの失敗、
 今のSSIDの自動入力、5GHzの表示、Wi-Fiにつながっていない・SSIDを読めない場合の表示を扱います。

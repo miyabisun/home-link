@@ -8,6 +8,8 @@ sealed interface Status {
     /** Connected; the device's name, empty when it has none. */
     data class Commissioned(val name: String) : Status
     data class BleFailed(val problem: BleProblem) : Status
+    /** Moved onto the Wi-Fi named [ssid]. */
+    data class WifiMoved(val ssid: String) : Status
 }
 
 /** Why the phone could not lend its Bluetooth to matterjs-server. */
@@ -54,6 +56,26 @@ class RegisterForm {
     val unconnected get() = devices.filter { it.state == DeviceState.UNCONNECTED }
 
     fun canConnect() = device?.state == DeviceState.UNCONNECTED && !busy
+
+    /** The device whose Wi-Fi is being moved. */
+    var moving: Long? = null
+
+    /** A connected device on another Wi-Fi than the one for devices moves onto it, one at a time. */
+    fun canMoveWifi(): Boolean {
+        val open = device ?: return false
+        return open.state == DeviceState.CONNECTED && open.wifiSsid != null && deviceWifi != null &&
+            open.wifiSsid != deviceWifi && moving == null
+    }
+
+    fun wifiMoved(result: ApiResult<Device>) {
+        when (result) {
+            is ApiResult.Ok -> {
+                put(result.value)
+                status = Status.WifiMoved(result.value.wifiSsid.orEmpty())
+            }
+            is ApiResult.Failed -> status = Status.Failed(result.error)
+        }
+    }
 
     /** Takes home-link's Wi-Fi networks; a failed read keeps what was read last. */
     fun wifiRead(result: ApiResult<List<SavedNetwork>>) {

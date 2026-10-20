@@ -3,7 +3,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tokio::time::Instant;
 
-use crate::matter::{Dropped, Socket, connect, receive, send};
+use crate::matter::{Dropped, Socket, connect, receive, request_until, send};
 
 /// A device matterjs-server commissioned, and its own identifiers.
 #[derive(Debug, PartialEq, Eq)]
@@ -54,8 +54,209 @@ pub async fn commission(
     let deadline = Instant::now() + timeout;
     let mut ws = connect(url).await.map_err(Error::Unreachable)?;
     let result = session(&mut ws, code, network, deadline).await;
+    // Refused before anything was sent, there is nothing to forget.
+    if !matches!(
+        result,
+        Err(Error::Failed(
+            Failure::BluetoothDisabled | Failure::ThreadNotReady
+        ))
+    ) {
+        forget_wifi(&mut ws).await;
+    }
     let _ = ws.close(None).await;
     result
+}
+
+const FORGET_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Clears the Wi-Fi credentials matterjs-server keeps once handed them; nothing needs them after.
+async fn forget_wifi(ws: &mut Socket) {
+    let request = json!({ "message_id": "forget", "command": "remove_wifi_credentials" });
+    match call(ws, &request, Instant::now() + FORGET_TIMEOUT).await {
+        Ok(reply) if error(&reply).is_none() => {}
+        _ => tracing::warn!("matterjs-server may still hold Wi-Fi credentials"),
+    }
+}
+
+/// The Wi-Fi network a device is on, from Network Commissioning (0x0031) on the root endpoint.
+#[derive(Debug, PartialEq, Eq)]
+pub struct WifiNetwork {
+    /// `NetworkID`, base64 as matterjs-server sends bytes.
+    pub id: String,
+    pub ssid: String,
+}
+
+/// The connected network of a device with the Wi-Fi feature; `None` on Thread or Ethernet.
+#[must_use]
+pub fn wifi_network(attributes: &Value) -> Option<WifiNetwork> {
+    if attributes["0/49/65532"].as_u64()? & 1 == 0 {
+        return None;
+    }
+    let id = attributes["0/49/1"]
+        .as_array()?
+        .iter()
+        .find(|network| network["1"] == true)?["0"]
+        .as_str()?;
+    Some(WifiNetwork {
+        id: id.to_owned(),
+        ssid: String::from_utf8_lossy(&base64(id)?).into_owned(),
+    })
+}
+
+/// How long a Wi-Fi move may take at each step.
+#[derive(Clone, Copy, Debug)]
+pub struct MoveTimes {
+    /// The fail-safe armed on the device: unless completed in time, it goes back to its network.
+    pub fail_safe: Duration,
+    /// The wait for the answer to `ConnectNetwork`, which a device leaving the network rarely sends.
+    pub connect: Duration,
+    /// The pause between tries to complete on the new network or read the device back.
+    pub retry: Duration,
+    /// How long the device has to come back after the fail-safe.
+    pub settle: Duration,
+}
+
+pub const MOVE_TIMES: MoveTimes = MoveTimes {
+    fail_safe: Duration::from_mins(2),
+    connect: Duration::from_secs(30),
+    retry: Duration::from_secs(3),
+    settle: Duration::from_mins(1),
+};
+
+/// What became of a Wi-Fi move.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Move {
+    /// The device is on the new network for good.
+    Done,
+    /// The device did not stay on the new network and answers on its old one.
+    Reverted,
+    /// The device did not stay on the new network and has not answered since.
+    Reverting,
+}
+
+/// Moves node `node_id` from network `from` (its `NetworkID`) onto Wi-Fi `ssid`
+/// without resetting it: under a fail-safe it swaps the one network it holds,
+/// joins, and completes on the new network, else the fail-safe takes it back.
+/// The password goes only to the device, through matterjs-server.
+///
+/// # Errors
+/// Fails when matterjs-server cannot be reached or drops the connection.
+pub async fn move_wifi(
+    url: &str,
+    node_id: u64,
+    from: &str,
+    ssid: &str,
+    password: &str,
+    times: MoveTimes,
+) -> Result<Move, String> {
+    let mut ws = connect(url).await?;
+    let result = moving(&mut ws, node_id, from, ssid, password, times).await;
+    forget_wifi(&mut ws).await;
+    let _ = ws.close(None).await;
+    result.map_err(|Dropped(error)| error)
+}
+
+async fn moving(
+    ws: &mut Socket,
+    node_id: u64,
+    from: &str,
+    ssid: &str,
+    password: &str,
+    times: MoveTimes,
+) -> Result<Move, Dropped> {
+    // matterjs-server greets every connection with its server info.
+    receive(ws).await?;
+    let command = |cluster: u16, name: &str, payload: Value| {
+        json!({ "command": "device_command", "args": {
+            "node_id": node_id, "endpoint_id": 0, "cluster_id": cluster,
+            "command_name": name, "payload": payload,
+        }})
+    };
+    let arm = |seconds: u64| {
+        command(
+            GENERAL_COMMISSIONING,
+            "ArmFailSafe",
+            json!({ "expiryLengthSeconds": seconds, "breadcrumb": 0 }),
+        )
+    };
+    let new = encode_base64(ssid.as_bytes());
+    let expires = Instant::now() + times.fail_safe;
+    let steps = [
+        (arm(times.fail_safe.as_secs()), "errorCode"),
+        (
+            command(
+                NETWORK_COMMISSIONING,
+                "RemoveNetwork",
+                json!({ "networkId": from, "breadcrumb": 0 }),
+            ),
+            "networkingStatus",
+        ),
+        (
+            command(
+                NETWORK_COMMISSIONING,
+                "AddOrUpdateWiFiNetwork",
+                json!({ "ssid": new, "credentials": encode_base64(password.as_bytes()), "breadcrumb": 0 }),
+            ),
+            "networkingStatus",
+        ),
+    ];
+    let mut prepared = true;
+    for (step, status) in steps {
+        if !succeeded(request_until(ws, step, expires).await?.as_ref(), status) {
+            prepared = false;
+            break;
+        }
+    }
+    let connect = command(
+        NETWORK_COMMISSIONING,
+        "ConnectNetwork",
+        json!({ "networkId": new, "breadcrumb": 0 }),
+    );
+    let joined = prepared
+        // A device leaving its network rarely answers; one refusing the new network does.
+        && match request_until(ws, connect, expires.min(Instant::now() + times.connect)).await? {
+            Some(reply) if reply.get("error_code").is_none() => succeeded(Some(&reply), "networkingStatus"),
+            _ => true,
+        };
+    if joined {
+        let complete = || command(GENERAL_COMMISSIONING, "CommissioningComplete", json!({}));
+        while Instant::now() < expires {
+            if succeeded(
+                request_until(ws, complete(), expires).await?.as_ref(),
+                "errorCode",
+            ) {
+                return Ok(Move::Done);
+            }
+            tokio::time::sleep_until(expires.min(Instant::now() + times.retry)).await;
+        }
+    }
+    // Ending the fail-safe takes the device back at once; else it goes back when the fail-safe runs out.
+    let disarm = request_until(ws, arm(0), Instant::now() + times.connect).await?;
+    if !succeeded(disarm.as_ref(), "errorCode") {
+        tokio::time::sleep_until(expires).await;
+    }
+    let settled = Instant::now() + times.settle;
+    let read = || json!({ "command": "read_attribute", "args": { "node_id": node_id, "attribute_path": ["0/49/1"] } });
+    while Instant::now() < settled {
+        if let Some(reply) = request_until(ws, read(), settled).await?
+            && let Some(networks) = reply["result"]["0/49/1"].as_array()
+        {
+            let on_new = networks
+                .iter()
+                .any(|n| n["1"] == true && n["0"] == new.as_str());
+            return Ok(if on_new { Move::Done } else { Move::Reverted });
+        }
+        tokio::time::sleep_until(settled.min(Instant::now() + times.retry)).await;
+    }
+    Ok(Move::Reverting)
+}
+
+const GENERAL_COMMISSIONING: u16 = 0x30;
+const NETWORK_COMMISSIONING: u16 = 0x31;
+
+/// A reply carrying `status` 0, the success of both commissioning clusters' responses.
+fn succeeded(reply: Option<&Value>, status: &str) -> bool {
+    reply.is_some_and(|reply| reply.get("error_code").is_none() && reply["result"][status] == 0)
 }
 
 /// Whether matterjs-server holds a Thread dataset to commission Thread devices with.
@@ -264,6 +465,26 @@ pub fn wifi_mac(attributes: &Value) -> Option<String> {
         })
 }
 
+/// Encodes standard padded base64.
+fn encode_base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut text = String::new();
+    for chunk in bytes.chunks(3) {
+        let bits = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |bits, (i, &b)| bits | u32::from(b) << (16 - 8 * i));
+        for i in 0..4 {
+            text.push(if i <= chunk.len() {
+                char::from(ALPHABET[(bits >> (18 - 6 * i) & 0x3F) as usize])
+            } else {
+                '='
+            });
+        }
+    }
+    text
+}
+
 /// Decodes standard padded base64; `None` on anything else.
 fn base64(text: &str) -> Option<Vec<u8>> {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -287,7 +508,46 @@ fn base64(text: &str) -> Option<Vec<u8>> {
 mod tests {
     use serde_json::json;
 
-    use super::{Failure, classify, identity, wifi_mac};
+    use super::{
+        Failure, WifiNetwork, base64, classify, encode_base64, identity, wifi_mac, wifi_network,
+    };
+
+    #[test]
+    fn base64_round_trips_every_length() {
+        for text in ["", "a", "ab", "abc", "iot-2g", "home-2g"] {
+            let encoded = encode_base64(text.as_bytes());
+            assert_eq!(
+                base64(&encoded).as_deref(),
+                Some(text.as_bytes()),
+                "{encoded}"
+            );
+        }
+        assert_eq!(encode_base64(b"iot-2g"), "aW90LTJn");
+        assert_eq!(encode_base64(b"home-2g"), "aG9tZS0yZw==");
+    }
+
+    #[test]
+    fn the_wifi_network_is_the_connected_one_on_a_wifi_device() {
+        let attributes = |features: u64| {
+            json!({ "0/49/65532": features, "0/49/1": [
+                { "0": "aG9tZS0yZw==", "1": false },
+                { "0": "aW90LTJn", "1": true },
+            ]})
+        };
+        let iot = WifiNetwork {
+            id: "aW90LTJn".into(),
+            ssid: "iot-2g".into(),
+        };
+        assert_eq!(wifi_network(&attributes(1)), Some(iot));
+        // Thread, Ethernet, or nothing connected.
+        assert_eq!(wifi_network(&attributes(2)), None);
+        assert_eq!(wifi_network(&attributes(4)), None);
+        assert_eq!(
+            wifi_network(&json!({ "0/49/65532": 1, "0/49/1": [{ "0": "aW90LTJn", "1": false }] })),
+            None
+        );
+        assert_eq!(wifi_network(&json!({})), None);
+    }
 
     #[test]
     fn failures_are_classified_from_matter_js_messages() {

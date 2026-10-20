@@ -16,7 +16,7 @@ data class Room(val id: Long, val name: String)
 enum class ApiError { NOT_CONFIGURED, UNREACHABLE, TIMEOUT, ROOM_NOT_FOUND, DUPLICATE_ROOM, INVALID_QR, INVALID_MANUAL, INVALID_NAME,
     MATTER_UNREACHABLE, MATTER_NOT_CONFIGURED, SERVER,
     DEVICE_NOT_FOUND, WRONG_CODE, WIFI_FAILED, COMMISSION_TIMEOUT, COMMISSION_FAILED, BLUETOOTH_UNAVAILABLE, INVALID_WIFI,
-    THREAD_FAILED, WIFI_NOT_SET, WIFI_NOT_FOUND, LABEL_NOT_FOUND, LABEL_HAS_NO_LIGHTS,
+    THREAD_FAILED, WIFI_NOT_SET, WIFI_NOT_FOUND, LABEL_NOT_FOUND, LABEL_HAS_NO_LIGHTS, WIFI_REVERTED, WIFI_REVERTING, NOT_ON_WIFI,
     SESAME_NOT_CONFIGURED, SESAME_REJECTED, SESAME_UNREACHABLE }
 
 /** A Wi-Fi network to save on home-link for new devices. */
@@ -34,9 +34,12 @@ enum class DeviceState {
     }
 }
 
-/** A ledger device; [code] is its QR payload or manual code, read only for one device at a time. */
+/**
+ * A ledger device; [code] is its QR payload or manual code, read only for one device at a time.
+ * [wifiSsid] is the Wi-Fi it reports being on.
+ */
 data class Device(val id: Long, val name: String, val roomId: Long?, val labelIds: Set<Long>, val state: DeviceState?,
-                  val code: String?)
+                  val code: String?, val wifiSsid: String? = null)
 
 data class Label(val id: Long, val name: String)
 
@@ -74,6 +77,8 @@ interface HomeLinkApi {
      * home-link hands over its Wi-Fi for devices, and matterjs-server picks Wi-Fi or Thread. Takes up to minutes.
      */
     fun commission(id: Long): ApiResult<Device>
+    /** Moves connected device `id` onto home-link's Wi-Fi for devices without resetting it. Takes up to minutes. */
+    fun moveWifi(id: Long): ApiResult<Device>
     fun wifiNetworks(): ApiResult<List<SavedNetwork>>
     /** Saves the network, replacing the password of one with the same name; the first becomes the one for devices. */
     fun saveWifi(network: WifiNetwork): ApiResult<SavedNetwork>
@@ -132,6 +137,10 @@ class HttpHomeLinkApi(private val baseUrl: () -> String?) : HomeLinkApi {
     override fun commission(id: Long): ApiResult<Device> =
         call("POST", "/api/devices/$id/commission", null, readTimeout = 360_000) { device(JSONObject(it).getJSONObject("device")) }
 
+    // Under a two-minute fail-safe, then a minute for the device to come back.
+    override fun moveWifi(id: Long): ApiResult<Device> =
+        call("POST", "/api/devices/$id/wifi", null, readTimeout = 360_000) { device(JSONObject(it).getJSONObject("device")) }
+
     private fun device(json: JSONObject): Device {
         val labels = json.getJSONArray("labels")
         return Device(
@@ -139,6 +148,7 @@ class HttpHomeLinkApi(private val baseUrl: () -> String?) : HomeLinkApi {
             (0 until labels.length()).map { labels.getJSONObject(it).getLong("id") }.toSet(),
             DeviceState.of(json.optString("state").takeUnless { json.isNull("state") }),
             json.optString("qr_payload").ifEmpty { json.optString("manual_code") }.ifEmpty { null },
+            json.optString("wifi_ssid").takeUnless { json.isNull("wifi_ssid") },
         )
     }
 
@@ -246,6 +256,9 @@ class HttpHomeLinkApi(private val baseUrl: () -> String?) : HomeLinkApi {
             "sesame_not_configured" -> ApiError.SESAME_NOT_CONFIGURED
             "sesame_rejected" -> ApiError.SESAME_REJECTED
             "sesame_unreachable" -> ApiError.SESAME_UNREACHABLE
+            "wifi_reverted" -> ApiError.WIFI_REVERTED
+            "wifi_reverting" -> ApiError.WIFI_REVERTING
+            "not_on_wifi" -> ApiError.NOT_ON_WIFI
             else -> ApiError.SERVER
         }
     }

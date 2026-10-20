@@ -1609,7 +1609,9 @@ async fn fake_matter(
                 seen.lock().unwrap().push(command.clone());
                 let id = command["message_id"].clone();
                 let reply = match (command["command"].as_str().unwrap(), &commission) {
-                    ("set_wifi_credentials", _) => json!({ "message_id": id, "result": {} }),
+                    ("set_wifi_credentials" | "remove_wifi_credentials", _) => {
+                        json!({ "message_id": id, "result": {} })
+                    }
                     ("get_nodes", _) => {
                         json!({ "message_id": id, "result": served.lock().unwrap().clone() })
                     }
@@ -1823,7 +1825,11 @@ async fn commissioning_hands_over_the_wifi_for_devices_then_registers_the_new_no
             .iter()
             .map(|c| c["command"].clone())
             .collect::<Vec<_>>(),
-        [json!("set_wifi_credentials"), json!("commission_with_code")]
+        [
+            json!("set_wifi_credentials"),
+            json!("commission_with_code"),
+            json!("remove_wifi_credentials")
+        ]
     );
     assert_eq!(
         commands[0]["args"],
@@ -2153,8 +2159,10 @@ async fn thread_commissioning_uses_the_stored_dataset_and_registers_the_node() {
     );
     // No Wi-Fi is handed over: matterjs-server commissions with its own dataset.
     let commands = commands.lock().unwrap().clone();
-    assert_eq!(commands.len(), 1);
-    assert_eq!(commands[0]["command"], "commission_with_code");
+    assert_eq!(
+        commands.iter().map(|c| &c["command"]).collect::<Vec<_>>(),
+        ["commission_with_code", "remove_wifi_credentials"]
+    );
     assert_eq!(
         commands[0]["args"],
         json!({ "code": MANUAL, "network_only": false })
@@ -2422,7 +2430,11 @@ async fn three_codes_scanned_first_then_connecting_one_connects_only_that_row() 
     let commands = sent(&commands);
     assert_eq!(
         commands.iter().map(|c| &c["command"]).collect::<Vec<_>>(),
-        ["set_wifi_credentials", "commission_with_code"]
+        [
+            "set_wifi_credentials",
+            "commission_with_code",
+            "remove_wifi_credentials"
+        ]
     );
     assert_eq!(
         commands[0]["args"],
@@ -2487,7 +2499,8 @@ async fn connecting_a_row_without_a_saved_wifi_leaves_the_network_to_the_device(
         sent(&commands),
         [
             json!({ "message_id": "commission", "command": "commission_with_code",
-                 "args": { "code": MANUAL, "network_only": false } })
+                 "args": { "code": MANUAL, "network_only": false } }),
+            json!({ "message_id": "forget", "command": "remove_wifi_credentials" })
         ]
     );
 }
@@ -4026,4 +4039,344 @@ async fn door_commands_reach_candy_house_from_any_address() {
         assert_eq!(received.len(), ips.len(), "{action}");
         assert!(received.iter().all(|(_, _, command)| command["cmd"] == cmd));
     }
+}
+
+/// How the fake bulb takes a move to another Wi-Fi.
+#[derive(Clone, Copy, PartialEq)]
+enum Join {
+    /// Answers `ConnectNetwork` and completes on the new network.
+    Answers,
+    /// Leaves without answering `ConnectNetwork`; the first completion fails, the next lands.
+    Silent,
+    /// Refuses the new network in its `ConnectNetwork` answer, then answers on the old one.
+    Refuses,
+    /// Never comes up on the new network; after the fail-safe it answers on the old one.
+    Reverts,
+    /// Never answers again.
+    Lost,
+}
+
+const HOME_2G: &str = "aG9tZS0yZw==";
+const IOT_2G: &str = "aW90LTJn";
+const IOT_PASSWORD_BASE64: &str = "aW90LWhpbWl0c3UtOTFjMg==";
+
+/// A Tapo bulb on Wi-Fi "home-2g", the only network it holds.
+fn wifi_bulb() -> Value {
+    json!({ "node_id": 17, "available": true, "attributes": {
+        "0/40/1": "Tapo", "0/40/15": TAPO, "0/40/3": "Smart Bulb",
+        "0/49/65532": 1, "0/49/0": 1, "0/49/1": [{ "0": HOME_2G, "1": true }],
+    }})
+}
+
+/// Serves `nodes` and answers a Wi-Fi move the way `join` says, recording every command.
+async fn fake_mover(nodes: Value, join: Join) -> (SocketAddr, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let seen = commands.clone();
+    tokio::spawn(async move {
+        let completions = AtomicUsize::new(0);
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            ws.send(Message::text(server_info(true, false).to_string()))
+                .await
+                .unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let command: Value = serde_json::from_str(&text).unwrap();
+                seen.lock().unwrap().push(command.clone());
+                let id = command["message_id"].clone();
+                let ok = |result: Value| json!({ "message_id": id, "result": result });
+                let unreachable = json!({ "message_id": id, "error_code": 0, "details": "Node 17 is not connected" });
+                let networking =
+                    |status: u64| ok(json!({ "networkingStatus": status, "networkIndex": 0 }));
+                let reply = match command["command"].as_str().unwrap() {
+                    "get_nodes" => ok(nodes.clone()),
+                    "remove_wifi_credentials" => ok(json!({})),
+                    "read_attribute" if join == Join::Lost => unreachable,
+                    "read_attribute" => ok(json!({ "0/49/1": [{ "0": HOME_2G, "1": true }] })),
+                    "device_command" => match command["args"]["command_name"].as_str().unwrap() {
+                        "ArmFailSafe" => ok(json!({ "errorCode": 0, "debugText": "" })),
+                        "RemoveNetwork" | "AddOrUpdateWiFiNetwork" => networking(0),
+                        "ConnectNetwork" => match join {
+                            Join::Answers => networking(0),
+                            // AuthFailure.
+                            Join::Refuses => networking(7),
+                            _ => continue,
+                        },
+                        "CommissioningComplete" => {
+                            let attempt = completions.fetch_add(1, Ordering::Relaxed);
+                            match join {
+                                Join::Answers => ok(json!({ "errorCode": 0, "debugText": "" })),
+                                Join::Silent if attempt > 0 => {
+                                    ok(json!({ "errorCode": 0, "debugText": "" }))
+                                }
+                                _ => unreachable,
+                            }
+                        }
+                        other => panic!("unexpected device command {other}"),
+                    },
+                    other => panic!("unexpected command {other}"),
+                };
+                ws.send(Message::text(reply.to_string())).await.unwrap();
+            }
+        }
+    });
+    (addr, commands)
+}
+
+/// A ledger with the bulb and "home-2g" and "iot-2g" saved, "iot-2g" for devices.
+async fn moving_app(addr: SocketAddr) -> (Router, rusqlite::Connection, Value) {
+    let (db, sql) = ledger();
+    sql.execute(
+        "INSERT INTO wifi_networks (ssid, password, for_devices) VALUES ('home-2g', ?1, 0), ('iot-2g', ?2, 1)",
+        [PASSWORD, IOT_PASSWORD],
+    )
+    .unwrap();
+    let app = home_link::Home::new(db, Some(format!("ws://{addr}/ws")))
+        .with_wifi_move_times(home_link::commission::MoveTimes {
+            fail_safe: std::time::Duration::from_secs(1),
+            connect: std::time::Duration::from_millis(200),
+            retry: std::time::Duration::from_millis(50),
+            settle: std::time::Duration::from_millis(300),
+        })
+        .router();
+    let device = add_device(
+        &app,
+        &sql,
+        json!({ "qr_payload": QR, "vendor": "Tapo", "serial_number": TAPO, "mac": TAPO, "name": "押入れ1" }),
+    )
+    .await;
+    (app, sql, device)
+}
+
+async fn move_wifi(app: &Router, device: &Value) -> (StatusCode, Value) {
+    call(
+        app,
+        "POST",
+        &format!("/api/devices/{}/wifi", device["id"]),
+        None,
+    )
+    .await
+}
+
+/// The device commands sent, by name, with the other commands but reading nodes.
+fn moves(commands: &Arc<Mutex<Vec<Value>>>) -> Vec<Value> {
+    sent(commands)
+        .iter()
+        .map(|c| match c["command"].as_str().unwrap() {
+            "device_command" => c["args"]["command_name"].clone(),
+            other => json!(other),
+        })
+        .collect()
+}
+
+/// No table but the saved networks holds `secret`.
+fn assert_only_saved(sql: &rusqlite::Connection, secret: &str) {
+    let tables: Vec<String> = sql
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name != 'wifi_networks'")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    for table in tables {
+        let rows: Vec<String> = sql
+            .prepare(&format!(
+                "SELECT quote(t.*) FROM (SELECT * FROM \"{table}\") AS t"
+            ))
+            .and_then(|mut s| {
+                s.query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap_or_default();
+        assert!(
+            rows.iter().all(|row| !row.contains(secret)),
+            "{table} holds the password"
+        );
+    }
+}
+
+#[tokio::test]
+async fn devices_show_the_wifi_they_are_on() {
+    let (addr, _) = fake_mover(json!([wifi_bulb()]), Join::Answers).await;
+    let (app, _, device) = moving_app(addr).await;
+    assert_eq!(device["wifi_ssid"], "home-2g");
+    let (_, list) = call(&app, "GET", "/api/devices", None).await;
+    assert_eq!(list[0]["wifi_ssid"], "home-2g");
+}
+
+#[tokio::test]
+async fn a_bulb_moves_to_the_wifi_for_devices_under_a_fail_safe() {
+    let (logs, _guard) = capture_logs();
+    let (addr, commands) = fake_mover(json!([wifi_bulb()]), Join::Answers).await;
+    let (app, sql, device) = moving_app(addr).await;
+    let (status, body) = move_wifi(&app, &device).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["device"]["wifi_ssid"], "iot-2g");
+    assert_eq!(
+        moves(&commands),
+        [
+            "ArmFailSafe",
+            "RemoveNetwork",
+            "AddOrUpdateWiFiNetwork",
+            "ConnectNetwork",
+            "CommissioningComplete",
+            "remove_wifi_credentials"
+        ]
+    );
+    let args: Vec<Value> = sent(&commands).iter().map(|c| c["args"].clone()).collect();
+    for (args, cluster) in args.iter().zip([48, 49, 49, 49, 48]) {
+        assert_eq!(
+            (&args["node_id"], &args["endpoint_id"], &args["cluster_id"]),
+            (&json!(17), &json!(0), &json!(cluster))
+        );
+    }
+    assert_eq!(
+        args[0]["payload"],
+        json!({ "expiryLengthSeconds": 1, "breadcrumb": 0 })
+    );
+    assert_eq!(
+        args[1]["payload"],
+        json!({ "networkId": HOME_2G, "breadcrumb": 0 })
+    );
+    assert_eq!(
+        args[2]["payload"],
+        json!({ "ssid": IOT_2G, "credentials": IOT_PASSWORD_BASE64, "breadcrumb": 0 })
+    );
+    assert_eq!(
+        args[3]["payload"],
+        json!({ "networkId": IOT_2G, "breadcrumb": 0 })
+    );
+    assert_eq!(args[4]["payload"], json!({}));
+
+    let (_, list) = call(&app, "GET", "/api/devices", None).await;
+    let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("wifi"), "logs were not captured: {logs}");
+    for secret in [IOT_PASSWORD, IOT_PASSWORD_BASE64] {
+        assert!(!body.to_string().contains(secret) && !list.to_string().contains(secret));
+        assert!(!logs.contains(secret), "password in logs: {logs}");
+        assert_only_saved(&sql, secret);
+    }
+}
+
+#[tokio::test]
+async fn a_bulb_that_drops_off_without_answering_still_moves() {
+    let (addr, commands) = fake_mover(json!([wifi_bulb()]), Join::Silent).await;
+    let (app, _, device) = moving_app(addr).await;
+    let (status, body) = move_wifi(&app, &device).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["device"]["wifi_ssid"], "iot-2g");
+    assert_eq!(
+        moves(&commands),
+        [
+            "ArmFailSafe",
+            "RemoveNetwork",
+            "AddOrUpdateWiFiNetwork",
+            "ConnectNetwork",
+            "CommissioningComplete",
+            "CommissioningComplete",
+            "remove_wifi_credentials"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_bulb_that_cannot_join_goes_back_to_its_wifi_and_says_so() {
+    for join in [Join::Refuses, Join::Reverts] {
+        let (addr, commands) = fake_mover(json!([wifi_bulb()]), join).await;
+        let (app, _, device) = moving_app(addr).await;
+        let started = std::time::Instant::now();
+        let (status, body) = move_wifi(&app, &device).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::UNPROCESSABLE_ENTITY, Some("wifi_reverted")),
+            "{body}"
+        );
+        assert!(
+            body["message"].as_str().unwrap().contains("iot-2g"),
+            "{body}"
+        );
+        let moves = moves(&commands);
+        assert_eq!(
+            moves[..4],
+            [
+                "ArmFailSafe",
+                "RemoveNetwork",
+                "AddOrUpdateWiFiNetwork",
+                "ConnectNetwork"
+            ]
+        );
+        // The fail-safe is dropped at once, which reverts the network, and the bulb read back.
+        let tail = &moves[moves.len() - 3..];
+        assert_eq!(
+            tail,
+            ["ArmFailSafe", "read_attribute", "remove_wifi_credentials"]
+        );
+        let disarm = sent(&commands).into_iter().rev().nth(2).unwrap();
+        assert_eq!(
+            disarm["args"]["payload"],
+            json!({ "expiryLengthSeconds": 0, "breadcrumb": 0 })
+        );
+        if join == Join::Refuses {
+            assert!(!moves.contains(&json!("CommissioningComplete")));
+            assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_bulb_that_answers_nothing_is_said_to_be_going_back() {
+    let (addr, commands) = fake_mover(json!([wifi_bulb()]), Join::Lost).await;
+    let (app, _, device) = moving_app(addr).await;
+    let (status, body) = move_wifi(&app, &device).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::GATEWAY_TIMEOUT, Some("wifi_reverting")),
+        "{body}"
+    );
+    assert_eq!(moves(&commands).last().unwrap(), "remove_wifi_credentials");
+}
+
+#[tokio::test]
+async fn moving_needs_a_wifi_bulb_off_the_wifi_for_devices() {
+    // Already on the Wi-Fi for devices: nothing to send.
+    let mut on_iot = wifi_bulb();
+    on_iot["attributes"]["0/49/1"] = json!([{ "0": IOT_2G, "1": true }]);
+    let (addr, commands) = fake_mover(json!([on_iot]), Join::Lost).await;
+    let (app, sql, device) = moving_app(addr).await;
+    let (status, body) = move_wifi(&app, &device).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["device"]["wifi_ssid"], "iot-2g");
+    assert_eq!(moves(&commands), Vec::<Value>::new());
+
+    // Not on Wi-Fi: a Thread bulb, or one matterjs-server does not serve.
+    let mut on_thread = wifi_bulb();
+    on_thread["attributes"]["0/49/65532"] = json!(2);
+    on_thread["attributes"]["0/49/1"] = json!([{ "0": "AAECAwQFBgc=", "1": true }]);
+    for nodes in [json!([on_thread]), json!([])] {
+        let (addr, commands) = fake_mover(nodes, Join::Lost).await;
+        let (app, _, device) = moving_app(addr).await;
+        let (status, body) = move_wifi(&app, &device).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::CONFLICT, Some("not_on_wifi")),
+            "{body}"
+        );
+        assert_eq!(moves(&commands), Vec::<Value>::new());
+    }
+
+    // No Wi-Fi for devices, and no such device.
+    sql.execute("UPDATE wifi_networks SET for_devices = 0", [])
+        .unwrap();
+    let (status, body) = move_wifi(&app, &device).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::CONFLICT, Some("wifi_not_set"))
+    );
+    let (status, body) = move_wifi(&app, &json!({ "id": 999 })).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::NOT_FOUND, Some("device_not_found"))
+    );
 }

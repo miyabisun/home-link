@@ -505,7 +505,16 @@ pub async fn read_on(
 
 /// Sends `request` under a fresh message id and waits for its reply; `None`
 /// when none arrives in time. Late replies to earlier requests are skipped.
-async fn request(ws: &mut Socket, mut request: Value) -> Result<Option<Value>, Dropped> {
+async fn request(ws: &mut Socket, request: Value) -> Result<Option<Value>, Dropped> {
+    request_until(ws, request, Instant::now() + REPLY_TIMEOUT).await
+}
+
+/// `request`, waiting for the reply until `deadline`.
+pub(crate) async fn request_until(
+    ws: &mut Socket,
+    mut request: Value,
+    deadline: Instant,
+) -> Result<Option<Value>, Dropped> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let id = format!(
         "tune-{}",
@@ -513,7 +522,6 @@ async fn request(ws: &mut Socket, mut request: Value) -> Result<Option<Value>, D
     );
     request["message_id"] = json!(id);
     send(ws, &request).await?;
-    let deadline = Instant::now() + REPLY_TIMEOUT;
     loop {
         let Ok(reply) = tokio::time::timeout_at(deadline, receive(ws)).await else {
             return Ok(None);

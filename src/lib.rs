@@ -243,6 +243,7 @@ struct AppState {
     sent: Mutex<HashMap<(u64, u16), schedule::Target>>,
     /// How long one commissioning may take, Bluetooth discovery to Wi-Fi join.
     commission_timeout: Duration,
+    wifi_move: commission::MoveTimes,
     /// The current time in Unix seconds for "all on" and its intent, and for signing a door command.
     clock: fn() -> i64,
     /// The front door's SESAME, or why it cannot be unlocked or locked.
@@ -274,6 +275,7 @@ impl Home {
             runs: Mutex::new(VecDeque::new()),
             sent: Mutex::new(HashMap::new()),
             commission_timeout: COMMISSION_TIMEOUT,
+            wifi_move: commission::MOVE_TIMES,
             clock: now,
             sesame: sesame::Config::new(None, None, None, sesame::API_URL),
         }))
@@ -312,6 +314,18 @@ impl Home {
         Arc::get_mut(&mut self.0)
             .expect("set before the Home is shared")
             .commission_timeout = timeout;
+        self
+    }
+
+    /// Replaces how long each step of moving a device to another Wi-Fi may take.
+    ///
+    /// # Panics
+    /// Panics once the router or a clone shares this `Home`.
+    #[must_use]
+    pub fn with_wifi_move_times(mut self, times: commission::MoveTimes) -> Self {
+        Arc::get_mut(&mut self.0)
+            .expect("set before the Home is shared")
+            .wifi_move = times;
         self
     }
 
@@ -357,6 +371,7 @@ fn router(state: Db) -> Router {
             "/devices/{id}/commission",
             axum::routing::post(commission_device),
         )
+        .route("/devices/{id}/wifi", axum::routing::post(move_wifi))
         .route("/labels", get(list_labels).post(create_label))
         .route(
             "/labels/{id}",
@@ -630,6 +645,8 @@ struct Device {
     state: Option<&'static str>,
     /// As the connected device reports it.
     product_name: Option<String>,
+    /// The Wi-Fi network the device is on, as it reports it.
+    wifi_ssid: Option<String>,
     /// The labels whose values the schedule uses for this light.
     labels: Vec<LabelRef>,
     /// Left out of switching, adjusting and the counts.
@@ -676,6 +693,7 @@ fn device_row(row: &rusqlite::Row, with_payload: bool) -> rusqlite::Result<Devic
         product_id: row.get(12)?,
         state: None,
         product_name: None,
+        wifi_ssid: None,
         created_at: row.get(4)?,
         qr_payload,
         manual_code,
@@ -733,7 +751,67 @@ async fn observe(state: &AppState, devices: &mut [Device]) {
         };
         device.state = Some(state);
         device.product_name = product;
+        device.wifi_ssid = wifi_of(device, &nodes).map(|(_, wifi)| wifi.ssid);
     }
+}
+
+/// The node of a device on Wi-Fi itself, not behind a bridge, and its network.
+fn wifi_of(device: &Device, nodes: &[serde_json::Value]) -> Option<(u64, commission::WifiNetwork)> {
+    let (node_id, 0) = place(device, nodes)? else {
+        return None;
+    };
+    let node = nodes.iter().find(|node| node["node_id"] == node_id)?;
+    commission::wifi_network(&node["attributes"]).map(|wifi| (node_id, wifi))
+}
+
+/// Moves a ledger device onto the Wi-Fi for devices without resetting it; one already on it stays.
+async fn move_wifi(
+    State(state): State<Db>,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let (device, (ssid, password)) = {
+        let db = state.db.lock().unwrap();
+        (find_device(&db, id, false)?, wifi_for_devices(&db)?)
+    };
+    let url = matter_url(&state)?;
+    let nodes = matter::fetch_nodes(url).await.map_err(matter_unreachable)?;
+    let (node_id, from) = wifi_of(&device, &nodes).ok_or_else(|| {
+        ApiError(
+            StatusCode::CONFLICT,
+            "not_on_wifi",
+            "Wi-Fiでつながっている機器ではありません".into(),
+        )
+    })?;
+    if from.ssid != ssid {
+        let moved =
+            commission::move_wifi(url, node_id, &from.id, &ssid, &password, state.wifi_move)
+                .await
+                .map_err(matter_unreachable)?;
+        tracing::info!(node_id, device = id, ?moved, "wifi move ended");
+        match moved {
+            commission::Move::Done => {}
+            commission::Move::Reverted => {
+                return Err(ApiError(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "wifi_reverted",
+                    format!("機器がWi-Fi「{ssid}」につながらず、元のWi-Fiに戻りました"),
+                ));
+            }
+            commission::Move::Reverting => {
+                return Err(ApiError(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "wifi_reverting",
+                    format!(
+                        "機器がWi-Fi「{ssid}」につながらず、応答がありません。元のWi-Fiへ戻ります"
+                    ),
+                ));
+            }
+        }
+    }
+    let mut device = observed(&state, device).await;
+    // matterjs-server may not have heard of the new network yet.
+    device.wifi_ssid = Some(ssid);
+    Ok(Json(json!({ "device": device })))
 }
 
 async fn observed(state: &AppState, mut device: Device) -> Device {

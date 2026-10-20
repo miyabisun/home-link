@@ -155,6 +155,8 @@ internal fun Activity.button(parent: LinearLayout, value: String, primary: Boole
     if (icon != 0) {
         setCompoundDrawablesRelativeWithIntrinsicBounds(icon, 0, 0, 0)
         compoundDrawablePadding = dp(8)
+        // Icons draw in the body text colour, which the accent fill does not carry.
+        if (primary) compoundDrawableTintList = textColors
     }
     setPadding(dp(12), dp(12), dp(12), dp(12))
     setOnClickListener { action() }

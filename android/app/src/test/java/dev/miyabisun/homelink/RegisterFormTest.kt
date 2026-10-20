@@ -220,4 +220,34 @@ class RegisterFormTest {
             assertNull(other, Stage.of(other))
         }
     }
+
+    @Test fun onlyAConnectedDeviceOffTheWifiForDevicesCanMoveAndOneAtATime() {
+        val form = RegisterForm()
+        val onHome = device(1, DeviceState.CONNECTED).copy(wifiSsid = "home-2g")
+        form.opened(onHome)
+        // Nothing to move onto until home-link's Wi-Fi for devices is read.
+        assertFalse(form.canMoveWifi())
+        form.wifiRead(ApiResult.Ok(listOf(SavedNetwork(1, "home-2g", false), SavedNetwork(2, "iot-2g", true))))
+        assertTrue(form.canMoveWifi())
+        form.moving = 1
+        assertFalse(form.canMoveWifi())
+        form.moving = null
+        for (other in listOf(onHome.copy(wifiSsid = "iot-2g"), onHome.copy(wifiSsid = null), onHome.copy(state = DeviceState.NO_RESPONSE),
+                device(2).copy(wifiSsid = "home-2g"))) {
+            form.opened(other)
+            assertFalse("$other", form.canMoveWifi())
+        }
+    }
+
+    @Test fun aMovedDeviceShowsItsNewWifiAndAFailureKeepsTheDevice() {
+        val form = RegisterForm()
+        val onHome = device(1, DeviceState.CONNECTED).copy(wifiSsid = "home-2g", code = qr)
+        form.opened(onHome)
+        form.wifiMoved(ApiResult.Ok(onHome.copy(wifiSsid = "iot-2g", code = null)))
+        assertEquals(Status.WifiMoved("iot-2g"), form.status)
+        assertEquals(onHome.copy(wifiSsid = "iot-2g"), form.device)
+        form.wifiMoved(ApiResult.Failed(ApiError.WIFI_REVERTED))
+        assertEquals(Status.Failed(ApiError.WIFI_REVERTED), form.status)
+        assertEquals("iot-2g", form.device?.wifiSsid)
+    }
 }

@@ -715,6 +715,66 @@ class RegisterScreenTest {
         }
     }
 
+    @Test fun aConnectedDeviceMovesOntoTheWifiForDevicesWithOneButton() {
+        api.wifi += listOf(SavedNetwork(1, "home-2g", forDevices = false), SavedNetwork(2, "iot-2g", forDevices = true))
+        api.ledger += Device(1, "押入れ1", null, emptySet(), DeviceState.CONNECTED, qrs[0], "home-2g")
+        api.ledger += Device(2, "天井1", null, emptySet(), DeviceState.CONNECTED, qrs[1], "iot-2g")
+        val move = "「iot-2g」へ移す"
+        ActivityScenario.launch(MainActivity::class.java).use { screen ->
+            eventually(screen) { hasLabel(it, "まだ読み取っていません") }
+            // A device already on the Wi-Fi for devices has nothing to move.
+            scanner.next = ScanResult.Read(qrs[1])
+            screen.onActivity { button(it, "QRを読み取る").performClick() }
+            eventually(screen) { hasLabel(it, "接続済み") && field(it, "機器名（任意）").text.toString() == "天井1" }
+            screen.onActivity { assertFalse(views(it).any { v -> v is Button && v.isShown && v.text == move }) }
+
+            scanner.next = ScanResult.Read(qrs[0])
+            screen.onActivity { button(it, "QRを読み取る").performClick() }
+            eventually(screen) { field(it, "機器名（任意）").text.toString() == "押入れ1" && button(it, move).isEnabled }
+            screen.onActivity { activity ->
+                assertNoWifiInputs(activity)
+                assertFalse(views(activity).any { it is Button && it.isShown && it.text == "接続" })
+            }
+            capture(screen, "move-ready")
+
+            // The move runs on across a recreated screen and cannot be pressed twice.
+            val gate = CountDownLatch(1)
+            api.moveGate = gate
+            screen.onActivity { button(it, move).performClick() }
+            eventually(screen) { hasLabel(it, "Wi-Fiを移しています…") }
+            screen.onActivity { assertFalse(views(it).any { v -> v is Button && v.isShown && v.text == move }) }
+            capture(screen, "move-busy")
+            screen.recreate()
+            eventually(screen) { hasLabel(it, "Wi-Fiを移しています…") && field(it, "機器名（任意）").text.toString() == "押入れ1" }
+            gate.countDown()
+            eventually(screen) { hasLabel(it, "「iot-2g」へ移しました") }
+            screen.onActivity { assertFalse(views(it).any { v -> v is Button && v.isShown && v.text == move }) }
+            assertEquals(listOf(1L), api.moves.toList())
+            capture(screen, "move-done")
+        }
+        api.moveGate = null
+        for ((failure, text, state) in listOf(
+            Triple(ApiError.WIFI_REVERTED, "「iot-2g」につながらず、元のWi-Fiに戻りました", "接続済み"),
+            Triple(ApiError.WIFI_REVERTING, "「iot-2g」につながらず、応答がありません。元のWi-Fiへ戻ります", "応答なし"),
+        )) {
+            api.ledger[0] = api.ledger[0].copy(wifiSsid = "home-2g", state = DeviceState.CONNECTED)
+            api.moveFailure = failure
+            ActivityScenario.launch(MainActivity::class.java).use { screen ->
+                scanner.next = ScanResult.Read(qrs[0])
+                eventually(screen) { hasLabel(it, "まだ読み取っていません") }
+                screen.onActivity { button(it, "QRを読み取る").performClick() }
+                eventually(screen) { button(it, move).isEnabled }
+                screen.onActivity { button(it, move).performClick() }
+                // The device's state, read again, tells whether it is still usable; a usable one may be moved again.
+                eventually(screen) {
+                    hasLabel(it, text) && hasLabel(it, state) &&
+                        views(it).any { v -> v is Button && v.isShown && v.text == move } == (state == "接続済み")
+                }
+                capture(screen, "move-${failure.name.lowercase()}")
+            }
+        }
+    }
+
     /** Registering neither chooses nor types a Wi-Fi. */
     private fun assertNoWifiInputs(activity: Activity) {
         assertFalse(views(activity).any { it.isShown && it is Spinner && it.contentDescription == "電球に渡すWi-Fi" })
@@ -900,6 +960,24 @@ private class FakeApi : HomeLinkApi {
             val index = ledger.indexOfFirst { it.id == id }
             ledger[index] = ledger[index].copy(state = DeviceState.CONNECTED)
             ApiResult.Ok(ledger[index].copy(code = null))
+        }
+    }
+
+    val moves: MutableList<Long> = Collections.synchronizedList(mutableListOf())
+    @Volatile var moveGate: CountDownLatch? = null
+    @Volatile var moveFailure: ApiError? = null
+
+    override fun moveWifi(id: Long): ApiResult<Device> {
+        moveGate?.await()
+        moves += id
+        return synchronized(ledger) {
+            val index = ledger.indexOfFirst { it.id == id }
+            when (moveFailure) {
+                null -> ledger[index] = ledger[index].copy(wifiSsid = wifi.first { it.forDevices }.ssid)
+                ApiError.WIFI_REVERTING -> ledger[index] = ledger[index].copy(state = DeviceState.NO_RESPONSE)
+                else -> Unit
+            }
+            moveFailure?.let { ApiResult.Failed(it) } ?: ApiResult.Ok(ledger[index].copy(code = null))
         }
     }
 

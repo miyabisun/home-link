@@ -99,6 +99,7 @@ class MainActivity : Activity() {
     private lateinit var resultRow: ResultRow
     private lateinit var reconnectButton: Button
     private lateinit var connectButton: Button
+    private lateinit var moveButton: Button
     private lateinit var cancelButton: Button
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -129,6 +130,8 @@ class MainActivity : Activity() {
         }
         CommissionSession.follow { sessionChanged() }
         sessionChanged()
+        WifiMove.follow { moveChanged() }
+        moveChanged()
         savedInstanceState?.getLong("device", -1)?.takeIf { it >= 0 }?.let { id ->
             background({ api.device(id) }) { result ->
                 if (result is ApiResult.Ok && form.device == null) open(result.value, savedInstanceState.getString("name"))
@@ -183,6 +186,7 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         CommissionSession.follow(null)
+        WifiMove.follow(null)
         worker.shutdownNow()
         lightsWorker.shutdownNow()
         super.onDestroy()
@@ -442,6 +446,23 @@ class MainActivity : Activity() {
         render()
     }
 
+    private fun moveWifi(id: Long) {
+        saveName()
+        form.status = null
+        WifiMove.start(id) { api.moveWifi(id) }
+        moveChanged()
+    }
+
+    private fun moveChanged() {
+        form.moving = WifiMove.device
+        WifiMove.take()?.let { (id, result) ->
+            if (form.device?.id == id) form.wifiMoved(result)
+            // The device may answer from the old Wi-Fi or not at all: its state shows which.
+            loadDevices()
+        }
+        render()
+    }
+
     private fun build() {
         content = page()
 
@@ -553,6 +574,9 @@ class MainActivity : Activity() {
             form.device?.let { commission(it.id) }
         }
         cancelButton = button(content, "キャンセル") { cancel() }
+        moveButton = button(content, "", primary = true, icon = R.drawable.ic_wifi) {
+            form.device?.let { moveWifi(it.id) }
+        }
         button(content, "接続先の設定", icon = R.drawable.ic_settings) { openSettings() }.apply {
             (layoutParams as LinearLayout.LayoutParams).topMargin = dp(24)
         }
@@ -647,6 +671,7 @@ class MainActivity : Activity() {
         val ssid = form.deviceWifi?.let { "「$it」" }.orEmpty()
         val result = when (status) {
             is Status.Commissioned -> if (status.name.isEmpty()) "接続しました" else "「${status.name}」を接続しました"
+            is Status.WifiMoved -> "「${status.ssid}」へ移しました"
             is Status.BleFailed -> when (status.problem) {
                 BleProblem.PERMISSION -> "Bluetoothで機器を探すには「付近のデバイス」の許可が必要です。" +
                     "許可してから「接続」を押し直してください"
@@ -664,7 +689,7 @@ class MainActivity : Activity() {
                 ApiError.INVALID_QR, ApiError.INVALID_MANUAL, ApiError.DUPLICATE_ROOM -> null
                 ApiError.SERVER, ApiError.MATTER_UNREACHABLE, ApiError.MATTER_NOT_CONFIGURED,
                 ApiError.LABEL_NOT_FOUND, ApiError.LABEL_HAS_NO_LIGHTS, ApiError.INVALID_WIFI, ApiError.WIFI_NOT_FOUND,
-                ApiError.WIFI_NOT_SET, ApiError.SESAME_NOT_CONFIGURED, ApiError.SESAME_REJECTED, ApiError.SESAME_UNREACHABLE ->
+                ApiError.WIFI_NOT_SET, ApiError.NOT_ON_WIFI, ApiError.SESAME_NOT_CONFIGURED, ApiError.SESAME_REJECTED, ApiError.SESAME_UNREACHABLE ->
                     "home-linkでエラーが発生しました。時間をおいてお試しください"
                 ApiError.DEVICE_NOT_FOUND -> "機器が見つかりませんでした。機器をペアリング待ちにし、" +
                     "電話を近づけてから「接続」を押し直してください"
@@ -677,17 +702,22 @@ class MainActivity : Activity() {
                 ApiError.BLUETOOTH_UNAVAILABLE -> "matterjs-serverでBluetoothの中継が有効になっていません。サーバーの設定を確かめてください"
                 ApiError.THREAD_FAILED -> "機器がThread網につながりませんでした。Thread網（OTBR）が動いているか確かめてから、" +
                     "もう一度お試しください"
+                ApiError.WIFI_REVERTED -> "${ssid}につながらず、元のWi-Fiに戻りました"
+                ApiError.WIFI_REVERTING -> "${ssid}につながらず、応答がありません。元のWi-Fiへ戻ります"
             }
             else -> null
         }
         val stage = form.stage
-        if (form.busy && stage != null) resultRow.show(stageText(stage), failed = false, R.drawable.ic_bluetooth)
+        if (device != null && form.moving == device.id) resultRow.show("Wi-Fiを移しています…", failed = false, R.drawable.ic_wifi)
+        else if (form.busy && stage != null) resultRow.show(stageText(stage), failed = false, R.drawable.ic_bluetooth)
         else resultRow.show(result, status is Status.Failed || status is Status.BleFailed)
         reconnectButton.visibility =
             if (form.roomsFailed || form.devicesFailed || status == Status.Failed(ApiError.UNREACHABLE)) View.VISIBLE
             else View.GONE
         connectButton.visibility = if (form.canConnect()) View.VISIBLE else View.GONE
         cancelButton.visibility = if (form.busy) View.VISIBLE else View.GONE
+        moveButton.text = "「${form.deviceWifi}」へ移す"
+        moveButton.visibility = if (form.canMoveWifi()) View.VISIBLE else View.GONE
     }
 
     /** One check box per label, ticked for the device's. */

@@ -108,6 +108,23 @@ class HttpHomeLinkApiTest {
         assertEquals("POST /api/devices/9/commission", requests.last())
     }
 
+    @Test fun movesADeviceOntoTheWifiForDevicesWithoutABody() {
+        respond("/api/devices/9/wifi", 200,
+            """{"device":${ledgerRow.replace("unconnected", "connected").replace("\"ignored\"", "\"wifi_ssid\":\"iot-2g\",\"ignored\"")}}""")
+        assertEquals(ApiResult.Ok(ledgerDevice.copy(state = DeviceState.CONNECTED, wifiSsid = "iot-2g")), api.moveWifi(9))
+        // home-link hands over the Wi-Fi it holds for devices; the phone sends none.
+        assertEquals("POST /api/devices/9/wifi", requests.last())
+        for ((status, code, expected) in listOf(
+            Triple(422, "wifi_reverted", ApiError.WIFI_REVERTED),
+            Triple(504, "wifi_reverting", ApiError.WIFI_REVERTING),
+            Triple(409, "not_on_wifi", ApiError.NOT_ON_WIFI),
+            Triple(409, "wifi_not_set", ApiError.WIFI_NOT_SET),
+        )) {
+            respond("/api/devices/9/wifi", status, """{"error":"$code","message":"m"}""")
+            assertEquals("$status $code", ApiResult.Failed(expected), api.moveWifi(9))
+        }
+    }
+
     @Test fun savesListsChoosesAndDeletesTheServersWifi() {
         respond("/api/wifi", 200, """[{"id":1,"ssid":"home-2g","for_devices":false},{"id":4,"ssid":"iot-2g","for_devices":true}]""")
         assertEquals(ApiResult.Ok(listOf(SavedNetwork(1, "home-2g", false), SavedNetwork(4, "iot-2g", true))), api.wifiNetworks())

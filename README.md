@@ -30,6 +30,7 @@ CANDY HOUSEのAPIキーとSESAMEの秘密鍵は、データベース・ログ・
 電球に渡すWi-FiのSSIDとパスワードは、home-linkのデータベースに平文で保存します。
 データベースファイルとそのバックアップ（R2などへのコピーを含む）には、Wi-Fiのパスワードが入ります。
 APIはパスワードを書き込むだけで、一覧・応答・ログには出しません。
+matterjs-serverへは登録と差し替えのときだけ渡します。終わったら、matterjs-serverが保存した分を `remove_wifi_credentials` で消します。
 
 ## サーバーの起動
 
@@ -176,6 +177,16 @@ Thread網の資格情報（dataset）は、matterjs-serverに `set_thread_datase
 機器が見つからない、コードが違う、Wi-FiやThread網につながらない、時間切れ、matterjs-serverに接続できない、はそれぞれ理由と次にすることを表示します。
 接続できなかった機器は未接続のまま一覧に残るので、機器の電源を入れ直して同じ機器を押せば、アプリの再起動やQRの読み直しをせずに試し直せます。
 
+### 接続済みの機器を別のWi-Fiへ移す
+
+接続済みのWi-Fiの機器は、初期化せずに、機器に渡すWi-Fi（接続先の設定の画面で選んだもの）へ移せます。
+機器のコードを読んでその機器の面を開き、「「Wi-Fiの名前」へ移す」を押します。
+このボタンは、機器が今つながっているWi-Fiが機器に渡すWi-Fiと違うときだけ出ます。
+移すのには数分かかることがあります。
+移した先のWi-Fiにつながらなかった機器は、自分で元のWi-Fiへ戻ります。
+アプリは、元のWi-Fiに戻ったか、まだ応答が無いかを示し、機器の接続の状態を読み直します。
+移した先のWi-Fiからmatterjs-serverへ届かない（家のネットワークから切り離したIoT用のWi-Fiなど）場合も、機器は元のWi-Fiへ戻ります。
+
 ## API
 
 すべてJSONです。失敗時は `{"error": "コード", "message": "説明"}` を返します。
@@ -191,6 +202,7 @@ Thread網の資格情報（dataset）は、matterjs-serverに `set_thread_datase
 | `GET /api/devices/{id}` | 機器1台。一覧の項目に、登録したコードの全文 `qr_payload` または `manual_code` を加えます | 404 `device_not_found` |
 | `PATCH /api/devices/{id}` | 機器の名前・部屋・labelの割り当て・無視の設定。本文は送った項目だけを変えます。`{"name": "押入れ1"}`、`{"room_id": 2}`（`null` で部屋から外す）、`{"label_ids": [1, 2]}`（割り当てを置き換え、`[]` で外す）、`{"ignored": true}`（`false` で戻す） | 400 `invalid_device_update`・`invalid_device_name`・`conflicting_labels`、404 `device_not_found`・`room_not_found`・`label_not_found` |
 | `POST /api/devices/{id}/commission` | 台帳の機器を、記録したコードでmatterjs-serverへBluetoothで登録（commissioning）し、その行に識別子を補います。本文は要りません | 404 `device_not_found`、409 `no_setup_code`、422 `device_not_found`・`wrong_code`・`wifi_failed`・`thread_failed`・`commission_failed`、504 `commission_timeout`、502 `matter_server_unreachable`、503 `matter_server_not_configured`・`bluetooth_unavailable` |
+| `POST /api/devices/{id}/wifi` | 接続済みのWi-Fiの機器を、初期化せずに機器に渡すWi-Fi（`for_devices`）へ移します。本文は要りません。既にそのWi-Fiにいれば何も送りません。成功すると `{"device": {…}}` を200で返します | 404 `device_not_found`、409 `wifi_not_set`・`not_on_wifi`、422 `wifi_reverted`、504 `wifi_reverting`、502 `matter_server_unreachable`、503 `matter_server_not_configured` |
 | `DELETE /api/devices/{id}` | 機器の削除 | 404 `device_not_found` |
 | `GET /api/labels` | labelの一覧（値と割り当てた機器の台数、専用か `dedicated`、明るくしている最中か `boosted` つき） | |
 | `POST /api/labels` | labelの作成。本文は `{"name": "キッチン", "night_level": 76, "warm_kelvin": 2700}`。`"dedicated": true` で専用にします（既定は `false`） | 400 `invalid_label_name`・`invalid_label`、409 `duplicate_label_name` |
@@ -227,6 +239,7 @@ Thread網の資格情報（dataset）は、matterjs-serverに `set_thread_datase
 機器の一覧と1台の取得は、そのたびにmatterjs-serverの全nodeを読み、識別子から接続の状態 `state` を求めます。
 `unconnected` は接続していない（またはmatterjs-serverにもう無い）、`connected` は接続済み、`no_response` はnodeがあるが応答しない機器です。
 matterjs-serverの接続先が無い・接続できないときは `null` です。人が直す状態の欄はありません。
+`wifi_ssid` は、Wi-Fiでつながっている機器が今いるWi-Fiの名前です（Network Commissioningの接続中のネットワーク）。それ以外の機器は `null` です。
 接続していない機器は識別子が無いので、照明の `missing_devices` には入りません。
 
 `POST /api/devices/{id}/commission` は、行に記録したコードで `commission_with_code`（`network_only: false`）を送ります。
@@ -236,6 +249,17 @@ Wi-FiかThreadかは指定せず、機器の申告からmatterjs-serverが決め
 失敗の分類と打ち切りの時間は `POST /api/commission` と同じです。失敗した行はそのまま残り、`unconnected` のままです。
 同じ識別子の機器が台帳の別の行にあれば（初期化して読み直した機器など）、その行を残し、読んだ行のコード、
 その行に無い名前と部屋を移して、読んだ行を消します。labelと無視の設定は残した行のものです。
+
+`POST /api/devices/{id}/wifi` は、Matterの仕様の手順でWi-Fiを差し替えます。
+まず `device_command` で、機器のGeneral CommissioningにArmFailSafe（2分）を送ります。
+続いてNetwork Commissioningで、今のネットワークをRemoveNetworkで外します。
+AddOrUpdateWiFiNetworkで新しいWi-Fiを入れ、ConnectNetworkでつながせます。
+ConnectNetworkの応答は、機器が元のネットワークを離れるため届かないことが多く、届かなくても先へ進みます。
+新しいWi-Fiの上でCommissioningCompleteを受け付けられたら確定し、200を返します。
+確定できないときは、ArmFailSafe（0秒）でfail-safeを終えます。ConnectNetworkが新しいWi-Fiを拒んだときと、fail-safeが切れるまで確定できなかったときです。
+fail-safeが終わると、機器は元のネットワークに戻ります（Matterの仕様）。
+その後に機器から接続中のネットワークを読みます。元のWi-Fiで応答すれば422 `wifi_reverted`、1分待っても応答が無ければ504 `wifi_reverting` です。
+Wi-Fiのパスワードは機器への命令だけに入れ、応答とログには含めません。
 
 `POST /api/commission` は、0.1.32までのアプリのために残しています。台帳の行を作らずに登録し、登録できたら行を作ります。
 QRコードは `MT:` で始まるMatterのセットアップコードとして検証し、前後の空白は除いて保存します。
