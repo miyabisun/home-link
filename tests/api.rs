@@ -1,6 +1,9 @@
 use std::{
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use axum::{
@@ -17,8 +20,6 @@ use tower::ServiceExt;
 const QR: &str = "MT:Y.K9042C00KA0648G00";
 // The same device as `QR` (passcode 20202021, discriminator 3840).
 const MANUAL: &str = "34970112332";
-// Another device: passcode 20202022.
-const OTHER_QR: &str = "MT:Y.K9042C000O0648G00";
 
 fn app() -> Router {
     home_link::app(home_link::open_db(":memory:").unwrap(), None)
@@ -44,6 +45,45 @@ async fn create_room(app: &Router, name: &str) -> i64 {
     let (status, room) = call(app, "POST", "/api/rooms", Some(json!({ "name": name }))).await;
     assert_eq!(status, StatusCode::CREATED, "{room}");
     room["id"].as_i64().unwrap()
+}
+
+/// Two connections to a fresh in-memory ledger: one for the app, one for the
+/// test to record devices in, as only commissioning does through the API.
+fn ledger() -> (rusqlite::Connection, rusqlite::Connection) {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let uri = format!("file:ledger-{n}?mode=memory&cache=shared");
+    let open = || home_link::open_db(&uri).unwrap();
+    (open(), open())
+}
+
+/// An app on a fresh `ledger()`, with the test's connection to it.
+fn ledger_app() -> (Router, rusqlite::Connection) {
+    let (db, sql) = ledger();
+    (home_link::app(db, None), sql)
+}
+
+/// Records `device` (`room_id`, a code and identifiers as stored, `name`) and
+/// returns it as `GET /api/devices/{id}` shows it.
+async fn add_device(app: &Router, db: &rusqlite::Connection, device: Value) -> Value {
+    let text = |key| device.get(key).and_then(Value::as_str);
+    db.execute(
+        "INSERT INTO devices (room_id, qr_payload, vendor, serial_number, mac, name)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            device["room_id"].as_i64(),
+            text("qr_payload").or(text("manual_code")),
+            text("vendor"),
+            text("serial_number"),
+            text("mac"),
+            text("name").unwrap_or(""),
+        ],
+    )
+    .unwrap();
+    let uri = format!("/api/devices/{}", db.last_insert_rowid());
+    let (status, device) = call(app, "GET", &uri, None).await;
+    assert_eq!(status, StatusCode::OK, "{device}");
+    device
 }
 
 #[tokio::test]
@@ -118,12 +158,21 @@ async fn room_names_must_be_present_and_unique() {
 }
 
 #[tokio::test]
-async fn rooms_with_devices_cannot_be_deleted() {
+async fn devices_enter_the_ledger_only_by_commissioning() {
     let app = app();
     let room = create_room(&app, "寝室").await;
-    let device = json!({ "room_id": room, "qr_payload": QR, "name": "" });
-    let (status, created) = call(&app, "POST", "/api/devices", Some(device)).await;
-    assert_eq!(status, StatusCode::CREATED);
+    let body = json!({ "room_id": room, "qr_payload": QR });
+    let (status, _) = call(&app, "POST", "/api/devices", Some(body)).await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    let (_, devices) = call(&app, "GET", "/api/devices", None).await;
+    assert_eq!(devices, json!([]));
+}
+
+#[tokio::test]
+async fn rooms_with_devices_cannot_be_deleted() {
+    let (app, sql) = ledger_app();
+    let room = create_room(&app, "寝室").await;
+    let created = add_device(&app, &sql, json!({ "room_id": room, "qr_payload": QR })).await;
 
     let uri = format!("/api/rooms/{room}");
     let (status, error) = call(&app, "DELETE", &uri, None).await;
@@ -141,246 +190,38 @@ async fn rooms_with_devices_cannot_be_deleted() {
     assert_eq!(status, StatusCode::NO_CONTENT);
 }
 
+const TAPO: &str = "AABBCCDDEEFF";
+
 #[tokio::test]
-async fn devices_register_with_optional_name_and_hide_payload_in_list() {
-    let app = app();
+async fn devices_hide_their_codes_in_list_but_not_alone() {
+    let (app, sql) = ledger_app();
     let room = create_room(&app, "寝室").await;
-
-    let (status, unnamed) = call(
-        &app,
-        "POST",
-        "/api/devices",
-        Some(json!({ "room_id": room, "qr_payload": QR })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED, "{unnamed}");
-    assert_eq!(unnamed["name"], "");
-    assert_eq!(unnamed["room_id"], room);
-    assert_eq!(unnamed["room_name"], "寝室");
-    assert!(unnamed.get("qr_payload").is_none());
-
-    let second = format!("{OTHER_QR}*{}", &OTHER_QR[3..]);
-    let (status, named) = call(
-        &app,
-        "POST",
-        "/api/devices",
-        Some(json!({ "room_id": room, "qr_payload": second, "name": " 天井灯 " })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED);
-    assert_eq!(named["name"], "天井灯");
+    let qr = add_device(&app, &sql, json!({ "room_id": room, "qr_payload": QR })).await;
+    let manual = json!({ "room_id": room, "manual_code": MANUAL, "name": "電球" });
+    let manual = add_device(&app, &sql, manual).await;
+    let tapo = json!({ "room_id": room, "vendor": "Tapo", "serial_number": TAPO });
+    let tapo = add_device(&app, &sql, tapo).await;
 
     let (status, devices) = call(&app, "GET", "/api/devices", None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(devices.as_array().unwrap().len(), 2);
+    assert_eq!(devices.as_array().unwrap().len(), 3);
+    assert_eq!(devices[1]["room_name"], "寝室");
+    assert_eq!(devices[2]["serial_number"], TAPO);
     assert!(!devices.to_string().contains("Y.K9042C00"));
+    assert!(!devices.to_string().contains("3497"));
 
-    let uri = format!("/api/devices/{}", named["id"]);
-    let (status, detail) = call(&app, "GET", &uri, None).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(detail["qr_payload"], second);
-    assert_eq!(detail["name"], "天井灯");
+    assert_eq!(qr["qr_payload"], QR);
+    assert!(qr.get("manual_code").is_none());
+    assert_eq!(manual["manual_code"], MANUAL);
+    assert!(manual.get("qr_payload").is_none());
+    assert!(tapo.get("qr_payload").is_none() && tapo.get("manual_code").is_none());
 
+    let uri = format!("/api/devices/{}", manual["id"]);
     let (status, _) = call(&app, "DELETE", &uri, None).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     let (status, error) = call(&app, "GET", &uri, None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(error["error"], "device_not_found");
-}
-
-#[tokio::test]
-async fn device_registration_rejects_invalid_input_and_duplicates() {
-    let app = app();
-    let room = create_room(&app, "寝室").await;
-    let post = |body: Value| {
-        let app = app.clone();
-        async move { call(&app, "POST", "/api/devices", Some(body)).await }
-    };
-
-    let (status, error) = post(json!({ "room_id": room, "qr_payload": "MT:abc" })).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(error["error"], "invalid_qr_payload");
-    assert!(!error.to_string().contains("MT:abc"));
-
-    let (status, error) = post(json!({ "room_id": room + 99, "qr_payload": QR })).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(error["error"], "room_not_found");
-
-    let long_name = "あ".repeat(101);
-    let (status, error) =
-        post(json!({ "room_id": room, "qr_payload": QR, "name": long_name })).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(error["error"], "invalid_device_name");
-
-    let (status, _) = post(json!({ "room_id": room, "qr_payload": QR })).await;
-    assert_eq!(status, StatusCode::CREATED);
-    let (status, error) = post(json!({ "room_id": room, "qr_payload": format!(" {QR}\n") })).await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(error["error"], "duplicate_qr_payload");
-
-    let (status, _) = post(json!({ "qr_payload": QR })).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-}
-
-#[tokio::test]
-async fn devices_register_with_a_manual_pairing_code_and_hide_it_in_list() {
-    let app = app();
-    let room = create_room(&app, "寝室").await;
-    let body = json!({ "room_id": room, "manual_code": " 3497-011 2332 ", "name": "電球" });
-    let (status, created) = call(&app, "POST", "/api/devices", Some(body)).await;
-    assert_eq!(status, StatusCode::CREATED, "{created}");
-    assert_eq!(created["name"], "電球");
-    assert!(created.get("manual_code").is_none());
-
-    let (_, devices) = call(&app, "GET", "/api/devices", None).await;
-    assert_eq!(devices.as_array().unwrap().len(), 1);
-    assert!(!devices.to_string().contains("3497"));
-
-    let uri = format!("/api/devices/{}", created["id"]);
-    let (status, detail) = call(&app, "GET", &uri, None).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(detail["manual_code"], MANUAL);
-    assert!(detail.get("qr_payload").is_none());
-}
-
-#[tokio::test]
-async fn qr_and_manual_codes_of_one_device_are_duplicates() {
-    let app = app();
-    let room = create_room(&app, "寝室").await;
-    let post = |body: Value| {
-        let app = app.clone();
-        async move { call(&app, "POST", "/api/devices", Some(body)).await }
-    };
-
-    let (status, manual) = post(json!({ "room_id": room, "manual_code": MANUAL })).await;
-    assert_eq!(status, StatusCode::CREATED);
-    for body in [
-        json!({ "room_id": room, "manual_code": "3497 011 2332" }),
-        json!({ "room_id": room, "qr_payload": QR }),
-        json!({ "room_id": room, "qr_payload": format!("{OTHER_QR}*{}", &QR[3..]) }),
-    ] {
-        let (status, error) = post(body.clone()).await;
-        assert_eq!(status, StatusCode::CONFLICT, "{body}");
-        assert_eq!(error["error"], "duplicate_qr_payload");
-    }
-
-    let uri = format!("/api/devices/{}", manual["id"]);
-    call(&app, "DELETE", &uri, None).await;
-    let (status, _) = post(json!({ "room_id": room, "qr_payload": QR })).await;
-    assert_eq!(status, StatusCode::CREATED);
-    let (status, _) = post(json!({ "room_id": room, "manual_code": MANUAL })).await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    let (status, _) = post(json!({ "room_id": room, "qr_payload": OTHER_QR })).await;
-    assert_eq!(status, StatusCode::CREATED);
-}
-
-#[tokio::test]
-async fn device_registration_needs_exactly_one_valid_code() {
-    let app = app();
-    let room = create_room(&app, "寝室").await;
-    let post = |body: Value| {
-        let app = app.clone();
-        async move { call(&app, "POST", "/api/devices", Some(body)).await }
-    };
-
-    let (status, error) = post(json!({ "room_id": room, "manual_code": "34970112331" })).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(error["error"], "invalid_manual_code");
-    assert!(!error.to_string().contains("3497"));
-
-    // A manual code is not accepted as a QR payload.
-    let (status, error) = post(json!({ "room_id": room, "qr_payload": MANUAL })).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(error["error"], "invalid_qr_payload");
-
-    for body in [
-        json!({ "room_id": room }),
-        json!({ "room_id": room, "qr_payload": QR, "manual_code": MANUAL }),
-    ] {
-        let (status, error) = post(body.clone()).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert_eq!(error["error"], "missing_setup_code");
-    }
-}
-
-const TAPO: &str = "AABBCCDDEEFF";
-
-#[tokio::test]
-async fn devices_register_with_identifiers_and_without_a_code() {
-    let app = app();
-    let room = create_room(&app, "寝室").await;
-    let body = json!({
-        "room_id": room,
-        "vendor": " Tapo ",
-        "serial_number": " AABBCCDDEEFF ",
-        "mac": "aa:bb:cc:dd:ee:ff",
-        "name": "天井灯",
-    });
-    let (status, created) = call(&app, "POST", "/api/devices", Some(body)).await;
-    assert_eq!(status, StatusCode::CREATED, "{created}");
-    assert_eq!(created["vendor"], "Tapo");
-    assert_eq!(created["serial_number"], TAPO);
-    assert_eq!(created["mac"], "AABBCCDDEEFF");
-
-    let (_, devices) = call(&app, "GET", "/api/devices", None).await;
-    assert_eq!(devices[0]["serial_number"], TAPO);
-    let uri = format!("/api/devices/{}", created["id"]);
-    let (_, detail) = call(&app, "GET", &uri, None).await;
-    assert!(detail.get("qr_payload").is_none() && detail.get("manual_code").is_none());
-
-    // A code and identifiers may be registered together.
-    let body = json!({
-        "room_id": room, "qr_payload": QR, "vendor": "Aqara", "serial_number": "54ef441001372c4c",
-    });
-    let (status, both) = call(&app, "POST", "/api/devices", Some(body)).await;
-    assert_eq!(status, StatusCode::CREATED, "{both}");
-    assert_eq!(both["vendor"], "Aqara");
-    assert!(both["mac"].is_null());
-}
-
-#[tokio::test]
-async fn device_identifiers_are_validated_and_unique() {
-    let app = app();
-    let room = create_room(&app, "寝室").await;
-    let post = |body: Value| {
-        let app = app.clone();
-        async move { call(&app, "POST", "/api/devices", Some(body)).await }
-    };
-
-    let tapo = json!({ "room_id": room, "vendor": "Tapo", "serial_number": TAPO, "mac": TAPO });
-    assert_eq!(post(tapo.clone()).await.0, StatusCode::CREATED);
-    for body in [
-        json!({ "room_id": room, "vendor": "Tapo", "serial_number": TAPO }),
-        json!({ "room_id": room, "vendor": "Tapo", "serial_number": "OTHER", "mac": "AA-BB-CC-DD-EE-FF" }),
-    ] {
-        let (status, error) = post(body.clone()).await;
-        assert_eq!(status, StatusCode::CONFLICT, "{body}");
-        assert_eq!(error["error"], "duplicate_identifier");
-    }
-    let other_vendor = json!({ "room_id": room, "vendor": "Aqara", "serial_number": TAPO });
-    assert_eq!(post(other_vendor).await.0, StatusCode::CREATED);
-
-    for body in [
-        json!({ "room_id": room, "vendor": "Tapo" }),
-        json!({ "room_id": room, "serial_number": "S1" }),
-        json!({ "room_id": room, "vendor": " ", "serial_number": "S1" }),
-        json!({ "room_id": room, "vendor": "Tapo", "serial_number": "S".repeat(101) }),
-    ] {
-        let (status, error) = post(body.clone()).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert_eq!(error["error"], "invalid_identifier");
-    }
-    for mac in ["AABBCCDDEEF", "AABBCCDDEEFG", "AA:BB:CC:DD:EE:FF:00"] {
-        let body = json!({ "room_id": room, "vendor": "Tapo", "serial_number": "S2", "mac": mac });
-        let (status, error) = post(body).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{mac}");
-        assert_eq!(error["error"], "invalid_mac");
-    }
-
-    // A MAC alone does not identify a device without a code.
-    let (status, error) = post(json!({ "room_id": room, "mac": "001122334455" })).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(error["error"], "missing_setup_code");
 }
 
 #[test]
@@ -455,7 +296,7 @@ async fn status_locates_ledger_devices_on_the_matter_server() {
         { "node_id": 5, "attributes": { "0/40/1": "Tapo", "0/40/15": TAPO }},
     ]);
     let addr = fake_matter_server(nodes).await;
-    let db = home_link::open_db(":memory:").unwrap();
+    let (db, sql) = ledger();
     let app = home_link::app(db, Some(format!("ws://{addr}/ws")));
     let room = create_room(&app, "寝室").await;
     for body in [
@@ -464,10 +305,7 @@ async fn status_locates_ledger_devices_on_the_matter_server() {
         json!({ "room_id": room, "vendor": "Tapo", "serial_number": "AABBCCDD0000", "name": "C" }),
         json!({ "room_id": room, "manual_code": MANUAL, "name": "D" }),
     ] {
-        assert_eq!(
-            call(&app, "POST", "/api/devices", Some(body)).await.0,
-            StatusCode::CREATED
-        );
+        add_device(&app, &sql, body).await;
     }
 
     let (status, body) = call(&app, "GET", "/api/status", None).await;
@@ -671,23 +509,18 @@ fn home_nodes() -> Value {
     ])
 }
 
-async fn light_app(addr: SocketAddr) -> Router {
-    let app = home_link::app(
-        home_link::open_db(":memory:").unwrap(),
-        Some(format!("ws://{addr}/ws")),
-    );
+async fn light_app(addr: SocketAddr) -> (Router, rusqlite::Connection) {
+    let (db, sql) = ledger();
+    let app = home_link::app(db, Some(format!("ws://{addr}/ws")));
     let room = create_room(&app, "寝室").await;
     for body in [
         json!({ "room_id": room, "vendor": "Tapo", "serial_number": TAPO, "name": "読書灯" }),
         json!({ "room_id": room, "vendor": "Aqara", "serial_number": "t2-b", "name": "台所" }),
         json!({ "room_id": room, "vendor": "Tapo", "serial_number": "gone", "name": "消えた灯" }),
     ] {
-        assert_eq!(
-            call(&app, "POST", "/api/devices", Some(body)).await.0,
-            StatusCode::CREATED
-        );
+        add_device(&app, &sql, body).await;
     }
-    app
+    (app, sql)
 }
 
 fn results(body: &Value, field: &str) -> Vec<(Value, Value, Value, Value)> {
@@ -709,7 +542,7 @@ fn results(body: &Value, field: &str) -> Vec<(Value, Value, Value, Value)> {
 #[tokio::test]
 async fn all_lights_switch_on_and_off_and_report_each_result() {
     let (addr, commands, _) = fake_light_server(home_nodes(), Fake::default()).await;
-    let app = light_app(addr).await;
+    let (app, _) = light_app(addr).await;
 
     let (status, body) = call(&app, "POST", "/api/lights/on", None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -815,7 +648,7 @@ async fn lights_that_fail_or_never_answer_are_not_counted_as_switched() {
         ..Fake::default()
     };
     let (addr, _, _) = fake_light_server(home_nodes(), fake).await;
-    let app = light_app(addr).await;
+    let (app, _) = light_app(addr).await;
 
     let (status, body) = call(&app, "POST", "/api/lights/off", None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -834,7 +667,7 @@ async fn switching_reconnects_when_the_connection_drops() {
         ..Fake::default()
     };
     let (addr, commands, connections) = fake_light_server(home_nodes(), fake).await;
-    let app = light_app(addr).await;
+    let (app, _) = light_app(addr).await;
 
     let (status, body) = call(&app, "POST", "/api/lights/on", None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -854,7 +687,7 @@ async fn lights_that_miss_the_first_on_are_sent_it_again() {
         ..Fake::default()
     };
     let (addr, commands, _) = fake_light_server(home_nodes(), fake).await;
-    let app = light_app(addr).await;
+    let (app, _) = light_app(addr).await;
 
     let (status, body) = call(&app, "POST", "/api/lights/on", None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -1115,18 +948,15 @@ async fn a_labelled_light_gets_its_labels_values_and_others_the_schedules() {
         ..Fake::default()
     };
     let (addr, commands, _) = fake_light_server(tuning_nodes(), fake).await;
-    let home = home_link::Home::new(
-        home_link::open_db(":memory:").unwrap(),
-        Some(format!("ws://{addr}/ws")),
-    );
+    let (db, sql) = ledger();
+    let home = home_link::Home::new(db, Some(format!("ws://{addr}/ws")));
     let app = home.router();
     enable(&app).await;
     let room = create_room(&app, "リビング").await;
-    let (_, t2) = call(
+    let t2 = add_device(
         &app,
-        "POST",
-        "/api/devices",
-        Some(json!({ "room_id": room, "vendor": "Aqara", "serial_number": "t2-b", "name": "キッチン" })),
+        &sql,
+        json!({ "room_id": room, "vendor": "Aqara", "serial_number": "t2-b", "name": "キッチン" }),
     )
     .await;
     let (_, kitchen) = call(
@@ -1224,15 +1054,12 @@ async fn a_labelled_light_gets_its_labels_values_and_others_the_schedules() {
 
 #[tokio::test]
 async fn labels_support_create_list_update_assign_and_delete() {
-    let app = app();
+    let (app, sql) = ledger_app();
     let room = create_room(&app, "リビング").await;
-    let (_, device) = call(
+    let device = add_device(
         &app,
-        "POST",
-        "/api/devices",
-        Some(
-            json!({ "room_id": room, "vendor": "Tapo", "serial_number": TAPO, "name": "ゲームPC" }),
-        ),
+        &sql,
+        json!({ "room_id": room, "vendor": "Tapo", "serial_number": TAPO, "name": "ゲームPC" }),
     )
     .await;
     let device_uri = format!("/api/devices/{}", device["id"]);
@@ -1315,13 +1142,12 @@ async fn labels_support_create_list_update_assign_and_delete() {
 
 #[tokio::test]
 async fn label_values_names_and_assignments_are_validated() {
-    let app = app();
+    let (app, sql) = ledger_app();
     let room = create_room(&app, "リビング").await;
-    let (_, device) = call(
+    let device = add_device(
         &app,
-        "POST",
-        "/api/devices",
-        Some(json!({ "room_id": room, "vendor": "Tapo", "serial_number": TAPO })),
+        &sql,
+        json!({ "room_id": room, "vendor": "Tapo", "serial_number": TAPO }),
     )
     .await;
     let device_uri = format!("/api/devices/{}", device["id"]);
@@ -1988,14 +1814,14 @@ async fn commissioning_a_device_already_in_the_ledger_keeps_one_entry() {
         json!({}),
     )
     .await;
-    let app = commissioning_app(addr, home_link::open_db(":memory:").unwrap());
+    let (db, sql) = ledger();
+    let app = commissioning_app(addr, db);
     let room = create_room(&app, "寝室").await;
     // Recorded by its code before, without identifiers.
-    let (_, old) = call(
+    let old = add_device(
         &app,
-        "POST",
-        "/api/devices",
-        Some(json!({ "room_id": room, "manual_code": MANUAL, "name": "読書灯" })),
+        &sql,
+        json!({ "room_id": room, "manual_code": MANUAL, "name": "読書灯" }),
     )
     .await;
     let closet = create_room(&app, "押入れ").await;
@@ -2055,6 +1881,18 @@ async fn commissioning_checks_its_input_before_reaching_the_matter_server() {
             with("qr_payload", Value::Null),
             StatusCode::BAD_REQUEST,
             "missing_setup_code",
+        ),
+        // A manual code is not accepted as a QR payload.
+        (
+            with("qr_payload", json!(MANUAL)),
+            StatusCode::BAD_REQUEST,
+            "invalid_qr_payload",
+        ),
+        (
+            json!({ "room_id": room, "manual_code": "34970112331", "name": "押入れ1",
+                    "wifi_ssid": "home-2g", "wifi_password": PASSWORD }),
+            StatusCode::BAD_REQUEST,
+            "invalid_manual_code",
         ),
         (
             with("manual_code", json!(MANUAL)),
@@ -2298,14 +2136,13 @@ async fn thread_readiness_follows_the_matter_server() {
 
 #[tokio::test]
 async fn devices_are_ignored_and_unignored_by_patch() {
-    let app = app();
+    let (app, sql) = ledger_app();
     let room = create_room(&app, "リビング").await;
     let (_, label) = call(&app, "POST", "/api/labels", Some(json!({ "name": "夜" }))).await;
-    let (_, device) = call(
+    let device = add_device(
         &app,
-        "POST",
-        "/api/devices",
-        Some(json!({ "room_id": room, "vendor": "Aqara", "serial_number": "54ef44100126e0a6" })),
+        &sql,
+        json!({ "room_id": room, "vendor": "Aqara", "serial_number": "54ef44100126e0a6" }),
     )
     .await;
     assert_eq!(device["ignored"], false);
@@ -2386,18 +2223,17 @@ async fn ignore(app: &Router, ids: &[i64]) {
 #[tokio::test]
 async fn ignored_lights_get_no_switch_and_are_not_counted() {
     let (addr, commands, _) = fake_light_server(home_nodes(), Fake::default()).await;
-    let app = light_app(addr).await;
+    let (app, sql) = light_app(addr).await;
     // The unreachable T2 behind the bridge, the reachable Tapo (読書灯, id 1) and
     // a ledger device matterjs-server does not serve.
     let room = create_room(&app, "通路").await;
     let mut ids = vec![1];
     for serial in ["t2-a", "gone-for-good"] {
         let vendor = if serial == "t2-a" { "Aqara" } else { "Tapo" };
-        let (_, device) = call(
+        let device = add_device(
             &app,
-            "POST",
-            "/api/devices",
-            Some(json!({ "room_id": room, "vendor": vendor, "serial_number": serial })),
+            &sql,
+            json!({ "room_id": room, "vendor": vendor, "serial_number": serial }),
         )
         .await;
         ids.push(device["id"].as_i64().unwrap());
@@ -2484,18 +2320,15 @@ async fn ignored_lights_get_no_switch_and_are_not_counted() {
 #[tokio::test]
 async fn ignored_lights_get_no_adjustment() {
     let (addr, commands, _) = fake_light_server(tuning_nodes(), Fake::default()).await;
-    let home = home_link::Home::new(
-        home_link::open_db(":memory:").unwrap(),
-        Some(format!("ws://{addr}/ws")),
-    );
+    let (db, sql) = ledger();
+    let home = home_link::Home::new(db, Some(format!("ws://{addr}/ws")));
     let app = home.router();
     enable(&app).await;
     let room = create_room(&app, "寝室").await;
-    let (_, tapo) = call(
+    let tapo = add_device(
         &app,
-        "POST",
-        "/api/devices",
-        Some(json!({ "room_id": room, "vendor": "Tapo", "serial_number": TAPO })),
+        &sql,
+        json!({ "room_id": room, "vendor": "Tapo", "serial_number": TAPO }),
     )
     .await;
     ignore(&app, &[tapo["id"].as_i64().unwrap()]).await;
@@ -2643,13 +2476,12 @@ async fn assign(app: &Router, device: &Value, labels: &[&Value]) -> (StatusCode,
 
 #[tokio::test]
 async fn a_light_takes_several_labels_unless_two_set_the_same_value() {
-    let app = app();
+    let (app, sql) = ledger_app();
     let room = create_room(&app, "リビング").await;
-    let (_, t2) = call(
+    let t2 = add_device(
         &app,
-        "POST",
-        "/api/devices",
-        Some(json!({ "room_id": room, "vendor": "Aqara", "serial_number": "t2-b", "name": "キッチン1" })),
+        &sql,
+        json!({ "room_id": room, "vendor": "Aqara", "serial_number": "t2-b", "name": "キッチン1" }),
     )
     .await;
     let kitchen = create_label(
@@ -2731,18 +2563,15 @@ async fn a_light_takes_several_labels_unless_two_set_the_same_value() {
 #[tokio::test]
 async fn several_labels_stack_their_values_in_the_adjustment() {
     let (addr, commands, _) = fake_light_server(tuning_nodes(), Fake::default()).await;
-    let home = home_link::Home::new(
-        home_link::open_db(":memory:").unwrap(),
-        Some(format!("ws://{addr}/ws")),
-    );
+    let (db, sql) = ledger();
+    let home = home_link::Home::new(db, Some(format!("ws://{addr}/ws")));
     let app = home.router();
     enable(&app).await;
     let room = create_room(&app, "リビング").await;
-    let (_, t2) = call(
+    let t2 = add_device(
         &app,
-        "POST",
-        "/api/devices",
-        Some(json!({ "room_id": room, "vendor": "Aqara", "serial_number": "t2-b", "name": "キッチン1" })),
+        &sql,
+        json!({ "room_id": room, "vendor": "Aqara", "serial_number": "t2-b", "name": "キッチン1" }),
     )
     .await;
     let dim = create_label(&app, json!({ "name": "暗め", "night_level": 76 })).await;
@@ -2831,7 +2660,7 @@ fn tunings_of(
 /// A home whose T2 (1/3, on) carries "キッチン" and "作業", whose second Tapo
 /// (6/1, off) carries "作業" and whose first Tapo (5/1, on) carries "ゲームPC".
 async fn boost_home(
-    db: rusqlite::Connection,
+    (db, sql): (rusqlite::Connection, rusqlite::Connection),
     addr: SocketAddr,
 ) -> (home_link::Home, Router, Vec<Value>) {
     let home =
@@ -2845,16 +2674,12 @@ async fn boost_home(
         ("Tapo", TAPO, "ゲームPC1"),
         ("Tapo", "tapo-desk", "デスク"),
     ] {
-        let (status, device) = call(
+        let device = add_device(
             &app,
-            "POST",
-            "/api/devices",
-            Some(
-                json!({ "room_id": room, "vendor": vendor, "serial_number": serial, "name": name }),
-            ),
+            &sql,
+            json!({ "room_id": room, "vendor": vendor, "serial_number": serial, "name": name }),
         )
         .await;
-        assert_eq!(status, StatusCode::CREATED, "{device}");
         devices.push(device);
     }
     let kitchen = create_label(
@@ -2892,7 +2717,14 @@ async fn boosting_a_label_lights_only_its_lights_at_the_days_values_until_presse
     let path = std::env::temp_dir().join(format!("home-link-boost-{}.db", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let db_path = path.to_str().unwrap();
-    let (home, app, _) = boost_home(home_link::open_db(db_path).unwrap(), addr).await;
+    let (home, app, _) = boost_home(
+        (
+            home_link::open_db(db_path).unwrap(),
+            home_link::open_db(db_path).unwrap(),
+        ),
+        addr,
+    )
+    .await;
     home.adjust(NIGHT, "scheduled").await;
 
     commands.lock().unwrap().clear();
@@ -3031,7 +2863,7 @@ async fn boosting_a_label_lights_only_its_lights_at_the_days_values_until_presse
 #[tokio::test]
 async fn a_light_under_two_boosted_labels_stays_bright_until_both_are_released() {
     let (addr, commands, _) = fake_light_server(tuning_nodes(), Fake::default()).await;
-    let (_, app, _) = boost_home(home_link::open_db(":memory:").unwrap(), addr).await;
+    let (_, app, _) = boost_home(ledger(), addr).await;
     assert_eq!(boost(&app, "作業").await.1["boosted"], true);
     assert_eq!(boost(&app, "キッチン").await.1["boosted"], true);
 
@@ -3053,7 +2885,7 @@ async fn a_light_under_two_boosted_labels_stays_bright_until_both_are_released()
 #[tokio::test]
 async fn all_off_releases_every_boost() {
     let (addr, commands, _) = fake_light_server(tuning_nodes(), Fake::default()).await;
-    let (home, app, _) = boost_home(home_link::open_db(":memory:").unwrap(), addr).await;
+    let (home, app, _) = boost_home(ledger(), addr).await;
     assert_eq!(boost(&app, "作業").await.1["boosted"], true);
     assert_eq!(boost(&app, "ゲームPC").await.1["boosted"], true);
 
@@ -3076,7 +2908,7 @@ async fn all_off_releases_every_boost() {
 #[tokio::test]
 async fn boosting_needs_a_known_label_with_lights() {
     let (addr, commands, _) = fake_light_server(tuning_nodes(), Fake::default()).await;
-    let (_, app, devices) = boost_home(home_link::open_db(":memory:").unwrap(), addr).await;
+    let (_, app, devices) = boost_home(ledger(), addr).await;
     let (status, error) = boost(&app, "仕事用デスク").await;
     assert_eq!(
         (status, &error["error"]),
@@ -3129,7 +2961,7 @@ async fn a_boost_that_reaches_no_light_is_not_kept() {
         ..Fake::default()
     };
     let (addr, _, _) = fake_light_server(tuning_nodes(), fake).await;
-    let (_, app, _) = boost_home(home_link::open_db(":memory:").unwrap(), addr).await;
+    let (_, app, _) = boost_home(ledger(), addr).await;
     let (status, body) = boost(&app, "作業").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
@@ -3149,7 +2981,7 @@ async fn a_boost_that_reaches_no_light_is_not_kept() {
 /// (100%, 5000 K), served by matterjs-server from `nodes`.
 async fn dedicated_home(nodes: Value) -> (home_link::Home, Router, Arc<Mutex<Vec<Value>>>) {
     let (addr, commands, _) = fake_light_server(nodes, Fake::default()).await;
-    let (home, app, devices) = boost_home(home_link::open_db(":memory:").unwrap(), addr).await;
+    let (home, app, devices) = boost_home(ledger(), addr).await;
     let desk = create_label(
         &app,
         json!({ "name": "仕事用デスク", "dedicated": true, "day_level": 254, "cool_kelvin": 5000 }),

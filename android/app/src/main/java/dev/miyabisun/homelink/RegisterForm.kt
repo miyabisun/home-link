@@ -4,7 +4,6 @@ sealed interface Status {
     data object NotMatter : Status
     data object ScanFailed : Status
     data class RoomAdded(val room: String) : Status
-    data class Registered(val room: String, val name: String) : Status
     data class Failed(val error: ApiError) : Status
     data class Commissioned(val device: dev.miyabisun.homelink.Commissioned) : Status
     data class BleFailed(val problem: BleProblem) : Status
@@ -15,7 +14,7 @@ enum class BleProblem { PERMISSION, BLUETOOTH_OFF, PROXY_NOT_CONFIGURED, PROXY_U
 
 /** How far a Bluetooth registration got, as the proxy commands show it. */
 enum class Stage {
-    PREPARING, SEARCHING, CONNECTING, SENDING, JOINING;
+    PREPARING, SEARCHING, CONNECTING, SENDING;
 
     companion object {
         fun of(command: String): Stage? = when (command) {
@@ -23,8 +22,6 @@ enum class Stage {
             "connect" -> CONNECTING
             // The BTP handshake opens the channel for PASE and the Wi-Fi credentials.
             "write_and_subscribe" -> SENDING
-            // Bluetooth is done; the device joins Wi-Fi and matterjs-server reaches it there.
-            "disconnect" -> JOINING
             else -> null
         }
     }
@@ -42,9 +39,7 @@ class RegisterForm {
     var busy = false
     var roomsFailed = false
     var status: Status? = null
-    /** Commission the device over Bluetooth rather than only record it. */
-    var bluetooth = true
-    /** The saved network to hand over; required for Bluetooth onto Wi-Fi. */
+    /** The saved network to hand over; required onto Wi-Fi. */
     var wifi: WifiNetwork? = null
     /** The Thread tab: the device joins the Thread network matterjs-server holds, not Wi-Fi. */
     var thread = false
@@ -54,7 +49,7 @@ class RegisterForm {
     var stage: Stage? = null
 
     fun canRegister() = payload != null && roomId != null && !busy &&
-        (!bluetooth || if (thread) threadReady == true else wifi != null)
+        if (thread) threadReady == true else wifi != null
 
     fun threadChecked(result: ApiResult<Boolean>) {
         threadReady = (result as? ApiResult.Ok)?.value
@@ -129,17 +124,6 @@ class RegisterForm {
         }
     }
 
-    fun registered(result: ApiResult<Unit>) {
-        busy = false
-        status = when (result) {
-            is ApiResult.Ok -> Status.Registered(rooms.firstOrNull { it.id == roomId }?.name.orEmpty(), name.trim()).also {
-                payload = null
-                name = ""
-            }
-            is ApiResult.Failed -> Status.Failed(result.error)
-        }
-    }
-
     fun commissioned(result: ApiResult<Commissioned>) {
         busy = false
         stage = null
@@ -152,6 +136,13 @@ class RegisterForm {
                 if (result.error == ApiError.THREAD_NOT_READY) threadReady = false
             }
         }
+    }
+
+    /** Back to a registration that can start again, with every input kept. */
+    fun cancelled() {
+        busy = false
+        stage = null
+        status = null
     }
 
     fun bleFailed(problem: BleProblem) {

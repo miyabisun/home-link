@@ -10,7 +10,7 @@ class RegisterFormTest {
     private val qr = "MT:Y.K9042C00KA0648G00"
 
     @Test fun registrationNeedsAScannedCodeAndARoom() {
-        val form = RegisterForm().apply { bluetooth = false }
+        val form = RegisterForm().apply { wifi = WifiNetwork("home-2g", "secret") }
         assertFalse(form.canRegister())
         form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
         assertEquals(1L, form.roomId)
@@ -65,9 +65,9 @@ class RegisterFormTest {
         assertFalse(form.roomsFailed)
         assertNull(form.status)
 
-        form.status = Status.Failed(ApiError.DUPLICATE_QR)
+        form.status = Status.Failed(ApiError.WRONG_CODE)
         form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
-        assertEquals(Status.Failed(ApiError.DUPLICATE_QR), form.status)
+        assertEquals(Status.Failed(ApiError.WRONG_CODE), form.status)
     }
 
     @Test fun createdRoomsAreAddedAndSelected() {
@@ -82,36 +82,8 @@ class RegisterFormTest {
         assertEquals(Status.Failed(ApiError.DUPLICATE_ROOM), form.status)
     }
 
-    @Test fun successClearsTheCodeAndNameButKeepsTheRoom() {
-        val form = RegisterForm()
-        form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
-        form.scanned(qr)
-        form.name = " 天井灯 "
-        form.busy = true
-        form.registered(ApiResult.Ok(Unit))
-        assertFalse(form.busy)
-        assertEquals(Status.Registered("寝室", "天井灯"), form.status)
-        assertNull(form.payload)
-        assertEquals("", form.name)
-        assertEquals(1L, form.roomId)
-    }
-
-    @Test fun failureKeepsEveryInput() {
-        val form = RegisterForm()
-        form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
-        form.scanned(qr)
-        form.name = "天井灯"
-        form.busy = true
-        form.registered(ApiResult.Failed(ApiError.DUPLICATE_QR))
-        assertFalse(form.busy)
-        assertEquals(Status.Failed(ApiError.DUPLICATE_QR), form.status)
-        assertEquals(qr, form.payload)
-        assertEquals("天井灯", form.name)
-        assertEquals(1L, form.roomId)
-    }
-
     @Test fun aValidManualCodeIsAcceptedOnceAllDigitsAreTyped() {
-        val form = RegisterForm().apply { bluetooth = false }
+        val form = RegisterForm().apply { wifi = WifiNetwork("home-2g", "secret") }
         form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
         form.scanned(qr)
         assertFalse(form.typed("3497 011 233"))
@@ -139,16 +111,12 @@ class RegisterFormTest {
         assertNull(form.manualError)
     }
 
-    @Test fun bluetoothRegistrationAlsoNeedsTheWifiToHandOver() {
+    @Test fun registrationAlsoNeedsTheWifiToHandOver() {
         val form = RegisterForm()
-        assertTrue(form.bluetooth)
         form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
         form.scanned(qr)
         assertFalse(form.canRegister())
         form.wifi = WifiNetwork("home-2g", "secret")
-        assertTrue(form.canRegister())
-        form.bluetooth = false
-        form.wifi = null
         assertTrue(form.canRegister())
     }
 
@@ -171,9 +139,6 @@ class RegisterFormTest {
         assertNull(form.threadReady)
         assertTrue(form.threadFailed)
         assertFalse(form.canRegister())
-        // Recording only needs neither network.
-        form.bluetooth = false
-        assertTrue(form.canRegister())
     }
 
     @Test fun aThreadNotReadyRefusalMarksTheNetworkNotReady() {
@@ -208,19 +173,36 @@ class RegisterFormTest {
         assertEquals(qr, form.payload)
         assertFalse(form.busy)
 
-        form.commissioned(ApiResult.Ok(Commissioned(true, "寝室", "押入れ1")))
-        assertEquals(Status.Commissioned(Commissioned(true, "寝室", "押入れ1")), form.status)
+        form.commissioned(ApiResult.Ok(Commissioned("寝室", "押入れ1")))
+        assertEquals(Status.Commissioned(Commissioned("寝室", "押入れ1")), form.status)
         assertNull(form.payload)
         assertEquals("", form.name)
         assertEquals(1L, form.roomId)
+    }
+
+    @Test fun cancellingReturnsToRegisteringAndKeepsTheInputs() {
+        val form = RegisterForm()
+        form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
+        form.scanned(qr)
+        form.wifi = WifiNetwork("home-2g", "secret")
+        form.name = "押入れ1"
+        form.busy = true
+        form.stage = Stage.SENDING
+        form.cancelled()
+        assertFalse(form.busy)
+        assertNull(form.stage)
+        assertNull(form.status)
+        assertEquals(qr, form.payload)
+        assertEquals("押入れ1", form.name)
+        assertTrue(form.canRegister())
     }
 
     @Test fun proxyCommandsMarkTheStages() {
         assertEquals(Stage.SEARCHING, Stage.of("start_scan"))
         assertEquals(Stage.CONNECTING, Stage.of("connect"))
         assertEquals(Stage.SENDING, Stage.of("write_and_subscribe"))
-        assertEquals(Stage.JOINING, Stage.of("disconnect"))
-        for (other in listOf("stop_scan", "discover_services", "read_characteristic", "request_mtu")) {
+        // matterjs-server also disconnects when the handshake failed, so it marks no stage.
+        for (other in listOf("stop_scan", "discover_services", "read_characteristic", "request_mtu", "disconnect")) {
             assertNull(other, Stage.of(other))
         }
     }

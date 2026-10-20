@@ -17,20 +17,22 @@ sealed interface Outcome {
 }
 
 /**
- * One Bluetooth registration at a time, kept outside the activity so a
- * recreated screen picks up its stage and result instead of abandoning it.
+ * One Bluetooth registration at a time. [post] runs on the screen's thread;
+ * [spawn] runs the registration off it.
  */
-object CommissionSession {
+class Commissioning(private val post: (() -> Unit) -> Unit, private val spawn: (() -> Unit) -> Unit) {
     @Volatile var stage: Stage? = null
         private set
     /** The finished registration's outcome, until the screen takes it. */
     @Volatile private var outcome: Outcome? = null
     private var listener: (() -> Unit)? = null
-    private val main = Handler(Looper.getMainLooper())
+    private var link: BleLink? = null
+    /** Counts registrations; a cancelled one's later news no longer matches. */
+    @Volatile private var run = 0
 
     val running get() = stage != null
 
-    /** Follows progress on the main thread; null stops following. */
+    /** Follows progress on the screen's thread; null stops following. */
     fun follow(listener: (() -> Unit)?) {
         this.listener = listener
     }
@@ -38,28 +40,46 @@ object CommissionSession {
     fun take(): Outcome? = outcome.also { outcome = null }
 
     fun start(link: BleLink, call: () -> ApiResult<Commissioned>) {
+        val id = ++run
+        this.link = link
         stage = Stage.PREPARING
         outcome = null
-        Thread {
-            val opened = link.open { command -> Stage.of(command)?.let { update(it) } }
+        spawn {
+            val opened = if (id == run) link.open { command -> Stage.of(command)?.let { update(id, it) } } else null
             val result = when (opened) {
-                ProxyOpen.OK -> Outcome.Done(call())
+                null -> null
+                ProxyOpen.OK -> if (id == run) Outcome.Done(call()) else null
                 ProxyOpen.UNREACHABLE -> Outcome.Failed(BleProblem.PROXY_UNREACHABLE)
                 ProxyOpen.UNSUPPORTED_VERSION -> Outcome.Failed(BleProblem.PROXY_VERSION)
             }
             link.close()
-            main.post {
-                outcome = result
-                stage = null
-                listener?.invoke()
+            post {
+                if (id == run) {
+                    outcome = result
+                    stage = null
+                    listener?.invoke()
+                }
             }
-        }.start()
+        }
     }
 
-    private fun update(next: Stage) = main.post {
-        if (stage != null) {
+    /** Stops following the registration and closes its proxy; home-link's late answer is dropped. */
+    fun cancel() {
+        run++
+        stage = null
+        link?.close()
+        link = null
+    }
+
+    private fun update(id: Int, next: Stage) = post {
+        if (id == run) {
             stage = next
             listener?.invoke()
         }
     }
+}
+
+/** Kept outside the activity so a recreated screen picks up the stage and result instead of abandoning them. */
+val CommissionSession = Handler(Looper.getMainLooper()).let { main ->
+    Commissioning(post = { main.post(it) }, spawn = { Thread(it).start() })
 }

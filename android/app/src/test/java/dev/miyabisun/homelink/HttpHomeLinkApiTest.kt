@@ -43,26 +43,8 @@ class HttpHomeLinkApiTest {
         assertEquals(ApiResult.Failed(ApiError.DUPLICATE_ROOM), api.createRoom("書斎"))
     }
 
-    @Test fun registersDevicesWithTheEnteredFields() {
-        respond("/api/devices", 201, """{"id":7,"room_id":1,"room_name":"寝室","name":"","created_at":"t"}""")
-        assertEquals(ApiResult.Ok(Unit), api.register(1, "MT:Y.K9042C00KA0648G00", ""))
-        val body = JSONObject(requests.single().substringAfter("/api/devices "))
-        assertEquals(1L, body.getLong("room_id"))
-        assertEquals("MT:Y.K9042C00KA0648G00", body.getString("qr_payload"))
-        assertEquals("", body.getString("name"))
-    }
-
-    @Test fun sendsADigitCodeAsTheManualCode() {
-        respond("/api/devices", 201, """{"id":8,"room_id":1,"room_name":"寝室","name":"","created_at":"t"}""")
-        assertEquals(ApiResult.Ok(Unit), api.register(1, "34970112332", ""))
-        val body = JSONObject(requests.single().substringAfter("/api/devices "))
-        assertEquals("34970112332", body.getString("manual_code"))
-        assertFalse(body.has("qr_payload"))
-    }
-
-    @Test fun mapsRegistrationFailures() {
+    @Test fun mapsCommissionInputFailures() {
         val cases = listOf(
-            Triple(409, "duplicate_qr_payload", ApiError.DUPLICATE_QR),
             Triple(404, "room_not_found", ApiError.ROOM_NOT_FOUND),
             Triple(400, "invalid_qr_payload", ApiError.INVALID_QR),
             Triple(400, "invalid_manual_code", ApiError.INVALID_MANUAL),
@@ -71,8 +53,8 @@ class HttpHomeLinkApiTest {
             Triple(502, "", ApiError.SERVER),
         )
         for ((status, code, expected) in cases) {
-            respond("/api/devices", status, if (code.isEmpty()) "<html>bad gateway</html>" else """{"error":"$code"}""")
-            assertEquals("$status $code", ApiResult.Failed(expected), api.register(1, "MT:x", "n"))
+            respond("/api/commission", status, if (code.isEmpty()) "<html>bad gateway</html>" else """{"error":"$code"}""")
+            assertEquals("$status $code", ApiResult.Failed(expected), api.commission(1, "MT:x", "n", null))
         }
     }
 
@@ -81,7 +63,7 @@ class HttpHomeLinkApiTest {
             "room_name":"押入れ","name":"押入れ1","vendor":"Tapo","serial_number":"AABBCCDDEEFF","mac":"AABBCCDDEEFF",
             "label_id":null,"label_name":null,"created_at":"t"}}""")
         val wifi = WifiNetwork("home-2g", "pass word")
-        assertEquals(ApiResult.Ok(Commissioned(true, "押入れ", "押入れ1")),
+        assertEquals(ApiResult.Ok(Commissioned("押入れ", "押入れ1")),
             api.commission(2, "MT:Y.K9042C00KA0648G00", "押入れ1", wifi))
         val body = JSONObject(requests.single().substringAfter("/api/commission "))
         assertEquals(2L, body.getLong("room_id"))
@@ -94,14 +76,14 @@ class HttpHomeLinkApiTest {
         // A device the ledger already holds keeps its own room and name.
         respond("/api/commission", 200, """{"node_id":17,"registered":false,"device":{"id":3,"room_id":1,
             "room_name":"寝室","name":"読書灯","created_at":"t"}}""")
-        assertEquals(ApiResult.Ok(Commissioned(false, "寝室", "読書灯")), api.commission(2, "34970112332", "", wifi))
+        assertEquals(ApiResult.Ok(Commissioned("寝室", "読書灯")), api.commission(2, "34970112332", "", wifi))
         assertEquals("34970112332", JSONObject(requests.last().substringAfter("/api/commission ")).getString("manual_code"))
     }
 
     @Test fun commissionsOntoThreadWithoutWifi() {
         respond("/api/commission", 201, """{"node_id":21,"registered":true,"device":{"id":5,"room_id":2,
             "room_name":"寝室","name":"T2","created_at":"t"}}""")
-        assertEquals(ApiResult.Ok(Commissioned(true, "寝室", "T2")), api.commission(2, "34970112332", "T2", null))
+        assertEquals(ApiResult.Ok(Commissioned("寝室", "T2")), api.commission(2, "34970112332", "T2", null))
         val body = JSONObject(requests.single().substringAfter("/api/commission "))
         assertEquals("thread", body.getString("network"))
         assertFalse(body.has("wifi_ssid"))
@@ -196,7 +178,6 @@ class HttpHomeLinkApiTest {
         val port = ServerSocket(0).use { it.localPort }
         val offline = HttpHomeLinkApi("http://127.0.0.1:$port")
         assertEquals(ApiResult.Failed(ApiError.UNREACHABLE), offline.rooms())
-        assertEquals(ApiResult.Failed(ApiError.UNREACHABLE), offline.register(1, "MT:x", ""))
         assertEquals(ApiResult.Failed(ApiError.UNREACHABLE), offline.switchLights(true))
         assertEquals(ApiResult.Failed(ApiError.UNREACHABLE), offline.commission(1, "MT:x", "", WifiNetwork("s", "p")))
     }

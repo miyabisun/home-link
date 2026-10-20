@@ -286,7 +286,7 @@ fn router(state: Db) -> Router {
             "/rooms/{id}",
             axum::routing::patch(rename_room).delete(delete_room),
         )
-        .route("/devices", get(list_devices).post(create_device))
+        .route("/devices", get(list_devices))
         .route(
             "/devices/{id}",
             get(get_device).patch(update_device).delete(delete_device),
@@ -565,20 +565,6 @@ struct Device {
     manual_code: Option<String>,
 }
 
-/// A device to register with at most one of its QR payload or manual pairing code,
-/// and its own identifiers; a code or the vendor and serial number is required.
-#[derive(Deserialize)]
-struct DeviceInput {
-    room_id: i64,
-    qr_payload: Option<String>,
-    manual_code: Option<String>,
-    vendor: Option<String>,
-    serial_number: Option<String>,
-    mac: Option<String>,
-    #[serde(default)]
-    name: String,
-}
-
 /// A label as a device lists it.
 #[derive(Serialize, Deserialize)]
 struct LabelRef {
@@ -645,25 +631,14 @@ async fn get_device(State(db): State<Db>, Path(id): Path<i64>) -> ApiResult<Json
     Ok(Json(find_device(&db.db.lock().unwrap(), id, true)?))
 }
 
-fn missing_setup_code() -> ApiError {
-    ApiError(
-        StatusCode::BAD_REQUEST,
-        "missing_setup_code",
-        "QRコードか手動ペアリングコードのどちらか一方、または機器の識別子（vendorとserial_number）を送ってください".into(),
-    )
-}
-
-/// Validates the optional QR payload or manual pairing code and returns the form to store.
-fn setup_code(
-    qr_payload: Option<&String>,
-    manual_code: Option<&String>,
-) -> ApiResult<Option<String>> {
+/// Validates the QR payload or manual pairing code, exactly one of them, and
+/// returns the form to store.
+fn setup_code(qr_payload: Option<&String>, manual_code: Option<&String>) -> ApiResult<String> {
     match (qr_payload, manual_code) {
-        (None, None) => Ok(None),
         (Some(payload), None) => {
             let payload = payload.trim();
             (payload.len() <= MAX_QR_CHARS && onboarding::is_valid(payload))
-                .then(|| Some(payload.to_owned()))
+                .then(|| payload.to_owned())
                 .ok_or_else(|| {
                     ApiError(
                         StatusCode::BAD_REQUEST,
@@ -672,57 +647,19 @@ fn setup_code(
                     )
                 })
         }
-        (None, Some(code)) => onboarding::normalize_manual(code.trim())
-            .map(Some)
-            .ok_or_else(|| {
-                ApiError(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_manual_code",
-                    "Matterの手動ペアリングコード（11桁の数字）として正しくありません".into(),
-                )
-            }),
-        (Some(_), Some(_)) => Err(missing_setup_code()),
-    }
-}
-
-/// The device's own identifiers: `(vendor, serial_number)` and a Wi-Fi MAC.
-type Identifiers = (Option<(String, String)>, Option<String>);
-
-/// Validates the vendor and serial number (both or neither) and normalizes the MAC
-/// to 12 upper-case hex digits.
-fn identifiers(input: &DeviceInput) -> ApiResult<Identifiers> {
-    let invalid = || {
-        ApiError(
+        (None, Some(code)) => onboarding::normalize_manual(code.trim()).ok_or_else(|| {
+            ApiError(
+                StatusCode::BAD_REQUEST,
+                "invalid_manual_code",
+                "Matterの手動ペアリングコード（11桁の数字）として正しくありません".into(),
+            )
+        }),
+        _ => Err(ApiError(
             StatusCode::BAD_REQUEST,
-            "invalid_identifier",
-            format!("vendorとserial_numberは両方を1〜{MAX_NAME_CHARS}文字で送ってください"),
-        )
-    };
-    let serial = match (&input.vendor, &input.serial_number) {
-        (None, None) => None,
-        (Some(vendor), Some(serial)) => Some((
-            clean_name(vendor, false).ok_or_else(invalid)?,
-            clean_name(serial, false).ok_or_else(invalid)?,
+            "missing_setup_code",
+            "QRコードか手動ペアリングコードのどちらか一方を送ってください".into(),
         )),
-        _ => return Err(invalid()),
-    };
-    let mac = input
-        .mac
-        .as_deref()
-        .map(|mac| {
-            let hex: String = mac.chars().filter(|c| !matches!(c, ':' | '-')).collect();
-            (hex.len() == 12 && hex.chars().all(|c| c.is_ascii_hexdigit()))
-                .then(|| hex.to_ascii_uppercase())
-                .ok_or_else(|| {
-                    ApiError(
-                        StatusCode::BAD_REQUEST,
-                        "invalid_mac",
-                        "MACアドレスは16進数12桁で送ってください".into(),
-                    )
-                })
-        })
-        .transpose()?;
-    Ok((serial, mac))
+    }
 }
 
 fn device_name(name: &str) -> ApiResult<String> {
@@ -733,18 +670,6 @@ fn device_name(name: &str) -> ApiResult<String> {
             format!("機器名は{MAX_NAME_CHARS}文字以内で入力してください"),
         )
     })
-}
-
-fn duplicate_device() -> ApiError {
-    ApiError(
-        StatusCode::CONFLICT,
-        "duplicate_qr_payload",
-        "この機器は登録済みです".into(),
-    )
-}
-
-fn is_registered(db: &Connection, code: &str) -> rusqlite::Result<bool> {
-    Ok(registered_id(db, code)?.is_some())
 }
 
 /// The stored device sharing a passcode and short discriminator with `code`.
@@ -764,51 +689,6 @@ fn registered_id(db: &Connection, code: &str) -> rusqlite::Result<Option<i64>> {
             .any(|key| new.contains(key))
             .then_some(id)
     }))
-}
-
-async fn create_device(
-    State(db): State<Db>,
-    Json(input): Json<DeviceInput>,
-) -> ApiResult<(StatusCode, Json<Device>)> {
-    let code = setup_code(input.qr_payload.as_ref(), input.manual_code.as_ref())?;
-    let (serial, mac) = identifiers(&input)?;
-    if code.is_none() && serial.is_none() {
-        return Err(missing_setup_code());
-    }
-    let name = device_name(&input.name)?;
-    let db = db.db.lock().unwrap();
-    find_room(&db, input.room_id)?.ok_or_else(room_not_found)?;
-    if let Some(code) = &code
-        && is_registered(&db, code)?
-    {
-        return Err(duplicate_device());
-    }
-    let (vendor, serial_number) = serial.unzip();
-    let taken: bool = db.query_row(
-        "SELECT EXISTS (SELECT 1 FROM devices
-            WHERE (vendor = ?1 AND serial_number = ?2) OR mac = ?3)",
-        params![vendor, serial_number, mac],
-        |row| row.get(0),
-    )?;
-    if taken {
-        return Err(ApiError(
-            StatusCode::CONFLICT,
-            "duplicate_identifier",
-            "同じ識別子の機器が登録済みです".into(),
-        ));
-    }
-    match db.execute(
-        "INSERT INTO devices (room_id, qr_payload, vendor, serial_number, mac, name)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![input.room_id, code, vendor, serial_number, mac, name],
-    ) {
-        Err(error) if is_unique_violation(&error) => Err(duplicate_device()),
-        result => {
-            result?;
-            let device = find_device(&db, db.last_insert_rowid(), false)?;
-            Ok((StatusCode::CREATED, Json(device)))
-        }
-    }
 }
 
 /// A ledger change to a device: the fields given change; `label_ids` replaces its labels.
@@ -1105,14 +985,7 @@ async fn commission(
     State(state): State<Db>,
     Json(input): Json<CommissionInput>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
-    let code =
-        setup_code(input.qr_payload.as_ref(), input.manual_code.as_ref())?.ok_or_else(|| {
-            ApiError(
-                StatusCode::BAD_REQUEST,
-                "missing_setup_code",
-                "QRコードか手動ペアリングコードのどちらか一方を送ってください".into(),
-            )
-        })?;
+    let code = setup_code(input.qr_payload.as_ref(), input.manual_code.as_ref())?;
     let network = match input.network.as_deref() {
         None | Some("wifi") => commission::Network::Wifi {
             ssid: &input.wifi_ssid,

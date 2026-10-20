@@ -141,30 +141,32 @@ SESAMEアプリの履歴には `home-link` の名前で記録されます。
 新品や初期化した、ペアリング待ちのMatter over Wi-Fiの電球（Tapo、BEAMTECなど）を、Aqara Homeを使わずに登録できます。
 前のルーター向けに設定されて今つながらない電球も、初期化すれば同じ手順で今のWi-Fiへ入れられます。
 Matter over Threadの電球（Aqara T2など）は、下の「Thread電球をBluetoothでつなぐ」で登録します。
-Zigbeeの電球は対象外です（親機が要るため）。Aqara Homeで追加してから、下の「記録だけ」で登録してください。
-登録の画面は「Wi-Fiの電球」と「Threadの電球（T2など）」のタブに分かれています。この節はWi-Fiのタブの手順です。
+Zigbeeの電球は対象外です（親機が要るため）。
+登録の画面は「Wi-Fiの電球」と「Threadの電球」のタブに分かれています。この節はWi-Fiのタブの手順です。
 
 電話がBluetoothでmatterjs-serverの[BLE Proxy](https://github.com/matter-js/matterjs-server/blob/main/docs/ble-proxy-protocol.md)
 （接続先の `ble_proxy_url`）の中継を務め、Matterの手順（暗号化、Wi-Fi情報の送付、fabricへの参加）はmatterjs-serverが行います。
 そのため、登録するときは電話を家のWi-Fiにつなぎ、電球の近くに置きます。
 matterjs-serverはBluetoothを有効にして（BLE Proxyを受け付けて）起動しておく必要があります。
 
-1. 「つなぎ方」で「新しいWi-Fi電球をBluetoothでつなぐ」を選びます（既定）。
-2. 「電球に渡すWi-Fi」のセレクトボックスで、電球をつなぐWi-Fiを選びます。最後に選んだWi-Fiが選ばれています。
+1. 「電球に渡すWi-Fi」のセレクトボックスで、電球をつなぐWi-Fiを選びます。最後に選んだWi-Fiが選ばれています。
    初回は「Wi-Fiを追加」を押します。今つながっているWi-FiのSSIDが入るので、パスワードを入力して保存します。
    SSIDを読むために、Androidの仕様で位置情報（正確な位置）の許可を求めます。許可しない場合はSSIDを入力します。
    電球は2.4GHzのWi-Fiにしかつながりません。今のWi-Fiが5GHzなら、追加の画面にそう表示されます。
    Wi-Fiは複数保存でき、要らなくなったものは「このWi-Fiを削除」で消せます。
    パスワードはこの電話の中だけに、Android Keystoreの鍵で暗号化して保存します。
    登録のたびにhome-link経由でmatterjs-serverへ渡し、home-linkのデータベースやログには残しません。
-3. 電球をペアリング待ちにします。BEAMTECは電源のオフ・オンを5回くり返します。ほかはメーカーの手順に従います。
-4. QRコードを読み取るか数字を入力し、部屋と名前（任意）を決めて「登録」を押します。
+2. 電球をペアリング待ちにします。BEAMTECは電源のオフ・オンを5回くり返します。ほかはメーカーの手順に従います。
+3. QRコードを読み取るか数字を入力し、部屋と名前（任意）を決めて「登録」を押します。
+   QRコードが無い機器は「数字で入力」で、機器に印字された11桁の数字を入力します。部屋が無ければ「部屋を追加」で作成します。
    初回は「付近のデバイス」の許可を求めます。Android 17では、家のネットワークにあるmatterjs-serverへの接続もこの許可に含まれます。
    Bluetoothがオフならオンにするよう求めます。
 
-登録中は、電球を探している・接続している・コードとWi-Fiの設定を送っている・電球がWi-Fiにつながるのを待っている、の段階を表示します。
+登録中は、電球を探している・接続している・コードとWi-Fiの設定を送っている、の段階を表示します。
+「キャンセル」を押すと、Bluetoothの中継を閉じてすぐに登録の前へ戻ります。後から届いた結果は表示しません。
 電球が見つからない、コードが違う、Wi-Fiにつながらない、時間切れ、matterjs-serverに接続できない、はそれぞれ理由と次にすることを表示し、入力は残ります。
-台帳に同じ機器（同じ識別子かコード）がある場合は新しく登録せず、既存の登録を示します。
+台帳に同じ機器（同じ識別子かコード）がある場合は新しい行を作らず、その行を使います。
+登録しても部屋の選択は残るので、同じ部屋の次の機器はQRを読み取るだけで登録できます。
 
 ### Thread電球をBluetoothでつなぐ
 
@@ -173,25 +175,11 @@ datasetはmatterjs-serverに `set_thread_dataset` で登録したものを使い
 Thread網（OpenThread Border Router）が無いうちは、Threadのタブに「Thread網が未準備です」と表示され、登録できません。
 matterjs-serverにdatasetが入ると、アプリを変えずに登録できるようになります（「もう一度確かめる」で表示を更新します）。
 
-1. 「Threadの電球（T2など）」のタブを選びます。「つなぎ方」は「新しいThread電球をBluetoothでつなぐ」（既定）のままにします。
+1. 「Threadの電球」のタブを選びます。
 2. 電球をペアリング待ちにします。Aqara T2は電源のオフ・オンを1秒間隔で10回くり返すと初期化されます（初期はThreadで動きます）。
 3. QRコードを読み取るか数字を入力し、部屋と名前（任意）を決めて「登録」を押します。Wi-Fiは選びません。
 
-段階の表示、失敗の表示、台帳に同じ機器がある場合の扱いはWi-Fi電球と同じです。電球がThread網に参加できない場合はその旨を表示します。
-
-### 機器を登録する（記録だけ）
-
-すでにmatterjs-serverにつながっている機器は、どちらのタブでも「つなぎ方」で「記録だけ」を選んで台帳にだけ登録します。
-
-1. 「QRを読み取る」で機器のQRコードを読み取ります。
-   QRコードが無い機器は「数字で入力」を押し、機器に印字された11桁の数字を入力します。
-   11桁そろうと確定し、数字の誤りはその場で表示します。
-2. 部屋を選びます。部屋が無ければ「部屋を追加」で作成します。
-3. 必要なら機器名を入力し、「登録」を押します。機器名は空欄でも登録できます。
-
-登録すると部屋の選択はそのまま残るので、同じ部屋の次の機器はQRを読み取るだけで登録できます。
-同じ機器の二重登録（QRコードと数字の組み合わせを含む）、存在しない部屋、サーバーへの接続失敗は、それぞれ理由を表示します。
-失敗した場合も入力内容は消えないので、原因を直してから「登録」を押し直してください。
+段階の表示、取り消し、失敗の表示、台帳に同じ機器がある場合の扱いはWi-Fi電球と同じです。電球がThread網に参加できない場合はその旨を表示します。
 
 ## API
 
@@ -204,7 +192,6 @@ matterjs-serverにdatasetが入ると、アプリを変えずに登録できる�
 | `PATCH /api/rooms/{id}` | 部屋の名前の変更。本文は作成と同じ | 404 `room_not_found`、409 `duplicate_room_name` |
 | `DELETE /api/rooms/{id}` | 部屋の削除。機器が残っている部屋は削除しません | 404 `room_not_found`、409 `room_has_devices` |
 | `GET /api/devices` | 機器の一覧。コードは含みません | |
-| `POST /api/devices` | 機器の登録 | 400 `invalid_qr_payload`・`invalid_manual_code`・`missing_setup_code`・`invalid_identifier`・`invalid_mac`・`invalid_device_name`、404 `room_not_found`、409 `duplicate_qr_payload`・`duplicate_identifier` |
 | `GET /api/devices/{id}` | 機器1台。登録したコードの全文 `qr_payload` または `manual_code` を含みます | 404 `device_not_found` |
 | `PATCH /api/devices/{id}` | labelの割り当てと無視の設定。本文は送った項目だけを変えます。`{"label_ids": [1, 2]}`（割り当てを置き換え、`[]` で外す）、`{"ignored": true}`（`false` で戻す） | 400 `invalid_device_update`・`conflicting_labels`、404 `device_not_found`・`label_not_found` |
 | `DELETE /api/devices/{id}` | 機器の削除 | 404 `device_not_found` |
@@ -227,17 +214,12 @@ matterjs-serverにdatasetが入ると、アプリを変えずに登録できる�
 | `GET /healthz` | 稼働確認（`ok`） | |
 
 部屋の名前は前後の空白を除いて1〜100文字、機器名は0〜100文字です。
-機器の登録では、QRコード `qr_payload` と手動ペアリングコード `manual_code` のどちらか一方、
-または機器の識別子 `vendor` と `serial_number` の組を送ります。コードと識別子は両方送っても構いません。
 QRコードは `MT:` で始まるMatterのセットアップコードとして検証し、前後の空白は除いて保存します。
 手動ペアリングコードは空白とハイフンを除いた11桁の数字にして、チェック数字とsetup passcodeを検証して保存します。
-QRコードと手動ペアリングコードは、setup passcodeとdiscriminatorの上位4ビットが一致すれば同じ機器として扱い、
-二重登録を `duplicate_qr_payload` で拒否します。
+QRコードと手動ペアリングコードは、setup passcodeとdiscriminatorの上位4ビットが一致すれば同じ機器として扱います。
 
 識別子は、matterjs-serverが機器から読んだBasic Information（ブリッジ配下の機器はBridged Device Basic Information）の
 VendorNameとSerialNumberです。Aqara Hub M3配下のT2ではZigbeeのIEEEアドレス、TapoではWi-FiのMACがSerialNumberになります。
-`vendor` と `serial_number` は両方を前後の空白を除いて1〜100文字で送り、`mac` は任意で16進数12桁（`:` と `-` は除きます）を送ります。
-同じ `vendor` と `serial_number` の組、または同じ `mac` の二重登録は `duplicate_identifier` で拒否します。
 
 `POST /api/commission` は、本文の `room_id`、`qr_payload` か `manual_code` のどちらか一方、`name`（任意）、
 `network`（`wifi` か `thread`、既定は `wifi`）を受け取ります。`wifi` では `wifi_ssid`（1〜32バイト）と `wifi_password`（1〜64文字）も受け取り、
@@ -267,15 +249,12 @@ nodeが使えない照明と、ブリッジが届かないと報告している�
 
 #### 二度と応答しない照明を無視する
 
-ブリッジ配下に残った電球など、二度と応答しない照明は、台帳に登録して無視の対象にできます。
+ブリッジ配下に残った電球など、二度と応答しない照明は、台帳の機器なら無視の対象にできます。
 無視の照明には、全部オン・全部オフと自動調整の命令を送りません。全部オン・全部オフの件数（`switched`・`no_response`・`failed`・`missing`）と、
 `GET /api/lights` の件数にも数えません。照明ごとの項目には、`result` または `state` が `ignored` として残ります。
 応答の無い照明を自動で無視にはしません。
 
 ```sh
-# ブリッジ配下のT2を、VendorNameとSerialNumberで登録してから無視にする
-curl -X POST http://home-link.example:5011/api/devices -H 'content-type: application/json' \
-  -d '{"room_id":1,"vendor":"Aqara","serial_number":"54ef44100126e0a6","name":"外したT2"}'
 curl -X PATCH http://home-link.example:5011/api/devices/7 -H 'content-type: application/json' -d '{"ignored":true}'
 # {"id":7,…,"ignored":true,…}
 ```
@@ -409,18 +388,6 @@ curl -X PATCH http://home-link.example:5011/api/labels/3 -H 'content-type: appli
 ```sh
 curl -X POST http://home-link.example:5011/api/rooms -H 'content-type: application/json' -d '{"name":"寝室"}'
 # {"id":1,"name":"寝室","device_count":0}
-
-curl -X POST http://home-link.example:5011/api/devices -H 'content-type: application/json' \
-  -d '{"room_id":1,"qr_payload":"MT:Y.K9042C00KA0648G00","name":"天井灯"}'
-# {"id":1,"room_id":1,"room_name":"寝室","name":"天井灯","created_at":"2026-10-05T09:46:07Z"}
-
-curl -X POST http://home-link.example:5011/api/devices -H 'content-type: application/json' \
-  -d '{"room_id":1,"manual_code":"3497 011 2332","name":"天井灯"}'
-# {"error":"duplicate_qr_payload","message":"この機器は登録済みです"}
-
-curl -X POST http://home-link.example:5011/api/devices -H 'content-type: application/json' \
-  -d '{"room_id":1,"vendor":"Tapo","serial_number":"AABBCCDDEEFF","mac":"AA:BB:CC:DD:EE:FF","name":"読書灯"}'
-# {"id":2,"room_id":1,"room_name":"寝室","name":"読書灯","vendor":"Tapo","serial_number":"AABBCCDDEEFF","mac":"AABBCCDDEEFF","created_at":"2026-10-05T12:30:00Z"}
 
 curl -X POST http://home-link.example:5011/api/commission -H 'content-type: application/json' \
   -d '{"room_id":2,"qr_payload":"MT:Y.K9042C00KA0648G00","name":"押入れ1","wifi_ssid":"home-2g","wifi_password":"…"}'

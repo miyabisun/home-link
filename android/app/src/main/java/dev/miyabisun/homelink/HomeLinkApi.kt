@@ -10,7 +10,7 @@ import java.net.URL
 
 data class Room(val id: Long, val name: String)
 
-enum class ApiError { NOT_CONFIGURED, UNREACHABLE, TIMEOUT, DUPLICATE_QR, ROOM_NOT_FOUND, DUPLICATE_ROOM, INVALID_QR, INVALID_MANUAL, INVALID_NAME,
+enum class ApiError { NOT_CONFIGURED, UNREACHABLE, TIMEOUT, ROOM_NOT_FOUND, DUPLICATE_ROOM, INVALID_QR, INVALID_MANUAL, INVALID_NAME,
     MATTER_UNREACHABLE, MATTER_NOT_CONFIGURED, SERVER,
     DEVICE_NOT_FOUND, WRONG_CODE, WIFI_FAILED, COMMISSION_TIMEOUT, COMMISSION_FAILED, BLUETOOTH_UNAVAILABLE, INVALID_WIFI,
     THREAD_NOT_READY, THREAD_FAILED, LABEL_NOT_FOUND, LABEL_HAS_NO_LIGHTS,
@@ -20,7 +20,7 @@ enum class ApiError { NOT_CONFIGURED, UNREACHABLE, TIMEOUT, DUPLICATE_QR, ROOM_N
 data class WifiNetwork(val ssid: String, val password: String)
 
 /** A commissioned device's ledger entry: new, or the one the ledger already held. */
-data class Commissioned(val registered: Boolean, val room: String, val name: String)
+data class Commissioned(val room: String, val name: String)
 
 sealed interface ApiResult<out T> {
     data class Ok<T>(val value: T) : ApiResult<T>
@@ -31,8 +31,6 @@ sealed interface ApiResult<out T> {
 interface HomeLinkApi {
     fun rooms(): ApiResult<List<Room>>
     fun createRoom(name: String): ApiResult<Room>
-    /** `payload` is a QR payload (`MT:`) or the digits of a manual pairing code. */
-    fun register(roomId: Long, payload: String, name: String): ApiResult<Unit>
     /** Switches every light matterjs-server serves on or off. */
     fun switchLights(on: Boolean): ApiResult<LightsResult>
     /** Boosts the lights of the label named `label` to the day's values, or releases them if boosted. */
@@ -40,7 +38,8 @@ interface HomeLinkApi {
     /** The names of the labels whose lights are boosted now. */
     fun boostedLabels(): ApiResult<Set<String>>
     /**
-     * Has matterjs-server commission the device behind `payload` over the BLE proxy
+     * Has matterjs-server commission the device behind `payload` (a QR payload, `MT:`,
+     * or the digits of a manual pairing code) over the BLE proxy
      * this phone holds open, onto `wifi` or, when null, onto Thread, and records it.
      * Takes up to minutes.
      */
@@ -63,10 +62,6 @@ class HttpHomeLinkApi(private val baseUrl: () -> String?) : HomeLinkApi {
     override fun createRoom(name: String): ApiResult<Room> =
         call("POST", "/api/rooms", JSONObject().put("name", name)) { room(JSONObject(it)) }
 
-    override fun register(roomId: Long, payload: String, name: String): ApiResult<Unit> {
-        return call("POST", "/api/devices", device(roomId, payload, name)) { }
-    }
-
     override fun commission(roomId: Long, payload: String, name: String, wifi: WifiNetwork?): ApiResult<Commissioned> {
         val body = device(roomId, payload, name)
         if (wifi == null) body.put("network", "thread")
@@ -75,7 +70,7 @@ class HttpHomeLinkApi(private val baseUrl: () -> String?) : HomeLinkApi {
         return call("POST", "/api/commission", body, readTimeout = 360_000) {
             val json = JSONObject(it)
             val device = json.getJSONObject("device")
-            Commissioned(json.getBoolean("registered"), device.getString("room_name"), device.getString("name"))
+            Commissioned(device.getString("room_name"), device.getString("name"))
         }
     }
 
@@ -161,7 +156,6 @@ class HttpHomeLinkApi(private val baseUrl: () -> String?) : HomeLinkApi {
     private fun error(body: String): ApiError {
         val code = try { JSONObject(body).optString("error") } catch (_: JSONException) { "" }
         return when (code) {
-            "duplicate_qr_payload" -> ApiError.DUPLICATE_QR
             "room_not_found" -> ApiError.ROOM_NOT_FOUND
             "duplicate_room_name" -> ApiError.DUPLICATE_ROOM
             "invalid_qr_payload" -> ApiError.INVALID_QR
