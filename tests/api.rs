@@ -1251,7 +1251,8 @@ async fn labels_support_create_list_update_assign_and_delete() {
     assert_eq!(
         label,
         json!({ "id": id, "name": "ゲームPC", "day_level": null, "night_level": null,
-                "cool_kelvin": null, "warm_kelvin": 3500, "device_count": 0, "boosted": false })
+                "cool_kelvin": null, "warm_kelvin": 3500, "device_count": 0, "boosted": false,
+                "dedicated": false })
     );
 
     // Assigning and the device's view of it.
@@ -3142,6 +3143,130 @@ async fn a_boost_that_reaches_no_light_is_not_kept() {
     );
     let (_, labels) = call(&app, "GET", "/api/labels", None).await;
     assert_eq!(boosted(&labels)[1], (json!("作業"), json!(false)));
+}
+
+/// `boost_home` whose desk light (6/1) also carries the dedicated "仕事用デスク"
+/// (100%, 5000 K), served by matterjs-server from `nodes`.
+async fn dedicated_home(nodes: Value) -> (home_link::Home, Router, Arc<Mutex<Vec<Value>>>) {
+    let (addr, commands, _) = fake_light_server(nodes, Fake::default()).await;
+    let (home, app, devices) = boost_home(home_link::open_db(":memory:").unwrap(), addr).await;
+    let desk = create_label(
+        &app,
+        json!({ "name": "仕事用デスク", "dedicated": true, "day_level": 254, "cool_kelvin": 5000 }),
+    )
+    .await;
+    assert_eq!(desk["dedicated"], true);
+    let (_, labels) = call(&app, "GET", "/api/labels", None).await;
+    let work = labels.as_array().unwrap()[1].clone();
+    assert_eq!(work["dedicated"], false);
+    assert_eq!(
+        assign(&app, &devices[2], &[&work, &desk]).await.0,
+        StatusCode::OK
+    );
+    (home, app, commands)
+}
+
+#[tokio::test]
+async fn a_dedicated_labels_lights_light_only_while_it_is_boosted() {
+    let (home, app, commands) = dedicated_home(tuning_nodes()).await;
+
+    // "All on" leaves the desk light off without counting it as failed.
+    let (status, body) = call(&app, "POST", "/api/lights/on", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!switches(&commands).contains(&(json!(6), json!(1), json!("On"))));
+    assert_eq!(tunings_of(&commands, 6, 1), []);
+    assert_eq!(body["failed"], 0);
+    let desk = results(&body, "result")
+        .into_iter()
+        .find(|(node, ..)| node == &json!(6))
+        .unwrap();
+    assert_eq!(desk.3, json!("dedicated"));
+
+    // Boosting 作業, which is not dedicated, lights the T2 but not the desk light.
+    commands.lock().unwrap().clear();
+    let (_, body) = boost(&app, "作業").await;
+    assert_eq!(
+        (&body["boosted"], &body["switched"]),
+        (&json!(true), &json!(1))
+    );
+    assert_eq!(switches(&commands), [(json!(1), json!(3), json!("On"))]);
+    assert_eq!(tunings_of(&commands, 6, 1), []);
+    assert_eq!(boost(&app, "作業").await.1["boosted"], false);
+
+    // Boosting the dedicated label lights it at the day's values: 100%, 5000 K.
+    commands.lock().unwrap().clear();
+    let (_, body) = boost(&app, "仕事用デスク").await;
+    assert_eq!(
+        (&body["boosted"], &body["switched"]),
+        (&json!(true), &json!(1))
+    );
+    assert_eq!(switches(&commands), [(json!(6), json!(1), json!("On"))]);
+    assert_eq!(
+        tunings_of(&commands, 6, 1),
+        [
+            at_once("MoveToLevelWithOnOff", 8, 254),
+            at_once("MoveToColorTemperature", 768, 200)
+        ]
+    );
+    commands.lock().unwrap().clear();
+    home.adjust(AFTER_MIDNIGHT, "scheduled").await;
+    assert_eq!(tunings_of(&commands, 6, 1), []);
+
+    // Released, it goes off.
+    commands.lock().unwrap().clear();
+    let (_, body) = boost(&app, "仕事用デスク").await;
+    assert_eq!(
+        (&body["boosted"], &body["switched"]),
+        (&json!(false), &json!(1))
+    );
+    assert_eq!(switches(&commands), [(json!(6), json!(1), json!("Off"))]);
+}
+
+#[tokio::test]
+async fn a_dedicated_light_left_on_keeps_the_days_values_and_goes_off_on_release() {
+    let mut nodes = tuning_nodes();
+    nodes[2]["attributes"]["1/6/0"] = json!(true);
+    let (home, app, commands) = dedicated_home(nodes).await;
+
+    // After midnight the schedule writes the day's values, not half the night's.
+    home.adjust(AFTER_MIDNIGHT, "scheduled").await;
+    let desk: Vec<_> = sent_values(&commands)
+        .into_iter()
+        .filter(|(node, ..)| node == &json!(6))
+        .map(|v| v.2)
+        .collect();
+    assert_eq!(desk, [json!(254), json!(200)]);
+
+    // Boosted while on and then released, it goes off all the same.
+    assert_eq!(boost(&app, "仕事用デスク").await.1["boosted"], true);
+    commands.lock().unwrap().clear();
+    let (_, body) = boost(&app, "仕事用デスク").await;
+    assert_eq!(
+        (&body["boosted"], &body["switched"]),
+        (&json!(false), &json!(1))
+    );
+    assert_eq!(switches(&commands), [(json!(6), json!(1), json!("Off"))]);
+    assert_eq!(tunings_of(&commands, 6, 1), []);
+}
+
+#[tokio::test]
+async fn dedicated_is_a_label_flag_set_by_post_and_patch() {
+    let app = app();
+    let label = create_label(&app, json!({ "name": "仕事用デスク" })).await;
+    assert_eq!(label["dedicated"], false);
+    let uri = format!("/api/labels/{}", label["id"]);
+    let (status, body) = call(&app, "PATCH", &uri, Some(json!({ "dedicated": true }))).await;
+    assert_eq!((status, &body["dedicated"]), (StatusCode::OK, &json!(true)));
+    // Other changes keep it.
+    let (_, body) = call(&app, "PATCH", &uri, Some(json!({ "day_level": 254 }))).await;
+    assert_eq!(body["dedicated"], true);
+    for bad in [json!({ "dedicated": "yes" }), json!({ "dedicated": null })] {
+        let (status, error) = call(&app, "PATCH", &uri, Some(bad.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+        assert_eq!(error["error"], "invalid_label", "{bad}");
+    }
+    let (_, labels) = call(&app, "GET", "/api/labels", None).await;
+    assert_eq!(labels[0]["dedicated"], true);
 }
 
 const SESAME_UUID: &str = "3DE4DE72-AAF9-25C1-8D0F-C9E019BB060C";

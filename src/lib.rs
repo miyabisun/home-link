@@ -160,6 +160,15 @@ pub fn open_db(path: &str) -> rusqlite::Result<Connection> {
             PRAGMA foreign_keys = ON;",
         )?;
     }
+    if version < 6 {
+        // Version 6 lets a label's lights light only while it is boosted.
+        db.execute_batch(
+            "BEGIN;
+            ALTER TABLE labels ADD COLUMN dedicated INTEGER NOT NULL DEFAULT 0;
+            PRAGMA user_version = 6;
+            COMMIT;",
+        )?;
+    }
     Ok(db)
 }
 
@@ -867,6 +876,8 @@ struct Label {
     #[serde(flatten)]
     values: schedule::Label,
     device_count: i64,
+    /// Its lights are lit only while it is boosted, then at the day's values.
+    dedicated: bool,
     /// Its lights are held at the day's values.
     boosted: bool,
     /// While boosted, the ledger devices that were off before.
@@ -875,7 +886,7 @@ struct Label {
 }
 
 const LABEL_SELECT: &str = "SELECT id, name, day_level, night_level, cool_kelvin, warm_kelvin,
-    (SELECT count(*) FROM device_labels WHERE label_id = labels.id), boost FROM labels";
+    (SELECT count(*) FROM device_labels WHERE label_id = labels.id), boost, dedicated FROM labels";
 
 fn label_row(row: &rusqlite::Row) -> rusqlite::Result<Label> {
     Ok(Label {
@@ -888,6 +899,7 @@ fn label_row(row: &rusqlite::Row) -> rusqlite::Result<Label> {
             warm_kelvin: row.get(5)?,
         },
         device_count: row.get(6)?,
+        dedicated: row.get(8)?,
         boosted: row.get::<_, Option<String>>(7)?.is_some(),
         was_off: row
             .get::<_, Option<String>>(7)?
@@ -930,11 +942,11 @@ fn find_label(db: &Connection, id: i64) -> ApiResult<Label> {
         .ok_or_else(label_not_found)
 }
 
-/// The name and values in `input`, checked over the schedule's current settings.
+/// The name, values and dedication in `input`, checked over the schedule's current settings.
 fn label_input(
     db: &Connection,
     mut input: serde_json::Value,
-) -> ApiResult<(String, schedule::Label)> {
+) -> ApiResult<(String, schedule::Label, bool)> {
     let invalid = |message: String| ApiError(StatusCode::BAD_REQUEST, "invalid_label", message);
     let fields = input
         .as_object_mut()
@@ -949,6 +961,11 @@ fn label_input(
                 format!("label名は1〜{MAX_NAME_CHARS}文字で入力してください"),
             )
         })?;
+    let dedicated = match fields.remove("dedicated") {
+        None => false,
+        Some(serde_json::Value::Bool(dedicated)) => dedicated,
+        Some(_) => return Err(invalid("dedicatedはtrueかfalseで送ってください".into())),
+    };
     let values: schedule::Label =
         serde_json::from_value(input).map_err(|e| invalid(e.to_string()))?;
     if let Some(message) = load::<schedule::Settings>(db, SCHEDULE)?
@@ -957,7 +974,7 @@ fn label_input(
     {
         return Err(invalid(message.into()));
     }
-    Ok((name, values))
+    Ok((name, values, dedicated))
 }
 
 fn save_label(
@@ -965,20 +982,22 @@ fn save_label(
     id: Option<i64>,
     name: &str,
     values: &schedule::Label,
+    dedicated: bool,
 ) -> ApiResult<i64> {
     let result = db.execute(
-        "INSERT INTO labels (id, name, day_level, night_level, cool_kelvin, warm_kelvin)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "INSERT INTO labels (id, name, day_level, night_level, cool_kelvin, warm_kelvin, dedicated)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT (id) DO UPDATE SET name = excluded.name, day_level = excluded.day_level,
             night_level = excluded.night_level, cool_kelvin = excluded.cool_kelvin,
-            warm_kelvin = excluded.warm_kelvin",
+            warm_kelvin = excluded.warm_kelvin, dedicated = excluded.dedicated",
         params![
             id,
             name,
             values.day_level,
             values.night_level,
             values.cool_kelvin,
-            values.warm_kelvin
+            values.warm_kelvin,
+            dedicated
         ],
     );
     match result {
@@ -1003,8 +1022,8 @@ async fn create_label(
     Json(input): Json<serde_json::Value>,
 ) -> ApiResult<(StatusCode, Json<Label>)> {
     let db = db.db.lock().unwrap();
-    let (name, values) = label_input(&db, input)?;
-    let id = save_label(&db, None, &name, &values)?;
+    let (name, values, dedicated) = label_input(&db, input)?;
+    let id = save_label(&db, None, &name, &values, dedicated)?;
     Ok((StatusCode::CREATED, Json(find_label(&db, id)?)))
 }
 
@@ -1018,6 +1037,7 @@ async fn update_label(
     let label = find_label(&db, id)?;
     let mut merged = json!(label.values);
     merged["name"] = json!(label.name);
+    merged["dedicated"] = json!(label.dedicated);
     if let Some(fields) = input.as_object() {
         for (key, value) in fields {
             merged[key] = value.clone();
@@ -1025,7 +1045,7 @@ async fn update_label(
     } else {
         merged = input;
     }
-    let (name, values) = label_input(&db, merged)?;
+    let (name, values, dedicated) = label_input(&db, merged)?;
     let changed = Label {
         name: name.clone(),
         values: values.clone(),
@@ -1042,7 +1062,7 @@ async fn update_label(
             no_overlap(&stacked)?;
         }
     }
-    save_label(&db, Some(id), &name, &values)?;
+    save_label(&db, Some(id), &name, &values, dedicated)?;
     Ok(Json(find_label(&db, id)?))
 }
 
@@ -1503,11 +1523,12 @@ async fn boost(
             format!("labelの「{}」に照明が割り当てられていません", label.name),
         ));
     }
+    // A dedicated light is left to its dedicated labels.
     let of_label = |nodes: &[serde_json::Value], light: &matter::Light| {
+        let mine = labels_of(&devices, nodes, light, &labels);
         !is_ignored(&devices, nodes, light)
-            && labels_of(&devices, nodes, light, &labels)
-                .iter()
-                .any(|l| l.id == label.id)
+            && mine.iter().any(|l| l.id == label.id)
+            && (label.dedicated || !is_dedicated(&mine))
     };
     let key = |light: &matter::Light| (light.node_id, light.endpoint);
     let result = |decision: matter::Decision| match decision {
@@ -1533,6 +1554,7 @@ async fn boost(
         };
         let off = |nodes: &[serde_json::Value], light: &matter::Light| {
             devices_of(&devices, nodes, light).any(|d| was_off.contains(&d.id))
+                || is_dedicated(&labels_of(&devices, nodes, light, &labels))
         };
         let (_, switched) = matter::switch(url, false, |nodes, light| {
             !(of_label(nodes, light) && !held(nodes, light) && off(nodes, light))
@@ -1676,18 +1698,23 @@ async fn switch_lights(
         action: if on { "on" } else { "off" }.into(),
         at: schedule::timestamp((state.clock)()),
     };
-    let devices = {
+    let (devices, labels) = {
         let db = state.db.lock().unwrap();
         store(&db, INTENT, &intent)?;
         if !on {
             db.execute("UPDATE labels SET boost = NULL", [])?;
         }
-        ledger(&db)?
+        (ledger(&db)?, labels(&db)?)
     };
-    let (nodes, results) =
-        matter::switch(url, on, |nodes, light| is_ignored(&devices, nodes, light))
-            .await
-            .map_err(matter_unreachable)?;
+    // "All on" leaves dedicated lights to their labels' boost.
+    let dedicated = |nodes: &[serde_json::Value], light: &matter::Light| {
+        on && is_dedicated(&labels_of(&devices, nodes, light, &labels))
+    };
+    let (nodes, results) = matter::switch(url, on, |nodes, light| {
+        is_ignored(&devices, nodes, light) || dedicated(nodes, light)
+    })
+    .await
+    .map_err(matter_unreachable)?;
     let (lights, outcomes): (Vec<_>, Vec<_>) = results.into_iter().unzip();
     let switched = lights
         .iter()
@@ -1695,13 +1722,15 @@ async fn switch_lights(
         .filter(|(_, outcome)| **outcome == matter::Outcome::Switched)
         .map(|(light, _)| (light.node_id, light.endpoint))
         .collect();
-    let outcomes: Vec<&str> = outcomes
-        .into_iter()
-        .map(|outcome| match outcome {
+    let outcomes: Vec<&str> = lights
+        .iter()
+        .zip(outcomes)
+        .map(|(light, outcome)| match outcome {
             matter::Outcome::Switched => "switched",
             matter::Outcome::NoResponse => "no_response",
             matter::Outcome::Failed => "failed",
-            matter::Outcome::Ignored => "ignored",
+            matter::Outcome::Ignored if is_ignored(&devices, &nodes, light) => "ignored",
+            matter::Outcome::Ignored => "dedicated",
         })
         .collect();
     let (names, missing) = match_ledger(&devices, &nodes, &lights);
@@ -1872,7 +1901,13 @@ fn labels_of<'a>(
         .unwrap_or_default()
 }
 
-/// The level and kelvin at `minute` for a light with `labels`: the day's while one is boosted.
+/// Whether a light with `labels` is lit only while one of its dedicated labels is boosted.
+fn is_dedicated(labels: &[&Label]) -> bool {
+    labels.iter().any(|l| l.dedicated)
+}
+
+/// The level and kelvin at `minute` for a light with `labels`: the day's while one is
+/// boosted or dedicated.
 fn light_goal(
     settings: &schedule::Settings,
     minute: u32,
@@ -1880,7 +1915,7 @@ fn light_goal(
     labels: &[&Label],
 ) -> (u8, u16) {
     let stacked = settings.with_all(labels.iter().map(|l| &l.values));
-    if labels.iter().any(|l| l.boosted) {
+    if is_dedicated(labels) || labels.iter().any(|l| l.boosted) {
         stacked.day()
     } else {
         schedule::target(minute, sun, &stacked)

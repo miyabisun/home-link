@@ -104,6 +104,7 @@ adb -s DEVICE_SERIAL push home-link.yaml /sdcard/Android/data/dev.miyabisun.home
 結果は切り替えた台数と、応答のなかった照明・失敗した照明・台帳にあるのに見つからない機器の台数で示します。
 1台でも切り替えられなかった照明があれば、失敗の色で表示します。
 無視の対象にした照明（下の「二度と応答しない照明を無視する」）は、切り替えず、台数にも数えません。
+専用のlabelの照明（下の「専用のlabel」）は、照明オンでは点けず、台数にも数えません。照明オフでは消します。
 
 「ホーム画面にボタンを置く」を押すと、同じ2つのボタンに「仕事」「作業」を加えた4つのボタンのウィジェットをホーム画面へ置けます。
 「仕事」はlabel「仕事用デスク」、「作業」はlabel「作業」の照明だけを昼の明るさで点け、もう一度押すと元に戻します
@@ -207,15 +208,15 @@ matterjs-serverにdatasetが入ると、アプリを変えずに登録できる�
 | `GET /api/devices/{id}` | 機器1台。登録したコードの全文 `qr_payload` または `manual_code` を含みます | 404 `device_not_found` |
 | `PATCH /api/devices/{id}` | labelの割り当てと無視の設定。本文は送った項目だけを変えます。`{"label_ids": [1, 2]}`（割り当てを置き換え、`[]` で外す）、`{"ignored": true}`（`false` で戻す） | 400 `invalid_device_update`・`conflicting_labels`、404 `device_not_found`・`label_not_found` |
 | `DELETE /api/devices/{id}` | 機器の削除 | 404 `device_not_found` |
-| `GET /api/labels` | labelの一覧（値と割り当てた機器の台数、明るくしている最中か `boosted` つき） | |
-| `POST /api/labels` | labelの作成。本文は `{"name": "キッチン", "night_level": 76, "warm_kelvin": 2700}` | 400 `invalid_label_name`・`invalid_label`、409 `duplicate_label_name` |
-| `PATCH /api/labels/{id}` | labelの名前・値のうち、送った項目だけを変更します。`null` の値は全体の設定に戻ります | 400 `invalid_label_name`・`invalid_label`・`conflicting_labels`、404 `label_not_found`、409 `duplicate_label_name` |
+| `GET /api/labels` | labelの一覧（値と割り当てた機器の台数、専用か `dedicated`、明るくしている最中か `boosted` つき） | |
+| `POST /api/labels` | labelの作成。本文は `{"name": "キッチン", "night_level": 76, "warm_kelvin": 2700}`。`"dedicated": true` で専用にします（既定は `false`） | 400 `invalid_label_name`・`invalid_label`、409 `duplicate_label_name` |
+| `PATCH /api/labels/{id}` | labelの名前・値・`dedicated` のうち、送った項目だけを変更します。`null` の値は全体の設定に戻ります（`dedicated` は `true` か `false` だけ） | 400 `invalid_label_name`・`invalid_label`・`conflicting_labels`、404 `label_not_found`、409 `duplicate_label_name` |
 | `DELETE /api/labels/{id}` | labelの削除。割り当てた機器はlabel無しに戻ります | 404 `label_not_found` |
 | `POST /api/commission` | 機器をmatterjs-serverへBluetoothで登録（commissioning）し、台帳に登録 | 400 `missing_setup_code`・`invalid_qr_payload`・`invalid_manual_code`・`invalid_network`・`invalid_wifi`・`invalid_device_name`、404 `room_not_found`、422 `device_not_found`・`wrong_code`・`wifi_failed`・`thread_failed`・`commission_failed`、504 `commission_timeout`、502 `matter_server_unreachable`、503 `matter_server_not_configured`・`bluetooth_unavailable`・`thread_not_ready` |
 | `GET /api/thread` | Thread電球を登録できるか（matterjs-serverがThread網のdatasetを持つか）を `{"ready": true}` で返します | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `GET /api/status` | 台帳の機器ごとに、matterjs-serverで見えるか（`visible`）と今の `node_id`・`endpoint` | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `GET /api/lights` | 照明ごとの今の状態（`on`・`off`・`no_response`・`ignored`）と、無視の照明を除いた件数 | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
-| `POST /api/lights/on` | 無視の照明を除く全部の照明をオンにし、照明ごとの結果（`switched`・`no_response`・`failed`・`ignored`）と、無視の照明を除いた件数を返します | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
+| `POST /api/lights/on` | 無視の照明と専用のlabelの照明を除く全部の照明をオンにし、照明ごとの結果（`switched`・`no_response`・`failed`・`ignored`・`dedicated`）と、それらを除いた件数を返します | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `POST /api/lights/off` | 全部の照明をオフにし、すべてのlabelの明るくする状態を切ります。応答は `on` と同じ形です | 同上 |
 | `POST /api/lights/boost` | 本文 `{"label": "作業"}` のlabelの照明を明るくする状態を切り替えます。応答は `on` と同じ件数に、`label`・`action`（`boost` か `release`）・`boosted` を加えた形です | 400 `invalid_boost`、404 `label_not_found`、422 `label_has_no_lights`、503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `GET /api/lights/schedule` | 明るさと色温度の自動調整の設定（`settings`）、labelごとの値と割り当てた機器（`labels`）、最後に押された全部オン・全部オフ（`intent`）、直近の調整の記録（`runs`、新しい順に144回分） | |
@@ -347,7 +348,7 @@ curl http://home-link.example:5011/api/lights/schedule
 #             {"node_id":5,"endpoint":1,"name":"読書灯","room_name":"寝室","labels":[],"target_level":102,"target_kelvin":3000,"decision":"off"},…]},…]}
 
 curl -X POST http://home-link.example:5011/api/labels -H 'content-type: application/json' -d '{"name":"キッチン","night_level":76,"warm_kelvin":2700}'
-# 201 {"id":1,"name":"キッチン","day_level":null,"night_level":76,"cool_kelvin":null,"warm_kelvin":2700,"device_count":0,"boosted":false}
+# 201 {"id":1,"name":"キッチン","day_level":null,"night_level":76,"cool_kelvin":null,"warm_kelvin":2700,"device_count":0,"dedicated":false,"boosted":false}
 
 curl -X PATCH http://home-link.example:5011/api/devices/5 -H 'content-type: application/json' -d '{"label_ids":[1]}'
 # {"id":5,…,"labels":[{"id":1,"name":"キッチン"}],…}
@@ -384,6 +385,24 @@ curl -X POST http://home-link.example:5011/api/lights/boost -H 'content-type: ap
 以前の版の色温度の下限（`min_kelvin`）は、更新後の最初の起動で、値ごとに `warm_kelvin` だけを持つlabel（`夜3500K` など）へ移り、
 その照明に割り当てられます。下限は日の入り〜22時の途中でも効いていましたが、labelの `warm_kelvin` は夜の値なので、
 その間は全体の `cool_kelvin` からlabelの値へ線形に下がります。`PATCH /api/devices/{id}` に `min_kelvin` を送ると400です。
+
+#### 専用のlabel
+
+`dedicated` が `true` のlabelの照明は、そのlabelを明るくしている間だけ点く専用の照明になります。
+仕事用のデスクライトのように、ふだんは消しておき、ウィジェットの「仕事」の間だけ点けたい照明に使います。
+1台のlabelのどれかが専用なら、その照明は専用です。
+
+- 全部オンでは点けません。照明ごとの結果は `dedicated` で、`switched`・`no_response`・`failed` の件数に数えません。
+- 専用のlabelを明るくすると点け、昼の値にします。専用でないlabelを明るくしても点けません。
+- 専用のlabelを切ると、入れる前に点いていたかにかかわらず消します。
+- 自動調整では暗くしません。点いていれば、0時以降も昼の値に保ちます。
+- 全部オフは、ほかの照明と同じく消してlabelの状態も切ります。
+
+```sh
+curl -X POST http://home-link.example:5011/api/labels -H 'content-type: application/json' \
+  -d '{"name":"仕事用デスク","dedicated":true,"day_level":254,"cool_kelvin":5000}'
+curl -X PATCH http://home-link.example:5011/api/labels/3 -H 'content-type: application/json' -d '{"dedicated":false}'
+```
 
 ### 例
 
