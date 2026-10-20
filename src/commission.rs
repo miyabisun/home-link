@@ -206,6 +206,18 @@ pub fn classify(details: &str) -> Failure {
         Failure::Timeout
     } else if has("No commissionable device") || has("Node not found") || has("No device found") {
         Failure::NotFound
+    } else if [
+        "[ble]",
+        "BLE proxy",
+        "Unknown command",
+        "peripheral disconnected",
+        "[peer-communication] Could not connect to device",
+    ]
+    .iter()
+    .any(|word| has(word))
+    {
+        // The Bluetooth link failed, not the passcode; show matter.js's causes.
+        Failure::Other(details.to_owned())
     } else if has("PASE") || has("attempt(s) failed") {
         // Found over Bluetooth, but the passcode exchange failed.
         Failure::WrongCode
@@ -318,6 +330,55 @@ mod tests {
         ];
         for (details, failure) in cases {
             assert_eq!(classify(details), failure, "{details}");
+        }
+    }
+
+    #[test]
+    fn bluetooth_proxy_failures_are_not_a_wrong_code() {
+        // Observed 2026-10-20 from matterjs-server 1.4.0 commissioning over a BLE proxy;
+        // `None` keeps matter.js's details as a commission_failed.
+        let failed = "Commission failed: commissioning discovery failed: No device could be commissioned (1 of 1 started attempt(s) failed, 1 discovered)";
+        let lost =
+            "Cause #0: [ble] No connected BLE proxy client owns peripheral 00:00:5E:00:53:01";
+        let cases = [
+            // 08:09
+            (
+                "Commission failed: commissioning discovery failed: No commissionable device was discovered".to_owned(),
+                Some(Failure::NotFound),
+            ),
+            // 08:13
+            (
+                format!("{failed}\nCause #0: internal_error: Unknown command: write_and_subscribe"),
+                None,
+            ),
+            // 08:16
+            (format!("{failed}\n{lost}"), None),
+            // 08:20
+            (
+                "Commission failed: commissioning discovery failed: No device could be commissioned (1 attempt(s) started of 1 discovered, all canceled or timed out)".to_owned(),
+                Some(Failure::Timeout),
+            ),
+            // 08:23
+            (format!("{failed}\n{lost}"), None),
+            // 11:35
+            (
+                format!("{failed}\n{lost}\nCause #1: internal_error: peripheral disconnected (state=disconnected)"),
+                None,
+            ),
+            // 11:38
+            (
+                format!("{failed}\nCause #0: [peer-communication] Could not connect to device"),
+                None,
+            ),
+            // 11:50
+            (
+                format!("{failed}\nCause #0: internal_error: peripheral disconnected (state=disconnected)"),
+                None,
+            ),
+        ];
+        for (details, failure) in cases {
+            let failure = failure.unwrap_or_else(|| Failure::Other(details.clone()));
+            assert_eq!(classify(&details), failure, "{details}");
         }
     }
 
