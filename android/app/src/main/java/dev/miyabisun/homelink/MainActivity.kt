@@ -46,15 +46,9 @@ class MainActivity : Activity() {
         /** A fake link also skips the Bluetooth permission and power checks. */
         internal var linkFactory: ((Activity) -> BleLink)? = null
         internal var wifiStoreFactory: ((Activity) -> WifiStore)? = null
-        /** A fake reader also skips the location permission. */
-        internal var wifiReaderFactory: ((Activity) -> WifiReader)? = null
         private const val MAX_NAME = 100
         private const val REQUEST_BLUETOOTH = 1
         private const val REQUEST_ENABLE = 2
-        private const val REQUEST_LOCATION = 3
-        // Android shows the SSID of the connected network only to apps with fine location.
-        private val LOCATION_PERMISSIONS = arrayOf(android.Manifest.permission.ACCESS_FINE_LOCATION,
-            android.Manifest.permission.ACCESS_COARSE_LOCATION)
         private val BLUETOOTH_PERMISSIONS = bluetoothPermissions(Build.VERSION.SDK_INT)
     }
 
@@ -62,13 +56,6 @@ class MainActivity : Activity() {
     private lateinit var api: HomeLinkApi
     private lateinit var scanner: QrScanner
     private lateinit var wifiStore: WifiStore
-    private lateinit var wifiReader: WifiReader
-    private var savedWifi = SavedWifi()
-    /** The network the phone was on when the adder opened; null until read or when not on Wi-Fi. */
-    private var currentWifi: CurrentWifi? = null
-    private var currentRead = false
-    private var locationDenied = false
-    private var wifiNotice: String? = null
     private lateinit var worker: ExecutorService
     private lateinit var lightsWorker: ExecutorService
     /** The light switch in flight: true for on, false for off. */
@@ -80,7 +67,6 @@ class MainActivity : Activity() {
     private var addingRoom = false
     private var enteringCode = false
     private var formattingCode = false
-    private var addingWifi = false
     private var checkingThread = false
 
     /** The home-link URL the rooms were last read from; another after the settings reads them again. */
@@ -95,20 +81,6 @@ class MainActivity : Activity() {
     private lateinit var threadState: TextView
     private lateinit var threadCheckButton: Button
     private lateinit var wifiPanel: LinearLayout
-    private lateinit var wifiState: TextView
-    private lateinit var wifiSpinner: Spinner
-    private lateinit var wifiAdapter: ArrayAdapter<String>
-    private lateinit var wifiNoticeView: TextView
-    private lateinit var wifiActions: LinearLayout
-    private lateinit var wifiDeleteButton: Button
-    private lateinit var wifiEditor: LinearLayout
-    private lateinit var wifiCurrent: TextView
-    private lateinit var wifiBand: TextView
-    private lateinit var wifiSsid: EditText
-    private lateinit var wifiPassword: EditText
-    private lateinit var wifiMessage: TextView
-    private lateinit var wifiCancelButton: Button
-    private lateinit var wifiSaveButton: Button
     private lateinit var lightsOnButton: Button
     private lateinit var lightsOffButton: Button
     private lateinit var lightsRow: ResultRow
@@ -141,10 +113,9 @@ class MainActivity : Activity() {
         loadedUrl = endpoints.homeLinkUrl
         scanner = scannerFactory?.invoke(this) ?: GmsQrScanner(this)
         wifiStore = wifiStoreFactory?.invoke(this) ?: KeystoreWifiStore(this)
-        wifiReader = wifiReaderFactory?.invoke(this) ?: AndroidWifiReader(this)
-        savedWifi = wifiStore.load()
-        form.wifi = savedWifi.selected
         worker = Executors.newSingleThreadExecutor()
+        // Networks earlier versions kept on this phone move to home-link before anything reads them.
+        background({ moveToServer(wifiStore, api::saveWifi) }) { }
         // Switching lights can wait seconds for every bulb; registration does not queue behind it.
         lightsWorker = Executors.newSingleThreadExecutor()
         savedInstanceState?.let { state ->
@@ -154,8 +125,6 @@ class MainActivity : Activity() {
             addingRoom = state.getBoolean("addingRoom")
             enteringCode = state.getBoolean("enteringCode")
             form.thread = state.getBoolean("thread")
-            addingWifi = state.getBoolean("addingWifi")
-            locationDenied = state.getBoolean("locationDenied")
             lightsResult = state.getString("lightsText")?.let { LightsMessage(it, state.getBoolean("lightsFailed")) }
         }
         build()
@@ -163,8 +132,6 @@ class MainActivity : Activity() {
         manualField.setSelection(manualField.length())
         newRoomName.setText(savedInstanceState?.getString("newRoom").orEmpty())
         nameField.setText(form.name)
-        wifiSsid.setText(savedInstanceState?.getString("wifiSsid").orEmpty())
-        if (addingWifi) readCurrentWifi(ask = false)
         // A registration started before the screen was recreated carries on.
         form.busy = CommissionSession.running
         form.stage = CommissionSession.stage
@@ -183,10 +150,6 @@ class MainActivity : Activity() {
         outState.putBoolean("enteringCode", enteringCode)
         outState.putString("manualCode", manualField.text.toString())
         outState.putBoolean("thread", form.thread)
-        outState.putBoolean("addingWifi", addingWifi)
-        outState.putBoolean("locationDenied", locationDenied)
-        // The password is never put in the saved state.
-        outState.putString("wifiSsid", wifiSsid.text.toString())
         lightsResult?.let {
             outState.putString("lightsText", it.text)
             outState.putBoolean("lightsFailed", it.failed)
@@ -207,6 +170,8 @@ class MainActivity : Activity() {
             loadRooms()
             if (form.thread) checkThread()
         }
+        // The settings screen may have saved the Wi-Fi for devices meanwhile.
+        loadWifi()
         render()
     }
 
@@ -233,6 +198,13 @@ class MainActivity : Activity() {
         background({ api.rooms() }) { result ->
             loadingRooms = false
             form.rooms(result)
+            render()
+        }
+    }
+
+    private fun loadWifi() {
+        background({ api.wifiNetworks() }) { result ->
+            form.wifiRead(result)
             render()
         }
     }
@@ -338,70 +310,6 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun openWifiAdder() {
-        addingWifi = true
-        wifiNotice = null
-        currentWifi = null
-        currentRead = false
-        wifiSsid.setText("")
-        wifiPassword.setText("")
-        render()
-        wifiSsid.requestFocus()
-        readCurrentWifi(ask = true)
-    }
-
-    /** Fills in the network the phone is on, asking for the location permission Android needs to name it. */
-    private fun readCurrentWifi(ask: Boolean) {
-        if (wifiReaderFactory == null && LOCATION_PERMISSIONS.any { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }) {
-            if (ask) return requestPermissions(LOCATION_PERMISSIONS, REQUEST_LOCATION)
-            locationDenied = true
-        } else {
-            locationDenied = false
-        }
-        wifiReader.read { wifi ->
-            if (isDestroyed || !addingWifi) return@read
-            currentWifi = wifi
-            currentRead = true
-            val ssid = wifi?.ssid
-            if (ssid != null && wifiSsid.text.isEmpty()) {
-                wifiSsid.setText(ssid)
-                wifiPassword.requestFocus()
-            }
-            render()
-        }
-    }
-
-    private fun saveWifi() {
-        val network = WifiNetwork(wifiSsid.text.toString(), wifiPassword.text.toString())
-        // SSIDs are up to 32 bytes; WPA passphrases up to 64 characters.
-        if (network.ssid.toByteArray().size !in 1..32 || network.password.length !in 1..64) {
-            show(wifiMessage, "Wi-Fiの名前（32バイトまで）とパスワード（64文字まで）を入力してください")
-            return
-        }
-        changeWifi(savedWifi.added(network))
-        addingWifi = false
-        wifiPassword.setText("")
-        wifiMessage.visibility = View.GONE
-        if (form.status == Status.Failed(ApiError.INVALID_WIFI) || form.status == Status.Failed(ApiError.WIFI_FAILED)) {
-            form.status = null
-        }
-        getSystemService(InputMethodManager::class.java).hideSoftInputFromWindow(wifiPassword.windowToken, 0)
-        render()
-    }
-
-    private fun deleteWifi() {
-        val ssid = savedWifi.selected?.ssid ?: return
-        changeWifi(savedWifi.removed(ssid))
-        wifiNotice = "「$ssid」を削除しました"
-        render()
-    }
-
-    private fun changeWifi(saved: SavedWifi) {
-        savedWifi = saved
-        wifiStore.save(saved)
-        form.wifi = saved.selected
-    }
-
     /** Checks the Bluetooth permissions and power, asking for them, then starts the registration. */
     private fun commission() {
         if (linkFactory == null) {
@@ -423,8 +331,7 @@ class MainActivity : Activity() {
         }
         val payload = form.payload ?: return
         val roomId = form.roomId ?: return
-        // Thread bulbs take the network matterjs-server holds; only Wi-Fi bulbs need one handed over.
-        val wifi = if (form.thread) null else form.wifi ?: return
+        val thread = form.thread
         val name = form.name.trim()
         endpoints = Endpoints.load(this)
         val proxy = endpoints.bleProxyUrl ?: run {
@@ -434,7 +341,7 @@ class MainActivity : Activity() {
         val link = linkFactory?.invoke(this) ?: ProxyLink(applicationContext, proxy)
         form.busy = true
         form.status = null
-        CommissionSession.start(link) { api.commission(roomId, payload, name, wifi) }
+        CommissionSession.start(link) { api.commission(roomId, payload, name, thread) }
         form.stage = CommissionSession.stage
         render()
     }
@@ -447,7 +354,6 @@ class MainActivity : Activity() {
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == REQUEST_LOCATION) return readCurrentWifi(ask = false)
         if (requestCode != REQUEST_BLUETOOTH) return
         if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) commission()
         else {
@@ -516,42 +422,8 @@ class MainActivity : Activity() {
 
         wifiPanel = panel()
         label(wifiPanel, "電球に渡すWi-Fi", 18, bold = true)
-        wifiState = label(wifiPanel, "まだ保存していません", 16, muted = true)
-        wifiAdapter = ArrayAdapter<String>(this, R.layout.select_item)
-        wifiSpinner = select(wifiPanel, wifiAdapter, "電球に渡すWi-Fi") { position ->
-            val ssid = savedWifi.networks.getOrNull(position)?.ssid
-            if (ssid != null && ssid != savedWifi.selected?.ssid) changeWifi(savedWifi.chose(ssid))
-            render()
-        }
-        wifiNoticeView = message(wifiPanel)
-        wifiActions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        wifiPanel.addView(wifiActions, LinearLayout.LayoutParams(-1, -2))
-        button(wifiActions, "Wi-Fiを追加", icon = R.drawable.ic_add, weight = true) { openWifiAdder() }
-        wifiDeleteButton = button(wifiActions, "このWi-Fiを削除", weight = true) { deleteWifi() }
-        wifiEditor = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        wifiPanel.addView(wifiEditor, LinearLayout.LayoutParams(-1, -2))
-        wifiCurrent = label(wifiEditor, "", 14, muted = true)
-        wifiBand = message(wifiEditor)
-        label(wifiEditor, "Wi-Fiの名前（SSID）", 14, muted = true)
-        wifiSsid = field(wifiEditor, "Wi-Fiの名前（SSID）", EditorInfo.IME_ACTION_NEXT) { wifiPassword.requestFocus() }
-        wifiSsid.addTextChangedListener(changed { render() })
-        label(wifiEditor, "パスワード", 14, muted = true)
-        wifiPassword = field(wifiEditor, "Wi-Fiのパスワード", EditorInfo.IME_ACTION_DONE) { saveWifi() }
-        wifiPassword.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-        wifiPassword.addTextChangedListener(changed { render() })
-        label(wifiEditor, "この電話の中だけに暗号化して保存し、登録のたびにmatterjs-serverへ渡します。", 14, muted = true)
-        wifiMessage = message(wifiEditor)
-        val editorActions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        wifiEditor.addView(editorActions, LinearLayout.LayoutParams(-1, -2))
-        wifiCancelButton = button(editorActions, "やめる", weight = true) {
-            addingWifi = false
-            wifiSsid.setText("")
-            wifiPassword.setText("")
-            wifiMessage.visibility = View.GONE
-            getSystemService(InputMethodManager::class.java).hideSoftInputFromWindow(wifiPassword.windowToken, 0)
-            render()
-        }
-        wifiSaveButton = button(editorActions, "保存", weight = true) { saveWifi() }
+        label(wifiPanel, "まだ保存していません", 16, muted = true)
+        button(wifiPanel, "Wi-Fiを設定", icon = R.drawable.ic_settings) { openSettings() }
 
         val qr = panel()
         label(qr, "機器のコード", 18, bold = true)
@@ -614,7 +486,10 @@ class MainActivity : Activity() {
         nameField.addTextChangedListener(changed { form.name = it })
 
         resultRow = ResultRow(this, content, dp(16))
-        reconnectButton = button(content, "再接続") { loadRooms() }
+        reconnectButton = button(content, "再接続") {
+            loadRooms()
+            loadWifi()
+        }
         registerButton = button(content, "登録", primary = true) { commission() }
         cancelButton = button(content, "キャンセル") { cancel() }
         button(content, "接続先の設定", icon = R.drawable.ic_settings) { openSettings() }.apply {
@@ -642,7 +517,8 @@ class MainActivity : Activity() {
             tab.isEnabled = !form.busy
             tab.typeface = if (selected) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
         }
-        wifiPanel.visibility = if (form.thread) View.GONE else View.VISIBLE
+        // Asked for only until home-link holds a Wi-Fi for devices; registering never asks for one.
+        wifiPanel.visibility = if (!form.thread && form.wifiMissing) View.VISIBLE else View.GONE
         threadPanel.visibility = if (form.thread) View.VISIBLE else View.GONE
         threadState.text = when {
             checkingThread -> "Thread網を確かめています…"
@@ -660,33 +536,6 @@ class MainActivity : Activity() {
         threadState.compoundDrawablePadding = dp(8)
         threadCheckButton.visibility = if (!checkingThread && form.threadReady != true) View.VISIBLE else View.GONE
         threadCheckButton.isEnabled = !form.busy
-        val ssids = savedWifi.networks.map { it.ssid }
-        fill(wifiAdapter, ssids)
-        val chosen = ssids.indexOf(savedWifi.selected?.ssid)
-        if (chosen >= 0 && wifiSpinner.selectedItemPosition != chosen) wifiSpinner.setSelection(chosen)
-        wifiState.visibility = if (ssids.isEmpty() && !addingWifi) View.VISIBLE else View.GONE
-        wifiSpinner.visibility = if (ssids.isEmpty() || addingWifi) View.GONE else View.VISIBLE
-        wifiSpinner.isEnabled = !form.busy
-        wifiActions.visibility = if (addingWifi) View.GONE else View.VISIBLE
-        for (i in 0 until wifiActions.childCount) wifiActions.getChildAt(i).isEnabled = !form.busy
-        wifiDeleteButton.visibility = if (ssids.isEmpty()) View.GONE else View.VISIBLE
-        wifiEditor.visibility = if (addingWifi) View.VISIBLE else View.GONE
-        wifiSaveButton.isEnabled = wifiSsid.text.isNotEmpty() && wifiPassword.text.isNotEmpty()
-        val current = currentWifi
-        wifiCurrent.text = when {
-            !currentRead -> ""
-            current == null -> "Wi-Fiにつながっていません。電球に渡すWi-Fiの名前を入力してください"
-            current.ssid != null -> "今つながっているWi-Fiの名前を入れました。パスワードを入力してください"
-            locationDenied -> "位置情報の「正確な位置」を許可すると、今つながっているWi-Fiの名前を自動で入れます"
-            else -> "今つながっているWi-Fiの名前を読めませんでした。位置情報がオンか確かめるか、名前を入力してください"
-        }
-        wifiCurrent.visibility = if (wifiCurrent.text.isEmpty()) View.GONE else View.VISIBLE
-        val frequency = current?.frequencyMhz
-        show(wifiBand, if (frequency == null || is24GHz(frequency)) null else
-            (current.ssid?.let { "今つながっている「$it」" } ?: "今つながっているWi-Fi") + "は${band(frequency)}です。" +
-            "電球は2.4GHzにしかつながりません。ルーターが2.4GHzを別の名前で出している場合は、その名前に直してください")
-        show(wifiNoticeView, wifiNotice.takeIf { !addingWifi }, failure = false)
-
         val payload = form.payload
         val scannedQr = payload?.startsWith("MT:") == true
         qrState.text = when {
@@ -734,7 +583,7 @@ class MainActivity : Activity() {
         newRoomPanel.visibility = if (addingRoom) View.VISIBLE else View.GONE
         createRoomButton.isEnabled = newRoomName.text.isNotBlank()
 
-        val ssid = form.wifi?.ssid.orEmpty()
+        val ssid = form.deviceWifi.orEmpty()
         val result = when (status) {
             is Status.Commissioned -> with(status.device) {
                 if (name.isEmpty()) "${room}に機器を登録しました" else "${room}に「$name」を登録しました"
@@ -756,7 +605,7 @@ class MainActivity : Activity() {
                 ApiError.INVALID_MANUAL -> "この数字はMatterの機器のコードとして使えません。数字を入力し直してください"
                 ApiError.INVALID_NAME -> "名前は${MAX_NAME}文字以内で入力してください"
                 ApiError.SERVER, ApiError.MATTER_UNREACHABLE, ApiError.MATTER_NOT_CONFIGURED,
-                ApiError.LABEL_NOT_FOUND, ApiError.LABEL_HAS_NO_LIGHTS,
+                ApiError.LABEL_NOT_FOUND, ApiError.LABEL_HAS_NO_LIGHTS, ApiError.INVALID_WIFI, ApiError.WIFI_NOT_FOUND,
                 ApiError.SESAME_NOT_CONFIGURED, ApiError.SESAME_REJECTED, ApiError.SESAME_UNREACHABLE ->
                     "home-linkでエラーが発生しました。時間をおいてお試しください"
                 ApiError.DUPLICATE_ROOM -> null
@@ -769,7 +618,7 @@ class MainActivity : Activity() {
                 ApiError.COMMISSION_FAILED -> "登録が途中で止まりました。電話を電球の近くに置いて、「登録」を押し直してください。" +
                     "電球の登録待ちが終わっていたら、電球の電源を1回入れ直してから押し直してください"
                 ApiError.BLUETOOTH_UNAVAILABLE -> "matterjs-serverでBluetoothの中継が有効になっていません。サーバーの設定を確かめてください"
-                ApiError.INVALID_WIFI -> "Wi-Fiの名前かパスワードが長すぎます。「Wi-Fiを追加」から入力し直してください"
+                ApiError.WIFI_NOT_SET -> "電球に渡すWi-Fiが未設定です"
                 ApiError.THREAD_NOT_READY -> "Thread網が未準備です。homeserverでThread網を用意してから登録してください"
                 ApiError.THREAD_FAILED -> "電球がThread網につながりませんでした。Thread網（OTBR）が動いているか確かめてから、" +
                     "もう一度お試しください"

@@ -13,11 +13,14 @@ data class Room(val id: Long, val name: String)
 enum class ApiError { NOT_CONFIGURED, UNREACHABLE, TIMEOUT, ROOM_NOT_FOUND, DUPLICATE_ROOM, INVALID_QR, INVALID_MANUAL, INVALID_NAME,
     MATTER_UNREACHABLE, MATTER_NOT_CONFIGURED, SERVER,
     DEVICE_NOT_FOUND, WRONG_CODE, WIFI_FAILED, COMMISSION_TIMEOUT, COMMISSION_FAILED, BLUETOOTH_UNAVAILABLE, INVALID_WIFI,
-    THREAD_NOT_READY, THREAD_FAILED, LABEL_NOT_FOUND, LABEL_HAS_NO_LIGHTS,
+    THREAD_NOT_READY, THREAD_FAILED, WIFI_NOT_SET, WIFI_NOT_FOUND, LABEL_NOT_FOUND, LABEL_HAS_NO_LIGHTS,
     SESAME_NOT_CONFIGURED, SESAME_REJECTED, SESAME_UNREACHABLE }
 
-/** The Wi-Fi network handed to a new device. */
+/** A Wi-Fi network to save on home-link for new devices. */
 data class WifiNetwork(val ssid: String, val password: String)
+
+/** A Wi-Fi network home-link holds; it never sends the password back. */
+data class SavedNetwork(val id: Long, val ssid: String, val forDevices: Boolean)
 
 /** A commissioned device's ledger entry: new, or the one the ledger already held. */
 data class Commissioned(val room: String, val name: String)
@@ -39,11 +42,17 @@ interface HomeLinkApi {
     fun boostedLabels(): ApiResult<Set<String>>
     /**
      * Has matterjs-server commission the device behind `payload` (a QR payload, `MT:`,
-     * or the digits of a manual pairing code) over the BLE proxy
-     * this phone holds open, onto `wifi` or, when null, onto Thread, and records it.
+     * or the digits of a manual pairing code) over the BLE proxy this phone holds open,
+     * onto the Wi-Fi home-link holds for devices or onto Thread, and records it.
      * Takes up to minutes.
      */
-    fun commission(roomId: Long, payload: String, name: String, wifi: WifiNetwork?): ApiResult<Commissioned>
+    fun commission(roomId: Long, payload: String, name: String, thread: Boolean): ApiResult<Commissioned>
+    fun wifiNetworks(): ApiResult<List<SavedNetwork>>
+    /** Saves the network, replacing the password of one with the same name; the first becomes the one for devices. */
+    fun saveWifi(network: WifiNetwork): ApiResult<SavedNetwork>
+    /** Makes the network the one handed to new devices. */
+    fun chooseWifi(id: Long): ApiResult<SavedNetwork>
+    fun deleteWifi(id: Long): ApiResult<Unit>
     /** Whether matterjs-server holds the Thread network's credentials to commission Thread devices. */
     fun threadReady(): ApiResult<Boolean>
     /** Has the front door's SESAME unlock or lock; `Ok` once CANDY HOUSE accepts the command. */
@@ -62,10 +71,8 @@ class HttpHomeLinkApi(private val baseUrl: () -> String?) : HomeLinkApi {
     override fun createRoom(name: String): ApiResult<Room> =
         call("POST", "/api/rooms", JSONObject().put("name", name)) { room(JSONObject(it)) }
 
-    override fun commission(roomId: Long, payload: String, name: String, wifi: WifiNetwork?): ApiResult<Commissioned> {
-        val body = device(roomId, payload, name)
-        if (wifi == null) body.put("network", "thread")
-        else body.put("network", "wifi").put("wifi_ssid", wifi.ssid).put("wifi_password", wifi.password)
+    override fun commission(roomId: Long, payload: String, name: String, thread: Boolean): ApiResult<Commissioned> {
+        val body = device(roomId, payload, name).put("network", if (thread) "thread" else "wifi")
         // matterjs-server may take minutes: Bluetooth discovery, PASE, Wi-Fi join and CASE.
         return call("POST", "/api/commission", body, readTimeout = 360_000) {
             val json = JSONObject(it)
@@ -73,6 +80,24 @@ class HttpHomeLinkApi(private val baseUrl: () -> String?) : HomeLinkApi {
             Commissioned(device.getString("room_name"), device.getString("name"))
         }
     }
+
+    override fun wifiNetworks(): ApiResult<List<SavedNetwork>> = call("GET", "/api/wifi", null) { body ->
+        val array = JSONArray(body)
+        (0 until array.length()).map { savedNetwork(array.getJSONObject(it)) }
+    }
+
+    override fun saveWifi(network: WifiNetwork): ApiResult<SavedNetwork> =
+        call("POST", "/api/wifi", JSONObject().put("ssid", network.ssid).put("password", network.password)) {
+            savedNetwork(JSONObject(it))
+        }
+
+    override fun chooseWifi(id: Long): ApiResult<SavedNetwork> =
+        call("PUT", "/api/wifi/devices", JSONObject().put("id", id)) { savedNetwork(JSONObject(it)) }
+
+    override fun deleteWifi(id: Long): ApiResult<Unit> = call("DELETE", "/api/wifi/$id", null) { }
+
+    private fun savedNetwork(json: JSONObject) =
+        SavedNetwork(json.getLong("id"), json.getString("ssid"), json.getBoolean("for_devices"))
 
     override fun threadReady(): ApiResult<Boolean> =
         call("GET", "/api/thread", null) { JSONObject(it).getBoolean("ready") }
@@ -172,6 +197,8 @@ class HttpHomeLinkApi(private val baseUrl: () -> String?) : HomeLinkApi {
             "invalid_wifi" -> ApiError.INVALID_WIFI
             "thread_not_ready" -> ApiError.THREAD_NOT_READY
             "thread_failed" -> ApiError.THREAD_FAILED
+            "wifi_not_set" -> ApiError.WIFI_NOT_SET
+            "wifi_not_found" -> ApiError.WIFI_NOT_FOUND
             "label_not_found" -> ApiError.LABEL_NOT_FOUND
             "label_has_no_lights" -> ApiError.LABEL_HAS_NO_LIGHTS
             "sesame_not_configured" -> ApiError.SESAME_NOT_CONFIGURED

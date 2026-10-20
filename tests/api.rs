@@ -1698,8 +1698,15 @@ async fn wifi_networks_are_saved_listed_chosen_and_deleted_without_their_passwor
     };
 
     let uri = format!("/api/wifi/{}", iot["id"]);
-    let (status, chosen) = call(&app, "PATCH", &uri, Some(json!({ "for_devices": true }))).await;
+    let (status, chosen) = call(
+        &app,
+        "PUT",
+        "/api/wifi/devices",
+        Some(json!({ "id": iot["id"] })),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{chosen}");
+    assert_eq!(chosen["for_devices"], true);
     let (_, list) = call(&app, "GET", "/api/wifi", None).await;
     assert_eq!(
         ids(&list),
@@ -1737,11 +1744,11 @@ async fn wifi_networks_are_saved_listed_chosen_and_deleted_without_their_passwor
             (StatusCode::BAD_REQUEST, "invalid_wifi")
         );
     }
-    for (method, body) in [
-        ("PATCH", Some(json!({ "for_devices": true }))),
-        ("DELETE", None),
+    for (method, uri, body) in [
+        ("PUT", "/api/wifi/devices", Some(json!({ "id": 999 }))),
+        ("DELETE", "/api/wifi/999", None),
     ] {
-        let (status, error) = call(&app, method, "/api/wifi/999", body).await;
+        let (status, error) = call(&app, method, uri, body).await;
         assert_eq!(
             (status, error["error"].as_str().unwrap()),
             (StatusCode::NOT_FOUND, "wifi_not_found")

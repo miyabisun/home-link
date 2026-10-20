@@ -39,8 +39,10 @@ class RegisterForm {
     var busy = false
     var roomsFailed = false
     var status: Status? = null
-    /** The saved network to hand over; required onto Wi-Fi. */
-    var wifi: WifiNetwork? = null
+    /** The name of the Wi-Fi home-link hands new devices; required onto Wi-Fi. */
+    var deviceWifi: String? = null
+    /** home-link was read to hold no Wi-Fi for devices. */
+    var wifiMissing = false
     /** The Thread tab: the device joins the Thread network matterjs-server holds, not Wi-Fi. */
     var thread = false
     /** Whether matterjs-server holds the Thread network; null until checked or when the check failed. */
@@ -49,7 +51,14 @@ class RegisterForm {
     var stage: Stage? = null
 
     fun canRegister() = payload != null && roomId != null && !busy &&
-        if (thread) threadReady == true else wifi != null
+        if (thread) threadReady == true else deviceWifi != null
+
+    /** Takes home-link's Wi-Fi networks; a failed read keeps what was read last. */
+    fun wifiRead(result: ApiResult<List<SavedNetwork>>) {
+        if (result !is ApiResult.Ok) return
+        deviceWifi = result.value.firstOrNull { it.forDevices }?.ssid
+        wifiMissing = deviceWifi == null
+    }
 
     fun threadChecked(result: ApiResult<Boolean>) {
         threadReady = (result as? ApiResult.Ok)?.value
@@ -134,6 +143,10 @@ class RegisterForm {
             }
             is ApiResult.Failed -> Status.Failed(result.error).also {
                 if (result.error == ApiError.THREAD_NOT_READY) threadReady = false
+                if (result.error == ApiError.WIFI_NOT_SET) {
+                    deviceWifi = null
+                    wifiMissing = true
+                }
             }
         }
     }

@@ -10,7 +10,7 @@ class RegisterFormTest {
     private val qr = "MT:Y.K9042C00KA0648G00"
 
     @Test fun registrationNeedsAScannedCodeAndARoom() {
-        val form = RegisterForm().apply { wifi = WifiNetwork("home-2g", "secret") }
+        val form = RegisterForm().apply { wifiRead(homeWifi) }
         assertFalse(form.canRegister())
         form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
         assertEquals(1L, form.roomId)
@@ -83,7 +83,7 @@ class RegisterFormTest {
     }
 
     @Test fun aValidManualCodeIsAcceptedOnceAllDigitsAreTyped() {
-        val form = RegisterForm().apply { wifi = WifiNetwork("home-2g", "secret") }
+        val form = RegisterForm().apply { wifiRead(homeWifi) }
         form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
         form.scanned(qr)
         assertFalse(form.typed("3497 011 233"))
@@ -111,20 +111,35 @@ class RegisterFormTest {
         assertNull(form.manualError)
     }
 
-    @Test fun registrationAlsoNeedsTheWifiToHandOver() {
+    @Test fun registrationOntoWifiNeedsTheServersWifiForDevices() {
         val form = RegisterForm()
         form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
         form.scanned(qr)
         assertFalse(form.canRegister())
-        form.wifi = WifiNetwork("home-2g", "secret")
+        assertFalse(form.wifiMissing)
+        // Saved, but none chosen for devices.
+        form.wifiRead(ApiResult.Ok(listOf(SavedNetwork(1, "home-2g", false))))
+        assertFalse(form.canRegister())
+        assertTrue(form.wifiMissing)
+        form.wifiRead(ApiResult.Ok(listOf(SavedNetwork(1, "home-2g", false), SavedNetwork(2, "iot-2g", true))))
         assertTrue(form.canRegister())
+        assertEquals("iot-2g", form.deviceWifi)
+        assertFalse(form.wifiMissing)
+        // A failed read keeps what was read last.
+        form.wifiRead(ApiResult.Failed(ApiError.UNREACHABLE))
+        assertTrue(form.canRegister())
+        // home-link refusing it for want of one shows it missing.
+        form.busy = true
+        form.commissioned(ApiResult.Failed(ApiError.WIFI_NOT_SET))
+        assertTrue(form.wifiMissing)
+        assertFalse(form.canRegister())
     }
 
     @Test fun threadRegistrationNeedsAReadyThreadNetworkInsteadOfWifi() {
         val form = RegisterForm()
         form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
         form.scanned(qr)
-        form.wifi = WifiNetwork("home-2g", "secret")
+        form.wifiRead(homeWifi)
         form.thread = true
         assertNull(form.threadReady)
         assertFalse(form.canRegister())
@@ -132,7 +147,7 @@ class RegisterFormTest {
         assertEquals(false, form.threadReady)
         assertFalse(form.canRegister())
         form.threadChecked(ApiResult.Ok(true))
-        form.wifi = null
+        form.wifiRead(ApiResult.Ok(emptyList()))
         assertTrue(form.canRegister())
         // A failed check is not taken as ready.
         form.threadChecked(ApiResult.Failed(ApiError.UNREACHABLE))
@@ -184,7 +199,7 @@ class RegisterFormTest {
         val form = RegisterForm()
         form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
         form.scanned(qr)
-        form.wifi = WifiNetwork("home-2g", "secret")
+        form.wifiRead(homeWifi)
         form.name = "押入れ1"
         form.busy = true
         form.stage = Stage.SENDING
@@ -206,4 +221,6 @@ class RegisterFormTest {
             assertNull(other, Stage.of(other))
         }
     }
+
+    private val homeWifi = ApiResult.Ok(listOf(SavedNetwork(1, "home-2g", true)))
 }

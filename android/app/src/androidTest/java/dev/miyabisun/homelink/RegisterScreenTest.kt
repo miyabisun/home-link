@@ -53,7 +53,7 @@ class RegisterScreenTest {
         MainActivity.scannerFactory = { scanner }
         MainActivity.linkFactory = { link }
         MainActivity.wifiStoreFactory = { wifi }
-        MainActivity.wifiReaderFactory = { reader }
+        SettingsActivity.wifiReaderFactory = { reader }
     }
 
     @After fun uninstall() {
@@ -61,14 +61,14 @@ class RegisterScreenTest {
         MainActivity.scannerFactory = null
         MainActivity.linkFactory = null
         MainActivity.wifiStoreFactory = null
-        MainActivity.wifiReaderFactory = null
+        SettingsActivity.wifiReaderFactory = null
         endpointsFile.delete()
     }
 
-    private val home = WifiNetwork("home-2g", "kakushi")
+    private val homeWifi = SavedNetwork(1, "home-2g", forDevices = true)
 
     @Test fun createSelectAndRegister() {
-        wifi.saved = SavedWifi().added(home)
+        api.wifi += homeWifi
         ActivityScenario.launch(MainActivity::class.java).use { screen ->
             eventually(screen) { hasLabel(it, "部屋がありません。「部屋を追加」から作成してください") }
             screen.onActivity { assertFalse(button(it, "登録").isEnabled) }
@@ -100,7 +100,7 @@ class RegisterScreenTest {
             capture(screen, "ready")
             screen.onActivity { button(it, "登録").performClick() }
             eventually(screen) { hasLabel(it, "寝室に「天井灯」を登録しました") }
-            assertEquals(listOf(CommissionCall(1, qr, "天井灯", home)), api.commissionings)
+            assertEquals(listOf(CommissionCall(1, qr, "天井灯", thread = false)), api.commissionings)
             screen.onActivity { activity ->
                 assertTrue(hasLabel(activity, "まだ読み取っていません"))
                 assertEquals("", field(activity, "機器名（任意）").text.toString())
@@ -126,7 +126,7 @@ class RegisterScreenTest {
 
     @Test fun failuresKeepTheInputs() {
         api.rooms += Room(1, "寝室")
-        wifi.saved = SavedWifi().added(home)
+        api.wifi += homeWifi
         ActivityScenario.launch(MainActivity::class.java).use { screen ->
             eventually(screen) { spinner(it, "部屋").selectedItem == "寝室" }
             scanner.next = ScanResult.Read(qr)
@@ -168,13 +168,13 @@ class RegisterScreenTest {
             api.failure = null
             screen.onActivity { button(it, "登録").performClick() }
             eventually(screen) { hasLabel(it, "居間に「天井灯」を登録しました") }
-            assertEquals(CommissionCall(2, qr, "天井灯", home), api.commissionings.last())
+            assertEquals(CommissionCall(2, qr, "天井灯", thread = false), api.commissionings.last())
         }
     }
 
     @Test fun manualCodeIsTypedCheckedAndRegistered() {
         api.rooms += Room(1, "寝室")
-        wifi.saved = SavedWifi().added(home)
+        api.wifi += homeWifi
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         ActivityScenario.launch(MainActivity::class.java).use { screen ->
             eventually(screen) { spinner(it, "部屋").selectedItem == "寝室" }
@@ -223,7 +223,7 @@ class RegisterScreenTest {
             capture(screen, "manual-ready")
             screen.onActivity { button(it, "登録").performClick() }
             eventually(screen) { hasLabel(it, "寝室に「電球」を登録しました") }
-            assertEquals(CommissionCall(1, "34970112332", "電球", home), api.commissionings.single())
+            assertEquals(CommissionCall(1, "34970112332", "電球", thread = false), api.commissionings.single())
             screen.onActivity { activity ->
                 assertTrue(hasLabel(activity, "まだ読み取っていません"))
                 assertTrue(button(activity, "数字で入力").isShown)
@@ -274,6 +274,9 @@ class RegisterScreenTest {
     @Test fun theSettingsWriteTheYamlAndTheNextRequestUsesIt() {
         MainActivity.apiFactory = null
         endpointsFile.delete()
+        // Saving asks Android 17 for the local network; a dialog left open would pause the screen.
+        if (android.os.Build.VERSION.SDK_INT >= 37) InstrumentationRegistry.getInstrumentation().uiAutomation
+            .grantRuntimePermission(context.packageName, android.Manifest.permission.ACCESS_LOCAL_NETWORK)
         FakeHomeLink().use { server ->
             ActivityScenario.launch(SettingsActivity::class.java).use { screen ->
                 eventually(screen) { hasLabel(it, "home-linkのURLを入れてください（例：http://home-link.example:5011）") }
@@ -308,7 +311,7 @@ class RegisterScreenTest {
 
     @Test fun recreationKeepsTheEnteredValues() {
         api.rooms += listOf(Room(1, "寝室"), Room(2, "居間"))
-        wifi.saved = SavedWifi().added(home)
+        api.wifi += homeWifi
         ActivityScenario.launch(MainActivity::class.java).use { screen ->
             eventually(screen) { spinner(it, "部屋").count == 2 }
             scanner.next = ScanResult.Read(qr)
@@ -379,31 +382,27 @@ class RegisterScreenTest {
         ActivityScenario.launch(MainActivity::class.java).use { screen ->
             eventually(screen) { spinner(it, "部屋").selectedItem == "押入れ" }
             scanner.next = ScanResult.Read(qr)
+            val settings = InstrumentationRegistry.getInstrumentation().addMonitor(SettingsActivity::class.java.name, null, true)
             screen.onActivity { activity ->
                 assertNoGuides(activity)
                 assertTrue(hasLabel(activity, "まだ保存していません"))
+                assertNoWifiInputs(activity)
                 button(activity, "QRを読み取る").performClick()
                 field(activity, "機器名（任意）").setText("押入れ1")
-                // No Wi-Fi to hand over yet.
+                // No Wi-Fi on home-link for devices yet: it is saved once in the settings.
                 assertFalse(button(activity, "登録").isEnabled)
-                button(activity, "Wi-Fiを追加").performClick()
-                // The network the phone is on fills in the name; only the password is left.
-                assertEquals("home-2g", field(activity, "Wi-Fiの名前（SSID）").text.toString())
-                assertTrue(hasLabel(activity, "今つながっているWi-Fiの名前を入れました。パスワードを入力してください"))
-                assertTrue(field(activity, "Wi-Fiのパスワード").isFocused)
-                field(activity, "Wi-Fiのパスワード").setText("x".repeat(65))
-                button(activity, "保存").performClick()
-                assertTrue(hasLabel(activity, "Wi-Fiの名前（32バイトまで）とパスワード（64文字まで）を入力してください"))
-                field(activity, "Wi-Fiのパスワード").setText("kakushi")
+                button(activity, "Wi-Fiを設定").performClick()
             }
+            assertEquals(1, settings.hits)
+            InstrumentationRegistry.getInstrumentation().removeMonitor(settings)
             capture(screen, "bt-wifi")
+            api.wifi += homeWifi
+            screen.recreate()
+            eventually(screen) { button(it, "登録").isEnabled }
             screen.onActivity { activity ->
-                button(activity, "保存").performClick()
-                assertEquals("home-2g", spinner(activity, "電球に渡すWi-Fi").selectedItem)
-                assertFalse(field(activity, "Wi-Fiのパスワード").isShown)
-                assertTrue(button(activity, "登録").isEnabled)
+                assertFalse(hasLabel(activity, "電球に渡すWi-Fi"))
+                assertNoWifiInputs(activity)
             }
-            assertEquals(SavedWifi(listOf(WifiNetwork("home-2g", "kakushi")), "home-2g"), wifi.saved)
             capture(screen, "bt-ready")
 
             link.script = listOf("start_scan", "stop_scan", "connect", "discover_services", "write_and_subscribe", "disconnect")
@@ -434,7 +433,7 @@ class RegisterScreenTest {
             screen.onActivity { assertTrue(hasLabel(it, "電球にコードとWi-Fiの設定を送っています…")) }
             gate.countDown()
             eventually(screen) { hasLabel(it, "押入れに「押入れ1」を登録しました") }
-            assertEquals(listOf(CommissionCall(1, qr, "押入れ1", WifiNetwork("home-2g", "kakushi"))), api.commissionings)
+            assertEquals(listOf(CommissionCall(1, qr, "押入れ1", thread = false)), api.commissionings)
             assertTrue(link.closed)
             screen.onActivity { activity ->
                 assertTrue(hasLabel(activity, "まだ読み取っていません"))
@@ -447,7 +446,7 @@ class RegisterScreenTest {
 
     @Test fun cancellingReturnsToRegisteringAtOnceAndDropsTheLateAnswer() {
         api.rooms += Room(1, "押入れ")
-        wifi.saved = SavedWifi().added(home)
+        api.wifi += homeWifi
         ActivityScenario.launch(MainActivity::class.java).use { screen ->
             eventually(screen) { spinner(it, "部屋").selectedItem == "押入れ" }
             scanner.next = ScanResult.Read(qr)
@@ -488,12 +487,12 @@ class RegisterScreenTest {
 
     @Test fun commissioningFailuresSayWhatToDoAndKeepTheInputs() {
         api.rooms += Room(1, "押入れ")
-        wifi.saved = SavedWifi().added(WifiNetwork("home-2g", "kakushi"))
+        api.wifi += homeWifi
         ActivityScenario.launch(MainActivity::class.java).use { screen ->
             eventually(screen) { spinner(it, "部屋").selectedItem == "押入れ" }
             scanner.next = ScanResult.Read(qr)
             screen.onActivity { activity ->
-                assertEquals("home-2g", spinner(activity, "電球に渡すWi-Fi").selectedItem)
+                assertNoWifiInputs(activity)
                 button(activity, "QRを読み取る").performClick()
                 field(activity, "機器名（任意）").setText("押入れ1")
             }
@@ -539,41 +538,38 @@ class RegisterScreenTest {
         }
     }
 
-    @Test fun savedNetworksAreChosenFromTheListAddedAndDeleted() {
-        api.rooms += Room(1, "押入れ")
-        val home = WifiNetwork("home-2g", "kakushi")
-        val annex = WifiNetwork("離れの2.4GHz（物置と作業部屋）", "hanare")
-        wifi.saved = SavedWifi(listOf(home, annex), last = annex.ssid)
-        api.commissioned = ApiResult.Ok(Commissioned("押入れ", ""))
-        ActivityScenario.launch(MainActivity::class.java).use { screen ->
-            eventually(screen) { spinner(it, "部屋").selectedItem == "押入れ" }
-            // The network used last is chosen already.
+    @Test fun theWifiForDevicesIsSavedChosenAndDeletedInTheSettings() {
+        val home = SavedNetwork(1, "home-2g", forDevices = false)
+        val annex = SavedNetwork(2, "離れの2.4GHz（物置と作業部屋）", forDevices = true)
+        api.wifi += listOf(home, annex)
+        ActivityScenario.launch(SettingsActivity::class.java).use { screen ->
+            // The network for devices is chosen already.
+            eventually(screen) { spinner(it, "電球に渡すWi-Fi").isShown }
             screen.onActivity { activity ->
                 val choice = spinner(activity, "電球に渡すWi-Fi")
                 assertEquals(annex.ssid, choice.selectedItem)
                 assertEquals(listOf(home.ssid, annex.ssid), (0 until choice.count).map { choice.getItemAtPosition(it) })
             }
             capture(screen, "wifi-list")
-            scanner.next = ScanResult.Read(qr)
-            screen.onActivity { activity ->
-                button(activity, "QRを読み取る").performClick()
-                button(activity, "登録").performClick()
-            }
-            eventually(screen) { hasLabel(it, "押入れに機器を登録しました") }
-            assertEquals(annex, api.commissionings.last().wifi)
 
-            // Choosing another network is remembered, also across a recreated screen.
+            // Choosing another network makes it the one for devices, also across a recreated screen.
             screen.onActivity { spinner(it, "電球に渡すWi-Fi").setSelection(0) }
-            eventually(screen) { wifi.saved.last == home.ssid }
+            eventually(screen) { api.wifi.single { w -> w.forDevices }.ssid == home.ssid }
             screen.recreate()
-            screen.onActivity { assertEquals(home.ssid, spinner(it, "電球に渡すWi-Fi").selectedItem) }
-            scanner.next = ScanResult.Read(qr)
+            eventually(screen) { spinner(it, "電球に渡すWi-Fi").selectedItem == home.ssid }
+
+            // The adder fills in the network the phone is on; only the password is left.
+            reader.next = CurrentWifi("home-2g", 2437)
             screen.onActivity { activity ->
-                button(activity, "QRを読み取る").performClick()
-                button(activity, "登録").performClick()
+                button(activity, "Wi-Fiを追加").performClick()
+                assertEquals("home-2g", field(activity, "Wi-Fiの名前（SSID）").text.toString())
+                assertTrue(hasLabel(activity, "今つながっているWi-Fiの名前を入れました。パスワードを入力してください"))
+                assertTrue(field(activity, "Wi-Fiのパスワード").isFocused)
+                field(activity, "Wi-Fiのパスワード").setText("x".repeat(65))
+                wifiSave(activity).performClick()
+                assertTrue(hasLabel(activity, "Wi-Fiの名前（32バイトまで）とパスワード（64文字まで）を入力してください"))
+                button(activity, "やめる").performClick()
             }
-            eventually(screen) { api.commissionings.size == 2 }
-            assertEquals(home, api.commissionings.last().wifi)
 
             // On 5GHz, the adder says the bulbs need 2.4GHz.
             reader.next = CurrentWifi("home-5g", 5180)
@@ -591,15 +587,17 @@ class RegisterScreenTest {
                 field(activity, "Wi-Fiのパスワード").setText("new-pass")
             }
             screen.recreate()
+            eventually(screen) { field(it, "Wi-Fiの名前（SSID）").isShown }
             screen.onActivity { activity ->
                 assertEquals("home-2g", field(activity, "Wi-Fiの名前（SSID）").text.toString())
                 assertEquals("", field(activity, "Wi-Fiのパスワード").text.toString())
-                // The same name replaces the saved password instead of adding a second entry.
+                // home-link replaces the password of the same name instead of adding a second entry.
                 field(activity, "Wi-Fiのパスワード").setText("new-pass")
-                button(activity, "保存").performClick()
-                assertEquals(home.ssid, spinner(activity, "電球に渡すWi-Fi").selectedItem)
+                wifiSave(activity).performClick()
             }
-            assertEquals(SavedWifi(listOf(WifiNetwork("home-2g", "new-pass"), annex), home.ssid), wifi.saved)
+            eventually(screen) { !field(it, "Wi-Fiのパスワード").isShown && spinner(it, "電球に渡すWi-Fi").isShown }
+            assertEquals(WifiNetwork("home-2g", "new-pass"), api.wifiSaves.last())
+            screen.onActivity { assertEquals(2, spinner(it, "電球に渡すWi-Fi").count) }
 
             // Without the name of the network, the adder says why and leaves the name to type.
             for ((current, text) in listOf(
@@ -610,31 +608,101 @@ class RegisterScreenTest {
                     button(activity, "Wi-Fiを追加").performClick()
                     assertTrue(hasLabel(activity, text))
                     assertEquals("", field(activity, "Wi-Fiの名前（SSID）").text.toString())
-                    assertFalse(button(activity, "保存").isEnabled)
+                    assertFalse(wifiSave(activity).isEnabled)
                     button(activity, "やめる").performClick()
                     assertTrue(spinner(activity, "電球に渡すWi-Fi").isShown)
                 }
             }
 
-            // Deleting the chosen network falls back to the one left, then to none.
+            // A save home-link refuses keeps the adder open with the reason.
+            api.wifiFailure = ApiError.UNREACHABLE
             screen.onActivity { activity ->
-                button(activity, "このWi-Fiを削除").performClick()
-                assertTrue(hasLabel(activity, "「home-2g」を削除しました"))
-                assertEquals(annex.ssid, spinner(activity, "電球に渡すWi-Fi").selectedItem)
-                assertEquals(1, spinner(activity, "電球に渡すWi-Fi").count)
+                button(activity, "Wi-Fiを追加").performClick()
+                field(activity, "Wi-Fiの名前（SSID）").setText("guest-2g")
+                field(activity, "Wi-Fiのパスワード").setText("guest-pass")
+                wifiSave(activity).performClick()
             }
+            val unreachable = "home-link（home-link.example:5011）に接続できません。接続先の設定と通信を確かめてください"
+            eventually(screen) { hasLabel(it, unreachable) && field(it, "Wi-Fiのパスワード").isShown }
+            capture(screen, "wifi-save-failed")
+            api.wifiFailure = null
+            screen.onActivity { button(it, "やめる").performClick() }
+
+            // Deleting the network for devices hands devices the one left, then none.
+            eventually(screen) { spinner(it, "電球に渡すWi-Fi").isShown }
+            screen.onActivity { button(it, "このWi-Fiを削除").performClick() }
+            eventually(screen) { hasLabel(it, "「home-2g」を削除しました") && spinner(it, "電球に渡すWi-Fi").count == 1 }
+            screen.onActivity { assertEquals(annex.ssid, spinner(it, "電球に渡すWi-Fi").selectedItem) }
             capture(screen, "wifi-deleted")
+            screen.onActivity { button(it, "このWi-Fiを削除").performClick() }
+            eventually(screen) { hasLabel(it, "まだ保存していません") }
             screen.onActivity { activity ->
-                button(activity, "このWi-Fiを削除").performClick()
-                assertTrue(hasLabel(activity, "まだ保存していません"))
                 assertFalse(spinner(activity, "電球に渡すWi-Fi").isShown)
                 assertFalse(views(activity).filterIsInstance<Button>().any { it.isShown && it.text == "このWi-Fiを削除" })
-                scanner.next = ScanResult.Read(qr)
-                button(activity, "QRを読み取る").performClick()
-                assertFalse(button(activity, "登録").isEnabled)
             }
-            assertEquals(SavedWifi(), wifi.saved)
+            assertEquals(emptyList<SavedNetwork>(), api.wifi.toList())
             capture(screen, "wifi-empty")
+
+            // A failed read says why and offers to read again.
+            api.wifiFailure = ApiError.UNREACHABLE
+            screen.recreate()
+            eventually(screen) { hasLabel(it, "Wi-Fiを読み込めませんでした") && hasLabel(it, unreachable) }
+            screen.onActivity { assertFalse(views(it).filterIsInstance<Button>().any { b -> b.isShown && b.text == "Wi-Fiを追加" }) }
+            capture(screen, "wifi-offline")
+            api.wifiFailure = null
+            screen.onActivity { button(it, "再接続").performClick() }
+            eventually(screen) { hasLabel(it, "まだ保存していません") && !hasLabel(it, unreachable) }
+        }
+    }
+
+    @Test fun wifiSavedOnThePhoneMovesToHomeLinkOnceAndRegisteringNeverAsksForIt() {
+        api.rooms += Room(1, "押入れ")
+        val home = WifiNetwork("home-2g", "kakushi")
+        val annex = WifiNetwork("離れの2.4GHz", "hanare")
+        val saved = SavedWifi(listOf(home, annex), last = annex.ssid)
+        wifi.saved = saved
+        // home-link cannot be reached at first: the phone keeps its networks for the next launch.
+        api.wifiFailure = ApiError.UNREACHABLE
+        ActivityScenario.launch(MainActivity::class.java).use { screen ->
+            eventually(screen) { spinner(it, "部屋").selectedItem == "押入れ" }
+            assertEquals(saved, wifi.saved)
+            assertEquals(emptyList<WifiNetwork>(), api.wifiSaves.toList())
+        }
+        api.wifiFailure = null
+        ActivityScenario.launch(MainActivity::class.java).use { screen ->
+            // The chosen network goes first and becomes the one for devices.
+            eventually(screen) { wifi.saved == SavedWifi() }
+            assertEquals(listOf(annex, home), api.wifiSaves.toList())
+            assertEquals(annex.ssid, api.wifi.single { it.forDevices }.ssid)
+            scanner.next = ScanResult.Read(qr)
+            eventually(screen) { activity ->
+                button(activity, "QRを読み取る").performClick()
+                button(activity, "登録").isEnabled
+            }
+            screen.onActivity { activity ->
+                assertFalse(hasLabel(activity, "電球に渡すWi-Fi"))
+                assertNoWifiInputs(activity)
+                button(activity, "登録").performClick()
+            }
+            eventually(screen) { hasLabel(it, "押入れに機器を登録しました") }
+            assertEquals(CommissionCall(1, qr, "", thread = false), api.commissionings.single())
+            capture(screen, "wifi-moved")
+
+            // home-link refusing for want of a Wi-Fi asks for it again in the settings.
+            api.commissioned = ApiResult.Failed(ApiError.WIFI_NOT_SET)
+            screen.onActivity { activity ->
+                button(activity, "QRを読み取る").performClick()
+                button(activity, "登録").performClick()
+            }
+            eventually(screen) { hasLabel(it, "電球に渡すWi-Fiが未設定です") && button(it, "Wi-Fiを設定").isShown }
+            screen.onActivity { assertFalse(button(it, "登録").isEnabled) }
+            capture(screen, "wifi-not-set")
+        }
+        // Moved once: nothing is sent again.
+        ActivityScenario.launch(MainActivity::class.java).use { screen ->
+            eventually(screen) { spinner(it, "部屋").selectedItem == "押入れ" }
+            InstrumentationRegistry.getInstrumentation().waitForIdleSync()
+            assertEquals(2, api.wifiSaves.size)
         }
     }
 
@@ -645,7 +713,7 @@ class RegisterScreenTest {
 
     @Test fun tabsSplitWifiAndThreadBulbs() {
         api.rooms += Room(1, "寝室")
-        wifi.saved = SavedWifi().added(WifiNetwork("home-2g", "kakushi"))
+        api.wifi += homeWifi
         api.thread = ApiResult.Ok(true)
         ActivityScenario.launch(MainActivity::class.java).use { screen ->
             eventually(screen) { spinner(it, "部屋").selectedItem == "寝室" }
@@ -653,7 +721,7 @@ class RegisterScreenTest {
                 assertTrue(tab(activity, "Wi-Fiの電球").isChecked)
                 assertFalse(tab(activity, threadTab).isChecked)
                 assertEquals(tab(activity, "Wi-Fiの電球").height, tab(activity, threadTab).height)
-                assertTrue(spinner(activity, "電球に渡すWi-Fi").isShown)
+                assertNoWifiInputs(activity)
                 assertFalse(hasLabel(activity, "Thread網"))
                 assertNoGuides(activity)
             }
@@ -667,7 +735,7 @@ class RegisterScreenTest {
                 assertFalse(tab(activity, "Wi-Fiの電球").isChecked)
                 // No Wi-Fi to choose: Thread bulbs take the network matterjs-server holds.
                 assertFalse(hasLabel(activity, "電球に渡すWi-Fi"))
-                assertFalse(spinner(activity, "電球に渡すWi-Fi").isShown)
+                assertNoWifiInputs(activity)
                 assertTrue(hasLabel(activity, "Thread網"))
                 assertNoGuides(activity)
             }
@@ -678,8 +746,7 @@ class RegisterScreenTest {
             eventually(screen) { tab(it, threadTab).isChecked && hasLabel(it, "Thread網") }
             screen.onActivity { tab(it, "Wi-Fiの電球").performClick() }
             screen.onActivity { activity ->
-                assertEquals("home-2g", spinner(activity, "電球に渡すWi-Fi").selectedItem)
-                assertTrue(spinner(activity, "電球に渡すWi-Fi").isShown)
+                assertTrue(tab(activity, "Wi-Fiの電球").isChecked)
                 assertFalse(hasLabel(activity, "Thread網"))
             }
         }
@@ -718,7 +785,7 @@ class RegisterScreenTest {
             link.step()
             gate.countDown()
             eventually(screen) { hasLabel(it, "寝室に「寝室T2」を登録しました") }
-            assertEquals(listOf(CommissionCall(1, qr, "寝室T2", null)), api.commissionings)
+            assertEquals(listOf(CommissionCall(1, qr, "寝室T2", thread = true)), api.commissionings)
             capture(screen, "thread-registered")
 
             // A device already in the ledger reads as any registration.
@@ -789,17 +856,6 @@ class RegisterScreenTest {
         }
     }
 
-    @Test fun theWifiPasswordIsKeptEncryptedInTheKeystore() {
-        val context = InstrumentationRegistry.getInstrumentation().targetContext
-        val store = KeystoreWifiStore(context)
-        val saved = SavedWifi().added(WifiNetwork("home-2g", "kakushi-pass")).added(WifiNetwork("guest", "welcome-pass"))
-        store.save(saved)
-        assertEquals(saved, KeystoreWifiStore(context).load())
-        val prefs = context.getSharedPreferences("wifi", android.content.Context.MODE_PRIVATE).all.values.joinToString()
-        assertFalse(listOf("kakushi-pass", "home-2g", "welcome-pass", "guest").any { it in prefs })
-        context.getSharedPreferences("wifi", android.content.Context.MODE_PRIVATE).edit().clear().commit()
-    }
-
     private fun assertInputsKept(screen: ActivityScenario<MainActivity>, name: String = "天井灯", room: String = "寝室") =
         screen.onActivity { activity ->
             assertTrue(hasLabel(activity, "読み取り済み：3497-011-2332"))
@@ -807,6 +863,15 @@ class RegisterScreenTest {
             assertEquals(room, spinner(activity, "部屋").selectedItem)
             assertTrue(button(activity, "登録").isEnabled)
         }
+
+    /** Registering neither chooses nor types a Wi-Fi. */
+    private fun assertNoWifiInputs(activity: Activity) {
+        assertFalse(views(activity).any { it.isShown && it is Spinner && it.contentDescription == "電球に渡すWi-Fi" })
+        assertFalse(views(activity).any { it.isShown && it is EditText && it.contentDescription.startsWith("Wi-Fi") })
+    }
+
+    /** The adder's save button, below the settings' own. */
+    private fun wifiSave(activity: Activity) = views(activity).filterIsInstance<Button>().last { it.isShown && it.text == "保存" }
 
     /** The removed ledger-only choice and its guide texts are gone from the screen. */
     private fun assertNoGuides(activity: Activity) {
@@ -822,7 +887,13 @@ class RegisterScreenTest {
             var met = false
             screen.onActivity { met = condition(it) }
             if (met) return
-            assertTrue("condition not met in time", System.currentTimeMillis() < deadline)
+            if (System.currentTimeMillis() >= deadline) {
+                var shown = ""
+                screen.onActivity { activity ->
+                    shown = views(activity).filterIsInstance<TextView>().filter { it.isShown }.joinToString(" | ") { it.text }
+                }
+                throw AssertionError("condition not met in time; shown: $shown")
+            }
             Thread.sleep(50)
         }
     }
@@ -860,7 +931,7 @@ class RegisterScreenTest {
         }
         InstrumentationRegistry.getInstrumentation().waitForIdleSync()
         screen.onActivity { activity ->
-            val register = button(activity, views(activity).filterIsInstance<Button>().last().text.toString())
+            val register = views(activity).filterIsInstance<Button>().last { it.isShown }
             val bounds = android.graphics.Rect()
             assertTrue("Register reachable", register.getGlobalVisibleRect(bounds))
             assertEquals(register.height, bounds.height())
@@ -894,7 +965,7 @@ class RegisterScreenTest {
         views(activity).filterIsInstance<EditText>().first { it.contentDescription == description }
 }
 
-private data class CommissionCall(val roomId: Long, val payload: String, val name: String, val wifi: WifiNetwork?)
+private data class CommissionCall(val roomId: Long, val payload: String, val name: String, val thread: Boolean)
 
 private class FakeApi : HomeLinkApi {
     val rooms: MutableList<Room> = Collections.synchronizedList(mutableListOf())
@@ -926,11 +997,41 @@ private class FakeApi : HomeLinkApi {
     /** Null registers into the chosen room under the given name. */
     @Volatile var commissioned: ApiResult<Commissioned>? = null
 
-    override fun commission(roomId: Long, payload: String, name: String, wifi: WifiNetwork?): ApiResult<Commissioned> {
+    override fun commission(roomId: Long, payload: String, name: String, thread: Boolean): ApiResult<Commissioned> {
         gate?.await()
-        commissionings += CommissionCall(roomId, payload, name, wifi)
+        commissionings += CommissionCall(roomId, payload, name, thread)
         failure?.let { return ApiResult.Failed(it) }
         return commissioned ?: ApiResult.Ok(Commissioned(rooms.first { it.id == roomId }.name, name))
+    }
+
+    /** home-link's saved networks, kept the way home-link keeps them. */
+    val wifi: MutableList<SavedNetwork> = Collections.synchronizedList(mutableListOf())
+    val wifiSaves: MutableList<WifiNetwork> = Collections.synchronizedList(mutableListOf())
+    @Volatile var wifiFailure: ApiError? = null
+
+    override fun wifiNetworks(): ApiResult<List<SavedNetwork>> =
+        wifiFailure?.let { ApiResult.Failed(it) } ?: ApiResult.Ok(wifi.toList())
+
+    override fun saveWifi(network: WifiNetwork): ApiResult<SavedNetwork> = synchronized(wifi) {
+        wifiFailure?.let { return ApiResult.Failed(it) }
+        wifiSaves += network
+        val saved = wifi.firstOrNull { it.ssid == network.ssid }
+            ?: SavedNetwork((wifi.maxOfOrNull { it.id } ?: 0) + 1, network.ssid, wifi.none { it.forDevices }).also { wifi += it }
+        ApiResult.Ok(saved)
+    }
+
+    override fun chooseWifi(id: Long): ApiResult<SavedNetwork> = synchronized(wifi) {
+        wifiFailure?.let { return ApiResult.Failed(it) }
+        wifi.replaceAll { it.copy(forDevices = it.id == id) }
+        ApiResult.Ok(wifi.first { it.id == id })
+    }
+
+    override fun deleteWifi(id: Long): ApiResult<Unit> = synchronized(wifi) {
+        wifiFailure?.let { return ApiResult.Failed(it) }
+        val gone = wifi.first { it.id == id }
+        wifi.remove(gone)
+        if (gone.forDevices && wifi.isNotEmpty()) wifi[0] = wifi[0].copy(forDevices = true)
+        ApiResult.Ok(Unit)
     }
 
     @Volatile var thread: ApiResult<Boolean> = ApiResult.Ok(false)
@@ -971,7 +1072,7 @@ private class FakeLink : BleLink {
 private class MemoryWifiStore : WifiStore {
     @Volatile var saved = SavedWifi()
     override fun load() = saved
-    override fun save(saved: SavedWifi) { this.saved = saved }
+    override fun clear() { saved = SavedWifi() }
 }
 
 private class FakeWifiReader : WifiReader {

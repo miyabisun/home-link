@@ -54,36 +54,60 @@ class HttpHomeLinkApiTest {
         )
         for ((status, code, expected) in cases) {
             respond("/api/commission", status, if (code.isEmpty()) "<html>bad gateway</html>" else """{"error":"$code"}""")
-            assertEquals("$status $code", ApiResult.Failed(expected), api.commission(1, "MT:x", "n", null))
+            assertEquals("$status $code", ApiResult.Failed(expected), api.commission(1, "MT:x", "n", thread = true))
         }
     }
 
-    @Test fun commissionsWithTheWifiAndReadsTheLedgerEntry() {
+    @Test fun commissionsOntoTheServersWifiAndReadsTheLedgerEntry() {
         respond("/api/commission", 201, """{"node_id":17,"registered":true,"device":{"id":9,"room_id":2,
             "room_name":"押入れ","name":"押入れ1","vendor":"Tapo","serial_number":"AABBCCDDEEFF","mac":"AABBCCDDEEFF",
             "label_id":null,"label_name":null,"created_at":"t"}}""")
-        val wifi = WifiNetwork("home-2g", "pass word")
         assertEquals(ApiResult.Ok(Commissioned("押入れ", "押入れ1")),
-            api.commission(2, "MT:Y.K9042C00KA0648G00", "押入れ1", wifi))
+            api.commission(2, "MT:Y.K9042C00KA0648G00", "押入れ1", thread = false))
         val body = JSONObject(requests.single().substringAfter("/api/commission "))
         assertEquals(2L, body.getLong("room_id"))
         assertEquals("MT:Y.K9042C00KA0648G00", body.getString("qr_payload"))
         assertEquals("押入れ1", body.getString("name"))
-        assertEquals("home-2g", body.getString("wifi_ssid"))
-        assertEquals("pass word", body.getString("wifi_password"))
         assertEquals("wifi", body.getString("network"))
+        // home-link hands over the Wi-Fi it holds for devices; the phone sends none.
+        assertFalse(body.has("wifi_ssid"))
+        assertFalse(body.has("wifi_password"))
 
         // A device the ledger already holds keeps its own room and name.
         respond("/api/commission", 200, """{"node_id":17,"registered":false,"device":{"id":3,"room_id":1,
             "room_name":"寝室","name":"読書灯","created_at":"t"}}""")
-        assertEquals(ApiResult.Ok(Commissioned("寝室", "読書灯")), api.commission(2, "34970112332", "", wifi))
+        assertEquals(ApiResult.Ok(Commissioned("寝室", "読書灯")), api.commission(2, "34970112332", "", thread = false))
         assertEquals("34970112332", JSONObject(requests.last().substringAfter("/api/commission ")).getString("manual_code"))
+    }
+
+    @Test fun savesListsChoosesAndDeletesTheServersWifi() {
+        respond("/api/wifi", 200, """[{"id":1,"ssid":"home-2g","for_devices":false},{"id":4,"ssid":"iot-2g","for_devices":true}]""")
+        assertEquals(ApiResult.Ok(listOf(SavedNetwork(1, "home-2g", false), SavedNetwork(4, "iot-2g", true))), api.wifiNetworks())
+        assertEquals("GET /api/wifi", requests.last())
+
+        respond("/api/wifi", 201, """{"id":5,"ssid":"離れ \"2.4\"","for_devices":false}""")
+        assertEquals(ApiResult.Ok(SavedNetwork(5, "離れ \"2.4\"", false)), api.saveWifi(WifiNetwork("離れ \"2.4\"", "pass word")))
+        val body = JSONObject(requests.last().substringAfter("POST /api/wifi "))
+        assertEquals("離れ \"2.4\"", body.getString("ssid"))
+        assertEquals("pass word", body.getString("password"))
+        respond("/api/wifi", 400, """{"error":"invalid_wifi"}""")
+        assertEquals(ApiResult.Failed(ApiError.INVALID_WIFI), api.saveWifi(WifiNetwork("s", "p")))
+
+        respond("/api/wifi/devices", 200, """{"id":1,"ssid":"home-2g","for_devices":true}""")
+        assertEquals(ApiResult.Ok(SavedNetwork(1, "home-2g", true)), api.chooseWifi(1))
+        assertEquals(1L, JSONObject(requests.last().substringAfter("PUT /api/wifi/devices ")).getLong("id"))
+        respond("/api/wifi/devices", 404, """{"error":"wifi_not_found"}""")
+        assertEquals(ApiResult.Failed(ApiError.WIFI_NOT_FOUND), api.chooseWifi(9))
+
+        respond("/api/wifi/4", 204, "")
+        assertEquals(ApiResult.Ok(Unit), api.deleteWifi(4))
+        assertEquals("DELETE /api/wifi/4", requests.last())
     }
 
     @Test fun commissionsOntoThreadWithoutWifi() {
         respond("/api/commission", 201, """{"node_id":21,"registered":true,"device":{"id":5,"room_id":2,
             "room_name":"寝室","name":"T2","created_at":"t"}}""")
-        assertEquals(ApiResult.Ok(Commissioned("寝室", "T2")), api.commission(2, "34970112332", "T2", null))
+        assertEquals(ApiResult.Ok(Commissioned("寝室", "T2")), api.commission(2, "34970112332", "T2", thread = true))
         val body = JSONObject(requests.single().substringAfter("/api/commission "))
         assertEquals("thread", body.getString("network"))
         assertFalse(body.has("wifi_ssid"))
@@ -108,7 +132,7 @@ class HttpHomeLinkApiTest {
             Triple(504, "commission_timeout", ApiError.COMMISSION_TIMEOUT),
             Triple(422, "commission_failed", ApiError.COMMISSION_FAILED),
             Triple(503, "bluetooth_unavailable", ApiError.BLUETOOTH_UNAVAILABLE),
-            Triple(400, "invalid_wifi", ApiError.INVALID_WIFI),
+            Triple(409, "wifi_not_set", ApiError.WIFI_NOT_SET),
             Triple(503, "thread_not_ready", ApiError.THREAD_NOT_READY),
             Triple(422, "thread_failed", ApiError.THREAD_FAILED),
             Triple(400, "invalid_qr_payload", ApiError.INVALID_QR),
@@ -118,7 +142,7 @@ class HttpHomeLinkApiTest {
         for ((status, code, expected) in cases) {
             respond("/api/commission", status, """{"error":"$code","message":"m"}""")
             assertEquals("$status $code", ApiResult.Failed(expected),
-                api.commission(1, "MT:x", "", WifiNetwork("s", "p")))
+                api.commission(1, "MT:x", "", thread = false))
         }
     }
 
@@ -179,7 +203,7 @@ class HttpHomeLinkApiTest {
         val offline = HttpHomeLinkApi("http://127.0.0.1:$port")
         assertEquals(ApiResult.Failed(ApiError.UNREACHABLE), offline.rooms())
         assertEquals(ApiResult.Failed(ApiError.UNREACHABLE), offline.switchLights(true))
-        assertEquals(ApiResult.Failed(ApiError.UNREACHABLE), offline.commission(1, "MT:x", "", WifiNetwork("s", "p")))
+        assertEquals(ApiResult.Failed(ApiError.UNREACHABLE), offline.commission(1, "MT:x", "", thread = false))
     }
 
     @Test fun sendsDoorCommandsAndMapsTheirFailures() {

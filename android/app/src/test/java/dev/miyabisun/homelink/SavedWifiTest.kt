@@ -12,37 +12,36 @@ class SavedWifiTest {
 
     @Test fun theLastChosenNetworkIsSelectedAndFallsBackToTheFirst() {
         assertNull(SavedWifi().selected)
-        val saved = SavedWifi().added(home).added(guest)
-        assertEquals(listOf(home, guest), saved.networks)
-        assertEquals(guest, saved.selected)
-        assertEquals(home, saved.chose("home-2g").selected)
-        // An unknown name keeps the current choice.
-        assertEquals(guest, saved.chose("nowhere").selected)
+        assertEquals(guest, SavedWifi(listOf(home, guest), last = "guest").selected)
         assertEquals(home, SavedWifi(listOf(home, guest), last = "gone").selected)
     }
 
-    @Test fun addingTheSameNameReplacesItsPasswordInPlace() {
-        val saved = SavedWifi().added(home).added(guest).added(WifiNetwork("home-2g", "new-pass"))
-        assertEquals(listOf(WifiNetwork("home-2g", "new-pass"), guest), saved.networks)
-        assertEquals("home-2g", saved.last)
-    }
-
-    @Test fun removingTheSelectedNetworkSelectsTheFirstLeft() {
-        val saved = SavedWifi().added(home).added(guest)
-        assertEquals(SavedWifi(listOf(home), last = "home-2g"), saved.removed("guest"))
-        assertEquals(SavedWifi(listOf(guest), last = "guest"), saved.removed("home-2g"))
-        assertEquals(SavedWifi(), saved.removed("guest").removed("home-2g"))
-    }
-
-    @Test fun roundTripsThroughJson() {
-        val saved = SavedWifi().added(home).added(WifiNetwork("カフェ \"2.4\"", "p\\w"))
-        assertEquals(saved, SavedWifi.parse(saved.json()))
-        assertEquals(SavedWifi(), SavedWifi.parse(SavedWifi().json()))
-    }
-
-    @Test fun readsTheSingleNetworkEarlierVersionsSaved() {
+    @Test fun readsWhatEarlierVersionsSaved() {
+        assertEquals(SavedWifi(listOf(home, guest), last = "guest"),
+            SavedWifi.parse("""{"networks":[{"ssid":"home-2g","password":"kakushi"},""" +
+                """{"ssid":"guest","password":"welcome"}],"last":"guest"}"""))
+        assertEquals(SavedWifi(), SavedWifi.parse("""{"networks":[],"last":null}"""))
+        // Versions up to 0.1.13 saved a single network.
         assertEquals(SavedWifi(listOf(home), last = "home-2g"),
             SavedWifi.parse("""{"ssid":"home-2g","password":"kakushi"}"""))
+    }
+
+    @Test fun theNetworksOnThePhoneMoveToHomeLinkOnceTheChosenFirst() {
+        val store = MemoryStore(SavedWifi(listOf(home, guest), last = "guest"))
+        val sent = mutableListOf<WifiNetwork>()
+        assertTrue(moveToServer(store) { sent += it; ApiResult.Ok(Unit) })
+        assertEquals(listOf(guest, home), sent)
+        assertEquals(SavedWifi(), store.load())
+        // Nothing is left to move the next time.
+        assertTrue(moveToServer(store) { sent += it; ApiResult.Ok(Unit) })
+        assertEquals(2, sent.size)
+    }
+
+    @Test fun aFailedMoveKeepsTheNetworksForTheNextTry() {
+        val saved = SavedWifi(listOf(home, guest), last = "home-2g")
+        val store = MemoryStore(saved)
+        assertFalse(moveToServer(store) { if (it == guest) ApiResult.Failed(ApiError.UNREACHABLE) else ApiResult.Ok(Unit) })
+        assertEquals(saved, store.load())
     }
 
     @Test fun onlyTheTwoPointFourGigahertzBandSuitsTheBulbs() {
@@ -55,5 +54,10 @@ class SavedWifiTest {
         assertEquals("6GHz", band(5955))
         assertEquals("6GHz", band(7115))
         assertEquals("2.4GHz", band(2437))
+    }
+
+    private class MemoryStore(private var saved: SavedWifi) : WifiStore {
+        override fun load() = saved
+        override fun clear() { saved = SavedWifi() }
     }
 }

@@ -311,10 +311,8 @@ fn router(state: Db) -> Router {
             axum::routing::patch(update_label).delete(delete_label),
         )
         .route("/wifi", get(list_wifi).post(save_wifi))
-        .route(
-            "/wifi/{id}",
-            axum::routing::patch(choose_wifi).delete(delete_wifi),
-        )
+        .route("/wifi/devices", axum::routing::put(choose_wifi))
+        .route("/wifi/{id}", axum::routing::delete(delete_wifi))
         .route("/commission", axum::routing::post(commission))
         .route("/thread", get(thread))
         .route("/status", get(status))
@@ -998,7 +996,7 @@ struct WifiInput {
 
 #[derive(Deserialize)]
 struct WifiChoice {
-    for_devices: bool,
+    id: i64,
 }
 
 fn find_wifi(db: &Connection, id: i64) -> ApiResult<Wifi> {
@@ -1095,17 +1093,11 @@ async fn save_wifi(
 }
 
 /// Makes the network the one handed to devices.
-async fn choose_wifi(
-    State(db): State<Db>,
-    Path(id): Path<i64>,
-    Json(input): Json<WifiChoice>,
-) -> ApiResult<Json<Wifi>> {
+async fn choose_wifi(State(db): State<Db>, Json(input): Json<WifiChoice>) -> ApiResult<Json<Wifi>> {
     let db = db.db.lock().unwrap();
-    find_wifi(&db, id)?;
-    if input.for_devices {
-        hand_to_devices(&db, id)?;
-    }
-    Ok(Json(find_wifi(&db, id)?))
+    find_wifi(&db, input.id)?;
+    hand_to_devices(&db, input.id)?;
+    Ok(Json(find_wifi(&db, input.id)?))
 }
 
 /// Deletes the network; devices then get the first one left.

@@ -34,12 +34,13 @@ cargo test --locked
 状態APIと照明APIのテストは、`tests/api.rs` の中でmatterjs-serverと同じ形で `get_nodes` と `device_command` に応答する
 WebSocketサーバーを立て、全部オン・全部オフ、エラーや無応答の照明、最初のオンに応答しない照明への送り直し、接続断からの再接続を検証します。
 無応答の照明のテストは、応答を待つ10秒の期限まで待ちます。
-`src/commission.rs` はmatterjs-serverへWi-Fi情報を渡して（Threadでは渡さず、Thread網の有無を確かめて）
+`src/commission.rs` はmatterjs-serverへ保存した電球用のWi-Fi情報を渡して（Threadでは渡さず、Thread網の有無を確かめて）
 `commission_with_code` で機器を登録する処理と、
 失敗の文言（matter.jsの例外の文）を見つからない・コード違い・Wi-Fi・Thread・時間切れに分ける処理、
 登録した機器のBasic InformationとWi-FiのMACアドレスの取り出しと、それらの単体テストを持ちます。
 機器登録APIのテストは、`tests/api.rs` の中で `set_wifi_credentials`・`commission_with_code`・`read_attribute` に応答するmockを立て、
-成功・各失敗・時間切れ・台帳の重複・入力の検証と、データベースのファイルと応答にWi-Fiのパスワードが残らないことを検証します。
+成功・各失敗・時間切れ・台帳の重複・入力の検証を検証します。
+Wi-FiのAPIは、保存・一覧・電球に渡すものの指定・削除と、一覧・応答・ログにパスワードが出ないこと、登録が電球に渡すWi-Fiを `set_wifi_credentials` で送ることを検証します。
 mockの `server_info` の `thread_credentials_set` を切り替え、Threadでの登録の成功（Wi-Fi情報を送らないこと）、
 Thread網が未準備のときの拒否と `GET /api/thread` も検証します。
 `src/schedule.rs` は自動調整の目標値（日の出・日の入り、朝・昼・夕・夜の境界と線形の補間、照明ごとの下限と範囲への丸め）と、
@@ -80,22 +81,23 @@ JVMテストは、JDKの一時HTTPサーバーを相手にAPIクライアント�
 `BleProxyTest` は、OkHttpのMockWebServerでmatterjs-serverの `/ble` を、fakeでBLEの層を置き換え、
 BLE Proxy Protocol v1のhello、各命令とその失敗、`device_discovered` などのevent、binary frame（`WRITE_DATA` と `NOTIFICATION`）を検証します。
 pingへのpongはOkHttpが自動で返します（実サーバーへ75秒接続して切られないことを確認済み）。
-実際のBluetoothを使う `AndroidBle` と、Keystoreに保存するWi-Fi情報は、エミュレータと実機で確かめます。
+実際のBluetoothを使う `AndroidBle` と、0.1.31までの版がKeystoreに保存したWi-Fi情報の移行は、エミュレータと実機で確かめます。
 
 ### 画面の検証
 
 instrumentationテストは、APIとQRスキャナーをfakeに置き換え、実際の画面部品を操作します。
 部屋の作成・選択・登録・成功表示と、部屋なし・接続不可・Matter以外のQR・画面の再生成を扱います。
-Bluetoothでの登録は、BLEの中継をfakeに置き換え、Wi-Fiの設定、段階の表示、画面の再生成をまたいだ進行、成功、
+Bluetoothでの登録は、BLEの中継をfakeに置き換え、電球に渡すWi-Fiが無いときの設定への入口、段階の表示、画面の再生成をまたいだ進行、成功、
 各失敗（電球が見つからない・コード違い・Wi-Fi・時間切れ・matterjs-serverに接続できないなど）での入力の保持、
 取り消しと、取り消した後に届いた結果を表示しないことを扱います。
 「Wi-Fiの電球」と「Threadの電球」のタブは、切り替えと画面の再生成での保持、Threadでの登録の段階と成功、
 Thread網が未準備・確認できない・登録時に未準備で拒否された・参加できない場合の表示を扱います。
-保存したWi-Fiの一覧は、今つながっているWi-Fiの読み取りをfakeにして、選択・最後に選んだものの保持・追加・同じ名前の上書き・削除、
+電球に渡すWi-Fiは、接続先の設定の画面で、今つながっているWi-Fiの読み取りをfakeにして、選択・追加・同じ名前の上書き・削除・保存と読み込みの失敗、
 今のSSIDの自動入力、5GHzの表示、Wi-Fiにつながっていない・SSIDを読めない場合の表示を扱います。
-Keystoreに暗号化して保存したWi-Fi情報を読み戻せること、平文で残らないことも同じテストで確かめます。
-一覧の操作と保存形式（0.1.13までの1件の形式の読み込みを含む）、2.4GHzの判定は `SavedWifiTest` で検証します。
+電話に残ったWi-Fiがhome-linkへ一度だけ移り電話から消えること、移せなかったときは次の起動まで残すこと、登録の画面にWi-Fiの入力が出ないことも扱います。
+保存形式の読み込み（0.1.13までの1件の形式を含む）と移す順序、2.4GHzの判定は `SavedWifiTest` で検証します。
 実際のSSIDの読み取り（位置情報の許可ダイアログを含む）は、エミュレータの実APKで「AndroidWifi」が入ることで確かめます。
+Keystoreからの移行は、0.1.31のAPKでWi-Fiを保存してから新しいAPKを上書きインストールし、fakeのhome-linkに一度だけ届くことで確かめます。
 照明のボタンは、送信中・全部成功・一部の照明が残った場合・接続不可の表示と、画面の再生成での結果の保持を扱います。
 テストは開始時に架空の接続先を `home-link.yaml` へ書き、文言のホスト名をそこから読みます。
 接続先が無いときの案内と送らないこと、設定の画面での入力の検査、YAMLへの保存、保存した接続先への次の要求（ループバックのfakeのhome-link）も扱います。
