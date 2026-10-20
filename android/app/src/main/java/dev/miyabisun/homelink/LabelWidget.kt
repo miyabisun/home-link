@@ -9,6 +9,11 @@ import android.content.Context
 import android.content.Intent
 import android.os.SystemClock
 import android.widget.RemoteViews
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Future
+import java.util.concurrent.FutureTask
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicInteger
 
 /** Where a placed label widget points: its label and the name it shows. */
@@ -39,11 +44,17 @@ abstract class LabelWidget(private val kind: Kind) : AppWidgetProvider() {
          * broadcast of its own: a receiver may run 10 s, and a slow answer to the press must not use that up.
          */
         private const val REREAD = "dev.miyabisun.homelink.LABEL_REREAD"
+        /** Waits on for a press's answer that has not come within one receiver's time. */
+        private const val AWAIT = "dev.miyabisun.homelink.LABEL_AWAIT"
         private const val OP = "op"
         /** How long a button shows a press's result before it reads as a button again. */
         private const val LABEL_MS = 5_000L
+        /** How long one receiver waits for a press's answer, within the 10 s a pressed button's receiver may run. */
+        private const val HOLD_MS = 8_000L
         private val CELLS = listOf(R.id.label_button to R.id.label_button_text, R.id.label_button2 to R.id.label_button2_text)
         private val presses = AtomicInteger()
+        /** The answers presses still wait for, by press. */
+        private val answers = ConcurrentHashMap<Int, Future<*>>()
 
         private fun Kind.provider() = when (this) {
             Kind.SWITCH -> LabelSwitchWidget::class.java
@@ -141,6 +152,23 @@ abstract class LabelWidget(private val kind: Kind) : AppWidgetProvider() {
         edit.apply()
     }
 
+    /**
+     * Waits for press `press`'s answer, handing the wait to a broadcast of its own before the receiver's time runs
+     * out: the label's server may take longer than 10 s, and a receiver over its time takes the process down.
+     */
+    private fun BroadcastReceiver.await(context: Context, press: Int) {
+        // None after the process was started again: the answer is lost, so the buttons read as buttons again.
+        val answer = answers[press] ?: return showAll(context)
+        async {
+            try {
+                answer.get(HOLD_MS, TimeUnit.MILLISECONDS)
+                answers.remove(press)
+            } catch (_: TimeoutException) {
+                context.sendBroadcast(Intent(context, kind.provider()).setAction(AWAIT).putExtra("press", press))
+            }
+        }
+    }
+
     override fun onReceive(context: Context, intent: Intent) {
         val id = intent.getIntExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, AppWidgetManager.INVALID_APPWIDGET_ID)
         when (intent.action) {
@@ -160,7 +188,7 @@ abstract class LabelWidget(private val kind: Kind) : AppWidgetProvider() {
                 val config = config(context, id) ?: return
                 val press = presses.incrementAndGet()
                 show(context, kind, id, Press(op, LightsMessage("送信中…", failed = false), sending = true))
-                async {
+                val answer = FutureTask {
                     val result = homeLinkApi(context).switchLabel(config.labelId, op)
                     if (result is ApiResult.Ok) saveState(context, config.labelId, result.value.on)
                     val short = pressLabel(op, result)
@@ -170,7 +198,11 @@ abstract class LabelWidget(private val kind: Kind) : AppWidgetProvider() {
                     context.sendBroadcast(Intent(context, kind.provider()).setAction(REREAD).putExtra("press", press)
                         .putExtra("shown", SystemClock.elapsedRealtime()).putExtra("restore", short != null))
                 }
+                answers[press] = answer
+                Thread(answer).start()
+                await(context, press)
             }
+            AWAIT -> await(context, intent.getIntExtra("press", 0))
             else -> super.onReceive(context, intent)
         }
     }
