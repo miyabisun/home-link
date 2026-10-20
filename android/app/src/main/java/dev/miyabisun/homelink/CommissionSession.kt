@@ -12,7 +12,7 @@ interface BleLink {
 }
 
 sealed interface Outcome {
-    data class Done(val result: ApiResult<Commissioned>) : Outcome
+    data class Done(val result: ApiResult<Device>) : Outcome
     data class Failed(val problem: BleProblem) : Outcome
 }
 
@@ -39,7 +39,7 @@ class Commissioning(private val post: (() -> Unit) -> Unit, private val spawn: (
 
     fun take(): Outcome? = outcome.also { outcome = null }
 
-    fun start(link: BleLink, call: () -> ApiResult<Commissioned>) {
+    fun start(link: BleLink, call: () -> ApiResult<Device>) {
         val id = ++run
         this.link = link
         stage = Stage.PREPARING

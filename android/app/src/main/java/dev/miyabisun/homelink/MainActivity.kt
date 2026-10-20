@@ -8,31 +8,22 @@ import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
-import android.graphics.Typeface
-import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.LayerDrawable
-import android.graphics.drawable.RippleDrawable
-import android.graphics.drawable.StateListDrawable
 import android.os.Build
 import android.os.Bundle
 import android.text.Editable
-import android.text.InputFilter
 import android.text.InputType
 import android.text.TextWatcher
 import android.view.Gravity
 import android.view.View
-import android.view.WindowInsets
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
-import android.widget.ImageView
 import android.widget.LinearLayout
-import android.widget.RadioButton
-import android.widget.RadioGroup
-import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
 import java.util.concurrent.ExecutorService
@@ -63,11 +54,15 @@ class MainActivity : Activity() {
     private var lightsResult: LightsMessage? = null
     /** Offer to place the widget while the launcher can pin one and none is placed. */
     private var canPinWidget = false
-    private var loadingRooms = false
     private var addingRoom = false
     private var enteringCode = false
     private var formattingCode = false
-    private var checkingThread = false
+    /** The room position last drawn; the select box reports it back without the user choosing. */
+    private var shownRoom = 0
+    /** The device, its room and the rooms last drawn; drawing again otherwise would undo a pick not yet reported. */
+    private var drawnRoom: Triple<Long?, Long?, List<Room>>? = null
+    /** The device to connect once Bluetooth is allowed and on. */
+    private var pendingConnect: Long? = null
 
     /** The home-link URL the rooms were last read from; another after the settings reads them again. */
     private var loadedUrl: String? = null
@@ -75,23 +70,19 @@ class MainActivity : Activity() {
 
     private lateinit var content: LinearLayout
     private lateinit var endpointNotice: LinearLayout
-    private lateinit var wifiTab: RadioButton
-    private lateinit var threadTab: RadioButton
-    private lateinit var threadPanel: LinearLayout
-    private lateinit var threadState: TextView
-    private lateinit var threadCheckButton: Button
     private lateinit var wifiPanel: LinearLayout
     private lateinit var lightsOnButton: Button
     private lateinit var lightsOffButton: Button
     private lateinit var lightsRow: ResultRow
     private lateinit var pinButton: Button
     private lateinit var qrState: TextView
+    private lateinit var deviceState: TextView
     private lateinit var qrMessage: TextView
-    private lateinit var scanButton: Button
     private lateinit var manualButton: Button
     private lateinit var manualPanel: LinearLayout
     private lateinit var manualField: EditText
     private lateinit var manualMessage: TextView
+    private lateinit var devicePanels: List<LinearLayout>
     private lateinit var roomSpinner: Spinner
     private lateinit var roomAdapter: ArrayAdapter<String>
     private lateinit var roomState: TextView
@@ -101,9 +92,13 @@ class MainActivity : Activity() {
     private lateinit var newRoomName: EditText
     private lateinit var createRoomButton: Button
     private lateinit var nameField: EditText
+    private lateinit var labelPanel: LinearLayout
+    private lateinit var labelBoxes: LinearLayout
+    private lateinit var unconnectedPanel: LinearLayout
+    private lateinit var unconnectedList: LinearLayout
     private lateinit var resultRow: ResultRow
     private lateinit var reconnectButton: Button
-    private lateinit var registerButton: Button
+    private lateinit var connectButton: Button
     private lateinit var cancelButton: Button
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -119,37 +114,41 @@ class MainActivity : Activity() {
         // Switching lights can wait seconds for every bulb; registration does not queue behind it.
         lightsWorker = Executors.newSingleThreadExecutor()
         savedInstanceState?.let { state ->
-            form.payload = state.getString("payload")
-            form.roomId = state.getLong("roomId", -1).takeIf { it >= 0 }
-            form.name = state.getString("name").orEmpty()
             addingRoom = state.getBoolean("addingRoom")
             enteringCode = state.getBoolean("enteringCode")
-            form.thread = state.getBoolean("thread")
             lightsResult = state.getString("lightsText")?.let { LightsMessage(it, state.getBoolean("lightsFailed")) }
         }
         build()
         manualField.setText(savedInstanceState?.getString("manualCode").orEmpty())
         manualField.setSelection(manualField.length())
         newRoomName.setText(savedInstanceState?.getString("newRoom").orEmpty())
-        nameField.setText(form.name)
         // A registration started before the screen was recreated carries on.
-        form.busy = CommissionSession.running
-        form.stage = CommissionSession.stage
+        if (CommissionSession.running) {
+            form.connect(savedInstanceState?.getLong("connecting") ?: -1)
+            form.stage = CommissionSession.stage
+        }
         CommissionSession.follow { sessionChanged() }
         sessionChanged()
+        savedInstanceState?.getLong("device", -1)?.takeIf { it >= 0 }?.let { id ->
+            background({ api.device(id) }) { result ->
+                if (result is ApiResult.Ok && form.device == null) open(result.value, savedInstanceState.getString("name"))
+                render()
+            }
+        }
         loadRooms()
-        if (form.thread) checkThread()
+        loadLabels()
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
-        outState.putString("payload", form.payload)
-        outState.putLong("roomId", form.roomId ?: -1)
-        outState.putString("name", form.name)
+        form.device?.let {
+            outState.putLong("device", it.id)
+            outState.putString("name", nameField.text.toString())
+        }
+        form.connecting?.let { outState.putLong("connecting", it) }
         outState.putBoolean("addingRoom", addingRoom)
         outState.putString("newRoom", newRoomName.text.toString())
         outState.putBoolean("enteringCode", enteringCode)
         outState.putString("manualCode", manualField.text.toString())
-        outState.putBoolean("thread", form.thread)
         lightsResult?.let {
             outState.putString("lightsText", it.text)
             outState.putBoolean("lightsFailed", it.failed)
@@ -168,11 +167,18 @@ class MainActivity : Activity() {
         if (endpoints.homeLinkUrl != loadedUrl) {
             loadedUrl = endpoints.homeLinkUrl
             loadRooms()
-            if (form.thread) checkThread()
+            loadLabels()
         }
         // The settings screen may have saved the Wi-Fi for devices meanwhile.
         loadWifi()
+        // Opening the app lists the devices still to connect.
+        loadDevices()
         render()
+    }
+
+    override fun onPause() {
+        saveName()
+        super.onPause()
     }
 
     override fun onDestroy() {
@@ -193,11 +199,29 @@ class MainActivity : Activity() {
     }
 
     private fun loadRooms() {
-        loadingRooms = true
-        render()
         background({ api.rooms() }) { result ->
-            loadingRooms = false
             form.rooms(result)
+            render()
+        }
+    }
+
+    private fun loadLabels() {
+        background({ api.labels() }) { result ->
+            if (result is ApiResult.Ok) form.labels = result.value
+            render()
+        }
+    }
+
+    /** Reads the ledger, then the codes of the devices still to connect, to tell them apart. */
+    private fun loadDevices() {
+        background({ api.devices() }) { result ->
+            form.devicesRead(result)
+            if (result is ApiResult.Ok) for (device in form.unconnected.filter { it.code == null }) {
+                background({ api.device(device.id) }) { detail ->
+                    form.detailRead(detail)
+                    render()
+                }
+            }
             render()
         }
     }
@@ -207,25 +231,6 @@ class MainActivity : Activity() {
             form.wifiRead(result)
             render()
         }
-    }
-
-    /** Asks home-link whether matterjs-server holds the Thread network to hand to Thread bulbs. */
-    private fun checkThread() {
-        checkingThread = true
-        render()
-        background({ api.threadReady() }) { result ->
-            checkingThread = false
-            form.threadChecked(result)
-            render()
-        }
-    }
-
-    private fun chooseNetwork(thread: Boolean) {
-        if (form.thread == thread) return
-        form.thread = thread
-        form.status = null
-        if (thread) checkThread()
-        render()
     }
 
     private fun switchLights(on: Boolean) {
@@ -250,13 +255,48 @@ class MainActivity : Activity() {
         scanner.scan { result ->
             if (isDestroyed) return@scan
             when (result) {
-                is ScanResult.Read -> {
-                    form.scanned(result.value)
-                    if (form.status == null) closeManual()
+                is ScanResult.Read -> form.scanned(result.value)?.let { code ->
+                    closeManual()
+                    add(code)
                 }
                 ScanResult.Cancelled -> Unit
                 ScanResult.Failed -> form.status = Status.ScanFailed
             }
+            render()
+        }
+    }
+
+    /** Sends a read code to home-link at once and opens the device it answers with. */
+    private fun add(code: String) {
+        saveName()
+        background({ api.addDevice(code) }) { result ->
+            val before = form.device
+            form.added(code, result)
+            form.device?.takeIf { it != before }?.let { open(it) }
+            render()
+        }
+    }
+
+    /** Opens the device's pane; [name] is a name typed before the screen was recreated. */
+    private fun open(device: Device, name: String? = null) {
+        form.opened(device)
+        nameField.setText(name ?: device.name)
+        addingRoom = false
+    }
+
+    /** Sends the typed name once it differs from the device's. */
+    private fun saveName() {
+        val device = form.device ?: return
+        val name = nameField.text.toString().trim()
+        if (name == device.name) return
+        update(device.id, DeviceUpdate.Name(name))
+    }
+
+    private fun update(id: Long, change: DeviceUpdate) {
+        background({ api.updateDevice(id, change) }) { result ->
+            form.updated(result)
+            if (result == ApiResult.Failed(ApiError.ROOM_NOT_FOUND)) loadRooms()
+            if (result == ApiResult.Failed(ApiError.LABEL_NOT_FOUND)) loadLabels()
             render()
         }
     }
@@ -287,12 +327,18 @@ class MainActivity : Activity() {
             formattingCode = false
             manualField.setSelection(ManualCode.cursor(shown, before))
         }
-        if (form.typed(shown)) closeManual()
+        form.typed(shown)?.let { code ->
+            closeManual()
+            add(code)
+        }
         render()
     }
 
     private fun submitManual() {
-        if (form.submitted(manualField.text.toString())) closeManual()
+        form.submitted(manualField.text.toString())?.let { code ->
+            closeManual()
+            add(code)
+        }
         render()
     }
 
@@ -305,13 +351,15 @@ class MainActivity : Activity() {
             if (result is ApiResult.Ok) {
                 addingRoom = false
                 newRoomName.setText("")
+                form.device?.let { update(it.id, DeviceUpdate.Room(result.value.id)) }
             }
             render()
         }
     }
 
-    /** Checks the Bluetooth permissions and power, asking for them, then starts the registration. */
-    private fun commission() {
+    /** Checks the Bluetooth permissions and power, asking for them, then connects device `id`. */
+    private fun commission(id: Long) {
+        pendingConnect = id
         if (linkFactory == null) {
             if (BLUETOOTH_PERMISSIONS.any { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }) {
                 requestPermissions(BLUETOOTH_PERMISSIONS, REQUEST_BLUETOOTH)
@@ -329,21 +377,26 @@ class MainActivity : Activity() {
                 return
             }
         }
-        val payload = form.payload ?: return
-        val roomId = form.roomId ?: return
-        val thread = form.thread
-        val name = form.name.trim()
         endpoints = Endpoints.load(this)
         val proxy = endpoints.bleProxyUrl ?: run {
             form.bleFailed(BleProblem.PROXY_NOT_CONFIGURED)
             return render()
         }
+        saveName()
         val link = linkFactory?.invoke(this) ?: ProxyLink(applicationContext, proxy)
-        form.busy = true
-        form.status = null
-        CommissionSession.start(link) { api.commission(roomId, payload, name, thread) }
+        form.connect(id)
+        CommissionSession.start(link) { api.commission(id) }
         form.stage = CommissionSession.stage
         render()
+    }
+
+    /** A device picked from the list opens and starts connecting. */
+    private fun connectListed(device: Device) {
+        if (form.device?.id != device.id) {
+            saveName()
+            open(device)
+        }
+        commission(device.id)
     }
 
     private fun cancel() {
@@ -355,7 +408,8 @@ class MainActivity : Activity() {
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode != REQUEST_BLUETOOTH) return
-        if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) commission()
+        val id = pendingConnect
+        if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED } && id != null) commission(id)
         else {
             form.bleFailed(BleProblem.PERMISSION)
             render()
@@ -367,7 +421,8 @@ class MainActivity : Activity() {
         @Suppress("DEPRECATION")
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode != REQUEST_ENABLE) return
-        if (resultCode == RESULT_OK) commission()
+        val id = pendingConnect
+        if (resultCode == RESULT_OK && id != null) commission(id)
         else {
             form.bleFailed(BleProblem.BLUETOOTH_OFF)
             render()
@@ -379,8 +434,7 @@ class MainActivity : Activity() {
         when (val outcome = CommissionSession.take()) {
             is Outcome.Done -> {
                 form.commissioned(outcome.result)
-                if (outcome.result is ApiResult.Ok) nameField.setText("")
-                if (outcome.result == ApiResult.Failed(ApiError.ROOM_NOT_FOUND)) loadRooms()
+                loadDevices()
             }
             is Outcome.Failed -> form.bleFailed(outcome.problem)
             null -> Unit
@@ -410,27 +464,13 @@ class MainActivity : Activity() {
             (layoutParams as LinearLayout.LayoutParams).topMargin = dp(24)
         }
 
-        val tabs = RadioGroup(this).apply { orientation = RadioGroup.HORIZONTAL }
-        content.addView(tabs, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
-        wifiTab = tab(tabs, "Wi-Fiの電球") { chooseNetwork(thread = false) }
-        threadTab = tab(tabs, "Threadの電球") { chooseNetwork(thread = true) }
-
-        threadPanel = panel()
-        label(threadPanel, "Thread網", 18, bold = true)
-        threadState = label(threadPanel, "", 16).apply { accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE }
-        threadCheckButton = button(threadPanel, "もう一度確かめる") { checkThread() }
-
-        wifiPanel = panel()
-        label(wifiPanel, "電球に渡すWi-Fi", 18, bold = true)
-        label(wifiPanel, "まだ保存していません", 16, muted = true)
-        button(wifiPanel, "Wi-Fiを設定", icon = R.drawable.ic_settings) { openSettings() }
-
         val qr = panel()
         label(qr, "機器のコード", 18, bold = true)
         qrState = label(qr, "", 16)
+        deviceState = label(qr, "", 16).apply { compoundDrawablePadding = dp(8) }
         qrMessage = message(qr)
-        scanButton = button(qr, "", icon = R.drawable.ic_qr) { scan() }
-        manualButton = button(qr, "", icon = R.drawable.ic_keypad) { openManual() }
+        button(qr, "QRを読み取る", icon = R.drawable.ic_qr) { scan() }
+        manualButton = button(qr, "数字で入力", icon = R.drawable.ic_keypad) { openManual() }
         manualPanel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         qr.addView(manualPanel, LinearLayout.LayoutParams(-1, -2))
         label(manualPanel, "機器に印字された11桁の数字", 14, muted = true)
@@ -450,13 +490,20 @@ class MainActivity : Activity() {
             render()
         }
 
+        val name = panel()
+        label(name, "機器名（任意）", 18, bold = true)
+        nameField = field(name, "機器名（任意）", EditorInfo.IME_ACTION_DONE) { saveName() }
+        nameField.setOnFocusChangeListener { _, focused -> if (!focused) saveName() }
+
         val room = panel()
         label(room, "部屋", 18, bold = true)
-        roomState = label(room, "", 16)
+        roomState = label(room, "部屋を読み込めませんでした", 16)
         roomAdapter = ArrayAdapter<String>(this, R.layout.select_item)
         roomSpinner = select(room, roomAdapter, "部屋") { position ->
-            form.rooms.getOrNull(position)?.let { form.roomId = it.id }
-            render()
+            val device = form.device
+            if (device == null || position == shownRoom) return@select
+            shownRoom = position
+            update(device.id, DeviceUpdate.Room(form.rooms.getOrNull(position - 1)?.id))
         }
         roomMessage = message(room)
         addRoomButton = button(room, "部屋を追加", icon = R.drawable.ic_add) {
@@ -479,18 +526,32 @@ class MainActivity : Activity() {
         }
         createRoomButton = button(roomActions, "追加", weight = true) { createRoom() }
 
-        val device = panel()
-        label(device, "機器名（任意）", 18, bold = true)
-        nameField = field(device, "機器名（任意）", EditorInfo.IME_ACTION_DONE) { if (form.canRegister()) commission() }
-        nameField.hint = "空欄でも登録できます"
-        nameField.addTextChangedListener(changed { form.name = it })
+        labelPanel = panel()
+        label(labelPanel, "ラベル", 18, bold = true)
+        labelBoxes = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        labelPanel.addView(labelBoxes, LinearLayout.LayoutParams(-1, -2))
+        devicePanels = listOf(name, room, labelPanel)
+
+        wifiPanel = panel()
+        label(wifiPanel, "機器に渡すWi-Fi", 18, bold = true)
+        label(wifiPanel, "まだ保存していません", 16, muted = true)
+        button(wifiPanel, "Wi-Fiを設定", icon = R.drawable.ic_settings) { openSettings() }
+
+        unconnectedPanel = panel()
+        label(unconnectedPanel, "未接続", 18, bold = true)
+        unconnectedList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        unconnectedPanel.addView(unconnectedList, LinearLayout.LayoutParams(-1, -2))
 
         resultRow = ResultRow(this, content, dp(16))
         reconnectButton = button(content, "再接続") {
             loadRooms()
+            loadLabels()
+            loadDevices()
             loadWifi()
         }
-        registerButton = button(content, "登録", primary = true) { commission() }
+        connectButton = button(content, "接続", primary = true, icon = R.drawable.ic_bluetooth) {
+            form.device?.let { commission(it.id) }
+        }
         cancelButton = button(content, "キャンセル") { cancel() }
         button(content, "接続先の設定", icon = R.drawable.ic_settings) { openSettings() }.apply {
             (layoutParams as LinearLayout.LayoutParams).topMargin = dp(24)
@@ -499,6 +560,9 @@ class MainActivity : Activity() {
     }
 
     private fun openSettings() = startActivity(Intent(this, SettingsActivity::class.java))
+
+    /** How a device reads in the list: its name, else its printed code. */
+    private fun title(device: Device) = device.name.ifEmpty { device.code?.let { ManualCode.label(it) ?: it } ?: "機器" }
 
     private fun render() {
         endpointNotice.visibility = if (endpoints.homeLinkUrl == null) View.VISIBLE else View.GONE
@@ -512,46 +576,43 @@ class MainActivity : Activity() {
         }
         pinButton.visibility = if (canPinWidget) View.VISIBLE else View.GONE
 
-        for ((tab, selected) in listOf(wifiTab to !form.thread, threadTab to form.thread)) {
-            tab.isChecked = selected
-            tab.isEnabled = !form.busy
-            tab.typeface = if (selected) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
-        }
-        // Asked for only until home-link holds a Wi-Fi for devices; registering never asks for one.
-        wifiPanel.visibility = if (!form.thread && form.wifiMissing) View.VISIBLE else View.GONE
-        threadPanel.visibility = if (form.thread) View.VISIBLE else View.GONE
-        threadState.text = when {
-            checkingThread -> "Thread網を確かめています…"
-            form.threadReady == true -> "準備できています。電球にはmatterjs-serverが持つThread網の設定を渡します"
-            form.threadReady == false -> "Thread網が未準備です。homeserverでThread網（OTBR）を用意するまで、Threadの電球は登録できません"
-            form.threadFailed -> "Thread網の状態を確かめられませんでした。home-linkにつながるか確かめてから、もう一度確かめてください"
-            else -> ""
-        }
-        threadState.setTextColor(getColor(if (!checkingThread && form.threadReady != true) R.color.danger else R.color.text))
-        threadState.setCompoundDrawablesRelativeWithIntrinsicBounds(when {
-            checkingThread || threadState.text.isEmpty() -> 0
-            form.threadReady == true -> R.drawable.ic_success
-            else -> R.drawable.ic_error
-        }, 0, 0, 0)
-        threadState.compoundDrawablePadding = dp(8)
-        threadCheckButton.visibility = if (!checkingThread && form.threadReady != true) View.VISIBLE else View.GONE
-        threadCheckButton.isEnabled = !form.busy
-        val payload = form.payload
-        val scannedQr = payload?.startsWith("MT:") == true
+        val device = form.device
+        val code = device?.code
         qrState.text = when {
-            payload == null -> "まだ読み取っていません"
-            scannedQr -> ManualCode.label(payload)?.let { "読み取り済み：$it" }
-                ?: "読み取り済み（ラベルの数字に直せないコード）：$payload"
-            else -> "入力済み：${ManualCode.label(payload)}"
+            device == null -> "まだ読み取っていません"
+            code == null -> ""
+            code.startsWith("MT:") -> ManualCode.label(code)?.let { "読み取り済み：$it" }
+                ?: "読み取り済み（ラベルの数字に直せないコード）：$code"
+            else -> "入力済み：${ManualCode.label(code)}"
         }
-        qrState.setTextColor(getColor(if (payload == null) R.color.muted else R.color.text))
-        scanButton.text = if (scannedQr) "読み取り直す" else "QRを読み取る"
-        manualButton.text = if (payload != null && !scannedQr) "数字を入力し直す" else "数字で入力"
+        qrState.setTextColor(getColor(if (device == null) R.color.muted else R.color.text))
+        qrState.visibility = if (qrState.text.isEmpty()) View.GONE else View.VISIBLE
+        val state = device?.state
+        deviceState.text = when (state) {
+            DeviceState.UNCONNECTED -> "未接続"
+            DeviceState.CONNECTED -> "接続済み"
+            DeviceState.NO_RESPONSE -> "応答なし"
+            null -> ""
+        }
+        deviceState.visibility = if (state == null) View.GONE else View.VISIBLE
+        deviceState.setTextColor(getColor(when (state) {
+            DeviceState.NO_RESPONSE -> R.color.danger
+            DeviceState.UNCONNECTED -> R.color.muted
+            else -> R.color.text
+        }))
+        deviceState.setCompoundDrawablesRelativeWithIntrinsicBounds(when (state) {
+            DeviceState.CONNECTED -> R.drawable.ic_success
+            DeviceState.NO_RESPONSE -> R.drawable.ic_error
+            else -> 0
+        }, 0, 0, 0)
         manualButton.visibility = if (enteringCode) View.GONE else View.VISIBLE
         manualPanel.visibility = if (enteringCode) View.VISIBLE else View.GONE
-        show(qrMessage, when (form.status) {
+        val status = form.status
+        show(qrMessage, when (status) {
             Status.NotMatter -> "MatterのQRコードではありません。QRコードが無い機器は「数字で入力」を使ってください"
             Status.ScanFailed -> "QRコードを読み取れませんでした。もう一度お試しください"
+            Status.Failed(ApiError.INVALID_QR) -> "MatterのQRコードとして読み取れませんでした。読み取り直してください"
+            Status.Failed(ApiError.INVALID_MANUAL) -> "この数字はMatterの機器のコードとして使えません。数字を入力し直してください"
             else -> null
         })
         val typed = ManualCode.digits(manualField.text.toString()).length
@@ -561,19 +622,15 @@ class MainActivity : Activity() {
             null -> null
         })
 
-        val names = form.rooms.map { it.name }
-        fill(roomAdapter, names)
-        val selected = form.rooms.indexOfFirst { it.id == form.roomId }
-        if (selected >= 0 && roomSpinner.selectedItemPosition != selected) roomSpinner.setSelection(selected)
-        roomSpinner.visibility = if (names.isEmpty()) View.GONE else View.VISIBLE
-        roomState.text = when {
-            loadingRooms && names.isEmpty() -> "部屋を読み込み中…"
-            names.isEmpty() && form.roomsFailed -> "部屋を読み込めませんでした"
-            names.isEmpty() -> "部屋がありません。「部屋を追加」から作成してください"
-            else -> ""
+        for (panel in devicePanels) panel.visibility = if (device == null) View.GONE else View.VISIBLE
+        fill(roomAdapter, listOf("未設定") + form.rooms.map { it.name })
+        val roomKey = Triple(device?.id, device?.roomId, form.rooms)
+        if (roomKey != drawnRoom) {
+            drawnRoom = roomKey
+            shownRoom = form.rooms.indexOfFirst { it.id == device?.roomId } + 1
+            roomSpinner.setSelection(shownRoom)
         }
-        roomState.visibility = if (roomState.text.isEmpty()) View.GONE else View.VISIBLE
-        val status = form.status
+        roomState.visibility = if (form.roomsFailed) View.VISIBLE else View.GONE
         show(roomMessage, when {
             status is Status.RoomAdded -> "部屋「${status.room}」を追加しました"
             status == Status.Failed(ApiError.DUPLICATE_ROOM) -> "同じ名前の部屋があります。一覧から選んでください"
@@ -582,16 +639,18 @@ class MainActivity : Activity() {
         addRoomButton.visibility = if (addingRoom) View.GONE else View.VISIBLE
         newRoomPanel.visibility = if (addingRoom) View.VISIBLE else View.GONE
         createRoomButton.isEnabled = newRoomName.text.isNotBlank()
+        if (device != null) renderLabels(device)
 
-        val ssid = form.deviceWifi.orEmpty()
+        wifiPanel.visibility = if (form.wifiMissing) View.VISIBLE else View.GONE
+        renderUnconnected()
+
+        val ssid = form.deviceWifi?.let { "「$it」" }.orEmpty()
         val result = when (status) {
-            is Status.Commissioned -> with(status.device) {
-                if (name.isEmpty()) "${room}に機器を登録しました" else "${room}に「$name」を登録しました"
-            }
+            is Status.Commissioned -> if (status.name.isEmpty()) "接続しました" else "「${status.name}」を接続しました"
             is Status.BleFailed -> when (status.problem) {
-                BleProblem.PERMISSION -> "Bluetoothで電球を探すには「付近のデバイス」の許可が必要です。" +
-                    "許可してから「登録」を押し直してください"
-                BleProblem.BLUETOOTH_OFF -> "Bluetoothがオフです。オンにしてから「登録」を押し直してください"
+                BleProblem.PERMISSION -> "Bluetoothで機器を探すには「付近のデバイス」の許可が必要です。" +
+                    "許可してから「接続」を押し直してください"
+                BleProblem.BLUETOOTH_OFF -> "Bluetoothがオフです。オンにしてから「接続」を押し直してください"
                 BleProblem.PROXY_NOT_CONFIGURED -> "matterjs-serverのBLE Proxyの接続先が未設定です。「接続先の設定」で入れてください"
                 BleProblem.PROXY_UNREACHABLE -> "matterjs-server（${authority(endpoints.bleProxyUrl)}）に" +
                     "接続できません。家のWi-Fiにつないでから、もう一度お試しください"
@@ -601,26 +660,22 @@ class MainActivity : Activity() {
                 ApiError.NOT_CONFIGURED -> NOT_CONFIGURED
                 ApiError.UNREACHABLE, ApiError.TIMEOUT -> "home-link（${authority(endpoints.homeLinkUrl)}）に接続できません。$CHECK_ENDPOINT"
                 ApiError.ROOM_NOT_FOUND -> "選んだ部屋が見つかりません。部屋を選び直してください"
-                ApiError.INVALID_QR -> "MatterのQRコードとして読み取れませんでした。読み取り直してください"
-                ApiError.INVALID_MANUAL -> "この数字はMatterの機器のコードとして使えません。数字を入力し直してください"
                 ApiError.INVALID_NAME -> "名前は${MAX_NAME}文字以内で入力してください"
+                ApiError.INVALID_QR, ApiError.INVALID_MANUAL, ApiError.DUPLICATE_ROOM -> null
                 ApiError.SERVER, ApiError.MATTER_UNREACHABLE, ApiError.MATTER_NOT_CONFIGURED,
                 ApiError.LABEL_NOT_FOUND, ApiError.LABEL_HAS_NO_LIGHTS, ApiError.INVALID_WIFI, ApiError.WIFI_NOT_FOUND,
-                ApiError.SESAME_NOT_CONFIGURED, ApiError.SESAME_REJECTED, ApiError.SESAME_UNREACHABLE ->
+                ApiError.WIFI_NOT_SET, ApiError.SESAME_NOT_CONFIGURED, ApiError.SESAME_REJECTED, ApiError.SESAME_UNREACHABLE ->
                     "home-linkでエラーが発生しました。時間をおいてお試しください"
-                ApiError.DUPLICATE_ROOM -> null
-                ApiError.DEVICE_NOT_FOUND -> "電球が見つかりませんでした。電球をペアリング待ちにし、" +
-                    "電話を近づけてから「登録」を押し直してください"
-                ApiError.WRONG_CODE -> "電球がコードを受け付けませんでした。電球のコードを読み取り直すか、入力し直してください"
-                ApiError.WIFI_FAILED -> "電球がWi-Fi「$ssid」につながりませんでした。Wi-Fiの名前とパスワードを確かめてください。" +
-                    "2.4GHzにしか対応しない電球もあります"
-                ApiError.COMMISSION_TIMEOUT -> "時間内に登録が終わりませんでした。電球をペアリング待ちにし直して、もう一度お試しください"
-                ApiError.COMMISSION_FAILED -> "登録が途中で止まりました。電話を電球の近くに置いて、「登録」を押し直してください。" +
-                    "電球の登録待ちが終わっていたら、電球の電源を1回入れ直してから押し直してください"
+                ApiError.DEVICE_NOT_FOUND -> "機器が見つかりませんでした。機器をペアリング待ちにし、" +
+                    "電話を近づけてから「接続」を押し直してください"
+                ApiError.WRONG_CODE -> "機器がコードを受け付けませんでした。機器のコードを読み取り直すか、入力し直してください"
+                ApiError.WIFI_FAILED -> "機器がWi-Fi${ssid}につながりませんでした。Wi-Fiの名前とパスワードを確かめてください。" +
+                    "2.4GHzにしか対応しない機器もあります"
+                ApiError.COMMISSION_TIMEOUT -> "時間内に接続が終わりませんでした。機器をペアリング待ちにし直して、もう一度お試しください"
+                ApiError.COMMISSION_FAILED -> "接続が途中で止まりました。電話を機器の近くに置いて、「接続」を押し直してください。" +
+                    "機器の接続待ちが終わっていたら、機器の電源を1回入れ直してから押し直してください"
                 ApiError.BLUETOOTH_UNAVAILABLE -> "matterjs-serverでBluetoothの中継が有効になっていません。サーバーの設定を確かめてください"
-                ApiError.WIFI_NOT_SET -> "電球に渡すWi-Fiが未設定です"
-                ApiError.THREAD_NOT_READY -> "Thread網が未準備です。homeserverでThread網を用意してから登録してください"
-                ApiError.THREAD_FAILED -> "電球がThread網につながりませんでした。Thread網（OTBR）が動いているか確かめてから、" +
+                ApiError.THREAD_FAILED -> "機器がThread網につながりませんでした。Thread網（OTBR）が動いているか確かめてから、" +
                     "もう一度お試しください"
             }
             else -> null
@@ -629,45 +684,56 @@ class MainActivity : Activity() {
         if (form.busy && stage != null) resultRow.show(stageText(stage), failed = false, R.drawable.ic_bluetooth)
         else resultRow.show(result, status is Status.Failed || status is Status.BleFailed)
         reconnectButton.visibility =
-            if ((form.roomsFailed || status == Status.Failed(ApiError.UNREACHABLE)) && !loadingRooms) View.VISIBLE
+            if (form.roomsFailed || form.devicesFailed || status == Status.Failed(ApiError.UNREACHABLE)) View.VISIBLE
             else View.GONE
-        registerButton.isEnabled = form.canRegister()
-        registerButton.visibility = if (form.busy) View.GONE else View.VISIBLE
+        connectButton.visibility = if (form.canConnect()) View.VISIBLE else View.GONE
         cancelButton.visibility = if (form.busy) View.VISIBLE else View.GONE
+    }
+
+    /** One check box per label, ticked for the device's. */
+    private fun renderLabels(device: Device) {
+        labelPanel.visibility = if (form.labels.isEmpty()) View.GONE else View.VISIBLE
+        if (labelBoxes.childCount != form.labels.size ||
+            form.labels.withIndex().any { (i, label) -> (labelBoxes.getChildAt(i) as CheckBox).text != label.name }) {
+            labelBoxes.removeAllViews()
+            for (label in form.labels) labelBoxes.addView(CheckBox(this).apply {
+                text = label.name
+                textSize = 16f
+                minHeight = dp(48)
+                setTextColor(getColor(R.color.text))
+                buttonTintList = ColorStateList.valueOf(getColor(R.color.accent))
+                // Clicks, not checked changes, so drawing the device's labels sends nothing.
+                setOnClickListener {
+                    val open = form.device ?: return@setOnClickListener
+                    update(open.id, DeviceUpdate.Labels(if (isChecked) open.labelIds + label.id else open.labelIds - label.id))
+                }
+            })
+        }
+        form.labels.forEachIndexed { i, label -> (labelBoxes.getChildAt(i) as CheckBox).isChecked = label.id in device.labelIds }
+    }
+
+    /** A button per device still to connect; pressing one connects it. */
+    private fun renderUnconnected() {
+        val listed = form.unconnected
+        unconnectedPanel.visibility = if (listed.isEmpty()) View.GONE else View.VISIBLE
+        val titles = listed.map(::title)
+        if (unconnectedList.childCount != listed.size ||
+            titles.withIndex().any { (i, title) -> (unconnectedList.getChildAt(i) as Button).text != title }) {
+            unconnectedList.removeAllViews()
+        }
+        listed.forEachIndexed { i, device ->
+            val row = unconnectedList.getChildAt(i) as Button? ?: button(unconnectedList, titles[i], icon = R.drawable.ic_bluetooth) { }
+            row.setOnClickListener { connectListed(device) }
+            row.isEnabled = !form.busy
+        }
     }
 
     private fun stageText(stage: Stage) = when (stage) {
         Stage.PREPARING -> "matterjs-serverに接続しています…"
-        Stage.SEARCHING -> "電球を探しています…"
-        Stage.CONNECTING -> "電球に接続しています…"
-        Stage.SENDING -> "電球にコードと${if (form.thread) "Thread網" else "Wi-Fi"}の設定を送っています…"
+        Stage.SEARCHING -> "機器を探しています…"
+        Stage.CONNECTING -> "機器に接続しています…"
+        Stage.SENDING -> "機器にコードと設定を送っています…"
     }
-
-    /** A tab: text on the background, underlined in the accent while selected. */
-    private fun tab(group: RadioGroup, value: String, select: () -> Unit): RadioButton = RadioButton(this).apply {
-        text = value
-        textSize = 16f
-        minHeight = dp(48)
-        gravity = Gravity.CENTER
-        buttonDrawable = null
-        setPadding(dp(8), dp(12), dp(8), dp(12))
-        setTextColor(ColorStateList(arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
-            intArrayOf(getColor(R.color.text), getColor(R.color.muted))))
-        val line = StateListDrawable().apply {
-            addState(intArrayOf(android.R.attr.state_checked), underline(R.color.accent, dp(3)))
-            addState(intArrayOf(), underline(R.color.border, dp(1)))
-        }
-        background = RippleDrawable(ColorStateList.valueOf(getColor(R.color.border)), line, null)
-        setOnClickListener { select() }
-        // Both tabs take the taller one's height so the underlines line up.
-        group.addView(this, RadioGroup.LayoutParams(0, -1, 1f))
-    }
-
-    private fun underline(color: Int, height: Int) =
-        LayerDrawable(arrayOf(GradientDrawable().apply { setColor(getColor(color)) })).apply {
-            setLayerGravity(0, Gravity.BOTTOM or Gravity.FILL_HORIZONTAL)
-            setLayerHeight(0, height)
-        }
 
     /** A select box: the input surface with an expand arrow, so it reads apart from buttons. */
     private fun select(parent: LinearLayout, items: ArrayAdapter<String>, description: String,

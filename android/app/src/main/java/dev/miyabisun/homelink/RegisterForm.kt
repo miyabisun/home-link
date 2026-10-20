@@ -5,7 +5,8 @@ sealed interface Status {
     data object ScanFailed : Status
     data class RoomAdded(val room: String) : Status
     data class Failed(val error: ApiError) : Status
-    data class Commissioned(val device: dev.miyabisun.homelink.Commissioned) : Status
+    /** Connected; the device's name, empty when it has none. */
+    data class Commissioned(val name: String) : Status
     data class BleFailed(val problem: BleProblem) : Status
 }
 
@@ -20,7 +21,7 @@ enum class Stage {
         fun of(command: String): Stage? = when (command) {
             "start_scan" -> SEARCHING
             "connect" -> CONNECTING
-            // The BTP handshake opens the channel for PASE and the Wi-Fi credentials.
+            // The BTP handshake opens the channel for PASE and the network credentials.
             "write_and_subscribe" -> SENDING
             else -> null
         }
@@ -30,28 +31,29 @@ enum class Stage {
 enum class ManualError { LENGTH, CHECK_DIGIT }
 
 class RegisterForm {
-    /** A scanned `MT:` payload or the 11 digits of a manual pairing code. */
-    var payload: String? = null
     var manualError: ManualError? = null
-    var roomId: Long? = null
     var rooms: List<Room> = emptyList()
-    var name = ""
-    var busy = false
     var roomsFailed = false
+    var labels: List<Label> = emptyList()
+    /** The ledger as last read, codes kept from earlier reads. */
+    var devices: List<Device> = emptyList()
+        private set
+    var devicesFailed = false
+    /** The device whose pane is open. */
+    var device: Device? = null
+        private set
+    var busy = false
     var status: Status? = null
-    /** The name of the Wi-Fi home-link hands new devices; required onto Wi-Fi. */
+    /** The name of the Wi-Fi home-link hands new devices. */
     var deviceWifi: String? = null
     /** home-link was read to hold no Wi-Fi for devices. */
     var wifiMissing = false
-    /** The Thread tab: the device joins the Thread network matterjs-server holds, not Wi-Fi. */
-    var thread = false
-    /** Whether matterjs-server holds the Thread network; null until checked or when the check failed. */
-    var threadReady: Boolean? = null
-    var threadFailed = false
     var stage: Stage? = null
 
-    fun canRegister() = payload != null && roomId != null && !busy &&
-        if (thread) threadReady == true else deviceWifi != null
+    /** Devices still to connect, in the order they were read. */
+    val unconnected get() = devices.filter { it.state == DeviceState.UNCONNECTED }
+
+    fun canConnect() = device?.state == DeviceState.UNCONNECTED && !busy
 
     /** Takes home-link's Wi-Fi networks; a failed read keeps what was read last. */
     fun wifiRead(result: ApiResult<List<SavedNetwork>>) {
@@ -60,57 +62,88 @@ class RegisterForm {
         wifiMissing = deviceWifi == null
     }
 
-    fun threadChecked(result: ApiResult<Boolean>) {
-        threadReady = (result as? ApiResult.Ok)?.value
-        threadFailed = result is ApiResult.Failed
-    }
-
-    /** Accepts a scanned code; anything but a Matter payload leaves the previous code. */
-    fun scanned(value: String) {
+    /** The Matter payload to send for a scanned code; anything else is refused. */
+    fun scanned(value: String): String? {
         val code = value.trim()
-        if (code.startsWith("MT:")) {
-            payload = code
-            status = null
-        } else {
-            status = Status.NotMatter
-        }
+        status = if (code.startsWith("MT:")) null else Status.NotMatter
+        return code.takeIf { status == null }
     }
 
-    /** Takes the code once all digits are typed; a wrong check digit shows at once. */
-    fun typed(text: String): Boolean {
+    /** The code once all digits are typed; a wrong check digit shows at once. */
+    fun typed(text: String): String? {
         val digits = ManualCode.digits(text)
         if (digits.length < ManualCode.LENGTH) {
             manualError = null
-            return false
+            return null
         }
         return accept(digits)
     }
 
     /** Like [typed], but also reports a code that is still too short. */
-    fun submitted(text: String): Boolean {
+    fun submitted(text: String): String? {
         val digits = ManualCode.digits(text)
         if (digits.length < ManualCode.LENGTH) {
             manualError = ManualError.LENGTH
-            return false
+            return null
         }
         return accept(digits)
     }
 
-    private fun accept(digits: String): Boolean {
+    private fun accept(digits: String): String? {
         val valid = ManualCode.isValid(digits)
         manualError = if (valid) null else ManualError.CHECK_DIGIT
-        if (valid) {
-            payload = digits
-            status = null
+        return digits.takeIf { valid }
+    }
+
+    /** home-link's answer to a read `code`: the device to edit, new or already in the ledger. */
+    fun added(code: String, result: ApiResult<Device>) {
+        when (result) {
+            is ApiResult.Ok -> {
+                status = null
+                opened(result.value.copy(code = code))
+            }
+            is ApiResult.Failed -> status = Status.Failed(result.error)
         }
-        return valid
+    }
+
+    fun opened(device: Device) {
+        this.device = device
+        put(device)
+    }
+
+    fun devicesRead(result: ApiResult<List<Device>>) {
+        devicesFailed = result is ApiResult.Failed
+        if (result !is ApiResult.Ok) return
+        val codes = devices.associate { it.id to it.code }
+        devices = result.value.map { it.copy(code = it.code ?: codes[it.id]) }
+        device = device?.let { open -> devices.firstOrNull { it.id == open.id } }
+    }
+
+    /** One device read with its code. */
+    fun detailRead(result: ApiResult<Device>) {
+        if (result is ApiResult.Ok) put(result.value)
+    }
+
+    fun updated(result: ApiResult<Device>) {
+        when (result) {
+            is ApiResult.Ok -> put(result.value)
+            is ApiResult.Failed -> status = Status.Failed(result.error)
+        }
+    }
+
+    /** Replaces the device in the list and the pane, keeping the code already read. */
+    private fun put(update: Device) {
+        val known = devices.firstOrNull { it.id == update.id } ?: device?.takeIf { it.id == update.id }
+        val merged = update.copy(code = update.code ?: known?.code)
+        devices = if (devices.any { it.id == update.id }) devices.map { if (it.id == update.id) merged else it }
+            else devices + merged
+        if (device?.id == update.id) device = merged
     }
 
     fun rooms(result: ApiResult<List<Room>>) {
         when (result) {
             is ApiResult.Ok -> {
                 rooms = result.value
-                if (rooms.none { it.id == roomId }) roomId = rooms.firstOrNull()?.id
                 // A successful load proves the server is reachable again.
                 if (status == Status.Failed(ApiError.UNREACHABLE)) status = null
                 roomsFailed = false
@@ -126,41 +159,54 @@ class RegisterForm {
         when (result) {
             is ApiResult.Ok -> {
                 rooms = rooms + result.value
-                roomId = result.value.id
                 status = Status.RoomAdded(result.value.name)
             }
             is ApiResult.Failed -> status = Status.Failed(result.error)
         }
     }
 
-    fun commissioned(result: ApiResult<Commissioned>) {
-        busy = false
-        stage = null
-        status = when (result) {
-            is ApiResult.Ok -> Status.Commissioned(result.value).also {
-                payload = null
-                name = ""
-            }
-            is ApiResult.Failed -> Status.Failed(result.error).also {
-                if (result.error == ApiError.THREAD_NOT_READY) threadReady = false
-                if (result.error == ApiError.WIFI_NOT_SET) {
-                    deviceWifi = null
-                    wifiMissing = true
-                }
-            }
-        }
+    /** The device being connected, until the outcome arrives. */
+    var connecting: Long? = null
+
+    /** Device `id` starts connecting. */
+    fun connect(id: Long) {
+        connecting = id
+        busy = true
+        status = null
+        stage = Stage.PREPARING
     }
 
-    /** Back to a registration that can start again, with every input kept. */
+    fun commissioned(result: ApiResult<Device>) {
+        busy = false
+        stage = null
+        when (result) {
+            is ApiResult.Ok -> {
+                val read = connecting
+                val code = (devices.firstOrNull { it.id == read } ?: device?.takeIf { it.id == read })?.code
+                // home-link may have kept another row that already held the device and dropped the read one.
+                devices = devices.filter { it.id != read }
+                val connected = result.value.copy(code = result.value.code ?: code)
+                put(connected)
+                if (device?.id == read) device = connected
+                status = Status.Commissioned(connected.name)
+            }
+            is ApiResult.Failed -> status = Status.Failed(result.error)
+        }
+        connecting = null
+    }
+
+    /** Back to a device that can connect again. */
     fun cancelled() {
         busy = false
         stage = null
         status = null
+        connecting = null
     }
 
     fun bleFailed(problem: BleProblem) {
         busy = false
         stage = null
         status = Status.BleFailed(problem)
+        connecting = null
     }
 }

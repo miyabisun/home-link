@@ -43,41 +43,69 @@ class HttpHomeLinkApiTest {
         assertEquals(ApiResult.Failed(ApiError.DUPLICATE_ROOM), api.createRoom("書斎"))
     }
 
-    @Test fun mapsCommissionInputFailures() {
-        val cases = listOf(
-            Triple(404, "room_not_found", ApiError.ROOM_NOT_FOUND),
-            Triple(400, "invalid_qr_payload", ApiError.INVALID_QR),
-            Triple(400, "invalid_manual_code", ApiError.INVALID_MANUAL),
-            Triple(400, "invalid_device_name", ApiError.INVALID_NAME),
-            Triple(500, "internal", ApiError.SERVER),
-            Triple(502, "", ApiError.SERVER),
-        )
-        for ((status, code, expected) in cases) {
-            respond("/api/commission", status, if (code.isEmpty()) "<html>bad gateway</html>" else """{"error":"$code"}""")
-            assertEquals("$status $code", ApiResult.Failed(expected), api.commission(1, "MT:x", "n", thread = true))
+    private val ledgerRow = """{"id":9,"room_id":2,"room_name":"押入れ","name":"押入れ1","vendor":null,"serial_number":null,
+        "mac":null,"vendor_id":65521,"product_id":32768,"state":"unconnected","product_name":null,
+        "labels":[{"id":1,"name":"作業"},{"id":3,"name":"夜"}],"ignored":false,"created_at":"t"}"""
+    private val ledgerDevice = Device(9, "押入れ1", 2, setOf(1, 3), DeviceState.UNCONNECTED, null)
+
+    @Test fun entersDevicesByTheirCodeAlone() {
+        respond("/api/devices", 201, """{"registered":true,"device":$ledgerRow}""")
+        assertEquals(ApiResult.Ok(ledgerDevice), api.addDevice("MT:Y.K9042C00KA0648G00"))
+        assertEquals("""POST /api/devices {"qr_payload":"MT:Y.K9042C00KA0648G00"}""", requests.last())
+        // The same device again comes back as it is.
+        respond("/api/devices", 200, """{"registered":false,"device":$ledgerRow}""")
+        assertEquals(ApiResult.Ok(ledgerDevice), api.addDevice("34970112332"))
+        assertEquals("""POST /api/devices {"manual_code":"34970112332"}""", requests.last())
+        respond("/api/devices", 400, """{"error":"invalid_qr_payload"}""")
+        assertEquals(ApiResult.Failed(ApiError.INVALID_QR), api.addDevice("MT:x"))
+    }
+
+    @Test fun listsTheLedgerWithEachDevicesState() {
+        val unknown = ledgerRow.replace("\"unconnected\"", "null").replace("\"room_id\":2", "\"room_id\":null")
+            .replace("[{\"id\":1,\"name\":\"作業\"},{\"id\":3,\"name\":\"夜\"}]", "[]")
+        respond("/api/devices", 200, "[$ledgerRow,${ledgerRow.replace("unconnected", "connected")},$unknown]")
+        assertEquals(ApiResult.Ok(listOf(ledgerDevice, ledgerDevice.copy(state = DeviceState.CONNECTED),
+            ledgerDevice.copy(roomId = null, labelIds = emptySet(), state = null))), api.devices())
+        assertEquals("GET /api/devices", requests.last())
+
+        // One device carries its code.
+        respond("/api/devices/9", 200, ledgerRow.replace("\"ignored\"", "\"qr_payload\":\"MT:Y.K9042C00KA0648G00\",\"ignored\""))
+        assertEquals(ApiResult.Ok(ledgerDevice.copy(code = "MT:Y.K9042C00KA0648G00")), api.device(9))
+        respond("/api/devices/9", 200, ledgerRow.replace("\"ignored\"", "\"manual_code\":\"34970112332\",\"ignored\""))
+        assertEquals(ApiResult.Ok(ledgerDevice.copy(code = "34970112332")), api.device(9))
+        respond("/api/devices/9", 404, """{"error":"device_not_found"}""")
+        assertEquals(ApiResult.Failed(ApiError.DEVICE_NOT_FOUND), api.device(9))
+    }
+
+    @Test fun changesANameARoomAndTheLabels() {
+        respond("/api/devices/9", 200, ledgerRow)
+        assertEquals(ApiResult.Ok(ledgerDevice), api.updateDevice(9, DeviceUpdate.Name("押入れ1")))
+        assertEquals("""PATCH /api/devices/9 {"name":"押入れ1"}""", requests.last())
+        api.updateDevice(9, DeviceUpdate.Room(2))
+        assertEquals("""PATCH /api/devices/9 {"room_id":2}""", requests.last())
+        api.updateDevice(9, DeviceUpdate.Room(null))
+        assertEquals("""PATCH /api/devices/9 {"room_id":null}""", requests.last())
+        api.updateDevice(9, DeviceUpdate.Labels(setOf(1, 3)))
+        assertEquals("""PATCH /api/devices/9 {"label_ids":[1,3]}""", requests.last())
+        for ((status, code, expected) in listOf(Triple(404, "room_not_found", ApiError.ROOM_NOT_FOUND),
+                Triple(404, "label_not_found", ApiError.LABEL_NOT_FOUND), Triple(400, "invalid_device_name", ApiError.INVALID_NAME),
+                Triple(400, "conflicting_labels", ApiError.SERVER))) {
+            respond("/api/devices/9", status, """{"error":"$code"}""")
+            assertEquals(code, ApiResult.Failed(expected), api.updateDevice(9, DeviceUpdate.Name("x")))
         }
     }
 
-    @Test fun commissionsOntoTheServersWifiAndReadsTheLedgerEntry() {
-        respond("/api/commission", 201, """{"node_id":17,"registered":true,"device":{"id":9,"room_id":2,
-            "room_name":"押入れ","name":"押入れ1","vendor":"Tapo","serial_number":"AABBCCDDEEFF","mac":"AABBCCDDEEFF",
-            "label_id":null,"label_name":null,"created_at":"t"}}""")
-        assertEquals(ApiResult.Ok(Commissioned("押入れ", "押入れ1")),
-            api.commission(2, "MT:Y.K9042C00KA0648G00", "押入れ1", thread = false))
-        val body = JSONObject(requests.single().substringAfter("/api/commission "))
-        assertEquals(2L, body.getLong("room_id"))
-        assertEquals("MT:Y.K9042C00KA0648G00", body.getString("qr_payload"))
-        assertEquals("押入れ1", body.getString("name"))
-        assertEquals("wifi", body.getString("network"))
-        // home-link hands over the Wi-Fi it holds for devices; the phone sends none.
-        assertFalse(body.has("wifi_ssid"))
-        assertFalse(body.has("wifi_password"))
+    @Test fun listsTheLabels() {
+        respond("/api/labels", 200, """[{"id":1,"name":"作業","night_level":null,"device_count":2,"dedicated":false,
+            "boosted":false},{"id":3,"name":"夜","device_count":0,"dedicated":true,"boosted":true}]""")
+        assertEquals(ApiResult.Ok(listOf(Label(1, "作業"), Label(3, "夜"))), api.labels())
+    }
 
-        // A device the ledger already holds keeps its own room and name.
-        respond("/api/commission", 200, """{"node_id":17,"registered":false,"device":{"id":3,"room_id":1,
-            "room_name":"寝室","name":"読書灯","created_at":"t"}}""")
-        assertEquals(ApiResult.Ok(Commissioned("寝室", "読書灯")), api.commission(2, "34970112332", "", thread = false))
-        assertEquals("34970112332", JSONObject(requests.last().substringAfter("/api/commission ")).getString("manual_code"))
+    @Test fun connectsALedgerRowWithoutABody() {
+        respond("/api/devices/9/commission", 200, """{"node_id":17,"device":${ledgerRow.replace("unconnected", "connected")}}""")
+        assertEquals(ApiResult.Ok(ledgerDevice.copy(state = DeviceState.CONNECTED)), api.commission(9))
+        // home-link hands over the Wi-Fi it holds for devices; the phone sends none.
+        assertEquals("POST /api/devices/9/commission", requests.last())
     }
 
     @Test fun savesListsChoosesAndDeletesTheServersWifi() {
@@ -104,26 +132,6 @@ class HttpHomeLinkApiTest {
         assertEquals("DELETE /api/wifi/4", requests.last())
     }
 
-    @Test fun commissionsOntoThreadWithoutWifi() {
-        respond("/api/commission", 201, """{"node_id":21,"registered":true,"device":{"id":5,"room_id":2,
-            "room_name":"寝室","name":"T2","created_at":"t"}}""")
-        assertEquals(ApiResult.Ok(Commissioned("寝室", "T2")), api.commission(2, "34970112332", "T2", thread = true))
-        val body = JSONObject(requests.single().substringAfter("/api/commission "))
-        assertEquals("thread", body.getString("network"))
-        assertFalse(body.has("wifi_ssid"))
-        assertFalse(body.has("wifi_password"))
-    }
-
-    @Test fun readsWhetherTheThreadNetworkIsReady() {
-        respond("/api/thread", 200, """{"ready":true}""")
-        assertEquals(ApiResult.Ok(true), api.threadReady())
-        assertEquals("GET /api/thread", requests.single())
-        respond("/api/thread", 200, """{"ready":false}""")
-        assertEquals(ApiResult.Ok(false), api.threadReady())
-        respond("/api/thread", 502, """{"error":"matter_server_unreachable"}""")
-        assertEquals(ApiResult.Failed(ApiError.MATTER_UNREACHABLE), api.threadReady())
-    }
-
     @Test fun mapsCommissioningFailures() {
         val cases = listOf(
             Triple(422, "device_not_found", ApiError.DEVICE_NOT_FOUND),
@@ -132,17 +140,14 @@ class HttpHomeLinkApiTest {
             Triple(504, "commission_timeout", ApiError.COMMISSION_TIMEOUT),
             Triple(422, "commission_failed", ApiError.COMMISSION_FAILED),
             Triple(503, "bluetooth_unavailable", ApiError.BLUETOOTH_UNAVAILABLE),
-            Triple(409, "wifi_not_set", ApiError.WIFI_NOT_SET),
-            Triple(503, "thread_not_ready", ApiError.THREAD_NOT_READY),
             Triple(422, "thread_failed", ApiError.THREAD_FAILED),
-            Triple(400, "invalid_qr_payload", ApiError.INVALID_QR),
-            Triple(404, "room_not_found", ApiError.ROOM_NOT_FOUND),
+            Triple(404, "device_not_found", ApiError.DEVICE_NOT_FOUND),
+            Triple(409, "no_setup_code", ApiError.SERVER),
             Triple(502, "matter_server_unreachable", ApiError.MATTER_UNREACHABLE),
         )
         for ((status, code, expected) in cases) {
-            respond("/api/commission", status, """{"error":"$code","message":"m"}""")
-            assertEquals("$status $code", ApiResult.Failed(expected),
-                api.commission(1, "MT:x", "", thread = false))
+            respond("/api/devices/1/commission", status, """{"error":"$code","message":"m"}""")
+            assertEquals("$status $code", ApiResult.Failed(expected), api.commission(1))
         }
     }
 
@@ -203,7 +208,7 @@ class HttpHomeLinkApiTest {
         val offline = HttpHomeLinkApi("http://127.0.0.1:$port")
         assertEquals(ApiResult.Failed(ApiError.UNREACHABLE), offline.rooms())
         assertEquals(ApiResult.Failed(ApiError.UNREACHABLE), offline.switchLights(true))
-        assertEquals(ApiResult.Failed(ApiError.UNREACHABLE), offline.commission(1, "MT:x", "", thread = false))
+        assertEquals(ApiResult.Failed(ApiError.UNREACHABLE), offline.commission(1))
     }
 
     @Test fun sendsDoorCommandsAndMapsTheirFailures() {

@@ -9,39 +9,167 @@ import org.junit.Test
 class RegisterFormTest {
     private val qr = "MT:Y.K9042C00KA0648G00"
 
-    @Test fun registrationNeedsAScannedCodeAndARoom() {
-        val form = RegisterForm().apply { wifiRead(homeWifi) }
-        assertFalse(form.canRegister())
-        form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
-        assertEquals(1L, form.roomId)
-        assertFalse(form.canRegister())
-        form.scanned(qr)
-        assertTrue(form.canRegister())
-        form.busy = true
-        assertFalse(form.canRegister())
-    }
+    private fun device(id: Long, state: DeviceState? = DeviceState.UNCONNECTED, name: String = "", roomId: Long? = null,
+                       code: String? = null) = Device(id, name, roomId, emptySet(), state, code)
 
-    @Test fun scanningANonMatterCodeKeepsThePreviousCode() {
+    @Test fun scanningANonMatterCodeSendsNothing() {
         val form = RegisterForm()
-        form.scanned(" $qr\n")
-        assertEquals(qr, form.payload)
-        form.scanned("https://example.com/")
-        assertEquals(qr, form.payload)
+        assertEquals(qr, form.scanned(" $qr\n"))
+        assertNull(form.status)
+        assertNull(form.scanned("https://example.com/"))
         assertEquals(Status.NotMatter, form.status)
-        form.scanned(qr)
+        assertEquals(qr, form.scanned(qr))
         assertNull(form.status)
     }
 
-    @Test fun reloadingRoomsKeepsTheSelectionWhileItExists() {
+    @Test fun aReadCodeOpensTheDeviceHomeLinkAnswersWith() {
         val form = RegisterForm()
-        form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"), Room(2, "居間"))))
-        form.roomId = 2
-        form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"), Room(2, "居間"), Room(3, "書斎"))))
-        assertEquals(2L, form.roomId)
-        form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
-        assertEquals(1L, form.roomId)
-        form.rooms(ApiResult.Ok(emptyList()))
-        assertNull(form.roomId)
+        form.devicesRead(ApiResult.Ok(listOf(device(1, DeviceState.CONNECTED))))
+        // New or already in the ledger, the answer is the device to edit.
+        form.added(qr, ApiResult.Ok(device(2)))
+        assertEquals(device(2, code = qr), form.device)
+        assertEquals(listOf(device(2, code = qr)), form.unconnected)
+        form.added(qr, ApiResult.Ok(device(2)))
+        assertEquals(listOf(device(1, DeviceState.CONNECTED), device(2, code = qr)), form.devices)
+
+        // A refused code keeps the open device.
+        form.added("34970112331", ApiResult.Failed(ApiError.INVALID_MANUAL))
+        assertEquals(2L, form.device?.id)
+        assertEquals(Status.Failed(ApiError.INVALID_MANUAL), form.status)
+    }
+
+    @Test fun onlyUnconnectedDevicesAreListedInTheLedgersOrder() {
+        val form = RegisterForm()
+        form.devicesRead(ApiResult.Ok(listOf(device(1), device(2, DeviceState.CONNECTED), device(3, DeviceState.NO_RESPONSE),
+            device(4, null), device(5))))
+        assertEquals(listOf(1L, 5L), form.unconnected.map { it.id })
+        // A failed read keeps the last list.
+        form.devicesRead(ApiResult.Failed(ApiError.UNREACHABLE))
+        assertEquals(listOf(1L, 5L), form.unconnected.map { it.id })
+        assertTrue(form.devicesFailed)
+    }
+
+    @Test fun rereadingTheLedgerKeepsTheCodesAlreadyRead() {
+        val form = RegisterForm()
+        form.added(qr, ApiResult.Ok(device(1)))
+        form.devicesRead(ApiResult.Ok(listOf(device(1, name = "天井1"), device(2))))
+        assertEquals(device(1, name = "天井1", code = qr), form.device)
+        form.detailRead(ApiResult.Ok(device(2, code = "34970112332")))
+        assertEquals(listOf(qr, "34970112332"), form.unconnected.map { it.code })
+        // The open device leaves the pane once home-link no longer holds it.
+        form.devicesRead(ApiResult.Ok(listOf(device(2))))
+        assertNull(form.device)
+    }
+
+    @Test fun statesParseFromTheApiAndUnknownIsNone() {
+        assertEquals(DeviceState.UNCONNECTED, DeviceState.of("unconnected"))
+        assertEquals(DeviceState.CONNECTED, DeviceState.of("connected"))
+        assertEquals(DeviceState.NO_RESPONSE, DeviceState.of("no_response"))
+        assertNull(DeviceState.of(null))
+        assertNull(DeviceState.of("other"))
+    }
+
+    @Test fun onlyAnUnconnectedDeviceCanBeConnectedAndOneAtATime() {
+        val form = RegisterForm()
+        assertFalse(form.canConnect())
+        form.opened(device(1, DeviceState.CONNECTED))
+        assertFalse(form.canConnect())
+        form.opened(device(2))
+        assertTrue(form.canConnect())
+        form.connect(2)
+        assertTrue(form.busy)
+        assertEquals(Stage.PREPARING, form.stage)
+        assertFalse(form.canConnect())
+    }
+
+    @Test fun aConnectedDeviceLeavesTheListAndItsPaneShowsItConnected() {
+        val form = RegisterForm()
+        form.devicesRead(ApiResult.Ok(listOf(device(1), device(2), device(3))))
+        form.opened(device(1, code = qr))
+        form.connect(1)
+        form.commissioned(ApiResult.Ok(device(1, DeviceState.CONNECTED, roomId = 2)))
+        assertFalse(form.busy)
+        assertNull(form.stage)
+        assertEquals(listOf(2L, 3L), form.unconnected.map { it.id })
+        assertEquals(DeviceState.CONNECTED, form.device?.state)
+        assertEquals(qr, form.device?.code)
+        assertEquals(Status.Commissioned(""), form.status)
+    }
+
+    @Test fun aRowMergedIntoAnotherIsReplacedByIt() {
+        val form = RegisterForm()
+        form.devicesRead(ApiResult.Ok(listOf(device(1, DeviceState.CONNECTED, name = "読書灯"), device(4))))
+        form.opened(device(4, code = qr))
+        form.connect(4)
+        // home-link keeps the row already holding the device's identifiers and drops the read one.
+        form.commissioned(ApiResult.Ok(device(1, DeviceState.CONNECTED, name = "読書灯")))
+        assertEquals(listOf(1L), form.devices.map { it.id })
+        assertEquals(1L, form.device?.id)
+        assertEquals(Status.Commissioned("読書灯"), form.status)
+    }
+
+    @Test fun aFailedConnectionKeepsTheDeviceListedToTryAgain() {
+        val form = RegisterForm()
+        form.devicesRead(ApiResult.Ok(listOf(device(1), device(2))))
+        form.opened(device(1))
+        form.connect(1)
+        form.stage = Stage.SENDING
+        form.commissioned(ApiResult.Failed(ApiError.WIFI_FAILED))
+        assertEquals(Status.Failed(ApiError.WIFI_FAILED), form.status)
+        assertFalse(form.busy)
+        assertNull(form.stage)
+        assertEquals(listOf(1L, 2L), form.unconnected.map { it.id })
+        assertTrue(form.canConnect())
+
+        form.connect(1)
+        form.bleFailed(BleProblem.BLUETOOTH_OFF)
+        assertEquals(Status.BleFailed(BleProblem.BLUETOOTH_OFF), form.status)
+        assertTrue(form.canConnect())
+    }
+
+    @Test fun cancellingReturnsToConnectingAtOnce() {
+        val form = RegisterForm()
+        form.opened(device(1))
+        form.connect(1)
+        form.stage = Stage.SENDING
+        form.cancelled()
+        assertFalse(form.busy)
+        assertNull(form.stage)
+        assertNull(form.status)
+        assertTrue(form.canConnect())
+    }
+
+    @Test fun editsReplaceTheDeviceInThePaneAndTheList() {
+        val form = RegisterForm()
+        form.devicesRead(ApiResult.Ok(listOf(device(1))))
+        form.added(qr, ApiResult.Ok(device(1)))
+        form.updated(ApiResult.Ok(device(1, name = "天井1", roomId = 3)))
+        assertEquals(device(1, name = "天井1", roomId = 3, code = qr), form.device)
+        assertEquals("天井1", form.unconnected.single().name)
+        form.updated(ApiResult.Failed(ApiError.ROOM_NOT_FOUND))
+        assertEquals(Status.Failed(ApiError.ROOM_NOT_FOUND), form.status)
+        assertEquals(3L, form.device?.roomId)
+    }
+
+    @Test fun aValidManualCodeIsTakenOnceAllDigitsAreTyped() {
+        val form = RegisterForm()
+        assertNull(form.typed("3497 011 233"))
+        assertNull(form.manualError)
+        assertEquals("34970112332", form.typed("3497 011 2332"))
+    }
+
+    @Test fun manualCodeErrorsShowAtOnceAndClearWhileEditing() {
+        val form = RegisterForm()
+        assertNull(form.typed("3497 011 2331"))
+        assertEquals(ManualError.CHECK_DIGIT, form.manualError)
+        form.typed("3497 011 233")
+        assertNull(form.manualError)
+        assertNull(form.submitted("3497 011 233"))
+        assertEquals(ManualError.LENGTH, form.manualError)
+        assertNull(form.submitted("3497 011 2331"))
+        assertEquals(ManualError.CHECK_DIGIT, form.manualError)
+        assertEquals("34970112332", form.submitted("3497 011 2332"))
+        assertNull(form.manualError)
     }
 
     @Test fun failedRoomLoadsKeepTheKnownRooms() {
@@ -49,18 +177,8 @@ class RegisterFormTest {
         form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
         form.rooms(ApiResult.Failed(ApiError.UNREACHABLE))
         assertEquals(listOf(Room(1, "寝室")), form.rooms)
-        assertEquals(1L, form.roomId)
+        assertTrue(form.roomsFailed)
         assertEquals(Status.Failed(ApiError.UNREACHABLE), form.status)
-    }
-
-    @Test fun aRoomLoadFailureOutlivesLaterMessages() {
-        val form = RegisterForm()
-        form.rooms(ApiResult.Failed(ApiError.UNREACHABLE))
-        assertTrue(form.roomsFailed)
-        form.status = Status.ScanFailed
-        form.scanned(qr)
-        assertTrue(form.roomsFailed)
-        form.rooms(ApiResult.Failed(ApiError.UNREACHABLE))
         form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
         assertFalse(form.roomsFailed)
         assertNull(form.status)
@@ -70,146 +188,27 @@ class RegisterFormTest {
         assertEquals(Status.Failed(ApiError.WRONG_CODE), form.status)
     }
 
-    @Test fun createdRoomsAreAddedAndSelected() {
+    @Test fun createdRoomsAreAdded() {
         val form = RegisterForm()
         form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
         form.roomCreated(ApiResult.Ok(Room(5, "書斎")))
         assertEquals(listOf(Room(1, "寝室"), Room(5, "書斎")), form.rooms)
-        assertEquals(5L, form.roomId)
         assertEquals(Status.RoomAdded("書斎"), form.status)
         form.roomCreated(ApiResult.Failed(ApiError.DUPLICATE_ROOM))
-        assertEquals(5L, form.roomId)
         assertEquals(Status.Failed(ApiError.DUPLICATE_ROOM), form.status)
     }
 
-    @Test fun aValidManualCodeIsAcceptedOnceAllDigitsAreTyped() {
-        val form = RegisterForm().apply { wifiRead(homeWifi) }
-        form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
-        form.scanned(qr)
-        assertFalse(form.typed("3497 011 233"))
-        assertEquals(qr, form.payload)
-        assertNull(form.manualError)
-        assertTrue(form.typed("3497 011 2332"))
-        assertEquals("34970112332", form.payload)
-        assertTrue(form.canRegister())
-        form.scanned(qr)
-        assertEquals(qr, form.payload)
-    }
-
-    @Test fun manualCodeErrorsShowAtOnceAndClearWhileEditing() {
+    @Test fun theWifiForDevicesIsMissingOnlyWhenHomeLinkHoldsNone() {
         val form = RegisterForm()
-        assertFalse(form.typed("3497 011 2331"))
-        assertEquals(ManualError.CHECK_DIGIT, form.manualError)
-        assertNull(form.payload)
-        form.typed("3497 011 233")
-        assertNull(form.manualError)
-        assertFalse(form.submitted("3497 011 233"))
-        assertEquals(ManualError.LENGTH, form.manualError)
-        assertFalse(form.submitted("3497 011 2331"))
-        assertEquals(ManualError.CHECK_DIGIT, form.manualError)
-        assertTrue(form.submitted("3497 011 2332"))
-        assertNull(form.manualError)
-    }
-
-    @Test fun registrationOntoWifiNeedsTheServersWifiForDevices() {
-        val form = RegisterForm()
-        form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
-        form.scanned(qr)
-        assertFalse(form.canRegister())
         assertFalse(form.wifiMissing)
-        // Saved, but none chosen for devices.
         form.wifiRead(ApiResult.Ok(listOf(SavedNetwork(1, "home-2g", false))))
-        assertFalse(form.canRegister())
         assertTrue(form.wifiMissing)
         form.wifiRead(ApiResult.Ok(listOf(SavedNetwork(1, "home-2g", false), SavedNetwork(2, "iot-2g", true))))
-        assertTrue(form.canRegister())
         assertEquals("iot-2g", form.deviceWifi)
         assertFalse(form.wifiMissing)
         // A failed read keeps what was read last.
         form.wifiRead(ApiResult.Failed(ApiError.UNREACHABLE))
-        assertTrue(form.canRegister())
-        // home-link refusing it for want of one shows it missing.
-        form.busy = true
-        form.commissioned(ApiResult.Failed(ApiError.WIFI_NOT_SET))
-        assertTrue(form.wifiMissing)
-        assertFalse(form.canRegister())
-    }
-
-    @Test fun threadRegistrationNeedsAReadyThreadNetworkInsteadOfWifi() {
-        val form = RegisterForm()
-        form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
-        form.scanned(qr)
-        form.wifiRead(homeWifi)
-        form.thread = true
-        assertNull(form.threadReady)
-        assertFalse(form.canRegister())
-        form.threadChecked(ApiResult.Ok(false))
-        assertEquals(false, form.threadReady)
-        assertFalse(form.canRegister())
-        form.threadChecked(ApiResult.Ok(true))
-        form.wifiRead(ApiResult.Ok(emptyList()))
-        assertTrue(form.canRegister())
-        // A failed check is not taken as ready.
-        form.threadChecked(ApiResult.Failed(ApiError.UNREACHABLE))
-        assertNull(form.threadReady)
-        assertTrue(form.threadFailed)
-        assertFalse(form.canRegister())
-    }
-
-    @Test fun aThreadNotReadyRefusalMarksTheNetworkNotReady() {
-        val form = RegisterForm().apply { thread = true }
-        form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
-        form.scanned(qr)
-        form.threadChecked(ApiResult.Ok(true))
-        form.busy = true
-        form.commissioned(ApiResult.Failed(ApiError.THREAD_NOT_READY))
-        assertEquals(false, form.threadReady)
-        assertEquals(qr, form.payload)
-        assertFalse(form.canRegister())
-    }
-
-    @Test fun commissioningClearsTheCodeAndNameOnlyOnSuccess() {
-        val form = RegisterForm()
-        form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
-        form.scanned(qr)
-        form.name = "押入れ1"
-        form.busy = true
-        form.stage = Stage.SENDING
-        form.commissioned(ApiResult.Failed(ApiError.WIFI_FAILED))
-        assertEquals(Status.Failed(ApiError.WIFI_FAILED), form.status)
-        assertEquals(qr, form.payload)
-        assertEquals("押入れ1", form.name)
-        assertFalse(form.busy)
-        assertNull(form.stage)
-
-        form.busy = true
-        form.bleFailed(BleProblem.BLUETOOTH_OFF)
-        assertEquals(Status.BleFailed(BleProblem.BLUETOOTH_OFF), form.status)
-        assertEquals(qr, form.payload)
-        assertFalse(form.busy)
-
-        form.commissioned(ApiResult.Ok(Commissioned("寝室", "押入れ1")))
-        assertEquals(Status.Commissioned(Commissioned("寝室", "押入れ1")), form.status)
-        assertNull(form.payload)
-        assertEquals("", form.name)
-        assertEquals(1L, form.roomId)
-    }
-
-    @Test fun cancellingReturnsToRegisteringAndKeepsTheInputs() {
-        val form = RegisterForm()
-        form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
-        form.scanned(qr)
-        form.wifiRead(homeWifi)
-        form.name = "押入れ1"
-        form.busy = true
-        form.stage = Stage.SENDING
-        form.cancelled()
-        assertFalse(form.busy)
-        assertNull(form.stage)
-        assertNull(form.status)
-        assertEquals(qr, form.payload)
-        assertEquals("押入れ1", form.name)
-        assertTrue(form.canRegister())
+        assertEquals("iot-2g", form.deviceWifi)
     }
 
     @Test fun proxyCommandsMarkTheStages() {
@@ -221,6 +220,4 @@ class RegisterFormTest {
             assertNull(other, Stage.of(other))
         }
     }
-
-    private val homeWifi = ApiResult.Ok(listOf(SavedNetwork(1, "home-2g", true)))
 }
