@@ -7,13 +7,17 @@ git clone https://github.com/miyabisun/home-link.git
 cd home-link
 ```
 
-利用者向けの説明は[README](../README.md)、Androidアプリの画面の規則は[DESIGN.md](../DESIGN.md)にあります。
+利用者向けの説明は[README](../README.md)、Webの管理画面とAndroidアプリの画面の規則は[DESIGN.md](../DESIGN.md)にあります。
 
 ## APIサーバー
 
 Rustのツールチェーンは `rust-toolchain.toml` の版を `rustup` が自動で選びます。
+サーバーはWebの管理画面（`client/dist`）を組み込んでビルドするので、先に画面をビルドします（Node.js 24）。
+`client/dist` が無いと `build.rs` がビルドを止めます。
 
 ```sh
+npm --prefix client ci
+npm --prefix client run build
 cargo run --locked
 ```
 
@@ -58,6 +62,42 @@ labelの操作のテストは、照明とプラグ（ブリッジ配下を含む
 上書きをやめた照明がほかのlabelの状態（自動調整か消灯）へ戻ること、スケジュールが時計を差し替えた各時刻（0時をまたぐ場合を含む）にONとOFFを送ることを検証します。
 v0.1.36（`user_version` 8）の形のDBを開き、labelと割り当てが残ることと、0.1.36のウィジェットとアプリが使う照明オン・照明オフ・「仕事」「作業」と自動調整が以前と同じ命令を送ることも確かめます。
 MCPのテストは、APIサーバーをループバックで立て、HTTPのclientとしてJSON-RPCで初期化・道具の一覧・各道具の呼び出しと失敗を確かめます。
+
+`tests/ui.rs` は、組み込んだ画面が `/` と画面のURLで返り、JSとCSSが正しい種類で返ること、`/api` と `/mcp` が画面へ流れないことを確かめます。
+
+## Webの管理画面
+
+画面は `client/` にあり、[rust-svelte-template](https://github.com/miyabi-sunny-side/rust-svelte-template) のSvelte 5（runes）とViteの構成から作りました。
+APIを `cargo run` で3000番に立てたまま、Viteの開発サーバーで画面を開けます（`/api` は3000番へ中継します）。
+
+```sh
+npm --prefix client run dev
+```
+
+変更後は次の検証を通してください。CIも同じ内容を実行します。
+
+```sh
+npm --prefix client run format:check
+npm --prefix client run check
+npm --prefix client test
+npm --prefix client run lint:design
+```
+
+`client/src/lib/admin.ts` は、入力の検査（名前の長さ、固定の明るさ・色温度、スケジュールの時刻）と、
+表示の組み立て（名前の無い機器の呼び名、状態、labelの要約、明るさの%と254段階の変換、入り切りの結果）を持ち、
+`admin.test.ts` で単体テストします。
+
+E2Eテストは、ChromiumとPlaywrightで、ビルドしたhome-link（`target/debug/home-link`）とmockのmatterjs-serverを相手に動きます。
+`client/e2e/serve.mjs` が一時ディレクトリの新しいDBでhome-linkを起動し、照明とプラグを1台ずつ返すmockを立て、台帳に機器を入れます。
+テストは画面を操作し、APIを通じてSQLiteのファイルに入った値を読んで確かめます（機器の名前・label・無視・削除、labelの作成・名前・調光・固定の値・スケジュール・機器・削除・入り切り）。
+`screens.spec.ts` は幅1280と390の明暗で全画面を撮り（`client/test-results/screens/`）、横のはみ出しと本文の内側の縦スクロールが無いことを確かめます。
+
+```sh
+npm --prefix client run build
+cargo build --locked
+npx --prefix client playwright install chromium
+npm --prefix client run test:e2e
+```
 
 コンテナは次のように作成し、確認できます。
 

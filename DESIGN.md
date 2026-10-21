@@ -1,16 +1,180 @@
+---
+version: alpha
+name: Sumi / home-link
+description: home-linkのWebの管理画面とAndroidアプリの意匠。
+colors:
+  primary: "#9a6a00"
+  accent: "#9a6a00"
+  accent-subtle: "rgba(154, 106, 0, 0.10)"
+  surface: "#faf6ef"
+  surface-raised: "#fffdf8"
+  on-surface: "#3a2f28"
+  muted: "#6f6257"
+  border: "#e3d9c9"
+  scrim: "rgba(58, 47, 40, 0.4)"
+  link: "#14506e"
+  danger: "#9c2b1d"
+  danger-subtle: "#f9e9e4"
+  wash-base: "#f6efe0"
+  wash-raised: "#faf4ea"
+  hover-1: "rgba(154, 106, 0, 0.10)"
+typography:
+  title:
+    fontFamily: system-ui
+    fontSize: 17px
+    fontWeight: 600
+    lineHeight: 1.3
+  body:
+    fontFamily: system-ui
+    fontSize: 16px
+    fontWeight: 400
+    lineHeight: 1.6
+  body-sm:
+    fontFamily: system-ui
+    fontSize: 14px
+    fontWeight: 400
+    lineHeight: 1.5
+  label:
+    fontFamily: system-ui
+    fontSize: 15px
+    fontWeight: 500
+    lineHeight: 1.2
+  caption:
+    fontFamily: system-ui
+    fontSize: 12px
+    fontWeight: 400
+    lineHeight: 1.4
+rounded:
+  sm: 6px
+  md: 8px
+  lg: 12px
+  full: 9999px
+spacing:
+  sp-1: 4px
+  sp-2: 8px
+  sp-3: 12px
+  sp-4: 16px
+  sp-5: 24px
+components:
+  app-header:
+    backgroundColor: "{colors.wash-base}"
+    textColor: "{colors.on-surface}"
+    height: 48px
+  sub-header:
+    backgroundColor: "{colors.wash-raised}"
+    textColor: "{colors.on-surface}"
+    height: 40px
+  hairline:
+    backgroundColor: "{colors.border}"
+    height: 1px
+  card:
+    backgroundColor: "{colors.surface-raised}"
+    textColor: "{colors.on-surface}"
+    rounded: "{rounded.md}"
+    padding: 10px
+  button:
+    backgroundColor: "{colors.surface-raised}"
+    textColor: "{colors.on-surface}"
+    typography: "{typography.label}"
+    rounded: "{rounded.sm}"
+    padding: 8px
+  button-hover:
+    backgroundColor: "{colors.hover-1}"
+  button-primary:
+    backgroundColor: "{colors.primary}"
+    textColor: "{colors.surface-raised}"
+    typography: "{typography.label}"
+    rounded: "{rounded.sm}"
+    padding: 8px
+  button-on:
+    backgroundColor: "{colors.accent-subtle}"
+    rounded: "{rounded.sm}"
+  button-danger:
+    backgroundColor: "{colors.surface-raised}"
+    textColor: "{colors.danger}"
+    rounded: "{rounded.sm}"
+  icon-button:
+    backgroundColor: "{colors.surface}"
+    textColor: "{colors.on-surface}"
+    rounded: "{rounded.sm}"
+    size: 36px
+  input:
+    backgroundColor: "{colors.surface}"
+    textColor: "{colors.on-surface}"
+    typography: "{typography.body}"
+    rounded: "{rounded.sm}"
+    padding: 8px
+  modal:
+    backgroundColor: "{colors.surface-raised}"
+    textColor: "{colors.on-surface}"
+    rounded: "{rounded.lg}"
+    padding: 16px
+  modal-scrim:
+    backgroundColor: "{colors.scrim}"
+  link:
+    backgroundColor: "{colors.surface}"
+    textColor: "{colors.link}"
+  error-banner:
+    backgroundColor: "{colors.danger-subtle}"
+    textColor: "{colors.danger}"
+    typography: "{typography.body-sm}"
+    rounded: "{rounded.sm}"
+    padding: 8px
+  spinner:
+    textColor: "{colors.accent}"
+    size: 18px
+  badge:
+    backgroundColor: "{colors.surface-raised}"
+    textColor: "{colors.muted}"
+    typography: "{typography.caption}"
+    rounded: "{rounded.full}"
+    padding: 4px
+---
+
 # home-link
 
 住まいの機器を、名前とlabelで扱えるようにする。
-共通デザイン原本は「rust-svelte-template / DESIGN.md」（2026-10-05参照）。
-そのSumi/Kinariと情報密度の規則を、AndroidアプリのAndroid標準Viewへ適用した。
+共通デザイン原本は「rust-svelte-template / DESIGN.md」（2026-10-21参照）。
+そのSumi/Kinariと情報密度の規則を、Webの管理画面とAndroidアプリのAndroid標準Viewへ適用した。
+frontmatterはKinariの値を持つ。
+
+## Webの管理画面
+
+2026-10-21のuser要求（task ecb6ccb0、「GitHubへのリンクではなく、機器を修正・管理する管理画面を作れと言ったはず」
+「ラベル管理・機器管理はアプリではなく、Webサーバのフロントエンドの仕事である」「rust-svelte-templateを使って実装すること」）により、
+機器とlabelの管理はhome-linkのサーバーが出すWebの画面で行う。家のLANとtailnetの出先から開く。
+2026-10-20のuser要求（「なんで文字を削れってあれだけknowledge等で指示しているのに兎に角文字を増やして画面を埋めれば良いって発想になるのか」）により、
+説明文を常設せず、画面の文字は対象の名前・状態・操作に要るものだけにする。
+
+- 原本の画面構成をそのまま使う。全幅48pxのstickyなapp header（左にホームへ戻るアプリ名、右に36pxのメニューボタン）、
+  詳細の40pxのsub-header（項目名だけを1行）、本文は中央最大720px・左右12pxの通常の文書フローとする。
+  ブレークポイントは768pxで、上下の余白は狭幅16px・広幅24px。幅320px以上でページを横にはみ出させない。
+- ホームは機器の一覧、labelの一覧はメニューから開く。メニューの先頭は原本どおりテーマ設定とし、ホームと同じ画面の項目は置かない（担当判断）。
+- 一覧はカードの1列とし、名前を主役にする。所属するlabelや設定の要約は注記の大きさとmutedで添え、
+  入っている状態と注意の要る状態だけを枠付きのバッジで示す（切れている・接続済みの通常の状態は示さない）。名前の無い機器は機器自身が報告する名前で示す。
+- 詳細は上から1列で、注記の大きさのラベルを入力の上に置く。変えた値はその場で送り、保存ボタンは置かない。
+  入力の誤りはその入力の直下に失敗の色で示し、それ以外の失敗は本文の先頭に失敗の面で示す。どちらも読み上げる。
+- 入り切りの操作は状態を文字で示すボタンとし、入っている間はaccent-subtleの面とaccentの縁で示す。
+- 選べる項目が複数のときはチェックボックスの列、1つを選ぶときはセレクトボックスとする。チェックボックスはaccentで塗り、行の高さは44px以上とする。
+- 削除は台帳やlabelの設定を失うため、名前を示した確認のモーダルを開いてから行う（担当判断）。
+- 塗りつぶす主操作は画面に最大1つとする。削除のボタンは通常のボタンに失敗の色の文字で示す。
+- テーマはOSに追従し、メニューのテーマ設定（自動・ライト・ダーク）で固定できる。設定はブラウザのlocalStorageの `home-link:theme` に保存し、初回描画前に適用する。
+- 色・寸法・部品・フォーカス・動きは原本の値を使い、client/src/global.sassのCSS変数に集める。アイコンは原本の辞書（client/src/lib/Icon.svelte）から使う。
+
+## 画面の確認（Web）
+
+同じデータで、幅1280と390、明暗の両方を実ブラウザで撮り、ページの横のはみ出しが0、本文に内側の縦スクロールが無いこと、
+390pxのheaderの操作対象がアプリ名とメニューの2つだけで、メニューがボタンの右端にそろうことを確かめる。
+長い機器名、未接続、空と読込の失敗、入力の誤り、削除の確認を含める。
 
 ## Androidアプリ
 
-- 2026-10-21のuser要求（task d2173c32・9aca0242、「自宅の電球の一括ON・OFF周りの仕様がごちゃついているので、仕様を統一させましょう」
-  「管理画面やMCPではラベルに対してスケジューリング設定が出来る」）により、全部オン・全部オフの2つのボタンをlabelの一覧に置き換え、
-  普段の操作として画面の最初に置く。機器の登録はその下に続く初回準備とする。
-  各labelの横に状態を示す入り切りのボタンを置き、名前からlabelの画面を開く（並べ方は担当判断）。
-  labelの画面は名前・機器・調光・スケジュールを上から1列で示し、変えた値はすぐ送る。自動調光と固定の値は同時に持てないので、1つのセレクトボックスで選ぶ。
+- 2026-10-21のuser要求（task d2173c32、「自宅の電球の一括ON・OFF周りの仕様がごちゃついているので、仕様を統一させましょう」）により、
+  全部オン・全部オフの2つのボタンをlabelの一覧に置き換え、普段の操作として画面の最初に置く。機器の登録はその下に続く初回準備とする。
+  各labelの横に状態を示す入り切りのボタンを置く（並べ方は担当判断）。
+- アプリのlabelの画面（名前・機器・調光・スケジュール）は、task 9aca0242の担当がuserの「管理画面やMCPではラベルに対してスケジューリング設定が出来る」
+  の「管理画面」をアプリの画面と解して作った（担当の誤り）。2026-10-21のuser要求（task ecb6ccb0、「ラベル管理・機器管理はアプリではなく、Webサーバのフロントエンドの仕事である」）により、
+  labelと機器の管理は上の「Webの管理画面」が受け持つ。アプリの画面の扱いはtask 2059250eが決める。
 - labelの切り替えは、送信中はそのボタンを押せなくし、成功ではボタンの状態だけを変える。
   1台でも切り替えられなかった機器があれば、結果の行に失敗の色とアイコンで示す。
 - 2026-10-20のuser要求（task 79bec4f7、「WiFiの電球とかThreadの電球とかの区分より真っ先にMatterのQRコードを読むように」
