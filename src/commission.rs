@@ -151,9 +151,24 @@ pub async fn move_wifi(
 ) -> Result<Move, String> {
     let mut ws = connect(url).await?;
     let result = moving(&mut ws, node_id, from, ssid, password, times).await;
+    if matches!(result, Ok(Move::Done)) {
+        reinterview(&mut ws, node_id).await;
+    }
     forget_wifi(&mut ws).await;
     let _ = ws.close(None).await;
     result.map_err(|Dropped(error)| error)
+}
+
+const INTERVIEW_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Has matterjs-server read the node again, whose cache keeps the old network after a move.
+/// The move stands either way.
+async fn reinterview(ws: &mut Socket, node_id: u64) {
+    let request = json!({ "command": "interview_node", "args": { "node_id": node_id } });
+    match request_until(ws, request, Instant::now() + INTERVIEW_TIMEOUT).await {
+        Ok(Some(reply)) if reply.get("error_code").is_none() => {}
+        _ => tracing::warn!(node_id, "matterjs-server may still show the old Wi-Fi"),
+    }
 }
 
 async fn moving(

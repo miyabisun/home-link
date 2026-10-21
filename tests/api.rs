@@ -3322,7 +3322,8 @@ async fn door_commands_reach_candy_house_from_any_address() {
 enum Join {
     /// Answers `ConnectNetwork` and completes on the new network.
     Answers,
-    /// Leaves without answering `ConnectNetwork`; the first completion fails, the next lands.
+    /// Leaves without answering `ConnectNetwork`; the first completion fails, the next lands,
+    /// and matterjs-server cannot read it again yet.
     Silent,
     /// Refuses the new network in its `ConnectNetwork` answer, then answers on the old one.
     Refuses,
@@ -3345,7 +3346,8 @@ fn wifi_bulb() -> Value {
 }
 
 /// Serves `nodes` and answers a Wi-Fi move the way `join` says, recording every command.
-async fn fake_mover(nodes: Value, join: Join) -> (SocketAddr, Arc<Mutex<Vec<Value>>>) {
+/// Like matterjs-server, the nodes served keep the old network until the bulb is interviewed.
+async fn fake_mover(mut nodes: Value, join: Join) -> (SocketAddr, Arc<Mutex<Vec<Value>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let commands = Arc::new(Mutex::new(Vec::new()));
@@ -3369,6 +3371,11 @@ async fn fake_mover(nodes: Value, join: Join) -> (SocketAddr, Arc<Mutex<Vec<Valu
                 let reply = match command["command"].as_str().unwrap() {
                     "get_nodes" => ok(nodes.clone()),
                     "remove_wifi_credentials" => ok(json!({})),
+                    "interview_node" if join == Join::Silent => unreachable,
+                    "interview_node" => {
+                        nodes[0]["attributes"]["0/49/1"] = json!([{ "0": IOT_2G, "1": true }]);
+                        ok(Value::Null)
+                    }
                     "read_attribute" if join == Join::Lost => unreachable,
                     "read_attribute" => ok(json!({ "0/49/1": [{ "0": HOME_2G, "1": true }] })),
                     "device_command" => match command["args"]["command_name"].as_str().unwrap() {
@@ -3498,9 +3505,11 @@ async fn a_bulb_moves_to_the_wifi_for_devices_under_a_fail_safe() {
             "AddOrUpdateWiFiNetwork",
             "ConnectNetwork",
             "CommissioningComplete",
+            "interview_node",
             "remove_wifi_credentials"
         ]
     );
+    assert_eq!(sent(&commands)[5]["args"], json!({ "node_id": 17 }));
     let args: Vec<Value> = sent(&commands).iter().map(|c| c["args"].clone()).collect();
     for (args, cluster) in args.iter().zip([48, 49, 49, 49, 48]) {
         assert_eq!(
@@ -3527,6 +3536,7 @@ async fn a_bulb_moves_to_the_wifi_for_devices_under_a_fail_safe() {
     assert_eq!(args[4]["payload"], json!({}));
 
     let (_, list) = call(&app, "GET", "/api/devices", None).await;
+    assert_eq!(list[0]["wifi_ssid"], "iot-2g");
     let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
     assert!(logs.contains("wifi"), "logs were not captured: {logs}");
     for secret in [IOT_PASSWORD, IOT_PASSWORD_BASE64] {
@@ -3552,6 +3562,8 @@ async fn a_bulb_that_drops_off_without_answering_still_moves() {
             "ConnectNetwork",
             "CommissioningComplete",
             "CommissioningComplete",
+            // Failing to read the bulb again leaves the move done.
+            "interview_node",
             "remove_wifi_credentials"
         ]
     );
