@@ -1,12 +1,12 @@
 # home-link
 
-住まいの機器を、部屋と名前で記録するサービスです。
-照明とスマートプラグにlabel（「room」「work」など）を付け、labelごとにON・OFF・切り替え、
+住まいの機器を、名前とlabelで記録するサービスです。
+照明とスマートプラグにlabel（「ambient」「work」など）を付け、labelごとにON・OFF・切り替え、
 明るさと色温度の自動調整への連動、ONの間の明るさの固定、毎日の時刻でのON・OFFを設定できます。
 labelの操作と設定は、APIのほかMCP（AIエージェント向けの道具）からも行えます。
 スマートプラグなど照明以外のMatterの機器は、1台ずつ入り切りもできます。
 玄関のSESAME 5なども、ホーム画面のボタン1つで家の外から解錠・施錠できます（CANDY HOUSEのWeb API経由）。
-機器に印刷されたMatterのQRコードをAndroidアプリで読み取り、部屋と名前を付けて登録します。
+機器に印刷されたMatterのQRコードをAndroidアプリで読み取り、名前とlabelを付けて登録します。
 QRコードが無い機器は、印字された11桁の数字（Matterの手動ペアリングコード）を入力して登録します。
 新しいWi-FiとThreadの機器（Aqara T2など）は、電話のBluetoothで直接つなぎ、家のWi-FiかThread網とmatterjs-serverへ入れてから台帳に登録できます。
 登録した内容は、自宅サーバーで動くhome-linkのAPIがSQLiteに保存します。
@@ -192,9 +192,9 @@ Thread網の資格情報（dataset）は、matterjs-serverに `set_thread_datase
    0.1.31までの版がこの電話に保存したWi-Fiは、更新後の初回起動で一度だけhome-linkへ移し、電話からは消します。
    保存したWi-Fiは、どの電話から接続しても使われます。登録の画面ではWi-Fiを選んだり入力したりしません。
 2. 「QRを読み取る」で機器のQRコードを読みます。QRコードが無い機器は「数字で入力」で、機器に印字された11桁の数字を入力します。
-   読んだ時点で機器はhome-linkの台帳に入り、その機器の面（コード・接続の状態・機器名・部屋・ラベル）が開きます。
+   読んだ時点で機器はhome-linkの台帳に入り、その機器の面（コード・接続の状態・機器名・ラベル）が開きます。
    台帳にある機器のコードを読むと、新しく入れずにその機器の面を開きます。
-   機器名・部屋・ラベルは、変えるとすぐhome-linkに送ります。部屋が無ければ「部屋を追加」で作成します。
+   機器名・ラベルは、変えるとすぐhome-linkに送ります。
 3. 機器をペアリング待ちにし（BEAMTECは電源のオフ・オンを5回、Aqara T2は1秒間隔で10回くり返します。ほかはメーカーの手順に従います）、「接続」を押します。
    初回は「付近のデバイス」の許可を求めます。Android 17では、家のネットワークにあるmatterjs-serverへの接続もこの許可に含まれます。
    Bluetoothがオフならオンにするよう求めます。
@@ -230,20 +230,16 @@ Thread網の資格情報（dataset）は、matterjs-serverに `set_thread_datase
 
 | メソッドとパス | 内容 | 主な失敗 |
 | --- | --- | --- |
-| `GET /api/rooms` | 部屋の一覧（登録された機器の台数つき） | |
-| `POST /api/rooms` | 部屋の作成。本文は `{"name": "寝室"}` | 400 `invalid_room_name`、409 `duplicate_room_name` |
-| `PATCH /api/rooms/{id}` | 部屋の名前の変更。本文は作成と同じ | 404 `room_not_found`、409 `duplicate_room_name` |
-| `DELETE /api/rooms/{id}` | 部屋の削除。機器が残っている部屋は削除しません | 404 `room_not_found`、409 `room_has_devices` |
 | `GET /api/devices` | 機器の一覧。接続の状態 `state`（`unconnected`・`connected`・`no_response`）と製品の情報を含み、コードは含みません。接続したことのある機器には、Matterのdevice typeから求めた種類 `kind`（`light`・`plug`・`other`）を付けます。照明以外で入り切りできる機器には、最後に読んだ入・切 `on`（`true`・`false`）を付けます | |
 | `POST /api/devices` | QRコードか11桁のコードだけで機器を台帳に入れます。本文は `{"qr_payload": "MT:…"}` か `{"manual_code": "…"}`。新しい行は201、同じ機器の行があれば作らずに200で返します（`registered`） | 400 `missing_setup_code`・`invalid_qr_payload`・`invalid_manual_code` |
 | `GET /api/devices/{id}` | 機器1台。一覧の項目に、登録したコードの全文 `qr_payload` または `manual_code` を加えます | 404 `device_not_found` |
-| `PATCH /api/devices/{id}` | 機器の名前・部屋・labelの割り当て・無視の設定。本文は送った項目だけを変えます。`{"name": "押入れ1"}`、`{"room_id": 2}`（`null` で部屋から外す）、`{"label_ids": [1, 2]}`（割り当てを置き換え、`[]` で外す）、`{"ignored": true}`（`false` で戻す） | 400 `invalid_device_update`・`invalid_device_name`、404 `device_not_found`・`room_not_found`・`label_not_found` |
+| `PATCH /api/devices/{id}` | 機器の名前・labelの割り当て・無視の設定。本文は送った項目だけを変えます。`{"name": "押入れ1"}`、`{"label_ids": [1, 2]}`（割り当てを置き換え、`[]` で外す）、`{"ignored": true}`（`false` で戻す） | 400 `invalid_device_update`・`invalid_device_name`、404 `device_not_found`・`label_not_found` |
 | `POST /api/devices/{id}/commission` | 台帳の機器を、記録したコードでmatterjs-serverへBluetoothで登録（commissioning）し、その行に識別子を補います。本文は要りません | 404 `device_not_found`、409 `no_setup_code`、422 `device_not_found`・`wrong_code`・`wifi_failed`・`thread_failed`・`commission_failed`、504 `commission_timeout`、502 `matter_server_unreachable`、503 `matter_server_not_configured`・`bluetooth_unavailable` |
 | `POST /api/devices/{id}/wifi` | 接続済みのWi-Fiの機器を、初期化せずに機器に渡すWi-Fi（`for_devices`）へ移します。本文は要りません。既にそのWi-Fiにいれば何も送りません。成功すると `{"device": {…}}` を200で返します | 404 `device_not_found`、409 `wifi_not_set`・`not_on_wifi`、422 `wifi_reverted`、504 `wifi_reverting`、502 `matter_server_unreachable`、503 `matter_server_not_configured` |
 | `POST /api/devices/{id}/on`・`/off` | プラグなど、照明以外で入り切りできる機器1台を入・切にします。応答は `{"state": "on"}`・`"off"`・`"no_response"`（応答しない・時間内に答えない機器） | 404 `device_not_found`、409 `not_connected`・`not_switchable`（照明と、入り切りの無い機器）、502 `switch_failed`・`matter_server_unreachable`、503 `matter_server_not_configured` |
 | `DELETE /api/devices/{id}` | 機器の削除 | 404 `device_not_found` |
 | `GET /api/labels` | labelの一覧。性質（`auto`・`override_level`・`override_kelvin`）、毎日の切り替え `schedule`、最後のON・OFF `on`（`true`・`false`・未操作の `null`）、割り当てた機器の台数 `device_count`、上書き中か `boosted` つき | |
-| `POST /api/labels` | labelの作成。本文は `{"name": "work", "override_level": 254, "override_kelvin": 5000}`、`{"name": "room", "auto": true}`、`{"name": "razor", "schedule": [{"time": "00:00", "on": true}, {"time": "05:00", "on": false}]}` など（下の「label」） | 400 `invalid_label_name`・`invalid_label`、409 `duplicate_label_name` |
+| `POST /api/labels` | labelの作成。本文は `{"name": "work", "override_level": 254, "override_kelvin": 5000}`、`{"name": "ambient", "auto": true}`、`{"name": "razor", "schedule": [{"time": "00:00", "on": true}, {"time": "05:00", "on": false}]}` など（下の「label」） | 400 `invalid_label_name`・`invalid_label`、409 `duplicate_label_name` |
 | `PATCH /api/labels/{id}` | labelの名前・性質・`schedule` のうち、送った項目だけを変更します。`override_level`・`override_kelvin` を `null` にすると上書きの値を外し、`schedule` は送ったもので置き換えます（`[]` で消す） | 400 `invalid_label_name`・`invalid_label`、404 `label_not_found`、409 `duplicate_label_name` |
 | `DELETE /api/labels/{id}` | labelの削除。割り当てた機器は、ほかのlabelだけになります | 404 `label_not_found` |
 | `POST /api/labels/{id}/on`・`/off`・`/toggle` | labelの機器（照明とプラグ、無視の機器を除く）をON・OFF・切り替えにします（下の「label」）。応答は、行った操作 `action`（`on`・`off`・`release`）、操作後の `on`・`boosted`、件数（`switched`・`no_response`・`failed`・`missing`）、機器ごとの結果 `devices` と、見つからない機器 `missing_devices` です | 404 `label_not_found`、422 `label_has_no_devices`、503 `matter_server_not_configured`、502 `matter_server_unreachable` |
@@ -251,7 +247,7 @@ Thread網の資格情報（dataset）は、matterjs-serverに `set_thread_datase
 | `POST /api/wifi` | Wi-Fiの保存。本文は `{"ssid": "home-2g", "password": "…"}`。同じSSIDならパスワードを置き換えます。最初の1つ、または `"for_devices": true` で送ったものを機器に渡します | 400 `invalid_wifi` |
 | `PUT /api/wifi/devices` | 機器に渡すWi-Fiの指定。本文は `{"id": 2}` | 404 `wifi_not_found` |
 | `DELETE /api/wifi/{id}` | Wi-Fiの削除。機器に渡すものを消すと、残りの最初のものを渡します | 404 `wifi_not_found` |
-| `POST /api/commission` | 0.1.32までのアプリの登録。部屋とWi-FiかThreadかを指定して機器をmatterjs-serverへBluetoothで登録（commissioning）し、台帳に登録 | 400 `missing_setup_code`・`invalid_qr_payload`・`invalid_manual_code`・`invalid_network`・`invalid_device_name`、404 `room_not_found`、409 `wifi_not_set`、422 `device_not_found`・`wrong_code`・`wifi_failed`・`thread_failed`・`commission_failed`、504 `commission_timeout`、502 `matter_server_unreachable`、503 `matter_server_not_configured`・`bluetooth_unavailable`・`thread_not_ready` |
+| `POST /api/commission` | 0.1.32までのアプリの登録。Wi-FiかThreadかを指定して機器をmatterjs-serverへBluetoothで登録（commissioning）し、台帳に登録 | 400 `missing_setup_code`・`invalid_qr_payload`・`invalid_manual_code`・`invalid_network`・`invalid_device_name`、409 `wifi_not_set`、422 `device_not_found`・`wrong_code`・`wifi_failed`・`thread_failed`・`commission_failed`、504 `commission_timeout`、502 `matter_server_unreachable`、503 `matter_server_not_configured`・`bluetooth_unavailable`・`thread_not_ready` |
 | `GET /api/thread` | Threadの機器を登録できるか（matterjs-serverがThread網のdatasetを持つか）を `{"ready": true}` で返します | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `GET /api/status` | 台帳の機器ごとに、matterjs-serverで見えるか（`visible`）と今の `node_id`・`endpoint` | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `GET /api/lights` | 照明ごとの今の状態（`on`・`off`・`no_response`・`ignored`）と、無視の照明を除いた件数 | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
@@ -266,11 +262,11 @@ Thread網の資格情報（dataset）は、matterjs-serverに `set_thread_datase
 | `GET /api/health` | 稼働確認と版（`{"status":"ok","version":"0.1.4"}`） | |
 | `GET /healthz` | 稼働確認（`ok`） | |
 
-部屋の名前は前後の空白を除いて1〜100文字、機器名は0〜100文字です。
+機器名は0〜100文字です。
 
 ### QRコードを読んだ時点で台帳に入れ、後から接続する
 
-機器は、QRコード（または11桁のコード）を読んだ時点で `POST /api/devices` で台帳に入ります。部屋と名前は無くてよく、
+機器は、QRコード（または11桁のコード）を読んだ時点で `POST /api/devices` で台帳に入ります。名前は無くてよく、
 後から `PATCH /api/devices/{id}` で付けます。QRコードからはVendor ID・Product ID（`vendor_id`・`product_id`）を読んで持ちます。
 11桁のコードには入っていないので、その場合は `null` です。製品名（`product_name`）は、接続した機器がmatterjs-serverへ報告したものです。
 同じ機器かどうかは、登録と同じくsetup passcodeとdiscriminatorの上位4ビットで判定します。
@@ -288,7 +284,7 @@ Wi-FiかThreadかは指定せず、機器の申告からmatterjs-serverが決め
 接続できたら、その行にVendorName・SerialNumber・Wi-FiのMACアドレスを補い、`{"node_id": …, "device": {…}}` を200で返します。
 失敗の分類と打ち切りの時間は `POST /api/commission` と同じです。失敗した行はそのまま残り、`unconnected` のままです。
 同じ識別子の機器が台帳の別の行にあれば（初期化して読み直した機器など）、その行を残し、読んだ行のコード、
-その行に無い名前と部屋を移して、読んだ行を消します。labelと無視の設定は残した行のものです。
+その行に無い名前を移して、読んだ行を消します。labelと無視の設定は残した行のものです。
 
 `POST /api/devices/{id}/wifi` は、Matterの仕様の手順でWi-Fiを差し替えます。
 まず `device_command` で、機器のGeneral CommissioningにArmFailSafe（2分）を送ります。
@@ -309,7 +305,7 @@ QRコードと手動ペアリングコードは、setup passcodeとdiscriminator
 識別子は、matterjs-serverが機器から読んだBasic Information（ブリッジ配下の機器はBridged Device Basic Information）の
 VendorNameとSerialNumberです。Aqara Hub M3配下のT2ではZigbeeのIEEEアドレス、TapoではWi-FiのMACがSerialNumberになります。
 
-`POST /api/commission` は、本文の `room_id`、`qr_payload` か `manual_code` のどちらか一方、`name`（任意）、
+`POST /api/commission` は、本文の `qr_payload` か `manual_code` のどちらか一方、`name`（任意）、
 `network`（`wifi` か `thread`、既定は `wifi`）を受け取ります。`wifi` では、保存したWi-Fiのうち機器に渡すもの（`for_devices`）を
 matterjs-serverへ `set_wifi_credentials` で渡してから、`commission_with_code`（`network_only: false`）でBluetooth経由の登録を行います。
 機器に渡すWi-Fiが無ければ、登録を始めずに409 `wifi_not_set` を返します。本文のWi-Fiの項目は使いません。
@@ -351,7 +347,7 @@ curl -X PATCH http://home-link.example:5011/api/devices/7 -H 'content-type: appl
 ### label
 
 labelは、照明とプラグ（On/Offを持つMatterの機器）をまとめて操作する単位です。1台に複数のlabelを付けられます（`PATCH /api/devices/{id}` の `label_ids`）。
-labelは部屋とは別に持ちます。SESAMEなどの錠はlabelの対象ではありません。
+SESAMEなどの錠はlabelの対象ではありません。
 
 labelには、次の性質を持たせられます。
 
@@ -384,21 +380,21 @@ labelの操作（`POST /api/labels/{id}/on`・`/off`・`/toggle`）は、label�
 
 | label | 性質 | 使い方 |
 | --- | --- | --- |
-| `room` | `auto: true` | 部屋の照明。ON/OFFで点け消しし、点いている間は自動調整に従います |
+| `ambient` | `auto: true` | 普段の照明。ON/OFFで点け消しし、点いている間は自動調整に従います |
 | `work` | 上書き 254・5000K | 仕事用のデスクライト。切り替えで100%・5000Kで点け、もう一度押すと消えます |
-| `game`・`kitchen` | 上書き 203・5000K | `room` の照明の一部。切り替えで昼の明るさにし、もう一度押すと `room` の自動調整に戻ります |
+| `game`・`kitchen` | 上書き 203・5000K | `ambient` の照明の一部。切り替えで昼の明るさにし、もう一度押すと `ambient` の自動調整に戻ります |
 | `razor` | `schedule` 00:00 ON・05:00 OFF | 電気シェーバーをつないだプラグ。夜中だけ電源を入れます |
 
 ```sh
-curl -X POST http://home-link.example:5011/api/labels -H 'content-type: application/json' -d '{"name":"room","auto":true}'
-# 201 {"id":1,"name":"room","auto":true,"override_level":null,"override_kelvin":null,"on":null,"schedule":[],"device_count":0,"boosted":false}
+curl -X POST http://home-link.example:5011/api/labels -H 'content-type: application/json' -d '{"name":"ambient","auto":true}'
+# 201 {"id":1,"name":"ambient","auto":true,"override_level":null,"override_kelvin":null,"on":null,"schedule":[],"device_count":0,"boosted":false}
 
 curl -X PATCH http://home-link.example:5011/api/devices/5 -H 'content-type: application/json' -d '{"label_ids":[1,2]}'
-# {"id":5,…,"labels":[{"id":1,"name":"room"},{"id":2,"name":"game"}],…}
+# {"id":5,…,"labels":[{"id":1,"name":"ambient"},{"id":2,"name":"game"}],…}
 
 curl -X POST http://home-link.example:5011/api/labels/2/toggle
 # {"label":"game","action":"on","on":true,"boosted":true,"switched":3,"no_response":0,"failed":0,"missing":0,
-#  "devices":[{"node_id":1,"endpoint":3,"name":"リビング1","room_name":"リビング","result":"switched"},…],"missing_devices":[]}
+#  "devices":[{"node_id":1,"endpoint":3,"name":"リビング1","result":"switched"},…],"missing_devices":[]}
 ```
 
 ### 明るさと色温度の自動調整
@@ -452,13 +448,13 @@ curl -X POST http://home-link.example:5011/api/labels/2/toggle
 ```sh
 curl -X PUT http://home-link.example:5011/api/lights/schedule -H 'content-type: application/json' -d '{"enabled":true}'
 # {"settings":{"enabled":true,"latitude":35.6895,"longitude":139.6917,"morning_end_minute":600,"day_level":203,"night_level":102,"warm_kelvin":3000,"cool_kelvin":5000,"late_night_percent":50},
-#  "labels":[{"id":1,"name":"room","auto":true,…,"devices":[{"id":5,"name":"リビング1","room_name":"リビング"},…]},…],"runs":[…]}
+#  "labels":[{"id":1,"name":"ambient","auto":true,…,"devices":[{"id":5,"name":"リビング1"},…]},…],"runs":[…]}
 
 curl http://home-link.example:5011/api/lights/schedule
 # {…,"runs":[{"at":"2026-10-05T23:00:00+09:00","trigger":"scheduled","sunrise":"05:39","sunset":"17:23","level":102,"kelvin":3000,"commands":2,
-#   "lights":[{"node_id":1,"endpoint":3,"name":"リビング1","room_name":"リビング","labels":["room"],"target_level":102,"target_kelvin":3000,
+#   "lights":[{"node_id":1,"endpoint":3,"name":"リビング1","labels":["ambient"],"target_level":102,"target_kelvin":3000,
 #              "decision":"sent","level":102,"mireds":333},
-#             {"node_id":5,"endpoint":1,"name":"デスク","room_name":"寝室","labels":["work"],"target_level":102,"target_kelvin":3000,"decision":"manual"},…]},…]}
+#             {"node_id":5,"endpoint":1,"name":"デスク","labels":["work"],"target_level":102,"target_kelvin":3000,"decision":"manual"},…]},…]}
 ```
 
 ### 0.1.36からの移行
@@ -497,34 +493,28 @@ claude mcp add --transport http home-link http://home-link.example:5011/mcp
 ### 例
 
 ```sh
-curl -X POST http://home-link.example:5011/api/rooms -H 'content-type: application/json' -d '{"name":"寝室"}'
-# {"id":1,"name":"寝室","device_count":0}
-
 curl -X POST http://home-link.example:5011/api/devices -H 'content-type: application/json' \
   -d '{"qr_payload":"MT:Y.K9042C00KA0648G00"}'
-# 201 {"registered":true,"device":{"id":9,"room_id":null,"room_name":null,"name":"","vendor":null,"serial_number":null,"mac":null,
+# 201 {"registered":true,"device":{"id":9,"name":"","vendor":null,"serial_number":null,"mac":null,
 #      "vendor_id":65521,"product_id":32768,"state":"unconnected","product_name":null,"labels":[],"ignored":false,"created_at":"2026-10-21T03:30:00Z"}}
 
 curl -X POST http://home-link.example:5011/api/devices/9/commission
 # 200 {"node_id":17,"device":{"id":9,…,"vendor":"Tapo","serial_number":"AABBCCDDEEFF","mac":"AABBCCDDEEFF","state":"connected","product_name":"Smart Bulb",…}}
 # 422 {"error":"wifi_failed","message":"機器がWi-Fi「home-2g」に接続できませんでした"}
 
-curl -X PATCH http://home-link.example:5011/api/devices/9 -H 'content-type: application/json' -d '{"name":"押入れ1","room_id":2}'
+curl -X PATCH http://home-link.example:5011/api/devices/9 -H 'content-type: application/json' -d '{"name":"押入れ1"}'
 
 curl http://home-link.example:5011/api/status
-# {"devices":[{"endpoint":null,"id":1,"name":"天井灯","node_id":null,"room_name":"寝室","visible":false},{"endpoint":0,"id":2,"name":"読書灯","node_id":5,"room_name":"寝室","visible":true}],"version":"0.1.4"}
+# {"devices":[{"endpoint":null,"id":1,"name":"天井灯","node_id":null,"visible":false},{"endpoint":0,"id":2,"name":"読書灯","node_id":5,"visible":true}],"version":"0.1.4"}
 
 curl -X POST http://home-link.example:5011/api/lights/off
 # {"action":"off","switched":10,"no_response":1,"failed":0,"missing":1,
-#  "lights":[{"node_id":1,"endpoint":2,"name":"Aqara LED Bulb T2","room_name":null,"result":"no_response"},
-#            {"node_id":5,"endpoint":1,"name":"読書灯","room_name":"寝室","result":"switched"},…],
-#  "missing_devices":[{"id":1,"name":"天井灯","room_name":"寝室"}]}
+#  "lights":[{"node_id":1,"endpoint":2,"name":"Aqara LED Bulb T2","result":"no_response"},
+#            {"node_id":5,"endpoint":1,"name":"読書灯","result":"switched"},…],
+#  "missing_devices":[{"id":1,"name":"天井灯"}]}
 
 curl http://home-link.example:5011/api/lights
-# {"on":0,"off":10,"no_response":1,"missing":1,"lights":[{"node_id":5,"endpoint":1,"name":"読書灯","room_name":"寝室","state":"off"},…],"missing_devices":[…]}
-
-curl -X DELETE http://home-link.example:5011/api/rooms/1
-# {"error":"room_has_devices","message":"この部屋には機器が1台登録されています。先に機器を削除してください"}
+# {"on":0,"off":10,"no_response":1,"missing":1,"lights":[{"node_id":5,"endpoint":1,"name":"読書灯","state":"off"},…],"missing_devices":[…]}
 ```
 
 ## 開発
