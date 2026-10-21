@@ -407,7 +407,7 @@ dependencies = [
 
 [[package]]
 name = "home-link"
-version = "0.1.41"
+version = "0.1.42"
 dependencies = [
  "aes",
  "axum",
