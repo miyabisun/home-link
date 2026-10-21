@@ -599,21 +599,21 @@ mod tests {
 
     #[test]
     fn a_lights_labels_decide_whether_it_is_held_adjusted_or_left() {
-        let room = label(true, None, None);
-        let room_off = label(true, None, Some(false));
+        let ambient = label(true, None, None);
+        let ambient_off = label(true, None, Some(false));
         let living = label(true, None, Some(true));
         let game = label(false, Some((203, 5000)), Some(true));
         let game_released = label(false, Some((203, 5000)), Some(false));
         let work = label(false, Some((254, 5000)), Some(true));
         let hallway = label(false, None, Some(true));
         // An override on wins over everything; the first one given wins over another.
-        assert_eq!(rule([&room, &game]), Rule::Fixed(203, 5000));
+        assert_eq!(rule([&ambient, &game]), Rule::Fixed(203, 5000));
         assert_eq!(rule([&work, &game]), Rule::Fixed(254, 5000));
-        assert_eq!(rule([&room_off, &game]), Rule::Fixed(203, 5000));
+        assert_eq!(rule([&ambient_off, &game]), Rule::Fixed(203, 5000));
         // An auto label never switched, or on, adjusts; all auto labels off do not.
-        assert_eq!(rule([&room, &game_released]), Rule::Auto);
-        assert_eq!(rule([&room_off, &living]), Rule::Auto);
-        assert_eq!(rule([&room_off]), Rule::AutoOff);
+        assert_eq!(rule([&ambient, &game_released]), Rule::Auto);
+        assert_eq!(rule([&ambient_off, &living]), Rule::Auto);
+        assert_eq!(rule([&ambient_off]), Rule::AutoOff);
         // Without an auto label nothing is adjusted.
         assert_eq!(rule([&hallway, &game_released]), Rule::Manual);
         assert_eq!(rule([]), Rule::Manual);

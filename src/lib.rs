@@ -37,8 +37,11 @@ pub fn open_db(path: &str) -> rusqlite::Result<Connection> {
     let db = Connection::open(path)?;
     db.pragma_update(None, "journal_mode", "WAL")?;
     db.pragma_update(None, "foreign_keys", "ON")?;
-    db.execute_batch(
-        "CREATE TABLE IF NOT EXISTS rooms (
+    let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 1 {
+        // The first schema, which the steps below carry to the current one.
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS rooms (
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL UNIQUE
         );
@@ -49,7 +52,8 @@ pub fn open_db(path: &str) -> rusqlite::Result<Connection> {
             name TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
         );",
-    )?;
+        )?;
+    }
     // The user's last "all on"/"all off" and the light schedule, as JSON by key.
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS settings (
@@ -57,7 +61,6 @@ pub fn open_db(path: &str) -> rusqlite::Result<Connection> {
             value TEXT NOT NULL
         );",
     )?;
-    let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version < 1 {
         // Version 1 makes the setup code optional and adds the device's own identifiers.
         db.execute_batch(
@@ -234,6 +237,37 @@ pub fn open_db(path: &str) -> rusqlite::Result<Connection> {
     }
     if version < 9 {
         migrate_to_labels_alone(&db)?;
+    }
+    if version < 10 {
+        // Version 10 drops rooms, and which room each device was in, for labels alone.
+        db.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+            BEGIN;
+            CREATE TABLE devices_v10 (
+                id INTEGER PRIMARY KEY,
+                qr_payload TEXT UNIQUE,
+                vendor TEXT,
+                serial_number TEXT,
+                mac TEXT UNIQUE,
+                name TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                ignored INTEGER NOT NULL DEFAULT 0,
+                vendor_id INTEGER,
+                product_id INTEGER,
+                UNIQUE (vendor, serial_number),
+                CHECK (qr_payload IS NOT NULL OR serial_number IS NOT NULL)
+            );
+            INSERT INTO devices_v10
+                SELECT id, qr_payload, vendor, serial_number, mac, name, created_at, ignored,
+                    vendor_id, product_id
+                FROM devices;
+            DROP TABLE devices;
+            ALTER TABLE devices_v10 RENAME TO devices;
+            DROP TABLE rooms;
+            PRAGMA user_version = 10;
+            COMMIT;
+            PRAGMA foreign_keys = ON;",
+        )?;
     }
     Ok(db)
 }
@@ -455,11 +489,6 @@ fn now() -> i64 {
 fn router(state: Db) -> Router {
     let api = Router::new()
         .route("/health", get(health))
-        .route("/rooms", get(list_rooms).post(create_room))
-        .route(
-            "/rooms/{id}",
-            axum::routing::patch(rename_room).delete(delete_room),
-        )
         .route("/devices", get(list_devices).post(create_device))
         .route(
             "/devices/{id}",
@@ -528,14 +557,6 @@ impl From<rusqlite::Error> for ApiError {
 }
 
 type ApiResult<T> = Result<T, ApiError>;
-
-fn room_not_found() -> ApiError {
-    ApiError(
-        StatusCode::NOT_FOUND,
-        "room_not_found",
-        "部屋が見つかりません".into(),
-    )
-}
 
 fn is_unique_violation(error: &rusqlite::Error) -> bool {
     error.sqlite_error_code() == Some(ErrorCode::ConstraintViolation)
@@ -619,129 +640,11 @@ async fn not_found() -> ApiError {
     )
 }
 
-#[derive(Serialize)]
-struct Room {
-    id: i64,
-    name: String,
-    device_count: i64,
-}
-
-#[derive(Deserialize)]
-struct RoomInput {
-    name: String,
-}
-
-fn find_room(db: &Connection, id: i64) -> rusqlite::Result<Option<Room>> {
-    db.query_row(
-        "SELECT id, name, (SELECT count(*) FROM devices WHERE room_id = rooms.id)
-         FROM rooms WHERE id = ?1",
-        [id],
-        |row| {
-            Ok(Room {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                device_count: row.get(2)?,
-            })
-        },
-    )
-    .optional()
-}
-
-fn valid_room_name(input: &RoomInput) -> ApiResult<String> {
-    clean_name(&input.name, false).ok_or_else(|| {
-        ApiError(
-            StatusCode::BAD_REQUEST,
-            "invalid_room_name",
-            format!("部屋名は1〜{MAX_NAME_CHARS}文字で入力してください"),
-        )
-    })
-}
-
-fn duplicate_room_name() -> ApiError {
-    ApiError(
-        StatusCode::CONFLICT,
-        "duplicate_room_name",
-        "同じ名前の部屋があります".into(),
-    )
-}
-
-async fn list_rooms(State(db): State<Db>) -> ApiResult<Json<Vec<Room>>> {
-    let db = db.db.lock().unwrap();
-    let mut statement = db.prepare(
-        "SELECT id, name, (SELECT count(*) FROM devices WHERE room_id = rooms.id)
-         FROM rooms ORDER BY id",
-    )?;
-    let rooms = statement
-        .query_map([], |row| {
-            Ok(Room {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                device_count: row.get(2)?,
-            })
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-    Ok(Json(rooms))
-}
-
-async fn create_room(
-    State(db): State<Db>,
-    Json(input): Json<RoomInput>,
-) -> ApiResult<(StatusCode, Json<Room>)> {
-    let name = valid_room_name(&input)?;
-    let db = db.db.lock().unwrap();
-    match db.execute("INSERT INTO rooms (name) VALUES (?1)", [&name]) {
-        Err(error) if is_unique_violation(&error) => Err(duplicate_room_name()),
-        result => {
-            result?;
-            let room = find_room(&db, db.last_insert_rowid())?.ok_or_else(room_not_found)?;
-            Ok((StatusCode::CREATED, Json(room)))
-        }
-    }
-}
-
-async fn rename_room(
-    State(db): State<Db>,
-    Path(id): Path<i64>,
-    Json(input): Json<RoomInput>,
-) -> ApiResult<Json<Room>> {
-    let name = valid_room_name(&input)?;
-    let db = db.db.lock().unwrap();
-    match db.execute(
-        "UPDATE rooms SET name = ?1 WHERE id = ?2",
-        params![name, id],
-    ) {
-        Err(error) if is_unique_violation(&error) => Err(duplicate_room_name()),
-        result => {
-            result?;
-            Ok(Json(find_room(&db, id)?.ok_or_else(room_not_found)?))
-        }
-    }
-}
-
-async fn delete_room(State(db): State<Db>, Path(id): Path<i64>) -> ApiResult<StatusCode> {
-    let db = db.db.lock().unwrap();
-    let room = find_room(&db, id)?.ok_or_else(room_not_found)?;
-    if room.device_count > 0 {
-        return Err(ApiError(
-            StatusCode::CONFLICT,
-            "room_has_devices",
-            format!(
-                "この部屋には機器が{}台登録されています。先に機器を削除してください",
-                room.device_count
-            ),
-        ));
-    }
-    db.execute("DELETE FROM rooms WHERE id = ?1", [id])?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
 /// A device as listed: its setup code holds the setup passcode, so it is
 /// returned only by the single-device endpoint.
 #[derive(Serialize)]
 struct Device {
     id: i64,
-    room_id: Option<i64>,
-    room_name: Option<String>,
     name: String,
     vendor: Option<String>,
     serial_number: Option<String>,
@@ -777,38 +680,36 @@ struct LabelRef {
     name: String,
 }
 
-const DEVICE_SELECT: &str = "SELECT devices.id, room_id, rooms.name, devices.name, created_at,
+const DEVICE_SELECT: &str = "SELECT devices.id, devices.name, created_at,
     qr_payload, vendor, serial_number, mac,
     (SELECT json_group_array(json_object('id', labels.id, 'name', labels.name) ORDER BY labels.id)
         FROM device_labels JOIN labels ON labels.id = label_id WHERE device_id = devices.id),
     ignored, vendor_id, product_id
-    FROM devices LEFT JOIN rooms ON rooms.id = room_id";
+    FROM devices";
 
 /// The `qr_payload` column stores either form; a QR payload starts with `MT:`.
 fn device_row(row: &rusqlite::Row, with_payload: bool) -> rusqlite::Result<Device> {
-    let code: Option<String> = if with_payload { row.get(5)? } else { None };
+    let code: Option<String> = if with_payload { row.get(3)? } else { None };
     let (qr_payload, manual_code) = match code {
         Some(code) if !code.starts_with("MT:") => (None, Some(code)),
         code => (code, None),
     };
     Ok(Device {
         id: row.get(0)?,
-        room_id: row.get(1)?,
-        room_name: row.get(2)?,
-        name: row.get(3)?,
-        vendor: row.get(6)?,
-        serial_number: row.get(7)?,
-        mac: row.get(8)?,
-        labels: serde_json::from_str(&row.get::<_, String>(9)?).unwrap_or_default(),
-        ignored: row.get(10)?,
-        vendor_id: row.get(11)?,
-        product_id: row.get(12)?,
+        name: row.get(1)?,
+        vendor: row.get(4)?,
+        serial_number: row.get(5)?,
+        mac: row.get(6)?,
+        labels: serde_json::from_str(&row.get::<_, String>(7)?).unwrap_or_default(),
+        ignored: row.get(8)?,
+        vendor_id: row.get(9)?,
+        product_id: row.get(10)?,
         state: None,
         product_name: None,
         kind: None,
         on: None,
         wifi_ssid: None,
-        created_at: row.get(4)?,
+        created_at: row.get(2)?,
         qr_payload,
         manual_code,
     })
@@ -1003,8 +904,8 @@ struct CodeInput {
     manual_code: Option<String>,
 }
 
-/// Enters a device into the ledger by its code alone, before it has a room or a
-/// name or is connected; a device already there by its code is returned as it is.
+/// Enters a device into the ledger by its code alone, before it has a name or is
+/// connected; a device already there by its code is returned as it is.
 async fn create_device(
     State(state): State<Db>,
     Json(input): Json<CodeInput>,
@@ -1101,7 +1002,7 @@ fn registered_id(db: &Connection, code: &str) -> rusqlite::Result<Option<i64>> {
 }
 
 /// A ledger change to a device: only the fields given change; `label_ids`
-/// replaces its labels and a `null` `room_id` takes it out of its room.
+/// replaces its labels.
 async fn update_device(
     State(state): State<Db>,
     Path(id): Path<i64>,
@@ -1111,7 +1012,7 @@ async fn update_device(
         ApiError(
             StatusCode::BAD_REQUEST,
             "invalid_device_update",
-            "変更は label_ids（labelのidの配列）・ignored（trueかfalse）・name（文字列）・room_id（部屋のidかnull）のうち、変える項目だけを送ってください".into(),
+            "変更は label_ids（labelのidの配列）・ignored（trueかfalse）・name（文字列）のうち、変える項目だけを送ってください".into(),
         )
     };
     let fields = input
@@ -1120,7 +1021,7 @@ async fn update_device(
             !fields.is_empty()
                 && fields
                     .keys()
-                    .all(|key| ["label_ids", "ignored", "name", "room_id"].contains(&key.as_str()))
+                    .all(|key| ["label_ids", "ignored", "name"].contains(&key.as_str()))
         })
         .ok_or_else(invalid)?;
     let label_ids = fields
@@ -1135,19 +1036,9 @@ async fn update_device(
         .get("name")
         .map(|name| device_name(name.as_str().ok_or_else(invalid)?))
         .transpose()?;
-    let room_id = fields
-        .get("room_id")
-        .map(|room| match room {
-            serde_json::Value::Null => Ok(None),
-            room => room.as_i64().map(Some).ok_or_else(invalid),
-        })
-        .transpose()?;
     let device = {
         let db = state.db.lock().unwrap();
         find_device(&db, id, false)?;
-        if let Some(Some(room)) = room_id {
-            find_room(&db, room)?.ok_or_else(room_not_found)?;
-        }
         if let Some(mut ids) = label_ids {
             ids.sort_unstable();
             ids.dedup();
@@ -1172,12 +1063,6 @@ async fn update_device(
             db.execute(
                 "UPDATE devices SET name = ?1 WHERE id = ?2",
                 params![name, id],
-            )?;
-        }
-        if let Some(room) = room_id {
-            db.execute(
-                "UPDATE devices SET room_id = ?1 WHERE id = ?2",
-                params![room, id],
             )?;
         }
         find_device(&db, id, false)?
@@ -1612,7 +1497,6 @@ fn wifi_for_devices(db: &Connection) -> ApiResult<(String, String)> {
 /// Wi-Fi saved for devices or onto Thread.
 #[derive(Deserialize)]
 struct CommissionInput {
-    room_id: i64,
     qr_payload: Option<String>,
     manual_code: Option<String>,
     #[serde(default)]
@@ -1644,7 +1528,6 @@ async fn commission(
     let url = matter_url(&state)?;
     let (ssid, password) = {
         let db = state.db.lock().unwrap();
-        find_room(&db, input.room_id)?.ok_or_else(room_not_found)?;
         if thread {
             Default::default()
         } else {
@@ -1666,7 +1549,7 @@ async fn commission(
             commission::Error::Failed(failure) => commission_failed(failure, &ssid),
         })?;
     let db = state.db.lock().unwrap();
-    let (registered, device) = record(&db, input.room_id, &name, &code, &commissioned)?;
+    let (registered, device) = record(&db, &name, &code, &commissioned)?;
     tracing::info!(
         node_id = commissioned.node_id,
         registered,
@@ -1734,7 +1617,7 @@ async fn commission_device(
 
 /// Fills row `id` with the commissioned device's identifiers. When another row
 /// already holds them, that row stays the device's, taking this row's code, and
-/// its name and room where it has none, and this row goes.
+/// and its name where it has none, and this row goes.
 fn connect_row(
     db: &Connection,
     id: i64,
@@ -1757,13 +1640,12 @@ fn connect_row(
         tx.execute("DELETE FROM devices WHERE id = ?1", [id])?;
         tx.execute(
             "UPDATE devices SET qr_payload = coalesce(qr_payload, ?1),
-                name = CASE name WHEN '' THEN ?2 ELSE name END, room_id = coalesce(room_id, ?3),
-                vendor_id = coalesce(vendor_id, ?4), product_id = coalesce(product_id, ?5)
-             WHERE id = ?6",
+                name = CASE name WHEN '' THEN ?2 ELSE name END,
+                vendor_id = coalesce(vendor_id, ?3), product_id = coalesce(product_id, ?4)
+             WHERE id = ?5",
             params![
                 scanned.qr_payload.or(scanned.manual_code),
                 scanned.name,
-                scanned.room_id,
                 scanned.vendor_id,
                 scanned.product_id,
                 other
@@ -1850,7 +1732,6 @@ const THREAD_TIMEOUT: Duration = Duration::from_secs(10);
 /// ledger already holds it.
 fn record(
     db: &Connection,
-    room_id: i64,
     name: &str,
     code: &str,
     commissioned: &commission::Commissioned,
@@ -1875,9 +1756,9 @@ fn record(
         return Ok((false, find_device(db, id, false)?));
     }
     db.execute(
-        "INSERT INTO devices (room_id, qr_payload, vendor, serial_number, mac, name)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![room_id, code, vendor, serial, mac, name],
+        "INSERT INTO devices (qr_payload, vendor, serial_number, mac, name)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![code, vendor, serial, mac, name],
     )?;
     Ok((true, find_device(db, db.last_insert_rowid(), false)?))
 }
@@ -1906,7 +1787,6 @@ fn matter_unreachable(error: String) -> ApiError {
 #[derive(Serialize)]
 struct DeviceStatus {
     id: i64,
-    room_name: Option<String>,
     name: String,
     visible: bool,
     node_id: Option<u64>,
@@ -1930,7 +1810,6 @@ async fn status(State(state): State<Db>) -> ApiResult<Json<serde_json::Value>> {
             let place = place(&device, &nodes);
             Ok(DeviceStatus {
                 id: device.id,
-                room_name: device.room_name,
                 name: device.name,
                 visible: place.is_some(),
                 node_id: place.map(|(node, _)| node),
@@ -1949,11 +1828,10 @@ async fn status(State(state): State<Db>) -> ApiResult<Json<serde_json::Value>> {
 struct MissingDevice {
     id: i64,
     name: String,
-    room_name: Option<String>,
 }
 
-/// A light's ledger name (else its product name), room and whether it is ignored.
-type LightName = (Option<String>, Option<String>, bool);
+/// A light's ledger name (else its product name) and whether it is ignored.
+type LightName = (Option<String>, bool);
 
 fn ledger(db: &Connection) -> rusqlite::Result<Vec<Device>> {
     let mut statement = db.prepare(&format!("{DEVICE_SELECT} ORDER BY devices.id"))?;
@@ -1999,12 +1877,10 @@ fn match_ledger(
     let names = lights
         .iter()
         .map(|light| {
-            let (name, room) = devices_of(devices, nodes, light)
+            let name = devices_of(devices, nodes, light)
                 .find(|device| !device.name.is_empty())
-                .map_or((light.product.clone(), None), |device| {
-                    (Some(device.name.clone()), device.room_name.clone())
-                });
-            (name, room, is_ignored(devices, nodes, light))
+                .map_or(light.product.clone(), |device| Some(device.name.clone()));
+            (name, is_ignored(devices, nodes, light))
         })
         .collect();
     let missing = devices
@@ -2013,7 +1889,6 @@ fn match_ledger(
         .map(|device| MissingDevice {
             id: device.id,
             name: device.name.clone(),
-            room_name: device.room_name.clone(),
         })
         .collect();
     (names, missing)
@@ -2029,7 +1904,7 @@ fn is_ignored(devices: &[Device], nodes: &[serde_json::Value], light: &matter::L
     devices_of(devices, nodes, light).any(|device| device.ignored)
 }
 
-/// Each light with its ledger name (else its product name) and room, and `field`'s value.
+/// Each light with its ledger name (else its product name), and `field`'s value.
 fn light_entries(
     lights: &[matter::Light],
     names: Vec<LightName>,
@@ -2040,12 +1915,11 @@ fn light_entries(
         .iter()
         .zip(names)
         .zip(values)
-        .map(|((light, (name, room_name, _)), value)| {
+        .map(|((light, (name, _)), value)| {
             json!({
                 "node_id": light.node_id,
                 "endpoint": light.endpoint,
                 "name": name,
-                "room_name": room_name,
                 field: value,
             })
         })
@@ -2069,7 +1943,7 @@ async fn light_states(State(state): State<Db>) -> ApiResult<Json<serde_json::Val
         .iter()
         .zip(&names)
         .map(
-            |(light, (_, _, ignored))| match (ignored, light.reachable, light.on) {
+            |(light, (_, ignored))| match (ignored, light.reachable, light.on) {
                 (true, ..) => "ignored",
                 (_, true, Some(true)) => "on",
                 (_, true, Some(false)) => "off",
@@ -2425,7 +2299,6 @@ async fn switch_label(state: &AppState, id: i64, op: Op) -> ApiResult<serde_json
         .map(|d| MissingDevice {
             id: d.id,
             name: d.name.clone(),
-            room_name: d.room_name.clone(),
         })
         .collect();
     tracing::info!(
@@ -2611,21 +2484,18 @@ async fn adjust(state: &AppState, unix: i64, trigger: &'static str, switched_on:
                 .iter()
                 .zip(names)
                 .zip(goals)
-                .map(
-                    |(((light, decision), (name, room_name, _)), (labels, _, goal))| {
-                        let mut entry = json!({
-                            "node_id": light.node_id,
-                            "endpoint": light.endpoint,
-                            "name": name,
-                            "room_name": room_name,
-                            "labels": labels,
-                            "target_level": goal.0,
-                            "target_kelvin": goal.1,
-                        });
-                        entry["decision"] = decide(&mut memory, light, *decision, &mut entry);
-                        entry
-                    },
-                )
+                .map(|(((light, decision), (name, _)), (labels, _, goal))| {
+                    let mut entry = json!({
+                        "node_id": light.node_id,
+                        "endpoint": light.endpoint,
+                        "name": name,
+                        "labels": labels,
+                        "target_level": goal.0,
+                        "target_kelvin": goal.1,
+                    });
+                    entry["decision"] = decide(&mut memory, light, *decision, &mut entry);
+                    entry
+                })
                 .collect();
             let sent = entries.iter().filter(|e| e["decision"] == "sent").count();
             tracing::info!(trigger, commands = tuned.commands, sent, "lights adjusted");
@@ -2691,7 +2561,6 @@ fn decide(
 struct LabelledDevice {
     id: i64,
     name: String,
-    room_name: Option<String>,
 }
 
 /// The schedule's settings, each label with its devices and the latest runs.
@@ -2710,7 +2579,6 @@ async fn get_schedule(State(state): State<Db>) -> ApiResult<Json<serde_json::Val
                         .map(|d| LabelledDevice {
                             id: d.id,
                             name: d.name.clone(),
-                            room_name: d.room_name.clone(),
                         })
                         .collect::<Vec<_>>()
                 );
