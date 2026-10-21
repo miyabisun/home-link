@@ -9,8 +9,8 @@ import org.junit.Test
 class RegisterFormTest {
     private val qr = "MT:Y.K9042C00KA0648G00"
 
-    private fun device(id: Long, state: DeviceState? = DeviceState.UNCONNECTED, name: String = "", roomId: Long? = null,
-                       code: String? = null) = Device(id, name, roomId, emptySet(), state, code)
+    private fun device(id: Long, state: DeviceState? = DeviceState.UNCONNECTED, name: String = "",
+                       code: String? = null) = Device(id, name, emptySet(), state, code)
 
     @Test fun scanningANonMatterCodeSendsNothing() {
         val form = RegisterForm()
@@ -87,7 +87,7 @@ class RegisterFormTest {
         form.devicesRead(ApiResult.Ok(listOf(device(1), device(2), device(3))))
         form.opened(device(1, code = qr))
         form.connect(1)
-        form.commissioned(ApiResult.Ok(device(1, DeviceState.CONNECTED, roomId = 2)))
+        form.commissioned(ApiResult.Ok(device(1, DeviceState.CONNECTED)))
         assertFalse(form.busy)
         assertNull(form.stage)
         assertEquals(listOf(2L, 3L), form.unconnected.map { it.id })
@@ -143,12 +143,12 @@ class RegisterFormTest {
         val form = RegisterForm()
         form.devicesRead(ApiResult.Ok(listOf(device(1))))
         form.added(qr, ApiResult.Ok(device(1)))
-        form.updated(ApiResult.Ok(device(1, name = "天井1", roomId = 3)))
-        assertEquals(device(1, name = "天井1", roomId = 3, code = qr), form.device)
+        form.updated(ApiResult.Ok(device(1, name = "天井1")))
+        assertEquals(device(1, name = "天井1", code = qr), form.device)
         assertEquals("天井1", form.unconnected.single().name)
-        form.updated(ApiResult.Failed(ApiError.ROOM_NOT_FOUND))
-        assertEquals(Status.Failed(ApiError.ROOM_NOT_FOUND), form.status)
-        assertEquals(3L, form.device?.roomId)
+        form.updated(ApiResult.Failed(ApiError.LABEL_NOT_FOUND))
+        assertEquals(Status.Failed(ApiError.LABEL_NOT_FOUND), form.status)
+        assertEquals("天井1", form.device?.name)
     }
 
     @Test fun aValidManualCodeIsTakenOnceAllDigitsAreTyped() {
@@ -172,30 +172,21 @@ class RegisterFormTest {
         assertNull(form.manualError)
     }
 
-    @Test fun failedRoomLoadsKeepTheKnownRooms() {
+    @Test fun failedLedgerReadsKeepTheKnownDevicesAndSayWhy() {
         val form = RegisterForm()
-        form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
-        form.rooms(ApiResult.Failed(ApiError.UNREACHABLE))
-        assertEquals(listOf(Room(1, "寝室")), form.rooms)
-        assertTrue(form.roomsFailed)
+        form.devicesRead(ApiResult.Ok(listOf(device(1))))
+        form.devicesRead(ApiResult.Failed(ApiError.UNREACHABLE))
+        assertEquals(listOf(1L), form.devices.map { it.id })
+        assertTrue(form.devicesFailed)
         assertEquals(Status.Failed(ApiError.UNREACHABLE), form.status)
-        form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
-        assertFalse(form.roomsFailed)
+        // A successful read proves the server is reachable again.
+        form.devicesRead(ApiResult.Ok(listOf(device(1))))
+        assertFalse(form.devicesFailed)
         assertNull(form.status)
 
         form.status = Status.Failed(ApiError.WRONG_CODE)
-        form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
+        form.devicesRead(ApiResult.Ok(listOf(device(1))))
         assertEquals(Status.Failed(ApiError.WRONG_CODE), form.status)
-    }
-
-    @Test fun createdRoomsAreAdded() {
-        val form = RegisterForm()
-        form.rooms(ApiResult.Ok(listOf(Room(1, "寝室"))))
-        form.roomCreated(ApiResult.Ok(Room(5, "書斎")))
-        assertEquals(listOf(Room(1, "寝室"), Room(5, "書斎")), form.rooms)
-        assertEquals(Status.RoomAdded("書斎"), form.status)
-        form.roomCreated(ApiResult.Failed(ApiError.DUPLICATE_ROOM))
-        assertEquals(Status.Failed(ApiError.DUPLICATE_ROOM), form.status)
     }
 
     @Test fun theWifiForDevicesIsMissingOnlyWhenHomeLinkHoldsNone() {

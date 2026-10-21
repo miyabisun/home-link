@@ -15,13 +15,11 @@ import android.view.Gravity
 import android.view.View
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
-import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
-import android.widget.Spinner
 import android.widget.TextView
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -51,18 +49,11 @@ class MainActivity : Activity() {
     /** What the last label switch left behind; none after a full success. */
     private var labelResult: LightsMessage? = null
     private var addingLabel = false
-    private var addingRoom = false
     private var enteringCode = false
     private var formattingCode = false
-    /** The room position last drawn; the select box reports it back without the user choosing. */
-    private var shownRoom = 0
-    /** The device, its room and the rooms last drawn; drawing again otherwise would undo a pick not yet reported. */
-    private var drawnRoom: Triple<Long?, Long?, List<Room>>? = null
     /** The device to connect once Bluetooth is allowed and on. */
     private var pendingConnect: Long? = null
 
-    /** The home-link URL the rooms were last read from; another after the settings reads them again. */
-    private var loadedUrl: String? = null
     private var endpoints = Endpoints()
 
     private lateinit var content: LinearLayout
@@ -85,14 +76,6 @@ class MainActivity : Activity() {
     private lateinit var manualField: EditText
     private lateinit var manualMessage: TextView
     private lateinit var devicePanels: List<LinearLayout>
-    private lateinit var roomSpinner: Spinner
-    private lateinit var roomAdapter: ArrayAdapter<String>
-    private lateinit var roomState: TextView
-    private lateinit var roomMessage: TextView
-    private lateinit var addRoomButton: Button
-    private lateinit var newRoomPanel: LinearLayout
-    private lateinit var newRoomName: EditText
-    private lateinit var createRoomButton: Button
     private lateinit var nameField: EditText
     private lateinit var labelPanel: LinearLayout
     private lateinit var labelBoxes: LinearLayout
@@ -110,7 +93,6 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         api = homeLinkApi(this)
         endpoints = Endpoints.load(this)
-        loadedUrl = endpoints.homeLinkUrl
         scanner = scannerFactory?.invoke(this) ?: GmsQrScanner(this)
         wifiStore = wifiStoreFactory?.invoke(this) ?: KeystoreWifiStore(this)
         worker = Executors.newSingleThreadExecutor()
@@ -120,7 +102,6 @@ class MainActivity : Activity() {
         switchWorker = Executors.newSingleThreadExecutor()
         savedInstanceState?.let { state ->
             addingLabel = state.getBoolean("addingLabel")
-            addingRoom = state.getBoolean("addingRoom")
             enteringCode = state.getBoolean("enteringCode")
             labelResult = state.getString("labelText")?.let { LightsMessage(it, failed = true) }
         }
@@ -128,7 +109,6 @@ class MainActivity : Activity() {
         newLabelName.setText(savedInstanceState?.getString("newLabel").orEmpty())
         manualField.setText(savedInstanceState?.getString("manualCode").orEmpty())
         manualField.setSelection(manualField.length())
-        newRoomName.setText(savedInstanceState?.getString("newRoom").orEmpty())
         // A registration started before the screen was recreated carries on.
         if (CommissionSession.running) {
             form.connect(savedInstanceState?.getLong("connecting") ?: -1)
@@ -144,7 +124,6 @@ class MainActivity : Activity() {
                 render()
             }
         }
-        loadRooms()
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -155,8 +134,6 @@ class MainActivity : Activity() {
         form.connecting?.let { outState.putLong("connecting", it) }
         outState.putBoolean("addingLabel", addingLabel)
         outState.putString("newLabel", newLabelName.text.toString())
-        outState.putBoolean("addingRoom", addingRoom)
-        outState.putString("newRoom", newRoomName.text.toString())
         outState.putBoolean("enteringCode", enteringCode)
         outState.putString("manualCode", manualField.text.toString())
         labelResult?.let { outState.putString("labelText", it.text) }
@@ -167,10 +144,6 @@ class MainActivity : Activity() {
         super.onResume()
         // The settings screen or `adb push` may have changed the endpoints meanwhile.
         endpoints = Endpoints.load(this)
-        if (endpoints.homeLinkUrl != loadedUrl) {
-            loadedUrl = endpoints.homeLinkUrl
-            loadRooms()
-        }
         // A label's screen may have changed the labels meanwhile.
         loadLabels()
         // The settings screen may have saved the Wi-Fi for devices meanwhile.
@@ -200,13 +173,6 @@ class MainActivity : Activity() {
         executor.execute {
             val result = call()
             runOnUiThread { if (!isDestroyed) done(result) }
-        }
-    }
-
-    private fun loadRooms() {
-        background({ api.rooms() }) { result ->
-            form.rooms(result)
-            render()
         }
     }
 
@@ -309,7 +275,6 @@ class MainActivity : Activity() {
     private fun open(device: Device, name: String? = null) {
         form.opened(device)
         nameField.setText(name ?: device.name)
-        addingRoom = false
     }
 
     /** Sends the typed name once it differs from the device's. */
@@ -323,7 +288,6 @@ class MainActivity : Activity() {
     private fun update(id: Long, change: DeviceUpdate) {
         background({ api.updateDevice(id, change) }) { result ->
             form.updated(result)
-            if (result == ApiResult.Failed(ApiError.ROOM_NOT_FOUND)) loadRooms()
             if (result == ApiResult.Failed(ApiError.LABEL_NOT_FOUND)) loadLabels()
             render()
         }
@@ -368,21 +332,6 @@ class MainActivity : Activity() {
             add(code)
         }
         render()
-    }
-
-    private fun createRoom() {
-        val name = newRoomName.text.toString().trim()
-        if (name.isEmpty()) return
-        createRoomButton.isEnabled = false
-        background({ api.createRoom(name) }) { result ->
-            form.roomCreated(result)
-            if (result is ApiResult.Ok) {
-                addingRoom = false
-                newRoomName.setText("")
-                form.device?.let { update(it.id, DeviceUpdate.Room(result.value.id)) }
-            }
-            render()
-        }
     }
 
     /** Checks the Bluetooth permissions and power, asking for them, then connects device `id`. */
@@ -603,42 +552,11 @@ class MainActivity : Activity() {
         nameField = field(name, "機器名（任意）", EditorInfo.IME_ACTION_DONE) { saveName() }
         nameField.setOnFocusChangeListener { _, focused -> if (!focused) saveName() }
 
-        val room = panel()
-        label(room, "部屋", 18, bold = true)
-        roomState = label(room, "部屋を読み込めませんでした", 16)
-        roomAdapter = ArrayAdapter<String>(this, R.layout.select_item)
-        roomSpinner = select(room, roomAdapter, "部屋") { position ->
-            val device = form.device
-            if (device == null || position == shownRoom) return@select
-            shownRoom = position
-            update(device.id, DeviceUpdate.Room(form.rooms.getOrNull(position - 1)?.id))
-        }
-        roomMessage = message(room)
-        addRoomButton = button(room, "部屋を追加", icon = R.drawable.ic_add) {
-            addingRoom = true
-            form.status = null
-            render()
-            newRoomName.requestFocus()
-        }
-        newRoomPanel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        room.addView(newRoomPanel, LinearLayout.LayoutParams(-1, -2))
-        label(newRoomPanel, "新しい部屋の名前", 14, muted = true)
-        newRoomName = field(newRoomPanel, "新しい部屋の名前", EditorInfo.IME_ACTION_DONE) { createRoom() }
-        newRoomName.addTextChangedListener(changed { render() })
-        val roomActions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        newRoomPanel.addView(roomActions, LinearLayout.LayoutParams(-1, -2))
-        button(roomActions, "やめる", weight = true) {
-            addingRoom = false
-            newRoomName.setText("")
-            render()
-        }
-        createRoomButton = button(roomActions, "追加", weight = true) { createRoom() }
-
         labelPanel = panel()
         label(labelPanel, "ラベル", 18, bold = true)
         labelBoxes = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         labelPanel.addView(labelBoxes, LinearLayout.LayoutParams(-1, -2))
-        devicePanels = listOf(name, room, labelPanel)
+        devicePanels = listOf(name, labelPanel)
 
         wifiPanel = panel()
         label(wifiPanel, "機器に渡すWi-Fi", 18, bold = true)
@@ -652,7 +570,6 @@ class MainActivity : Activity() {
 
         resultRow = ResultRow(this, content, dp(16))
         reconnectButton = button(content, "再接続") {
-            loadRooms()
             loadLabels()
             loadDevices()
             loadWifi()
@@ -730,22 +647,6 @@ class MainActivity : Activity() {
         })
 
         for (panel in devicePanels) panel.visibility = if (device == null) View.GONE else View.VISIBLE
-        fill(roomAdapter, listOf("未設定") + form.rooms.map { it.name })
-        val roomKey = Triple(device?.id, device?.roomId, form.rooms)
-        if (roomKey != drawnRoom) {
-            drawnRoom = roomKey
-            shownRoom = form.rooms.indexOfFirst { it.id == device?.roomId } + 1
-            roomSpinner.setSelection(shownRoom)
-        }
-        roomState.visibility = if (form.roomsFailed) View.VISIBLE else View.GONE
-        show(roomMessage, when {
-            status is Status.RoomAdded -> "部屋「${status.room}」を追加しました"
-            status == Status.Failed(ApiError.DUPLICATE_ROOM) -> "同じ名前の部屋があります。一覧から選んでください"
-            else -> null
-        }, failure = status is Status.Failed)
-        addRoomButton.visibility = if (addingRoom) View.GONE else View.VISIBLE
-        newRoomPanel.visibility = if (addingRoom) View.VISIBLE else View.GONE
-        createRoomButton.isEnabled = newRoomName.text.isNotBlank()
         if (device != null) renderLabels(device)
 
         wifiPanel.visibility = if (form.wifiMissing) View.VISIBLE else View.GONE
@@ -768,9 +669,8 @@ class MainActivity : Activity() {
             is Status.Failed -> when (status.error) {
                 ApiError.NOT_CONFIGURED -> NOT_CONFIGURED
                 ApiError.UNREACHABLE, ApiError.TIMEOUT -> "home-link（${authority(endpoints.homeLinkUrl)}）に接続できません。$CHECK_ENDPOINT"
-                ApiError.ROOM_NOT_FOUND -> "選んだ部屋が見つかりません。部屋を選び直してください"
                 ApiError.INVALID_NAME -> "名前は${MAX_NAME}文字以内で入力してください"
-                ApiError.INVALID_QR, ApiError.INVALID_MANUAL, ApiError.DUPLICATE_ROOM -> null
+                ApiError.INVALID_QR, ApiError.INVALID_MANUAL -> null
                 ApiError.SERVER, ApiError.MATTER_UNREACHABLE, ApiError.MATTER_NOT_CONFIGURED,
                 ApiError.LABEL_NOT_FOUND, ApiError.LABEL_HAS_NO_DEVICES, ApiError.DUPLICATE_LABEL, ApiError.INVALID_LABEL, ApiError.INVALID_WIFI, ApiError.WIFI_NOT_FOUND,
                 ApiError.WIFI_NOT_SET, ApiError.NOT_ON_WIFI, ApiError.SESAME_NOT_CONFIGURED, ApiError.SESAME_REJECTED, ApiError.SESAME_UNREACHABLE ->
@@ -797,7 +697,7 @@ class MainActivity : Activity() {
         else if (form.busy && stage != null) resultRow.show(stageText(stage), failed = false, R.drawable.ic_bluetooth)
         else resultRow.show(result, status is Status.Failed || status is Status.BleFailed)
         reconnectButton.visibility =
-            if (form.roomsFailed || form.devicesFailed || status == Status.Failed(ApiError.UNREACHABLE)) View.VISIBLE
+            if (form.devicesFailed || status == Status.Failed(ApiError.UNREACHABLE)) View.VISIBLE
             else View.GONE
         connectButton.visibility = if (form.canConnect()) View.VISIBLE else View.GONE
         cancelButton.visibility = if (form.busy) View.VISIBLE else View.GONE

@@ -3,7 +3,6 @@ package dev.miyabisun.homelink
 sealed interface Status {
     data object NotMatter : Status
     data object ScanFailed : Status
-    data class RoomAdded(val room: String) : Status
     data class Failed(val error: ApiError) : Status
     /** Connected; the device's name, empty when it has none. */
     data class Commissioned(val name: String) : Status
@@ -34,8 +33,6 @@ enum class ManualError { LENGTH, CHECK_DIGIT }
 
 class RegisterForm {
     var manualError: ManualError? = null
-    var rooms: List<Room> = emptyList()
-    var roomsFailed = false
     var labels: List<Label> = emptyList()
     /** The ledger as last read, codes kept from earlier reads. */
     var devices: List<Device> = emptyList()
@@ -161,7 +158,10 @@ class RegisterForm {
 
     fun devicesRead(result: ApiResult<List<Device>>) {
         devicesFailed = result is ApiResult.Failed
+        if (result is ApiResult.Failed) status = Status.Failed(result.error)
         if (result !is ApiResult.Ok) return
+        // A successful read proves the server is reachable again.
+        if (status == Status.Failed(ApiError.UNREACHABLE)) status = null
         val codes = devices.associate { it.id to it.code }
         devices = result.value.map { it.copy(code = it.code ?: codes[it.id]) }
         device = device?.let { open -> devices.firstOrNull { it.id == open.id } }
@@ -186,31 +186,6 @@ class RegisterForm {
         devices = if (devices.any { it.id == update.id }) devices.map { if (it.id == update.id) merged else it }
             else devices + merged
         if (device?.id == update.id) device = merged
-    }
-
-    fun rooms(result: ApiResult<List<Room>>) {
-        when (result) {
-            is ApiResult.Ok -> {
-                rooms = result.value
-                // A successful load proves the server is reachable again.
-                if (status == Status.Failed(ApiError.UNREACHABLE)) status = null
-                roomsFailed = false
-            }
-            is ApiResult.Failed -> {
-                roomsFailed = true
-                status = Status.Failed(result.error)
-            }
-        }
-    }
-
-    fun roomCreated(result: ApiResult<Room>) {
-        when (result) {
-            is ApiResult.Ok -> {
-                rooms = rooms + result.value
-                status = Status.RoomAdded(result.value.name)
-            }
-            is ApiResult.Failed -> status = Status.Failed(result.error)
-        }
     }
 
     /** The device being connected, until the outcome arrives. */

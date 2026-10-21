@@ -53,11 +53,11 @@ class LabelsTest {
     }
 
     @Test fun aWidgetIsNamedAfterItsLabelUntilAnotherNameIsTyped() {
-        val room = Label(1, "room")
+        val ambient = Label(1, "ambient")
         val game = Label(2, "game")
         assertEquals("game", nameAfterPick("", null, game))
-        assertEquals("game", nameAfterPick("room", room, game))
-        assertEquals("ゲーム", nameAfterPick("ゲーム", room, game))
+        assertEquals("game", nameAfterPick("ambient", ambient, game))
+        assertEquals("ゲーム", nameAfterPick("ゲーム", ambient, game))
         assertEquals("ゲーム", widgetName(" ゲーム ", game))
         assertEquals("game", widgetName("  ", game))
     }
@@ -89,14 +89,14 @@ class LabelsTest {
 
     @Test fun theAppSaysNothingOnSuccessAndCountsWhatWasLeftBehind() {
         val host = "home-link.example:5011"
-        assertEquals(null, labelMessage("room", result("on", true), host))
-        assertEquals(LightsMessage("roomの一部の機器をオフにできませんでした。応答なし2台・失敗1台・見つからない2台（台所、通路）", failed = true),
-            labelMessage("room", result("off", false, SwitchResult(3, 2, 1, listOf("台所", "通路"))), host))
+        assertEquals(null, labelMessage("ambient", result("on", true), host))
+        assertEquals(LightsMessage("ambientの一部の機器をオフにできませんでした。応答なし2台・失敗1台・見つからない2台（台所、通路）", failed = true),
+            labelMessage("ambient", result("off", false, SwitchResult(3, 2, 1, listOf("台所", "通路"))), host))
         assertEquals(LightsMessage("gameの機器を元に戻せませんでした。応答なし3台", failed = true),
             labelMessage("game", result("release", true, SwitchResult(0, 3, 0, emptyList())), host))
-        assertEquals(LightsMessage("ラベル「room」に機器がありません", failed = true),
-            labelMessage("room", ApiResult.Failed(ApiError.LABEL_HAS_NO_DEVICES), host))
+        assertEquals(LightsMessage("ラベル「ambient」に機器がありません", failed = true),
+            labelMessage("ambient", ApiResult.Failed(ApiError.LABEL_HAS_NO_DEVICES), host))
         assertEquals(LightsMessage("home-link（home-link.example:5011）に接続できません。接続先の設定と通信を確かめてください", failed = true),
-            labelMessage("room", ApiResult.Failed(ApiError.UNREACHABLE), host))
+            labelMessage("ambient", ApiResult.Failed(ApiError.UNREACHABLE), host))
     }
 }

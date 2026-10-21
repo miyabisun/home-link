@@ -11,9 +11,7 @@ import java.io.IOException
 import java.net.SocketTimeoutException
 import java.util.concurrent.TimeUnit
 
-data class Room(val id: Long, val name: String)
-
-enum class ApiError { NOT_CONFIGURED, UNREACHABLE, TIMEOUT, ROOM_NOT_FOUND, DUPLICATE_ROOM, INVALID_QR, INVALID_MANUAL, INVALID_NAME,
+enum class ApiError { NOT_CONFIGURED, UNREACHABLE, TIMEOUT, INVALID_QR, INVALID_MANUAL, INVALID_NAME,
     MATTER_UNREACHABLE, MATTER_NOT_CONFIGURED, SERVER,
     DEVICE_NOT_FOUND, WRONG_CODE, WIFI_FAILED, COMMISSION_TIMEOUT, COMMISSION_FAILED, BLUETOOTH_UNAVAILABLE, INVALID_WIFI,
     THREAD_FAILED, WIFI_NOT_SET, WIFI_NOT_FOUND, LABEL_NOT_FOUND, LABEL_HAS_NO_DEVICES, DUPLICATE_LABEL, INVALID_LABEL,
@@ -48,7 +46,7 @@ enum class DeviceKind {
  * A ledger device; [code] is its QR payload or manual code, read only for one device at a time.
  * [wifiSsid] is the Wi-Fi it reports being on; [on] the On/Off last read of a device that switches and is not a light.
  */
-data class Device(val id: Long, val name: String, val roomId: Long?, val labelIds: Set<Long>, val state: DeviceState?,
+data class Device(val id: Long, val name: String, val labelIds: Set<Long>, val state: DeviceState?,
                   val code: String?, val wifiSsid: String? = null, val kind: DeviceKind? = null, val on: Boolean? = null,
                   val productName: String? = null)
 
@@ -58,8 +56,6 @@ val Device.title: String get() = name.ifEmpty { productName ?: code?.let { Manua
 /** One field of a device to change. */
 sealed interface DeviceUpdate {
     data class Name(val name: String) : DeviceUpdate
-    /** Null takes the device out of its room. */
-    data class Room(val id: Long?) : DeviceUpdate
     data class Labels(val ids: Set<Long>) : DeviceUpdate
 }
 
@@ -70,8 +66,6 @@ sealed interface ApiResult<out T> {
 
 /** The home-link ledger API. Calls block; run them off the main thread. */
 interface HomeLinkApi {
-    fun rooms(): ApiResult<List<Room>>
-    fun createRoom(name: String): ApiResult<Room>
     fun devices(): ApiResult<List<Device>>
     fun device(id: Long): ApiResult<Device>
     /** Enters the device behind `payload` (a QR payload, `MT:`, or a manual code's digits), or returns the one entered. */
@@ -112,14 +106,6 @@ class HttpHomeLinkApi(private val baseUrl: () -> String?) : HomeLinkApi {
         val EMPTY = ByteArray(0).toRequestBody()
     }
 
-    override fun rooms(): ApiResult<List<Room>> = call("GET", "/api/rooms", null) { body ->
-        val array = JSONArray(body)
-        (0 until array.length()).map { room(array.getJSONObject(it)) }
-    }
-
-    override fun createRoom(name: String): ApiResult<Room> =
-        call("POST", "/api/rooms", JSONObject().put("name", name)) { room(JSONObject(it)) }
-
     override fun devices(): ApiResult<List<Device>> = call("GET", "/api/devices", null) { body ->
         val array = JSONArray(body)
         (0 until array.length()).map { device(array.getJSONObject(it)) }
@@ -135,7 +121,6 @@ class HttpHomeLinkApi(private val baseUrl: () -> String?) : HomeLinkApi {
     override fun updateDevice(id: Long, update: DeviceUpdate): ApiResult<Device> {
         val body = when (update) {
             is DeviceUpdate.Name -> JSONObject().put("name", update.name)
-            is DeviceUpdate.Room -> JSONObject().put("room_id", update.id ?: JSONObject.NULL)
             is DeviceUpdate.Labels -> JSONObject().put("label_ids", JSONArray(update.ids.sorted()))
         }
         return call("PATCH", "/api/devices/$id", body) { device(JSONObject(it)) }
@@ -206,7 +191,7 @@ class HttpHomeLinkApi(private val baseUrl: () -> String?) : HomeLinkApi {
     private fun device(json: JSONObject): Device {
         val labels = json.getJSONArray("labels")
         return Device(
-            json.getLong("id"), json.getString("name"), json.optLong("room_id").takeUnless { json.isNull("room_id") },
+            json.getLong("id"), json.getString("name"),
             (0 until labels.length()).map { labels.getJSONObject(it).getLong("id") }.toSet(),
             DeviceState.of(json.optString("state").takeUnless { json.isNull("state") }),
             json.optString("qr_payload").ifEmpty { json.optString("manual_code") }.ifEmpty { null },
@@ -245,12 +230,10 @@ class HttpHomeLinkApi(private val baseUrl: () -> String?) : HomeLinkApi {
             json.getInt("switched"), json.getInt("no_response"), json.getInt("failed"),
             (0 until missing.length()).map { index ->
                 val device = missing.getJSONObject(index)
-                device.getString("name").ifEmpty { device.getString("room_name") + "の機器" }
+                device.getString("name").ifEmpty { "機器" }
             },
         )
     }
-
-    private fun room(json: JSONObject) = Room(json.getLong("id"), json.getString("name"))
 
     private fun <T> call(method: String, path: String, body: JSONObject?, readTimeout: Int = 20_000,
                          connectTimeout: Int = 5_000, timedOut: ApiError = ApiError.UNREACHABLE,
@@ -283,11 +266,9 @@ class HttpHomeLinkApi(private val baseUrl: () -> String?) : HomeLinkApi {
     private fun error(body: String): ApiError {
         val code = try { JSONObject(body).optString("error") } catch (_: JSONException) { "" }
         return when (code) {
-            "room_not_found" -> ApiError.ROOM_NOT_FOUND
-            "duplicate_room_name" -> ApiError.DUPLICATE_ROOM
             "invalid_qr_payload" -> ApiError.INVALID_QR
             "invalid_manual_code" -> ApiError.INVALID_MANUAL
-            "invalid_room_name", "invalid_device_name", "invalid_label_name" -> ApiError.INVALID_NAME
+            "invalid_device_name", "invalid_label_name" -> ApiError.INVALID_NAME
             "matter_server_unreachable" -> ApiError.MATTER_UNREACHABLE
             "matter_server_not_configured" -> ApiError.MATTER_NOT_CONFIGURED
             "device_not_found" -> ApiError.DEVICE_NOT_FOUND

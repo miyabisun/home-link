@@ -17,7 +17,7 @@ class CommissioningTest {
         override fun close() { closed++ }
     }
 
-    private val done = ApiResult.Ok(Device(1, "押入れ1", 2, emptySet(), DeviceState.CONNECTED, null))
+    private val done = ApiResult.Ok(Device(1, "押入れ1", emptySet(), DeviceState.CONNECTED, null))
     /** The registration's thread, run when the test says. */
     private var thread: (() -> Unit)? = null
     private val session = Commissioning(post = { it() }, spawn = { thread = it })

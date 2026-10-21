@@ -5,7 +5,7 @@ import org.junit.Assert.assertNull
 import org.junit.Test
 
 class WifiMovingTest {
-    private val moved = ApiResult.Ok(Device(1, "押入れ1", 2, emptySet(), DeviceState.CONNECTED, null, "iot-2g"))
+    private val moved = ApiResult.Ok(Device(1, "押入れ1", emptySet(), DeviceState.CONNECTED, null, "iot-2g"))
     /** The move's thread, run when the test says. */
     private var thread: (() -> Unit)? = null
     private val moves = WifiMoving(post = { it() }, spawn = { thread = it })

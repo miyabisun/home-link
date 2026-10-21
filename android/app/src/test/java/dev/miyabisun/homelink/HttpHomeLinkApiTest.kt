@@ -30,23 +30,10 @@ class HttpHomeLinkApiTest {
         }
     }
 
-    @Test fun listsRooms() {
-        respond("/api/rooms", 200, """[{"id":1,"name":"寝室","device_count":2},{"id":3,"name":"居間","device_count":0}]""")
-        assertEquals(ApiResult.Ok(listOf(Room(1, "寝室"), Room(3, "居間"))), api.rooms())
-    }
-
-    @Test fun createsRoomsAndMapsDuplicates() {
-        respond("/api/rooms", 201, """{"id":4,"name":"書斎","device_count":0}""")
-        assertEquals(ApiResult.Ok(Room(4, "書斎")), api.createRoom("書斎"))
-        assertEquals("書斎", JSONObject(requests.single().substringAfter("/api/rooms ")).getString("name"))
-        respond("/api/rooms", 409, """{"error":"duplicate_room_name","message":"x"}""")
-        assertEquals(ApiResult.Failed(ApiError.DUPLICATE_ROOM), api.createRoom("書斎"))
-    }
-
-    private val ledgerRow = """{"id":9,"room_id":2,"room_name":"押入れ","name":"押入れ1","vendor":null,"serial_number":null,
+    private val ledgerRow = """{"id":9,"name":"押入れ1","vendor":null,"serial_number":null,
         "mac":null,"vendor_id":65521,"product_id":32768,"state":"unconnected","product_name":null,
         "labels":[{"id":1,"name":"作業"},{"id":3,"name":"夜"}],"ignored":false,"created_at":"t"}"""
-    private val ledgerDevice = Device(9, "押入れ1", 2, setOf(1, 3), DeviceState.UNCONNECTED, null)
+    private val ledgerDevice = Device(9, "押入れ1", setOf(1, 3), DeviceState.UNCONNECTED, null)
 
     @Test fun entersDevicesByTheirCodeAlone() {
         respond("/api/devices", 201, """{"registered":true,"device":$ledgerRow}""")
@@ -61,11 +48,11 @@ class HttpHomeLinkApiTest {
     }
 
     @Test fun listsTheLedgerWithEachDevicesState() {
-        val unknown = ledgerRow.replace("\"unconnected\"", "null").replace("\"room_id\":2", "\"room_id\":null")
+        val unknown = ledgerRow.replace("\"unconnected\"", "null")
             .replace("[{\"id\":1,\"name\":\"作業\"},{\"id\":3,\"name\":\"夜\"}]", "[]")
         respond("/api/devices", 200, "[$ledgerRow,${ledgerRow.replace("unconnected", "connected")},$unknown]")
         assertEquals(ApiResult.Ok(listOf(ledgerDevice, ledgerDevice.copy(state = DeviceState.CONNECTED),
-            ledgerDevice.copy(roomId = null, labelIds = emptySet(), state = null))), api.devices())
+            ledgerDevice.copy(labelIds = emptySet(), state = null))), api.devices())
         assertEquals("GET /api/devices", requests.last())
 
         // One device carries its code.
@@ -77,17 +64,13 @@ class HttpHomeLinkApiTest {
         assertEquals(ApiResult.Failed(ApiError.DEVICE_NOT_FOUND), api.device(9))
     }
 
-    @Test fun changesANameARoomAndTheLabels() {
+    @Test fun changesANameAndTheLabels() {
         respond("/api/devices/9", 200, ledgerRow)
         assertEquals(ApiResult.Ok(ledgerDevice), api.updateDevice(9, DeviceUpdate.Name("押入れ1")))
         assertEquals("""PATCH /api/devices/9 {"name":"押入れ1"}""", requests.last())
-        api.updateDevice(9, DeviceUpdate.Room(2))
-        assertEquals("""PATCH /api/devices/9 {"room_id":2}""", requests.last())
-        api.updateDevice(9, DeviceUpdate.Room(null))
-        assertEquals("""PATCH /api/devices/9 {"room_id":null}""", requests.last())
         api.updateDevice(9, DeviceUpdate.Labels(setOf(1, 3)))
         assertEquals("""PATCH /api/devices/9 {"label_ids":[1,3]}""", requests.last())
-        for ((status, code, expected) in listOf(Triple(404, "room_not_found", ApiError.ROOM_NOT_FOUND),
+        for ((status, code, expected) in listOf(
                 Triple(404, "label_not_found", ApiError.LABEL_NOT_FOUND), Triple(400, "invalid_device_name", ApiError.INVALID_NAME),
                 Triple(400, "conflicting_labels", ApiError.SERVER))) {
             respond("/api/devices/9", status, """{"error":"$code"}""")
@@ -96,13 +79,13 @@ class HttpHomeLinkApiTest {
     }
 
     @Test fun listsTheLabelsWithTheirTraitsAndSchedules() {
-        respond("/api/labels", 200, """[{"id":1,"name":"room","auto":true,"override_level":null,"override_kelvin":null,"on":null,
+        respond("/api/labels", 200, """[{"id":1,"name":"ambient","auto":true,"override_level":null,"override_kelvin":null,"on":null,
             "schedule":[],"device_count":12,"boosted":false},{"id":3,"name":"razor","auto":false,"override_level":null,
             "override_kelvin":null,"on":false,"schedule":[{"time":"00:00","on":true},{"time":"05:00","on":false}],"device_count":1,
             "boosted":false},{"id":4,"name":"work","auto":false,"override_level":254,"override_kelvin":5000,"on":true,"schedule":[],
             "device_count":1,"boosted":true}]""")
         assertEquals(ApiResult.Ok(listOf(
-            Label(1, "room", auto = true),
+            Label(1, "ambient", auto = true),
             Label(3, "razor", on = false, schedule = listOf(ScheduleEntry(0, true), ScheduleEntry(300, false))),
             Label(4, "work", override = Override(254, 5000), on = true),
         )), api.labels())
@@ -147,14 +130,14 @@ class HttpHomeLinkApiTest {
         )
         for ((status, code, expected) in cases) {
             respond("/api/labels", status, """{"error":"$code"}""")
-            assertEquals("$status $code", ApiResult.Failed(expected), api.createLabel("room"))
+            assertEquals("$status $code", ApiResult.Failed(expected), api.createLabel("ambient"))
         }
     }
 
     @Test fun switchesALabelAndCountsEachResult() {
         respond("/api/labels/2/toggle", 200, """{"label":"game","action":"release","on":false,"boosted":false,"switched":2,
-            "no_response":1,"failed":0,"missing":1,"devices":[],"missing_devices":[{"id":3,"name":"","room_name":"寝室"}]}""")
-        assertEquals(ApiResult.Ok(LabelResult("release", false, SwitchResult(2, 1, 0, listOf("寝室の機器")))),
+            "no_response":1,"failed":0,"missing":1,"devices":[],"missing_devices":[{"id":3,"name":""}]}""")
+        assertEquals(ApiResult.Ok(LabelResult("release", false, SwitchResult(2, 1, 0, listOf("機器")))),
             api.switchLabel(2, LabelOp.TOGGLE))
         respond("/api/labels/2/on", 200, """{"label":"game","action":"on","on":true,"boosted":true,"switched":3,"no_response":0,
             "failed":0,"missing":0,"devices":[],"missing_devices":[]}""")
@@ -259,7 +242,7 @@ class HttpHomeLinkApiTest {
     @Test fun reportsAnUnreachableServer() {
         val port = ServerSocket(0).use { it.localPort }
         val offline = HttpHomeLinkApi("http://127.0.0.1:$port")
-        assertEquals(ApiResult.Failed(ApiError.UNREACHABLE), offline.rooms())
+        assertEquals(ApiResult.Failed(ApiError.UNREACHABLE), offline.devices())
         assertEquals(ApiResult.Failed(ApiError.UNREACHABLE), offline.switchLabel(1, LabelOp.ON))
         assertEquals(ApiResult.Failed(ApiError.UNREACHABLE), offline.commission(1))
     }
@@ -295,14 +278,14 @@ class HttpHomeLinkApiTest {
     }
 
     @Test fun readsTheBaseUrlForEveryRequestAndSendsNothingWithoutOne() {
-        respond("/api/rooms", 200, "[]")
+        respond("/api/devices", 200, "[]")
         var base: String? = null
         val configured = HttpHomeLinkApi { base }
-        assertEquals(ApiResult.Failed(ApiError.NOT_CONFIGURED), configured.rooms())
+        assertEquals(ApiResult.Failed(ApiError.NOT_CONFIGURED), configured.devices())
         assertEquals(ApiResult.Failed(ApiError.NOT_CONFIGURED), configured.door(DoorCommand.UNLOCK))
         assertEquals(emptyList<String>(), requests)
         base = "http://127.0.0.1:${server.address.port}"
-        assertEquals(ApiResult.Ok(emptyList<Room>()), configured.rooms())
-        assertEquals(listOf("GET /api/rooms"), requests)
+        assertEquals(ApiResult.Ok(emptyList<Device>()), configured.devices())
+        assertEquals(listOf("GET /api/devices"), requests)
     }
 }

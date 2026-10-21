@@ -72,7 +72,6 @@ class RegisterScreenTest {
     private val qrs = listOf("MT:Y.K9042C00084-0Z800", "MT:Y.K9042C00SIWN1WH00", "MT:Y.K9042C00ITMB2TQ00")
 
     @Test fun aReadCodeEntersTheLedgerAndOpensTheDevice() {
-        api.rooms += Room(1, "寝室")
         api.wifi += homeWifi
         ActivityScenario.launch(MainActivity::class.java).use { screen ->
             eventually(screen) { hasLabel(it, "まだ読み取っていません") }
@@ -93,7 +92,7 @@ class RegisterScreenTest {
             assertEquals(1, api.ledger.size)
             screen.onActivity { activity ->
                 assertEquals("", field(activity, "機器名（任意）").text.toString())
-                assertEquals("未設定", spinner(activity, "部屋").selectedItem)
+                assertNoRooms(activity)
                 assertTrue(button(activity, "接続").isEnabled)
             }
             capture(screen, "opened")
@@ -224,8 +223,8 @@ class RegisterScreenTest {
     @Test fun aFailedDeviceStaysListedAndConnectsOnTheNextPress() {
         api.wifi += homeWifi
         api.ledger += listOf(
-            Device(1, "天井1", null, emptySet(), DeviceState.UNCONNECTED, qrs[0]),
-            Device(2, "読書灯", 1, emptySet(), DeviceState.CONNECTED, qr),
+            Device(1, "天井1", emptySet(), DeviceState.UNCONNECTED, qrs[0]),
+            Device(2, "読書灯", emptySet(), DeviceState.CONNECTED, qr),
         )
         ActivityScenario.launch(MainActivity::class.java).use { screen ->
             eventually(screen) { listed(it) == listOf("天井1") }
@@ -250,21 +249,20 @@ class RegisterScreenTest {
         }
     }
 
-    @Test fun theNameTheRoomAndTheLabelsReachHomeLink() {
-        api.rooms += listOf(Room(1, "寝室"), Room(2, "リビングと続きの和室（南側・大きな窓のある部屋）"))
+    @Test fun theNameAndTheLabelsReachHomeLink() {
         api.labels += listOf(Label(1, "作業"), Label(2, "夜"))
         ActivityScenario.launch(MainActivity::class.java).use { screen ->
             scanner.next = ScanResult.Read(qr)
             eventually(screen) { hasLabel(it, "まだ読み取っていません") }
             screen.onActivity { button(it, "QRを読み取る").performClick() }
-            eventually(screen) { spinner(it, "部屋").isShown && spinner(it, "部屋").count == 3 }
+            eventually(screen) { field(it, "機器名（任意）").isShown && checkBox(it, "夜").isShown }
             val id = api.ledger.single().id
             screen.onActivity { activity ->
+                assertNoRooms(activity)
                 field(activity, "機器名（任意）").setText("押入れ1")
                 field(activity, "機器名（任意）").onEditorAction(EditorInfo.IME_ACTION_DONE)
-                spinner(activity, "部屋").setSelection(2)
             }
-            eventually(screen) { api.ledger.single().roomId == 2L }
+            eventually(screen) { api.ledger.single().name == "押入れ1" }
             screen.onActivity { activity ->
                 checkBox(activity, "夜").performClick()
             }
@@ -274,39 +272,26 @@ class RegisterScreenTest {
             screen.onActivity { checkBox(it, "夜").performClick() }
             eventually(screen) { api.ledger.single().labelIds == setOf(1L) }
             assertEquals("押入れ1", api.ledger.single().name)
-            assertEquals(listOf(DeviceUpdate.Name("押入れ1"), DeviceUpdate.Room(2), DeviceUpdate.Labels(setOf(2)),
+            assertEquals(listOf(DeviceUpdate.Name("押入れ1"), DeviceUpdate.Labels(setOf(2)),
                 DeviceUpdate.Labels(setOf(1, 2)), DeviceUpdate.Labels(setOf(1))), api.updates.filter { it.first == id }.map { it.second })
             capture(screen, "edited")
-
-            // A new room is made in the pane and given to the device; no room takes it out again.
-            screen.onActivity { activity ->
-                button(activity, "部屋を追加").performClick()
-                field(activity, "新しい部屋の名前").setText("書斎")
-            }
-            capture(screen, "add-room")
-            screen.onActivity { button(it, "追加").performClick() }
-            eventually(screen) { hasLabel(it, "部屋「書斎」を追加しました") && spinner(it, "部屋").selectedItem == "書斎" }
-            eventually(screen) { api.ledger.single().roomId == 3L }
-            screen.onActivity { spinner(it, "部屋").setSelection(0) }
-            eventually(screen) { api.ledger.single().roomId == null }
 
             // A recreated screen reopens the device with its values.
             screen.recreate()
             eventually(screen) { field(it, "機器名（任意）").isShown && checkBox(it, "作業").isChecked }
             screen.onActivity { activity ->
                 assertEquals("押入れ1", field(activity, "機器名（任意）").text.toString())
-                assertEquals("未設定", spinner(activity, "部屋").selectedItem)
+                assertNoRooms(activity)
                 assertFalse(checkBox(activity, "夜").isChecked)
                 assertTrue(hasLabel(activity, "読み取り済み：3497-011-2332"))
             }
             // Drawing the reopened device sends nothing.
-            assertEquals(listOf(DeviceUpdate.Room(3), DeviceUpdate.Room(null)), api.updates.drop(5).map { it.second })
+            assertEquals(4, api.updates.size)
         }
     }
 
     @Test fun unreachableServerOnLaunchOffersReconnect() {
         api.devicesFailure = ApiError.UNREACHABLE
-        api.roomsFailure = ApiError.UNREACHABLE
         ActivityScenario.launch(MainActivity::class.java).use { screen ->
             eventually(screen) { button(it, "再接続").isShown }
             scanner.next = ScanResult.Failed
@@ -316,8 +301,7 @@ class RegisterScreenTest {
             }
             capture(screen, "offline")
             api.devicesFailure = null
-            api.roomsFailure = null
-            api.ledger += Device(1, "天井1", null, emptySet(), DeviceState.UNCONNECTED, qr)
+            api.ledger += Device(1, "天井1", emptySet(), DeviceState.UNCONNECTED, qr)
             screen.onActivity { button(it, "再接続").performClick() }
             eventually(screen) { activity ->
                 listed(activity) == listOf("天井1") && views(activity).none { it is Button && it.text == "再接続" && it.isShown }
@@ -326,7 +310,7 @@ class RegisterScreenTest {
     }
 
     @Test fun connectingShowsEachStageAndSurvivesRecreation() {
-        api.ledger += Device(1, "押入れ1", null, emptySet(), DeviceState.UNCONNECTED, qr)
+        api.ledger += Device(1, "押入れ1", emptySet(), DeviceState.UNCONNECTED, qr)
         ActivityScenario.launch(MainActivity::class.java).use { screen ->
             eventually(screen) { listed(it) == listOf("押入れ1") }
             // No Wi-Fi on home-link for devices yet: it is saved once in the settings, and Thread devices need none.
@@ -377,7 +361,7 @@ class RegisterScreenTest {
 
     @Test fun cancellingReturnsToConnectingAtOnceAndDropsTheLateAnswer() {
         api.wifi += homeWifi
-        api.ledger += Device(1, "押入れ1", null, emptySet(), DeviceState.UNCONNECTED, qr)
+        api.ledger += Device(1, "押入れ1", emptySet(), DeviceState.UNCONNECTED, qr)
         ActivityScenario.launch(MainActivity::class.java).use { screen ->
             eventually(screen) { listed(it) == listOf("押入れ1") }
             val gate = CountDownLatch(1)
@@ -416,7 +400,7 @@ class RegisterScreenTest {
 
     @Test fun connectionFailuresSayWhatToDoAndKeepTheDevice() {
         api.wifi += homeWifi
-        api.ledger += Device(1, "押入れ1", null, emptySet(), DeviceState.UNCONNECTED, qr)
+        api.ledger += Device(1, "押入れ1", emptySet(), DeviceState.UNCONNECTED, qr)
         ActivityScenario.launch(MainActivity::class.java).use { screen ->
             eventually(screen) { listed(it) == listOf("押入れ1") }
             screen.onActivity { button(it, "押入れ1").performClick() }
@@ -462,7 +446,7 @@ class RegisterScreenTest {
         if (android.os.Build.VERSION.SDK_INT >= 37) InstrumentationRegistry.getInstrumentation().uiAutomation
             .grantRuntimePermission(context.packageName, android.Manifest.permission.ACCESS_LOCAL_NETWORK)
         FakeHomeLink().use { server ->
-            HttpHomeLinkApi(server.url).updateDevice(9, DeviceUpdate.Room(null))
+            HttpHomeLinkApi(server.url).updateDevice(9, DeviceUpdate.Name(""))
             assertEquals(listOf("PATCH /api/devices/9"), server.requests.toList())
         }
     }
@@ -478,7 +462,7 @@ class RegisterScreenTest {
             capture(screen, "no-endpoints")
             screen.onActivity { activity ->
                 button(activity, "ラベルを追加").performClick()
-                field(activity, "新しいラベルの名前").setText("room")
+                field(activity, "新しいラベルの名前").setText("ambient")
                 button(activity, "追加").performClick()
             }
             eventually(screen) { hasLabel(it, "接続先が未設定です。アプリの「接続先の設定」でhome-linkのURLを入れてください") }
@@ -522,17 +506,16 @@ class RegisterScreenTest {
                 eventually(screen) { "GET /api/devices" in server.requests }
                 screen.onActivity { assertFalse(hasLabel(it, "接続先が未設定です。home-linkのURLを設定してください")) }
             }
-            assertTrue(server.requests.toString(), "GET /api/rooms" in server.requests)
         }
     }
 
     @Test fun labelsAreListedSwitchedAndAddedFromTheTop() {
-        api.labels += listOf(Label(1, "room", auto = true, on = true), Label(2, "work", override = Override(254, 5000)),
+        api.labels += listOf(Label(1, "ambient", auto = true, on = true), Label(2, "work", override = Override(254, 5000)),
             Label(3, "リビングと続きの和室（南側・大きな窓のある部屋）", on = false))
         val opened = InstrumentationRegistry.getInstrumentation().addMonitor(LabelActivity::class.java.name, null, true)
         ActivityScenario.launch(MainActivity::class.java).use { screen ->
             // The labels lead the screen, each with its switch; the old light buttons are gone.
-            eventually(screen) { switch(it, "room 入") != null && switch(it, "work 切") != null }
+            eventually(screen) { switch(it, "ambient 入") != null && switch(it, "work 切") != null }
             screen.onActivity { activity ->
                 assertTrue(hasLabel(activity, "ラベル"))
                 for (gone in listOf("照明オン", "照明オフ", "ホーム画面にボタンを置く")) assertFalse(gone, hasLabel(activity, gone))
@@ -549,8 +532,8 @@ class RegisterScreenTest {
             gate.countDown()
             api.labelGate = null
             eventually(screen) { switch(it, "work 入")?.isEnabled == true }
-            screen.onActivity { switch(it, "room 入")!!.performClick() }
-            eventually(screen) { switch(it, "room 切") != null }
+            screen.onActivity { switch(it, "ambient 入")!!.performClick() }
+            eventually(screen) { switch(it, "ambient 切") != null }
             assertEquals(listOf(2L to LabelOp.TOGGLE, 1L to LabelOp.TOGGLE), api.labelSwitches.toList())
             // Success says nothing more.
             screen.onActivity { activity ->
@@ -559,8 +542,8 @@ class RegisterScreenTest {
 
             // Devices left behind are counted, and the line survives recreation.
             api.labelCounts = SwitchResult(1, 2, 0, listOf("通路"))
-            screen.onActivity { switch(it, "room 切")!!.performClick() }
-            val partial = "roomの一部の機器をオンにできませんでした。応答なし2台・見つからない1台（通路）"
+            screen.onActivity { switch(it, "ambient 切")!!.performClick() }
+            val partial = "ambientの一部の機器をオンにできませんでした。応答なし2台・見つからない1台（通路）"
             eventually(screen) { hasLabel(it, partial) }
             capture(screen, "label-partial")
             screen.recreate()
@@ -570,7 +553,7 @@ class RegisterScreenTest {
             // A label is added in place and its screen opens.
             screen.onActivity { activity ->
                 button(activity, "ラベルを追加").performClick()
-                field(activity, "新しいラベルの名前").setText("room")
+                field(activity, "新しいラベルの名前").setText("ambient")
             }
             capture(screen, "add-label")
             screen.onActivity { button(it, "追加").performClick() }
@@ -587,11 +570,11 @@ class RegisterScreenTest {
     }
 
     @Test fun aLabelsScreenSendsEachChangeAsItIsMade() {
-        api.labels += listOf(Label(1, "room", auto = true), Label(2, "razor", schedule = listOf(ScheduleEntry(0, true))))
-        api.ledger += Device(1, "天井1", null, setOf(1), DeviceState.CONNECTED, qrs[0], kind = DeviceKind.LIGHT)
-        api.ledger += Device(2, "", null, emptySet(), DeviceState.CONNECTED, qrs[1], kind = DeviceKind.PLUG, productName = "Mini Plug")
-        api.ledger += Device(3, "温湿度計", null, emptySet(), DeviceState.CONNECTED, qrs[2], kind = DeviceKind.OTHER)
-        api.ledger += Device(4, "", null, emptySet(), DeviceState.UNCONNECTED, qr)
+        api.labels += listOf(Label(1, "ambient", auto = true), Label(2, "razor", schedule = listOf(ScheduleEntry(0, true))))
+        api.ledger += Device(1, "天井1", setOf(1), DeviceState.CONNECTED, qrs[0], kind = DeviceKind.LIGHT)
+        api.ledger += Device(2, "", emptySet(), DeviceState.CONNECTED, qrs[1], kind = DeviceKind.PLUG, productName = "Mini Plug")
+        api.ledger += Device(3, "温湿度計", emptySet(), DeviceState.CONNECTED, qrs[2], kind = DeviceKind.OTHER)
+        api.ledger += Device(4, "", emptySet(), DeviceState.UNCONNECTED, qr)
         var times = mutableListOf<Int>()
         LabelActivity.timePicker = { _, _, picked -> picked(times.removeAt(0)) }
         try {
@@ -614,7 +597,7 @@ class RegisterScreenTest {
                 }
                 eventually(screen) { api.ledger.first { it.id == 2L }.labelIds == setOf(2L) && api.labels[1].name == "ひげ剃り" }
                 screen.onActivity { activity ->
-                    field(activity, "名前").setText("room")
+                    field(activity, "名前").setText("ambient")
                     field(activity, "名前").onEditorAction(EditorInfo.IME_ACTION_DONE)
                 }
                 eventually(screen) { hasLabel(it, "同じ名前のラベルがあります") }
@@ -693,19 +676,19 @@ class RegisterScreenTest {
     }
 
     @Test fun aLabelsScreenThatCannotReadHomeLinkOffersReconnect() {
-        api.labels += Label(1, "room")
+        api.labels += Label(1, "ambient")
         api.labelsFailure = ApiError.UNREACHABLE
         ActivityScenario.launch<LabelActivity>(LabelActivity.intent(context, 1)).use { screen ->
             eventually(screen) { hasLabel(it, "home-link（home-link.example:5011）に接続できません。接続先の設定と通信を確かめてください") }
             capture(screen, "label-unreachable")
             api.labelsFailure = null
             screen.onActivity { button(it, "再接続").performClick() }
-            eventually(screen) { field(it, "名前").text.toString() == "room" && !hasLabel(it, "再接続") }
+            eventually(screen) { field(it, "名前").text.toString() == "ambient" && !hasLabel(it, "再接続") }
         }
     }
 
     @Test fun aWidgetIsSetUpWithItsLabelAndNameAndAgainLater() {
-        api.labels += listOf(Label(1, "room"), Label(2, "game", override = Override(203, 5000)))
+        api.labels += listOf(Label(1, "ambient"), Label(2, "game", override = Override(203, 5000)))
         shell("appwidget grantbind --package ${context.packageName} --user 0")
         val host = android.appwidget.AppWidgetHost(context, 7)
         val widget = host.allocateAppWidgetId()
@@ -716,7 +699,7 @@ class RegisterScreenTest {
                 .putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, widget)
             ActivityScenario.launchActivityForResult<WidgetConfigActivity>(setup).use { screen ->
                 // Named after the first label until another is picked or a name typed.
-                eventually(screen) { field(it, "名前").text.toString() == "room" }
+                eventually(screen) { field(it, "名前").text.toString() == "ambient" }
                 capture(screen, "widget-setup")
                 screen.onActivity { spinner(it, "ラベル").setSelection(1) }
                 eventually(screen) { field(it, "名前").text.toString() == "game" }
@@ -902,8 +885,8 @@ class RegisterScreenTest {
 
     @Test fun aConnectedDeviceMovesOntoTheWifiForDevicesWithOneButton() {
         api.wifi += listOf(SavedNetwork(1, "home-2g", forDevices = false), SavedNetwork(2, "iot-2g", forDevices = true))
-        api.ledger += Device(1, "押入れ1", null, emptySet(), DeviceState.CONNECTED, qrs[0], "home-2g")
-        api.ledger += Device(2, "天井1", null, emptySet(), DeviceState.CONNECTED, qrs[1], "iot-2g")
+        api.ledger += Device(1, "押入れ1", emptySet(), DeviceState.CONNECTED, qrs[0], "home-2g")
+        api.ledger += Device(2, "天井1", emptySet(), DeviceState.CONNECTED, qrs[1], "iot-2g")
         val move = "「iot-2g」へ移す"
         ActivityScenario.launch(MainActivity::class.java).use { screen ->
             eventually(screen) { hasLabel(it, "まだ読み取っていません") }
@@ -965,11 +948,11 @@ class RegisterScreenTest {
     }
 
     @Test fun plugsAreListedAndSwitchedFromTheListAndTheirPane() {
-        api.ledger += Device(1, "冷蔵庫", null, emptySet(), DeviceState.CONNECTED, qrs[0], kind = DeviceKind.PLUG, on = true)
-        api.ledger += Device(2, "天井1", null, emptySet(), DeviceState.CONNECTED, qrs[1], kind = DeviceKind.LIGHT)
-        api.ledger += Device(3, "", null, emptySet(), DeviceState.CONNECTED, qrs[2], kind = DeviceKind.PLUG, on = false,
+        api.ledger += Device(1, "冷蔵庫", emptySet(), DeviceState.CONNECTED, qrs[0], kind = DeviceKind.PLUG, on = true)
+        api.ledger += Device(2, "天井1", emptySet(), DeviceState.CONNECTED, qrs[1], kind = DeviceKind.LIGHT)
+        api.ledger += Device(3, "", emptySet(), DeviceState.CONNECTED, qrs[2], kind = DeviceKind.PLUG, on = false,
             productName = "Mini Plug")
-        api.ledger += Device(4, "", null, emptySet(), DeviceState.UNCONNECTED, qr)
+        api.ledger += Device(4, "", emptySet(), DeviceState.UNCONNECTED, qr)
         ActivityScenario.launch(MainActivity::class.java).use { screen ->
             // Connected devices in the ledger's order, a switch beside each plug only.
             eventually(screen) { switch(it, "冷蔵庫 入") != null && switch(it, "Mini Plug 切") != null }
@@ -1146,23 +1129,18 @@ class RegisterScreenTest {
         val list = (heading.parent as ViewGroup).getChildAt(1) as ViewGroup
         return (0 until list.childCount).map { (list.getChildAt(it) as Button).text.toString() }
     }
+    /** The device's pane has no room: no select box and no word of one. */
+    private fun assertNoRooms(activity: Activity) {
+        assertFalse(views(activity).any { it is android.widget.Spinner && it.isShown })
+        assertFalse(views(activity).any { it is TextView && it.isShown && "部屋" in it.text })
+    }
     private fun checkBoxes(activity: Activity) = views(activity).filterIsInstance<android.widget.CheckBox>().filter { it.isShown }
     private fun checkBox(activity: Activity, text: String) =
         views(activity).filterIsInstance<android.widget.CheckBox>().first { it.isShown && it.text.toString() == text }
 }
 
 private class FakeApi : HomeLinkApi {
-    val rooms: MutableList<Room> = Collections.synchronizedList(mutableListOf())
-    @Volatile var roomsFailure: ApiError? = null
     @Volatile var gate: CountDownLatch? = null
-
-    override fun rooms(): ApiResult<List<Room>> =
-        roomsFailure?.let { ApiResult.Failed(it) } ?: ApiResult.Ok(rooms.toList())
-
-    override fun createRoom(name: String): ApiResult<Room> {
-        if (rooms.any { it.name == name }) return ApiResult.Failed(ApiError.DUPLICATE_ROOM)
-        return Room(rooms.size + 1L, name).also { rooms += it }.let { ApiResult.Ok(it) }
-    }
 
     override fun door(command: DoorCommand): ApiResult<Unit> = ApiResult.Failed(ApiError.SERVER)
 
@@ -1185,7 +1163,7 @@ private class FakeApi : HomeLinkApi {
     override fun addDevice(payload: String): ApiResult<Device> = synchronized(ledger) {
         adds += payload
         val device = ledger.firstOrNull { it.code == payload }
-            ?: Device((ledger.maxOfOrNull { it.id } ?: 0) + 1, "", null, emptySet(), DeviceState.UNCONNECTED, payload).also { ledger += it }
+            ?: Device((ledger.maxOfOrNull { it.id } ?: 0) + 1, "", emptySet(), DeviceState.UNCONNECTED, payload).also { ledger += it }
         ApiResult.Ok(device.copy(code = null))
     }
 
@@ -1195,7 +1173,6 @@ private class FakeApi : HomeLinkApi {
         val device = ledger[index]
         ledger[index] = when (update) {
             is DeviceUpdate.Name -> device.copy(name = update.name)
-            is DeviceUpdate.Room -> device.copy(roomId = update.id)
             is DeviceUpdate.Labels -> device.copy(labelIds = update.ids)
         }
         ApiResult.Ok(ledger[index].copy(code = null))
