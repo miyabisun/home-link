@@ -133,13 +133,11 @@ class RegisterScreenTest {
     }
 
     @Test fun manualCodeIsTypedCheckedAndEntered() {
-        val instrumentation = InstrumentationRegistry.getInstrumentation()
         ActivityScenario.launch(MainActivity::class.java).use { screen ->
             eventually(screen) { hasLabel(it, "機器を登録") }
             screen.onActivity { button(it, "数字で入力").performClick() }
             eventually(screen) { field(it, "11桁の数字").hasFocus() }
-            instrumentation.waitForIdleSync()
-            instrumentation.sendStringSync("3497011")
+            type(screen, "3497011")
             eventually(screen) { field(it, "11桁の数字").text.toString() == "3497 011" }
             capture(screen, "manual-typing")
 
@@ -153,8 +151,7 @@ class RegisterScreenTest {
             capture(screen, "manual-length")
 
             screen.onActivity { field(it, "11桁の数字").requestFocus() }
-            instrumentation.waitForIdleSync()
-            instrumentation.sendStringSync("2331")
+            type(screen, "2331")
             eventually(screen) { hasLabel(it, "数字が正しくありません。機器に印字された数字と見比べてください") }
             screen.onActivity { assertEquals("3497 011 2331", field(it, "11桁の数字").text.toString()) }
             capture(screen, "manual-check-digit")
@@ -166,8 +163,7 @@ class RegisterScreenTest {
                 field(activity, "11桁の数字").requestFocus()
                 field(activity, "11桁の数字").setSelection(12)
             }
-            instrumentation.waitForIdleSync()
-            instrumentation.sendStringSync("2")
+            type(screen, "2")
             eventually(screen) { hasLabel(it, "3497-011-2332") && hasLabel(it, "未接続") }
             assertEquals(listOf("34970112332"), api.adds.toList())
             screen.onActivity { activity ->
@@ -1030,6 +1026,14 @@ class RegisterScreenTest {
         views(activity).filterIsInstance<Spinner>().first { it.contentDescription == description }
     private fun field(activity: Activity, description: String) =
         views(activity).filterIsInstance<EditText>().first { it.contentDescription == description }
+    /**
+     * Types into the code field as the soft keyboard does, one commit per digit. Injected key events
+     * pass through the IME, which on API 36 can hand them back out of order while it restarts input.
+     */
+    private fun type(screen: ActivityScenario<MainActivity>, digits: String) = screen.onActivity { activity ->
+        val connection = field(activity, "11桁の数字").onCreateInputConnection(EditorInfo())
+        digits.forEach { connection.commitText(it.toString(), 1) }
+    }
     /** The titles of the devices listed to connect, top to bottom. */
     private fun listed(activity: Activity): List<String> {
         // The list's heading leads its panel; the open device's state reads the same.
