@@ -91,49 +91,6 @@ class HttpHomeLinkApiTest {
         )), api.labels())
     }
 
-    @Test fun createsChangesAndDeletesALabel() {
-        val work = """{"id":4,"name":"work","auto":false,"override_level":254,"override_kelvin":5000,"on":null,"schedule":[],
-            "device_count":0,"boosted":false}"""
-        respond("/api/labels", 201, work)
-        assertEquals(ApiResult.Ok(Label(4, "work", override = Override(254, 5000))), api.createLabel("work"))
-        assertEquals("""POST /api/labels {"name":"work"}""", requests.removeAt(0))
-        respond("/api/labels/4", 200, work)
-        api.updateLabel(4, LabelUpdate.Name("仕事"))
-        api.updateLabel(4, LabelUpdate.Dimming(auto = false, override = Override(254, 5000)))
-        api.updateLabel(4, LabelUpdate.Dimming(auto = true, override = null))
-        api.updateLabel(4, LabelUpdate.Schedule(listOf(ScheduleEntry(1320, false), ScheduleEntry(0, true))))
-        val sent = listOf(
-            """{"name":"仕事"}""",
-            """{"auto":false,"override_level":254,"override_kelvin":5000}""",
-            """{"auto":true,"override_level":null,"override_kelvin":null}""",
-            """{"schedule":[{"time":"00:00","on":true},{"time":"22:00","on":false}]}""",
-        )
-        assertEquals(4, requests.size)
-        for ((request, body) in requests.zip(sent)) {
-            assertEquals("PATCH /api/labels/4", request.substringBefore(" {"))
-            // JSONObject keeps no key order, so the bodies compare field by field.
-            assertEquals(request, fields(body), fields(request.substringAfter("/api/labels/4 ")))
-        }
-        requests.clear()
-        respond("/api/labels/9", 404, """{"error":"label_not_found"}""")
-        assertEquals(ApiResult.Failed(ApiError.LABEL_NOT_FOUND), api.deleteLabel(9))
-        assertEquals("DELETE /api/labels/9", requests.single())
-    }
-
-    private fun fields(json: String) = JSONObject(json).let { obj -> obj.keys().asSequence().associateWith { obj.get(it).toString() } }
-
-    @Test fun mapsLabelEditFailures() {
-        val cases = listOf(
-            Triple(409, "duplicate_label_name", ApiError.DUPLICATE_LABEL),
-            Triple(400, "invalid_label_name", ApiError.INVALID_NAME),
-            Triple(400, "invalid_label", ApiError.INVALID_LABEL),
-        )
-        for ((status, code, expected) in cases) {
-            respond("/api/labels", status, """{"error":"$code"}""")
-            assertEquals("$status $code", ApiResult.Failed(expected), api.createLabel("ambient"))
-        }
-    }
-
     @Test fun switchesALabelAndCountsEachResult() {
         respond("/api/labels/2/toggle", 200, """{"label":"game","action":"release","on":false,"boosted":false,"switched":2,
             "no_response":1,"failed":0,"missing":1,"devices":[],"missing_devices":[{"id":3,"name":""}]}""")

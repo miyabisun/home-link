@@ -27,8 +27,6 @@
         </activity>
         <activity android:name=".SettingsActivity" android:exported="false"
             android:windowSoftInputMode="adjustResize" />
-        <activity android:name=".LabelActivity" android:exported="false"
-            android:windowSoftInputMode="adjustResize" />
         <!-- The launcher opens it when a label widget is placed or set up again. -->
         <activity android:name=".WidgetConfigActivity" android:exported="true"
             android:windowSoftInputMode="adjustResize">

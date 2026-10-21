@@ -37,7 +37,9 @@ class RegisterForm {
     /** The ledger as last read, codes kept from earlier reads. */
     var devices: List<Device> = emptyList()
         private set
-    var devicesFailed = false
+    /** Why the ledger could not be read last; none once it was. */
+    var devicesError: ApiError? = null
+        private set
     /** The device whose pane is open. */
     var device: Device? = null
         private set
@@ -52,8 +54,8 @@ class RegisterForm {
     /** Devices still to connect, in the order they were read. */
     val unconnected get() = devices.filter { it.state == DeviceState.UNCONNECTED }
 
-    /** Devices matterjs-server serves, answering or not, in the ledger's order. */
-    val connected get() = devices.filter { it.state == DeviceState.CONNECTED || it.state == DeviceState.NO_RESPONSE }
+    /** The devices the list offers to connect: none while one connects, and not the one whose pane is open. */
+    val pickable get() = if (busy) emptyList() else unconnected.filter { it.id != device?.id }
 
     /** The devices being switched. */
     var switching: Set<Long> = emptySet()
@@ -157,8 +159,7 @@ class RegisterForm {
     }
 
     fun devicesRead(result: ApiResult<List<Device>>) {
-        devicesFailed = result is ApiResult.Failed
-        if (result is ApiResult.Failed) status = Status.Failed(result.error)
+        devicesError = (result as? ApiResult.Failed)?.error
         if (result !is ApiResult.Ok) return
         // A successful read proves the server is reachable again.
         if (status == Status.Failed(ApiError.UNREACHABLE)) status = null

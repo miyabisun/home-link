@@ -83,24 +83,20 @@ class SettingsActivity : Activity() {
         worker = Executors.newSingleThreadExecutor()
         addingWifi = savedInstanceState?.getBoolean("addingWifi") == true
         locationDenied = savedInstanceState?.getBoolean("locationDenied") == true
-        val content = page()
-        label(content, "接続先の設定", 28, bold = true)
+        val content = headedPage(home = ::finish, subtitle = "接続先の設定")
 
-        val homeLink = panel(content)
-        label(homeLink, "home-link", 18, bold = true)
-        label(homeLink, "照明・登録・玄関の要求を送るURL", 14, muted = true)
-        homeLinkField = urlField(homeLink, "home-linkのURL", HOME_LINK_EXAMPLE, EditorInfo.IME_ACTION_NEXT) { bleProxyField.requestFocus() }
-        homeLinkMessage = message(homeLink)
-
-        val bleProxy = panel(content)
-        label(bleProxy, "matterjs-serverのBLE Proxy", 18, bold = true)
-        label(bleProxy, "Bluetoothで機器を登録するときに使うURL。登録しないなら空欄で構いません", 14, muted = true)
-        bleProxyField = urlField(bleProxy, "BLE ProxyのURL", BLE_PROXY_EXAMPLE, EditorInfo.IME_ACTION_DONE) { save() }
-        bleProxyMessage = message(bleProxy)
-
-        label(content, "保存先：${Endpoints.path(this)}", 14, muted = true)
-        resultRow = ResultRow(this, content, dp(16))
-        button(content, "保存", primary = true) { save() }
+        // Both URLs are saved together, by the button in their panel.
+        val urls = panel(content)
+        label(urls, "home-link", 14, muted = true)
+        homeLinkField = urlField(urls, "home-linkのURL", HOME_LINK_EXAMPLE, EditorInfo.IME_ACTION_NEXT) { bleProxyField.requestFocus() }
+        homeLinkMessage = message(urls)
+        label(urls, "matterjs-serverのBLE Proxy", 14, muted = true).apply {
+            (layoutParams as LinearLayout.LayoutParams).topMargin = dp(8)
+        }
+        bleProxyField = urlField(urls, "BLE ProxyのURL", BLE_PROXY_EXAMPLE, EditorInfo.IME_ACTION_DONE) { save() }
+        bleProxyMessage = message(urls)
+        resultRow = ResultRow(this, urls, dp(12))
+        button(urls, "保存", primary = true) { save() }
         buildWifi(content)
 
         val saved = Endpoints.load(this)

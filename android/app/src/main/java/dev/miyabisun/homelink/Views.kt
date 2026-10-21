@@ -2,7 +2,9 @@ package dev.miyabisun.homelink
 
 import android.app.Activity
 import android.content.res.ColorStateList
+import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.LayerDrawable
 import android.graphics.drawable.RippleDrawable
@@ -13,13 +15,16 @@ import android.text.InputType
 import android.text.TextWatcher
 import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
 import android.view.WindowInsets
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
+import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.PopupWindow
 import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
@@ -45,6 +50,117 @@ internal fun Activity.page(): LinearLayout {
     scroll.addView(content)
     setContentView(scroll)
     return content
+}
+
+/** An entry of the header's menu. */
+internal class MenuEntry(val text: String, val icon: Int, val action: () -> Unit)
+
+/**
+ * Sets a page under the app header: the app's name at the start, going back home through [home] when given,
+ * and a menu button at the end when there is [menu]. [subtitle] names the screen in a sub-header.
+ * Returns the scrolling column, which keeps clear of the system bars and keyboard.
+ */
+internal fun Activity.headedPage(home: (() -> Unit)? = null, subtitle: String? = null,
+                                 menu: List<MenuEntry> = emptyList()): LinearLayout {
+    val root = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setBackgroundColor(getColor(R.color.background))
+    }
+    val header = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER_VERTICAL
+        setBackgroundColor(getColor(R.color.wash_base))
+        minimumHeight = dp(48)
+    }
+    root.addView(header, LinearLayout.LayoutParams(-1, -2))
+    TextView(this).apply {
+        text = getString(R.string.app_name)
+        textSize = 18f
+        typeface = Typeface.DEFAULT_BOLD
+        setTextColor(getColor(R.color.text))
+        gravity = Gravity.CENTER_VERTICAL
+        minHeight = dp(48)
+        setPadding(dp(16), 0, dp(16), 0)
+        if (home != null) {
+            background = ripple()
+            setOnClickListener { home() }
+        }
+        header.addView(this, LinearLayout.LayoutParams(0, -2, 1f))
+    }
+    if (menu.isNotEmpty()) ImageButton(this).apply {
+        setImageResource(R.drawable.ic_menu)
+        contentDescription = "メニュー"
+        background = ripple()
+        setOnClickListener { openMenu(this, menu) }
+        header.addView(this, LinearLayout.LayoutParams(dp(48), dp(48)).apply { marginEnd = dp(4) })
+    }
+    hairline(root)
+    if (subtitle != null) {
+        label(root, subtitle, 18, bold = true).apply {
+            setBackgroundColor(getColor(R.color.wash_raised))
+            gravity = Gravity.CENTER_VERTICAL
+            minHeight = dp(40)
+            setPadding(dp(16), dp(4), dp(16), dp(4))
+            layoutParams = LinearLayout.LayoutParams(-1, -2)
+        }
+        hairline(root)
+    }
+    val scroll = ScrollView(this).apply { isFillViewport = true }
+    root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+    val content = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(16), dp(4), dp(16), dp(24))
+    }
+    scroll.addView(content)
+    // The header's wash runs up behind the status bar; the column keeps clear of the rest.
+    root.setOnApplyWindowInsetsListener { _, insets ->
+        val bars = insets.getInsets(WindowInsets.Type.systemBars() or
+            WindowInsets.Type.displayCutout() or WindowInsets.Type.ime())
+        root.setPadding(bars.left, 0, bars.right, bars.bottom)
+        header.setPadding(0, bars.top, 0, 0)
+        insets
+    }
+    setContentView(root)
+    return content
+}
+
+private fun Activity.hairline(parent: LinearLayout) = View(this).apply {
+    setBackgroundColor(getColor(R.color.border))
+    parent.addView(this, LinearLayout.LayoutParams(-1, dp(1)))
+}
+
+private fun Activity.ripple() = RippleDrawable(ColorStateList.valueOf(getColor(R.color.border)), null,
+    ColorDrawable(Color.WHITE))
+
+/** Drops the menu from the bottom of [button], its end on the button's end; Back or a touch outside closes it. */
+private fun Activity.openMenu(button: View, entries: List<MenuEntry>) {
+    val list = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        background = surface(R.color.surface).apply { cornerRadius = dp(12).toFloat() }
+        setPadding(0, dp(4), 0, dp(4))
+        minimumWidth = dp(180)
+    }
+    val popup = PopupWindow(list, ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, true).apply {
+        elevation = dp(8).toFloat()
+        setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+    }
+    for (entry in entries) TextView(this).apply {
+        text = entry.text
+        textSize = 16f
+        setTextColor(getColor(R.color.text))
+        gravity = Gravity.CENTER_VERTICAL
+        minHeight = dp(48)
+        setPadding(dp(12), dp(8), dp(12), dp(8))
+        setCompoundDrawablesRelativeWithIntrinsicBounds(entry.icon, 0, 0, 0)
+        compoundDrawablePadding = dp(8)
+        background = ripple()
+        setOnClickListener {
+            popup.dismiss()
+            entry.action()
+        }
+        list.addView(this, LinearLayout.LayoutParams(-1, -2))
+    }
+    popup.showAsDropDown(button, 0, 0, Gravity.END)
 }
 
 /** A result line: an icon and text on a surface that turns to the failure colors. */

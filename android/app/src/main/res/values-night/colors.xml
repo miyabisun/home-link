@@ -3,6 +3,9 @@
     <color name="surface">#232323</color>
     <color name="text">#e6e6e6</color>
     <color name="muted">#9a9a9a</color>
+    <!-- The app header and the sub-header below it. -->
+    <color name="wash_base">#232323</color>
+    <color name="wash_raised">#191919</color>
     <color name="border">#333333</color>
     <color name="accent">#e0a800</color>
     <color name="on_accent">#191919</color>

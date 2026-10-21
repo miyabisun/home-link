@@ -7,49 +7,11 @@ class LabelsTest {
     private val all = SwitchResult(3, 0, 0, emptyList())
     private fun result(action: String, on: Boolean?, counts: SwitchResult = all) = ApiResult.Ok(LabelResult(action, on, counts))
 
-    @Test fun percentsAndLevelsRoundTripAtTheValuesInUse() {
-        assertEquals(254, levelOf(100))
-        assertEquals(203, levelOf(80))
-        assertEquals(3, levelOf(1))
-        assertEquals(100, percentOf(254))
-        assertEquals(80, percentOf(203))
-        // The lowest level still reads as lit.
-        assertEquals(1, percentOf(1))
-    }
-
-    @Test fun aFixedValueIsTakenOnlyWithinRange() {
-        assertEquals(Override(203, 5000), overrideOf("80", "5000"))
-        assertEquals(Override(254, 1000), overrideOf(" 100 ", "1000"))
-        assertEquals(emptySet<OverrideError>(), overrideErrors("1", "10000"))
-        assertEquals(setOf(OverrideError.LEVEL), overrideErrors("0", "5000"))
-        assertEquals(setOf(OverrideError.LEVEL), overrideErrors("101", "5000"))
-        assertEquals(setOf(OverrideError.KELVIN), overrideErrors("80", "999"))
-        assertEquals(setOf(OverrideError.KELVIN), overrideErrors("80", "10001"))
-        assertEquals(setOf(OverrideError.LEVEL, OverrideError.KELVIN), overrideErrors("", "5千"))
-        assertEquals(null, overrideOf("80", ""))
-    }
-
-    @Test fun clocksReadAndWriteAsTheServerDoes() {
-        assertEquals("00:00", clock(0))
-        assertEquals("05:07", clock(307))
-        assertEquals("23:59", clock(1439))
+    @Test fun clocksReadAsTheServerWritesThem() {
         assertEquals(0, minuteOf("00:00"))
         assertEquals(1439, minuteOf("23:59"))
         assertEquals(null, minuteOf("24:00"))
         assertEquals(null, minuteOf("5:00"))
-    }
-
-    @Test fun aScheduleStaysInTimeOrderAndRefusesASecondSwitchAtOneTime() {
-        val razor = listOf(ScheduleEntry(0, true), ScheduleEntry(300, false))
-        assertEquals(listOf(ScheduleEntry(0, true), ScheduleEntry(300, false), ScheduleEntry(1320, true)),
-            scheduleWith(razor, ScheduleEntry(1320, true)))
-        assertEquals(listOf(ScheduleEntry(60, false), ScheduleEntry(300, false), ScheduleEntry(1320, true)),
-            scheduleWith(listOf(ScheduleEntry(1320, true), ScheduleEntry(300, false)), ScheduleEntry(60, false)))
-        // Changing one entry, its own time included, is no clash.
-        assertEquals(listOf(ScheduleEntry(0, false), ScheduleEntry(300, false)), scheduleWith(razor, ScheduleEntry(0, false), index = 0))
-        assertEquals(listOf(ScheduleEntry(300, false), ScheduleEntry(360, true)), scheduleWith(razor, ScheduleEntry(360, true), index = 0))
-        assertEquals(null, scheduleWith(razor, ScheduleEntry(300, true)))
-        assertEquals(null, scheduleWith(razor, ScheduleEntry(300, true), index = 0))
     }
 
     @Test fun aWidgetIsNamedAfterItsLabelUntilAnotherNameIsTyped() {

@@ -44,11 +44,6 @@ class MainActivity : Activity() {
     private lateinit var wifiStore: WifiStore
     private lateinit var worker: ExecutorService
     private lateinit var switchWorker: ExecutorService
-    /** The labels being switched. */
-    private var labelsSwitching: Set<Long> = emptySet()
-    /** What the last label switch left behind; none after a full success. */
-    private var labelResult: LightsMessage? = null
-    private var addingLabel = false
     private var enteringCode = false
     private var formattingCode = false
     /** The device to connect once Bluetooth is allowed and on. */
@@ -57,37 +52,31 @@ class MainActivity : Activity() {
     private var endpoints = Endpoints()
 
     private lateinit var content: LinearLayout
-    private lateinit var endpointNotice: LinearLayout
+    private lateinit var noticePanel: LinearLayout
+    private lateinit var noticeRow: ResultRow
+    private lateinit var noticeButton: Button
     private lateinit var wifiPanel: LinearLayout
-    private lateinit var labelList: LinearLayout
-    private lateinit var labelRow: ResultRow
-    private lateinit var addLabelButton: Button
-    private lateinit var newLabelPanel: LinearLayout
-    private lateinit var newLabelName: EditText
-    private lateinit var newLabelMessage: TextView
-    private lateinit var createLabelButton: Button
     private lateinit var qrPanel: LinearLayout
-    private lateinit var qrState: TextView
-    private lateinit var deviceState: TextView
-    private lateinit var faceSwitch: Button
     private lateinit var qrMessage: TextView
+    private lateinit var qrRow: ResultRow
     private lateinit var manualButton: Button
     private lateinit var manualPanel: LinearLayout
     private lateinit var manualField: EditText
     private lateinit var manualMessage: TextView
-    private lateinit var devicePanels: List<LinearLayout>
+    private lateinit var devicePane: LinearLayout
+    private lateinit var deviceViews: List<View>
+    private lateinit var codeView: TextView
+    private lateinit var deviceState: TextView
+    private lateinit var faceSwitch: Button
     private lateinit var nameField: EditText
     private lateinit var labelPanel: LinearLayout
     private lateinit var labelBoxes: LinearLayout
-    private lateinit var unconnectedPanel: LinearLayout
-    private lateinit var unconnectedList: LinearLayout
-    private lateinit var connectedPanel: LinearLayout
-    private lateinit var connectedList: LinearLayout
     private lateinit var resultRow: ResultRow
-    private lateinit var reconnectButton: Button
     private lateinit var connectButton: Button
     private lateinit var moveButton: Button
     private lateinit var cancelButton: Button
+    private lateinit var unconnectedPanel: LinearLayout
+    private lateinit var unconnectedList: LinearLayout
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -100,13 +89,8 @@ class MainActivity : Activity() {
         background({ moveToServer(wifiStore, api::saveWifi) }) { }
         // Switching a label can wait seconds for every device; registration does not queue behind it.
         switchWorker = Executors.newSingleThreadExecutor()
-        savedInstanceState?.let { state ->
-            addingLabel = state.getBoolean("addingLabel")
-            enteringCode = state.getBoolean("enteringCode")
-            labelResult = state.getString("labelText")?.let { LightsMessage(it, failed = true) }
-        }
+        enteringCode = savedInstanceState?.getBoolean("enteringCode") == true
         build()
-        newLabelName.setText(savedInstanceState?.getString("newLabel").orEmpty())
         manualField.setText(savedInstanceState?.getString("manualCode").orEmpty())
         manualField.setSelection(manualField.length())
         // A registration started before the screen was recreated carries on.
@@ -132,11 +116,8 @@ class MainActivity : Activity() {
             outState.putString("name", nameField.text.toString())
         }
         form.connecting?.let { outState.putLong("connecting", it) }
-        outState.putBoolean("addingLabel", addingLabel)
-        outState.putString("newLabel", newLabelName.text.toString())
         outState.putBoolean("enteringCode", enteringCode)
         outState.putString("manualCode", manualField.text.toString())
-        labelResult?.let { outState.putString("labelText", it.text) }
         super.onSaveInstanceState(outState)
     }
 
@@ -144,7 +125,7 @@ class MainActivity : Activity() {
         super.onResume()
         // The settings screen or `adb push` may have changed the endpoints meanwhile.
         endpoints = Endpoints.load(this)
-        // A label's screen may have changed the labels meanwhile.
+        // The admin screen may have changed the labels meanwhile.
         loadLabels()
         // The settings screen may have saved the Wi-Fi for devices meanwhile.
         loadWifi()
@@ -179,47 +160,6 @@ class MainActivity : Activity() {
     private fun loadLabels() {
         background({ api.labels() }) { result ->
             if (result is ApiResult.Ok) form.labels = result.value
-            render()
-        }
-    }
-
-    /** Toggles `label` as its widget does, then reads every label again: an off may end others' overrides. */
-    private fun switchLabel(label: Label) {
-        labelsSwitching = labelsSwitching + label.id
-        labelResult = null
-        render()
-        val host = homeLinkHost(this)
-        background(switchWorker, { api.switchLabel(label.id, LabelOp.TOGGLE) to api.labels() }) { (result, labels) ->
-            labelsSwitching = labelsSwitching - label.id
-            labelResult = labelMessage(label.name, result, host)
-            if (labels is ApiResult.Ok) form.labels = labels.value
-            else if (result is ApiResult.Ok) form.labels = form.labels.map { if (it.id == label.id) it.copy(on = result.value.on) else it }
-            // The widgets show the same labels.
-            LabelWidget.saveStates(this, ApiResult.Ok(form.labels))
-            LabelWidget.showAll(this)
-            render()
-        }
-    }
-
-    private fun createLabel() {
-        val name = newLabelName.text.toString().trim()
-        if (name.isEmpty()) return
-        createLabelButton.isEnabled = false
-        background({ api.createLabel(name) }) { result ->
-            when (result) {
-                is ApiResult.Ok -> {
-                    addingLabel = false
-                    newLabelName.setText("")
-                    show(newLabelMessage, null)
-                    form.labels = form.labels + result.value
-                    startActivity(LabelActivity.intent(this, result.value.id))
-                }
-                is ApiResult.Failed -> show(newLabelMessage, when (result.error) {
-                    ApiError.DUPLICATE_LABEL -> "同じ名前のラベルがあります"
-                    ApiError.INVALID_NAME -> "名前は${MAX_NAME}文字以内で入力してください"
-                    else -> failure(result.error, homeLinkHost(this)).text
-                })
-            }
             render()
         }
     }
@@ -367,24 +307,14 @@ class MainActivity : Activity() {
         render()
     }
 
-    /** A device picked from the list opens and starts connecting. */
+    /** A device picked from the list opens in the pane, which connects it and shows how that goes. */
     private fun connectListed(device: Device) {
         if (form.device?.id != device.id) {
             saveName()
             open(device)
         }
         commission(device.id)
-    }
-
-    /** A connected device picked from the list opens its pane. */
-    private fun openListed(device: Device) {
-        if (form.device?.id != device.id) {
-            saveName()
-            open(device)
-        }
-        form.status = null
-        render()
-        (content.parent as ScrollView).smoothScrollTo(0, qrPanel.top)
+        devicePane.post { (content.parent as ScrollView).smoothScrollTo(0, devicePane.top) }
     }
 
     private fun switchDevice(device: Device) {
@@ -459,78 +389,28 @@ class MainActivity : Activity() {
     }
 
     private fun build() {
-        content = page()
+        content = headedPage(menu = listOf(MenuEntry("接続先の設定", R.drawable.ic_settings) { openSettings() }))
 
-        // Until home-link's URL is set, nothing can be sent: the way to set it comes first.
-        endpointNotice = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        content.addView(endpointNotice, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(16) })
-        ResultRow(this, endpointNotice, 0).show("接続先が未設定です。home-linkのURLを設定してください", failed = true)
-        button(endpointNotice, "接続先を設定", icon = R.drawable.ic_settings) { openSettings() }
+        // Until home-link's URL is set or its ledger read, nothing below works: the way out comes first.
+        noticePanel = panel(content)
+        noticeRow = ResultRow(this, noticePanel, dp(4))
+        noticeButton = button(noticePanel, "") { if (endpoints.homeLinkUrl == null) openSettings() else reload() }
 
-        // Labels are what is switched day to day; their screens open from here.
-        label(content, "ラベル", 28, bold = true)
-        val labels = panel()
-        labelList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        labels.addView(labelList, LinearLayout.LayoutParams(-1, -2))
-        labelRow = ResultRow(this, labels, dp(8))
-        addLabelButton = button(labels, "ラベルを追加", icon = R.drawable.ic_add) {
-            addingLabel = true
-            render()
-            newLabelName.requestFocus()
-        }
-        newLabelPanel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        labels.addView(newLabelPanel, LinearLayout.LayoutParams(-1, -2))
-        label(newLabelPanel, "新しいラベルの名前", 14, muted = true)
-        newLabelName = field(newLabelPanel, "新しいラベルの名前", EditorInfo.IME_ACTION_DONE) { createLabel() }
-        newLabelName.addTextChangedListener(changed { render() })
-        newLabelMessage = message(newLabelPanel)
-        val labelActions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        newLabelPanel.addView(labelActions, LinearLayout.LayoutParams(-1, -2))
-        button(labelActions, "やめる", weight = true) {
-            addingLabel = false
-            newLabelName.setText("")
-            show(newLabelMessage, null)
-            render()
-        }
-        createLabelButton = button(labelActions, "追加", weight = true) { createLabel() }
+        wifiPanel = panel(content)
+        label(wifiPanel, "機器に渡すWi-Fi", 18, bold = true)
+        label(wifiPanel, "まだ保存していません", 16, muted = true)
+        button(wifiPanel, "Wi-Fiを設定", icon = R.drawable.ic_settings) { openSettings() }
 
-        // Connected devices are used day to day, like the labels; their panes open from here.
-        connectedPanel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        content.addView(connectedPanel, LinearLayout.LayoutParams(-1, -2))
-        label(connectedPanel, "機器", 28, bold = true).apply {
-            (layoutParams as LinearLayout.LayoutParams).topMargin = dp(24)
-        }
-        connectedList = panel(connectedPanel)
-
-        label(content, "機器を登録", 28, bold = true).apply {
-            (layoutParams as LinearLayout.LayoutParams).topMargin = dp(24)
-        }
-
-        val qr = panel()
-        qrPanel = qr
-        label(qr, "機器のコード", 18, bold = true)
-        qrState = label(qr, "", 16)
-        // A plug's switch sits beside its state, apart from the pane's main action.
-        val stateRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            isBaselineAligned = false
-        }
-        qr.addView(stateRow, LinearLayout.LayoutParams(-1, -2))
-        deviceState = label(stateRow, "", 16).apply {
-            compoundDrawablePadding = dp(8)
-            layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
-        }
-        // Centred in the row, a top margin would push the switch past its bottom.
-        faceSwitch = button(stateRow, "") { form.device?.let(::switchDevice) }.apply {
-            layoutParams = LinearLayout.LayoutParams(-2, -2)
-        }
-        qrMessage = message(qr)
-        button(qr, "QRを読み取る", icon = R.drawable.ic_qr) { scan() }
-        manualButton = button(qr, "数字で入力", icon = R.drawable.ic_keypad) { openManual() }
+        qrPanel = panel(content)
+        label(qrPanel, "機器を登録", 18, bold = true)
+        qrMessage = message(qrPanel)
+        // What sending a read code to home-link left behind, before any device is open.
+        qrRow = ResultRow(this, qrPanel, dp(8))
+        button(qrPanel, "QRを読み取る", icon = R.drawable.ic_qr) { scan() }
+        manualButton = button(qrPanel, "数字で入力", icon = R.drawable.ic_keypad) { openManual() }
         manualPanel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        qr.addView(manualPanel, LinearLayout.LayoutParams(-1, -2))
-        label(manualPanel, "機器に印字された11桁の数字", 14, muted = true)
+        qrPanel.addView(manualPanel, LinearLayout.LayoutParams(-1, -2))
+        label(manualPanel, "11桁の数字", 14, muted = true)
         manualField = field(manualPanel, "11桁の数字", EditorInfo.IME_ACTION_DONE) { submitManual() }
         // The phone keypad shows digits and, unlike the number class, keeps the grouping spaces.
         manualField.inputType = InputType.TYPE_CLASS_PHONE
@@ -547,67 +427,99 @@ class MainActivity : Activity() {
             render()
         }
 
-        val name = panel()
-        label(name, "機器名（任意）", 18, bold = true)
-        nameField = field(name, "機器名（任意）", EditorInfo.IME_ACTION_DONE) { saveName() }
+        // The open device's pane holds everything that acts on it: its fields, how connecting goes, and the actions.
+        devicePane = panel(content)
+        codeView = label(devicePane, "", 18, bold = true)
+        // A plug's switch sits beside its state, apart from the pane's main action.
+        val stateRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            isBaselineAligned = false
+        }
+        devicePane.addView(stateRow, LinearLayout.LayoutParams(-1, -2))
+        deviceState = label(stateRow, "", 16).apply {
+            compoundDrawablePadding = dp(8)
+            layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
+        }
+        // Centred in the row, a top margin would push the switch past its bottom.
+        faceSwitch = button(stateRow, "") { form.device?.let(::switchDevice) }.apply {
+            layoutParams = LinearLayout.LayoutParams(-2, -2)
+        }
+        val nameCaption = label(devicePane, "機器名", 14, muted = true).apply {
+            (layoutParams as LinearLayout.LayoutParams).topMargin = dp(8)
+        }
+        nameField = field(devicePane, "機器名", EditorInfo.IME_ACTION_DONE) { saveName() }
         nameField.setOnFocusChangeListener { _, focused -> if (!focused) saveName() }
-
-        labelPanel = panel()
-        label(labelPanel, "ラベル", 18, bold = true)
+        labelPanel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        devicePane.addView(labelPanel, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+        label(labelPanel, "ラベル", 14, muted = true)
         labelBoxes = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         labelPanel.addView(labelBoxes, LinearLayout.LayoutParams(-1, -2))
-        devicePanels = listOf(name, labelPanel)
+        deviceViews = listOf(stateRow, nameCaption, nameField, labelPanel)
+        resultRow = ResultRow(this, devicePane, dp(12))
+        connectButton = button(devicePane, "接続", primary = true, icon = R.drawable.ic_bluetooth) {
+            form.device?.let { commission(it.id) }
+        }
+        cancelButton = button(devicePane, "キャンセル") { cancel() }
+        moveButton = button(devicePane, "", primary = true, icon = R.drawable.ic_wifi) {
+            form.device?.let { moveWifi(it.id) }
+        }
 
-        wifiPanel = panel()
-        label(wifiPanel, "機器に渡すWi-Fi", 18, bold = true)
-        label(wifiPanel, "まだ保存していません", 16, muted = true)
-        button(wifiPanel, "Wi-Fiを設定", icon = R.drawable.ic_settings) { openSettings() }
-
-        unconnectedPanel = panel()
+        unconnectedPanel = panel(content)
         label(unconnectedPanel, "未接続", 18, bold = true)
         unconnectedList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         unconnectedPanel.addView(unconnectedList, LinearLayout.LayoutParams(-1, -2))
-
-        resultRow = ResultRow(this, content, dp(16))
-        reconnectButton = button(content, "再接続") {
-            loadLabels()
-            loadDevices()
-            loadWifi()
-        }
-        connectButton = button(content, "接続", primary = true, icon = R.drawable.ic_bluetooth) {
-            form.device?.let { commission(it.id) }
-        }
-        cancelButton = button(content, "キャンセル") { cancel() }
-        moveButton = button(content, "", primary = true, icon = R.drawable.ic_wifi) {
-            form.device?.let { moveWifi(it.id) }
-        }
-        button(content, "接続先の設定", icon = R.drawable.ic_settings) { openSettings() }.apply {
-            (layoutParams as LinearLayout.LayoutParams).topMargin = dp(24)
-        }
         render()
+    }
+
+    private fun reload() {
+        loadLabels()
+        loadDevices()
+        loadWifi()
     }
 
     private fun openSettings() = startActivity(Intent(this, SettingsActivity::class.java))
 
     private fun render() {
-        endpointNotice.visibility = if (endpoints.homeLinkUrl == null) View.VISIBLE else View.GONE
-        renderLabelList()
-        labelRow.show(labelResult?.text, failed = true)
-        addLabelButton.visibility = if (addingLabel) View.GONE else View.VISIBLE
-        newLabelPanel.visibility = if (addingLabel) View.VISIBLE else View.GONE
-        createLabelButton.isEnabled = newLabelName.text.isNotBlank()
+        val unset = endpoints.homeLinkUrl == null
+        val ledgerError = form.devicesError
+        noticePanel.visibility = if (unset || ledgerError != null) View.VISIBLE else View.GONE
+        noticeRow.show(when {
+            unset -> "接続先が未設定です。home-linkのURLを設定してください"
+            ledgerError != null -> resultText(Status.Failed(ledgerError))
+            else -> null
+        }, failed = true)
+        noticeButton.text = if (unset) "接続先を設定" else "再接続"
+        noticeButton.setCompoundDrawablesRelativeWithIntrinsicBounds(if (unset) R.drawable.ic_settings else 0, 0, 0, 0)
 
         val device = form.device
-        val code = device?.code
-        qrState.text = when {
-            device == null -> "まだ読み取っていません"
-            code == null -> ""
-            code.startsWith("MT:") -> ManualCode.label(code)?.let { "読み取り済み：$it" }
-                ?: "読み取り済み（ラベルの数字に直せないコード）：$code"
-            else -> "入力済み：${ManualCode.label(code)}"
-        }
-        qrState.setTextColor(getColor(if (device == null) R.color.muted else R.color.text))
-        qrState.visibility = if (qrState.text.isEmpty()) View.GONE else View.VISIBLE
+        val status = form.status
+        val result = resultText(status)
+        val failed = status is Status.Failed || status is Status.BleFailed
+
+        // Reading another code while one connects would leave that connection without its pane.
+        qrPanel.visibility = if (form.busy) View.GONE else View.VISIBLE
+        manualButton.visibility = if (enteringCode) View.GONE else View.VISIBLE
+        manualPanel.visibility = if (enteringCode) View.VISIBLE else View.GONE
+        show(qrMessage, when (status) {
+            Status.NotMatter -> "MatterのQRコードではありません。QRコードが無い機器は「数字で入力」を使ってください"
+            Status.ScanFailed -> "QRコードを読み取れませんでした。もう一度お試しください"
+            Status.Failed(ApiError.INVALID_QR) -> "MatterのQRコードとして読み取れませんでした。読み取り直してください"
+            Status.Failed(ApiError.INVALID_MANUAL) -> "この数字はMatterの機器のコードとして使えません。数字を入力し直してください"
+            else -> null
+        })
+        val typed = ManualCode.digits(manualField.text.toString()).length
+        show(manualMessage, when (form.manualError) {
+            ManualError.LENGTH -> "11桁の数字を入力してください（あと${ManualCode.LENGTH - typed}桁）"
+            ManualError.CHECK_DIGIT -> "数字が正しくありません。機器に印字された数字と見比べてください"
+            null -> null
+        })
+        qrRow.show(if (device == null) result else null, failed)
+
+        devicePane.visibility = if (device != null || form.busy) View.VISIBLE else View.GONE
+        for (view in deviceViews) view.visibility = if (device == null) View.GONE else View.VISIBLE
+        codeView.text = device?.code?.let { ManualCode.label(it) ?: it }.orEmpty()
+        codeView.visibility = if (codeView.text.isEmpty()) View.GONE else View.VISIBLE
         val state = device?.state
         deviceState.text = when (state) {
             DeviceState.UNCONNECTED -> "未接続"
@@ -629,32 +541,25 @@ class MainActivity : Activity() {
         val plug = device?.takeIf { it.kind == DeviceKind.PLUG && it.state != DeviceState.UNCONNECTED }
         faceSwitch.visibility = if (plug == null) View.GONE else View.VISIBLE
         plug?.let { renderSwitch(faceSwitch, it) }
-        manualButton.visibility = if (enteringCode) View.GONE else View.VISIBLE
-        manualPanel.visibility = if (enteringCode) View.VISIBLE else View.GONE
-        val status = form.status
-        show(qrMessage, when (status) {
-            Status.NotMatter -> "MatterのQRコードではありません。QRコードが無い機器は「数字で入力」を使ってください"
-            Status.ScanFailed -> "QRコードを読み取れませんでした。もう一度お試しください"
-            Status.Failed(ApiError.INVALID_QR) -> "MatterのQRコードとして読み取れませんでした。読み取り直してください"
-            Status.Failed(ApiError.INVALID_MANUAL) -> "この数字はMatterの機器のコードとして使えません。数字を入力し直してください"
-            else -> null
-        })
-        val typed = ManualCode.digits(manualField.text.toString()).length
-        show(manualMessage, when (form.manualError) {
-            ManualError.LENGTH -> "11桁の数字を入力してください（あと${ManualCode.LENGTH - typed}桁）"
-            ManualError.CHECK_DIGIT -> "数字が正しくありません。機器に印字された数字と見比べてください"
-            null -> null
-        })
-
-        for (panel in devicePanels) panel.visibility = if (device == null) View.GONE else View.VISIBLE
         if (device != null) renderLabels(device)
+
+        val stage = form.stage
+        if (device != null && form.moving == device.id) resultRow.show("Wi-Fiを移しています…", failed = false, R.drawable.ic_wifi)
+        else if (form.busy && stage != null) resultRow.show(stageText(stage), failed = false, R.drawable.ic_bluetooth)
+        else resultRow.show(if (device != null) result else null, failed)
+        connectButton.visibility = if (form.canConnect()) View.VISIBLE else View.GONE
+        cancelButton.visibility = if (form.busy) View.VISIBLE else View.GONE
+        moveButton.text = "「${form.deviceWifi}」へ移す"
+        moveButton.visibility = if (form.canMoveWifi()) View.VISIBLE else View.GONE
 
         wifiPanel.visibility = if (form.wifiMissing) View.VISIBLE else View.GONE
         renderUnconnected()
-        renderConnected()
+    }
 
+    /** What the last action left to say, in the pane or the panel it started from; none for a code's own errors. */
+    private fun resultText(status: Status?): String? {
         val ssid = form.deviceWifi?.let { "「$it」" }.orEmpty()
-        val result = when (status) {
+        return when (status) {
             is Status.Commissioned -> if (status.name.isEmpty()) "接続しました" else "「${status.name}」を接続しました"
             is Status.WifiMoved -> "「${status.ssid}」へ移しました"
             is Status.BleFailed -> when (status.problem) {
@@ -692,17 +597,6 @@ class MainActivity : Activity() {
             }
             else -> null
         }
-        val stage = form.stage
-        if (device != null && form.moving == device.id) resultRow.show("Wi-Fiを移しています…", failed = false, R.drawable.ic_wifi)
-        else if (form.busy && stage != null) resultRow.show(stageText(stage), failed = false, R.drawable.ic_bluetooth)
-        else resultRow.show(result, status is Status.Failed || status is Status.BleFailed)
-        reconnectButton.visibility =
-            if (form.devicesFailed || status == Status.Failed(ApiError.UNREACHABLE)) View.VISIBLE
-            else View.GONE
-        connectButton.visibility = if (form.canConnect()) View.VISIBLE else View.GONE
-        cancelButton.visibility = if (form.busy) View.VISIBLE else View.GONE
-        moveButton.text = "「${form.deviceWifi}」へ移す"
-        moveButton.visibility = if (form.canMoveWifi()) View.VISIBLE else View.GONE
     }
 
     /** One check box per label, ticked for the device's. */
@@ -727,38 +621,9 @@ class MainActivity : Activity() {
         form.labels.forEachIndexed { i, label -> (labelBoxes.getChildAt(i) as CheckBox).isChecked = label.id in device.labelIds }
     }
 
-    /** A row per label opening its screen, with its switch. */
-    private fun renderLabelList() {
-        val listed = form.labels
-        val titles = listed.map { it.name }
-        if (labelList.childCount != listed.size ||
-            titles.withIndex().any { (i, title) -> ((labelList.getChildAt(i) as LinearLayout).getChildAt(0) as Button).text != title }) {
-            labelList.removeAllViews()
-            for (title in titles) {
-                val row = LinearLayout(this).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    isBaselineAligned = false
-                }
-                labelList.addView(row, LinearLayout.LayoutParams(-1, -2))
-                button(row, title, weight = true) { }
-                button(row, "") { }.layoutParams = LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(8) }
-            }
-        }
-        listed.forEachIndexed { i, label ->
-            val row = labelList.getChildAt(i) as LinearLayout
-            row.getChildAt(0).setOnClickListener { startActivity(LabelActivity.intent(this, label.id)) }
-            (row.getChildAt(1) as Button).apply {
-                isEnabled = label.id !in labelsSwitching
-                paintSwitch(this, if (label.on == true) "入" else "切", label.on == true)
-                contentDescription = "${label.name} $text"
-                setOnClickListener { switchLabel(label) }
-            }
-        }
-    }
-
-    /** A button per device still to connect; pressing one connects it. */
+    /** A button per device still to connect; pressing one opens it in the pane and connects it. */
     private fun renderUnconnected() {
-        val listed = form.unconnected
+        val listed = form.pickable
         unconnectedPanel.visibility = if (listed.isEmpty()) View.GONE else View.VISIBLE
         val titles = listed.map { it.title }
         if (unconnectedList.childCount != listed.size ||
@@ -768,37 +633,6 @@ class MainActivity : Activity() {
         listed.forEachIndexed { i, device ->
             val row = unconnectedList.getChildAt(i) as Button? ?: button(unconnectedList, titles[i], icon = R.drawable.ic_bluetooth) { }
             row.setOnClickListener { connectListed(device) }
-            row.isEnabled = !form.busy
-        }
-    }
-
-    /** A row per connected device opening its pane, with a switch for a plug. */
-    private fun renderConnected() {
-        val listed = form.connected
-        connectedPanel.visibility = if (listed.isEmpty()) View.GONE else View.VISIBLE
-        val rows = listed.map { it.title to (it.kind == DeviceKind.PLUG) }
-        if (connectedList.childCount != listed.size || rows.withIndex().any { (i, row) ->
-                val shown = connectedList.getChildAt(i) as LinearLayout
-                (shown.getChildAt(0) as Button).text != row.first || (shown.childCount == 2) != row.second
-            }) {
-            connectedList.removeAllViews()
-            for ((title, plug) in rows) {
-                val row = LinearLayout(this).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    isBaselineAligned = false
-                }
-                connectedList.addView(row, LinearLayout.LayoutParams(-1, -2))
-                button(row, title, weight = plug) { }
-                if (plug) button(row, "") { }.layoutParams = LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(8) }
-            }
-        }
-        listed.forEachIndexed { i, device ->
-            val row = connectedList.getChildAt(i) as LinearLayout
-            row.getChildAt(0).apply {
-                setOnClickListener { openListed(device) }
-                isEnabled = !form.busy
-            }
-            (row.getChildAt(1) as Button?)?.let { renderSwitch(it, device) }
         }
     }
 
@@ -822,7 +656,5 @@ class MainActivity : Activity() {
         Stage.CONNECTING -> "機器に接続しています…"
         Stage.SENDING -> "機器にコードと設定を送っています…"
     }
-
-    private fun panel() = panel(content)
 
 }

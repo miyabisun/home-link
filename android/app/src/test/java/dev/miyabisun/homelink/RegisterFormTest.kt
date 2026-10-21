@@ -46,7 +46,7 @@ class RegisterFormTest {
         // A failed read keeps the last list.
         form.devicesRead(ApiResult.Failed(ApiError.UNREACHABLE))
         assertEquals(listOf(1L, 5L), form.unconnected.map { it.id })
-        assertTrue(form.devicesFailed)
+        assertEquals(ApiError.UNREACHABLE, form.devicesError)
     }
 
     @Test fun rereadingTheLedgerKeepsTheCodesAlreadyRead() {
@@ -177,11 +177,13 @@ class RegisterFormTest {
         form.devicesRead(ApiResult.Ok(listOf(device(1))))
         form.devicesRead(ApiResult.Failed(ApiError.UNREACHABLE))
         assertEquals(listOf(1L), form.devices.map { it.id })
-        assertTrue(form.devicesFailed)
-        assertEquals(Status.Failed(ApiError.UNREACHABLE), form.status)
+        // The ledger's failure is its own, apart from what the open device last did.
+        assertEquals(ApiError.UNREACHABLE, form.devicesError)
+        assertNull(form.status)
         // A successful read proves the server is reachable again.
+        form.status = Status.Failed(ApiError.UNREACHABLE)
         form.devicesRead(ApiResult.Ok(listOf(device(1))))
-        assertFalse(form.devicesFailed)
+        assertNull(form.devicesError)
         assertNull(form.status)
 
         form.status = Status.Failed(ApiError.WRONG_CODE)
@@ -242,11 +244,18 @@ class RegisterFormTest {
         assertEquals("iot-2g", form.device?.wifiSsid)
     }
 
-    @Test fun connectedDevicesAreListedInTheLedgersOrder() {
+    @Test fun theListOffersTheUnconnectedDevicesNotOpenAndNoneWhileConnecting() {
         val form = RegisterForm()
-        form.devicesRead(ApiResult.Ok(listOf(device(1), device(2, DeviceState.CONNECTED), device(3, DeviceState.NO_RESPONSE),
-            device(4, null), device(5, DeviceState.CONNECTED))))
-        assertEquals(listOf(2L, 3L, 5L), form.connected.map { it.id })
+        form.devicesRead(ApiResult.Ok(listOf(device(1), device(2, DeviceState.CONNECTED), device(3), device(4))))
+        assertEquals(listOf(1L, 3L, 4L), form.pickable.map { it.id })
+        // The open device's pane connects it; the list does not show it again.
+        form.opened(device(3))
+        assertEquals(listOf(1L, 4L), form.pickable.map { it.id })
+        // While one connects, no other can start.
+        form.connect(3)
+        assertEquals(emptyList<Device>(), form.pickable)
+        form.bleFailed(BleProblem.BLUETOOTH_OFF)
+        assertEquals(listOf(1L, 4L), form.pickable.map { it.id })
     }
 
     @Test fun aPlugSwitchesToTheOtherSideAndShowsItsAnswer() {
@@ -262,7 +271,7 @@ class RegisterFormTest {
         assertEquals(setOf(1L), form.switching)
         form.switched(1, ApiResult.Ok(true))
         assertEquals(plug.copy(on = true), form.device)
-        assertEquals(listOf(plug.copy(on = true)), form.connected)
+        assertEquals(listOf(plug.copy(on = true)), form.devices)
         assertEquals(emptySet<Long>(), form.switching)
 
         // No answer keeps the last On/Off read; an answer again brings the plug back.

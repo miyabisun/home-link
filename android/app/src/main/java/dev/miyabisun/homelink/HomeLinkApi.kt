@@ -72,9 +72,6 @@ interface HomeLinkApi {
     fun addDevice(payload: String): ApiResult<Device>
     fun updateDevice(id: Long, update: DeviceUpdate): ApiResult<Device>
     fun labels(): ApiResult<List<Label>>
-    fun createLabel(name: String): ApiResult<Label>
-    fun updateLabel(id: Long, update: LabelUpdate): ApiResult<Label>
-    fun deleteLabel(id: Long): ApiResult<Unit>
     /** Switches label `id`'s lights and plugs on or off, or toggles them. */
     fun switchLabel(id: Long, op: LabelOp): ApiResult<LabelResult>
     /**
@@ -131,24 +128,6 @@ class HttpHomeLinkApi(private val baseUrl: () -> String?) : HomeLinkApi {
         val array = JSONArray(body)
         (0 until array.length()).map { label(array.getJSONObject(it)) }
     }
-
-    override fun createLabel(name: String): ApiResult<Label> =
-        call("POST", "/api/labels", JSONObject().put("name", name)) { label(JSONObject(it)) }
-
-    override fun updateLabel(id: Long, update: LabelUpdate): ApiResult<Label> {
-        val body = when (update) {
-            is LabelUpdate.Name -> JSONObject().put("name", update.name)
-            is LabelUpdate.Dimming -> JSONObject().put("auto", update.auto)
-                .put("override_level", update.override?.level ?: JSONObject.NULL)
-                .put("override_kelvin", update.override?.kelvin ?: JSONObject.NULL)
-            is LabelUpdate.Schedule -> JSONObject().put("schedule", JSONArray(update.entries.sortedBy { it.minute }.map {
-                JSONObject().put("time", clock(it.minute)).put("on", it.on)
-            }))
-        }
-        return call("PATCH", "/api/labels/$id", body) { label(JSONObject(it)) }
-    }
-
-    override fun deleteLabel(id: Long): ApiResult<Unit> = call("DELETE", "/api/labels/$id", null) { }
 
     override fun switchLabel(id: Long, op: LabelOp): ApiResult<LabelResult> =
         call("POST", "/api/labels/$id/${op.path}", null) { body ->
