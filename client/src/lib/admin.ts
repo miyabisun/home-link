@@ -1,0 +1,142 @@
+// Pure rules of the admin screen: what a row shows and what an input sends.
+// The server checks the same limits; these keep a bad value from leaving the page.
+
+const MAX_NAME = 100;
+const FIXED_DEFAULT = { override_level: 203, override_kelvin: 5000 };
+
+export type Dimming = "none" | "auto" | "fixed";
+
+export interface LabelTraits {
+  auto: boolean;
+  override_level: number | null;
+  override_kelvin: number | null;
+}
+
+export interface Switch {
+  time: string;
+  on: boolean;
+}
+
+const length = (text: string) => [...text].length;
+
+export function deviceName(device: {
+  name: string;
+  product_name: string | null;
+  vendor: string | null;
+}): string {
+  return device.name || device.product_name || device.vendor || "名前なし";
+}
+
+export function deviceNameError(name: string): string | null {
+  return length(name.trim()) > MAX_NAME ? `${MAX_NAME}文字以内` : null;
+}
+
+export function labelNameError(name: string): string | null {
+  const n = length(name.trim());
+  return n < 1 || n > MAX_NAME ? `1〜${MAX_NAME}文字` : null;
+}
+
+export function stateText(state: string | null): string | null {
+  if (state === "unconnected") return "未接続";
+  if (state === "no_response") return "応答なし";
+  return null;
+}
+
+/** Matter's brightness runs 1–254; 254 is 100%. */
+export function percentOf(level: number): number {
+  return Math.round((level * 100) / 254);
+}
+
+export function levelOf(percent: number): number {
+  return Math.max(1, Math.min(254, Math.round((percent * 254) / 100)));
+}
+
+export function dimming(label: LabelTraits): Dimming {
+  if (label.override_level !== null) return "fixed";
+  return label.auto ? "auto" : "none";
+}
+
+/** The server holds auto and an override apart, so a change sends all three. */
+export function dimmingChange(mode: Dimming, label: LabelTraits): LabelTraits {
+  if (mode === "fixed") {
+    return label.override_level !== null && label.override_kelvin !== null
+      ? {
+          auto: false,
+          override_level: label.override_level,
+          override_kelvin: label.override_kelvin,
+        }
+      : { auto: false, ...FIXED_DEFAULT };
+  }
+  return { auto: mode === "auto", override_level: null, override_kelvin: null };
+}
+
+const integerIn = (text: string, min: number, max: number) => {
+  const value = Number(text);
+  return text.trim() !== "" &&
+    Number.isInteger(value) &&
+    value >= min &&
+    value <= max
+    ? value
+    : null;
+};
+
+export function overrideInput(
+  percent: string,
+  kelvin: string,
+):
+  | { patch: { override_level: number; override_kelvin: number } }
+  | { field: "percent" | "kelvin"; error: string } {
+  const p = integerIn(percent, 1, 100);
+  if (p === null) return { field: "percent", error: "明るさは1〜100%" };
+  const k = integerIn(kelvin, 1000, 10000);
+  if (k === null) return { field: "kelvin", error: "色温度は1000〜10000K" };
+  return { patch: { override_level: levelOf(p), override_kelvin: k } };
+}
+
+export function labelSummary(label: LabelTraits): string {
+  if (label.override_level !== null) {
+    return `固定 ${percentOf(label.override_level)}%・${label.override_kelvin}K`;
+  }
+  return label.auto ? "自動調光" : "";
+}
+
+export function scheduleInput(
+  rows: Switch[],
+): { schedule: Switch[] } | { error: string } {
+  if (rows.some((row) => !/^\d\d:\d\d$/.test(row.time)))
+    return { error: "時刻を入力" };
+  if (new Set(rows.map((row) => row.time)).size !== rows.length) {
+    return { error: "同じ時刻があります" };
+  }
+  const schedule = rows
+    .map(({ time, on }) => ({ time, on }))
+    .sort((a, b) => a.time.localeCompare(b.time));
+  return { schedule };
+}
+
+export function withLabel(ids: number[], id: number, on: boolean): number[] {
+  if (on) return ids.includes(id) ? ids : [...ids, id];
+  return ids.filter((other) => other !== id);
+}
+
+export function errorMessage(status: number, body: unknown): string {
+  const message = (body as { message?: unknown } | null)?.message;
+  return typeof message === "string" && message
+    ? message
+    : `失敗しました（HTTP ${status}）`;
+}
+
+export function switchProblem(result: {
+  no_response: number;
+  failed: number;
+  missing: number;
+}): string | null {
+  const parts = [
+    ["応答なし", result.no_response],
+    ["失敗", result.failed],
+    ["見つからない", result.missing],
+  ]
+    .filter(([, count]) => Number(count) > 0)
+    .map(([name, count]) => `${name} ${count}`);
+  return parts.length ? parts.join("・") : null;
+}

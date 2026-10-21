@@ -1,20 +1,28 @@
 # syntax=docker/dockerfile:1
 
+FROM node:24-bookworm-slim AS frontend
+WORKDIR /app/client
+COPY client/package.json client/package-lock.json ./
+RUN npm ci
+COPY client/ ./
+RUN npm run build
+
 FROM rust:1.96-bookworm AS chef
 WORKDIR /app
 COPY rust-toolchain.toml ./
 RUN cargo install cargo-chef --locked
 
 FROM chef AS planner
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
 COPY src/ src/
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS backend
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --locked --release --recipe-path recipe.json
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
 COPY src/ src/
+COPY --from=frontend /app/client/dist ./client/dist
 RUN cargo build --locked --release
 
 FROM debian:bookworm-slim AS runtime

@@ -529,12 +529,32 @@ fn router(state: Db) -> Router {
 
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/api", axum::routing::any(not_found))
+        .route("/api/", axum::routing::any(not_found))
         .nest("/api", api)
         .route(
             "/mcp",
             axum::routing::post(move |body: axum::body::Bytes| mcp::handle(tools.clone(), body)),
         )
+        .fallback_service(get(admin_screen))
         .layer(TraceLayer::new_for_http())
+}
+
+/// The admin screen built into `client/dist`.
+static UI: include_dir::Dir<'_> = include_dir::include_dir!("$CARGO_MANIFEST_DIR/client/dist");
+
+/// A built file, or the screen's `index.html` for its own routes.
+async fn admin_screen(uri: axum::http::Uri) -> Response {
+    let file = UI
+        .get_file(uri.path().trim_start_matches('/'))
+        .or_else(|| UI.get_file("index.html"))
+        .expect("the build requires client/dist/index.html");
+    let content_type = mime_guess::from_path(file.path()).first_or_octet_stream();
+    (
+        [(axum::http::header::CONTENT_TYPE, content_type.as_ref())],
+        file.contents(),
+    )
+        .into_response()
 }
 
 struct ApiError(StatusCode, &'static str, String);

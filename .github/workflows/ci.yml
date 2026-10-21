@@ -15,6 +15,13 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@1.96.0
         with:
@@ -22,6 +29,24 @@ jobs:
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
+
+      - name: Install frontend dependencies
+        run: npm --prefix client ci
+
+      - name: Check frontend formatting
+        run: npm --prefix client run format:check
+
+      - name: Check Svelte
+        run: npm --prefix client run check
+
+      - name: Test frontend
+        run: npm --prefix client test
+
+      - name: Build frontend
+        run: npm --prefix client run build
+
+      - name: Lint design contract
+        run: npm --prefix client run lint:design
 
       - name: Check Rust formatting
         run: cargo fmt --check
@@ -34,6 +59,12 @@ jobs:
 
       - name: Build smoke-test binary
         run: cargo build --locked
+
+      - name: Install Chromium
+        run: npx --prefix client playwright install --with-deps chromium
+
+      - name: Test the admin screen against a mock matterjs-server
+        run: npm --prefix client run test:e2e
 
       - name: Smoke-test the API from an isolated directory
         shell: bash
@@ -62,6 +93,13 @@ jobs:
           test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:3100/api/status)" = "503"
           test "$(curl --fail --silent -X POST -H 'content-type: application/json' -d '{"name":"smoke"}' http://127.0.0.1:3100/api/labels)" = '{"id":1,"name":"smoke","auto":false,"override_level":null,"override_kelvin":null,"on":null,"schedule":[],"device_count":0,"boosted":false}'
           test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:3100/api/missing)" = "404"
+          curl --fail --silent http://127.0.0.1:3100/ > index.html
+          grep --ignore-case '<!doctype html' index.html
+          asset=$(sed -n 's/.*src="\([^" ]*\.js\)".*/\1/p' index.html)
+          test -n "$asset"
+          curl --fail --silent "http://127.0.0.1:3100$asset" > app.js
+          test -s app.js
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:3100/labels/1)" = "200"
 
           kill -TERM "$server_pid"
           wait "$server_pid"
