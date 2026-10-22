@@ -371,6 +371,9 @@ const COMMISSION_TIMEOUT: Duration = Duration::from_mins(5);
 
 type Db = Arc<AppState>;
 
+/// Every lock in `AppState` guards plain data, and no code panics while holding one.
+const UNPOISONED: &str = "a lock is poisoned only by a panic while holding it";
+
 /// A day of runs every ten minutes.
 const RUNS_KEPT: usize = 144;
 
@@ -752,13 +755,13 @@ fn find_device(db: &Connection, id: i64, with_payload: bool) -> ApiResult<Device
 }
 
 async fn list_devices(State(state): State<Db>) -> ApiResult<Json<Vec<Device>>> {
-    let mut devices = ledger(&state.db.lock().unwrap())?;
+    let mut devices = ledger(&state.db.lock().expect(UNPOISONED))?;
     observe(&state, &mut devices).await;
     Ok(Json(devices))
 }
 
 async fn get_device(State(state): State<Db>, Path(id): Path<i64>) -> ApiResult<Json<Device>> {
-    let device = find_device(&state.db.lock().unwrap(), id, true)?;
+    let device = find_device(&state.db.lock().expect(UNPOISONED), id, true)?;
     Ok(Json(observed(&state, device).await))
 }
 
@@ -815,7 +818,7 @@ async fn move_wifi(
     Path(id): Path<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let (device, (ssid, password)) = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock().expect(UNPOISONED);
         (find_device(&db, id, false)?, wifi_for_devices(&db)?)
     };
     let url = matter_url(&state)?;
@@ -874,7 +877,7 @@ async fn switch_device(
     Path(id): Path<i64>,
     on: bool,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let device = find_device(&state.db.lock().unwrap(), id, false)?;
+    let device = find_device(&state.db.lock().expect(UNPOISONED), id, false)?;
     let url = matter_url(&state)?;
     let nodes = matter::fetch_nodes(url).await.map_err(matter_unreachable)?;
     let (node_id, endpoint) = place(&device, &nodes).ok_or_else(|| {
@@ -933,7 +936,7 @@ async fn create_device(
     let code = setup_code(input.qr_payload.as_ref(), input.manual_code.as_ref())?;
     let (vendor_id, product_id) = onboarding::ids(&code).unzip();
     let (registered, device) = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock().expect(UNPOISONED);
         if let Some(id) = registered_id(&db, &code)? {
             db.execute(
                 "UPDATE devices SET vendor_id = coalesce(vendor_id, ?1),
@@ -1057,7 +1060,7 @@ async fn update_device(
         .map(|name| device_name(name.as_str().ok_or_else(invalid)?))
         .transpose()?;
     let device = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock().expect(UNPOISONED);
         find_device(&db, id, false)?;
         if let Some(mut ids) = label_ids {
             ids.sort_unstable();
@@ -1303,7 +1306,7 @@ fn save_label(db: &Connection, id: Option<i64>, input: &LabelInput) -> ApiResult
 }
 
 async fn list_labels(State(db): State<Db>) -> ApiResult<Json<Vec<Label>>> {
-    Ok(Json(labels(&db.db.lock().unwrap())?))
+    Ok(Json(labels(&db.db.lock().expect(UNPOISONED))?))
 }
 
 async fn create_label(
@@ -1311,7 +1314,7 @@ async fn create_label(
     Json(input): Json<serde_json::Value>,
 ) -> ApiResult<(StatusCode, Json<Label>)> {
     let input = label_input(&input)?;
-    let db = db.db.lock().unwrap();
+    let db = db.db.lock().expect(UNPOISONED);
     let id = save_label(&db, None, &input)?;
     Ok((StatusCode::CREATED, Json(find_label(&db, id)?)))
 }
@@ -1322,7 +1325,7 @@ async fn update_label(
     Path(id): Path<i64>,
     Json(input): Json<serde_json::Value>,
 ) -> ApiResult<Json<Label>> {
-    let db = db.db.lock().unwrap();
+    let db = db.db.lock().expect(UNPOISONED);
     let label = find_label(&db, id)?;
     let mut merged = json!(label.traits);
     merged["name"] = json!(label.name);
@@ -1343,14 +1346,14 @@ async fn update_label(
 
 /// Deletes the label; its devices keep their other labels.
 async fn delete_label(State(db): State<Db>, Path(id): Path<i64>) -> ApiResult<StatusCode> {
-    let db = db.db.lock().unwrap();
+    let db = db.db.lock().expect(UNPOISONED);
     find_label(&db, id)?;
     db.execute("DELETE FROM labels WHERE id = ?1", [id])?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn delete_device(State(db): State<Db>, Path(id): Path<i64>) -> ApiResult<StatusCode> {
-    let db = db.db.lock().unwrap();
+    let db = db.db.lock().expect(UNPOISONED);
     find_device(&db, id, false)?;
     db.execute("DELETE FROM devices WHERE id = ?1", [id])?;
     Ok(StatusCode::NO_CONTENT)
@@ -1406,7 +1409,7 @@ fn hand_to_devices(db: &Connection, id: i64) -> rusqlite::Result<()> {
 }
 
 async fn list_wifi(State(db): State<Db>) -> ApiResult<Json<Vec<Wifi>>> {
-    let db = db.db.lock().unwrap();
+    let db = db.db.lock().expect(UNPOISONED);
     let mut statement = db.prepare("SELECT id FROM wifi_networks ORDER BY id")?;
     let ids = statement
         .query_map([], |row| row.get(0))?
@@ -1433,7 +1436,7 @@ async fn save_wifi(
             "Wi-Fiの名前（32バイト以内）とパスワード（64文字以内）を送ってください".into(),
         ));
     }
-    let db = db.db.lock().unwrap();
+    let db = db.db.lock().expect(UNPOISONED);
     let existing: Option<i64> = db
         .query_row(
             "SELECT id FROM wifi_networks WHERE ssid = ?1",
@@ -1472,7 +1475,7 @@ async fn save_wifi(
 
 /// Makes the network the one handed to devices.
 async fn choose_wifi(State(db): State<Db>, Json(input): Json<WifiChoice>) -> ApiResult<Json<Wifi>> {
-    let db = db.db.lock().unwrap();
+    let db = db.db.lock().expect(UNPOISONED);
     find_wifi(&db, input.id)?;
     hand_to_devices(&db, input.id)?;
     Ok(Json(find_wifi(&db, input.id)?))
@@ -1480,7 +1483,7 @@ async fn choose_wifi(State(db): State<Db>, Json(input): Json<WifiChoice>) -> Api
 
 /// Deletes the network; devices then get the first one left.
 async fn delete_wifi(State(db): State<Db>, Path(id): Path<i64>) -> ApiResult<StatusCode> {
-    let db = db.db.lock().unwrap();
+    let db = db.db.lock().expect(UNPOISONED);
     let wifi = find_wifi(&db, id)?;
     db.execute("DELETE FROM wifi_networks WHERE id = ?1", [id])?;
     if wifi.for_devices
@@ -1547,7 +1550,7 @@ async fn commission(
     let name = device_name(&input.name)?;
     let url = matter_url(&state)?;
     let (ssid, password) = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock().expect(UNPOISONED);
         if thread {
             Default::default()
         } else {
@@ -1568,7 +1571,7 @@ async fn commission(
             commission::Error::Unreachable(error) => matter_unreachable(error),
             commission::Error::Failed(failure) => commission_failed(failure, &ssid),
         })?;
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock().expect(UNPOISONED);
     let (registered, device) = record(&db, &name, &code, &commissioned)?;
     tracing::info!(
         node_id = commissioned.node_id,
@@ -1599,7 +1602,7 @@ async fn commission_device(
     Path(id): Path<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let (code, wifi) = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock().expect(UNPOISONED);
         let device = find_device(&db, id, true)?;
         let code = device.qr_payload.or(device.manual_code).ok_or_else(|| {
             ApiError(
@@ -1622,7 +1625,7 @@ async fn commission_device(
             commission::Error::Unreachable(error) => matter_unreachable(error),
             commission::Error::Failed(failure) => commission_failed(failure, ssid),
         })?;
-    let device = connect_row(&state.db.lock().unwrap(), id, &commissioned)?;
+    let device = connect_row(&state.db.lock().expect(UNPOISONED), id, &commissioned)?;
     tracing::info!(
         node_id = commissioned.node_id,
         device = device.id,
@@ -1821,7 +1824,7 @@ async fn status(State(state): State<Db>) -> ApiResult<Json<serde_json::Value>> {
     let nodes = matter::fetch_nodes(matter_url(&state)?)
         .await
         .map_err(matter_unreachable)?;
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock().expect(UNPOISONED);
     let mut statement = db.prepare(&format!("{DEVICE_SELECT} ORDER BY devices.id"))?;
     let devices = statement
         .query_map([], |row| device_row(row, false))?
@@ -1958,7 +1961,11 @@ async fn light_states(State(state): State<Db>) -> ApiResult<Json<serde_json::Val
         .await
         .map_err(matter_unreachable)?;
     let lights = matter::lights(&nodes);
-    let (names, missing) = match_ledger(&ledger(&state.db.lock().unwrap())?, &nodes, &lights);
+    let (names, missing) = match_ledger(
+        &ledger(&state.db.lock().expect(UNPOISONED))?,
+        &nodes,
+        &lights,
+    );
     let states: Vec<&str> = lights
         .iter()
         .zip(&names)
@@ -1986,7 +1993,7 @@ async fn light_states(State(state): State<Db>) -> ApiResult<Json<serde_json::Val
 /// When the schedule is on, the lights are brought to the current values.
 async fn lights_on(State(state): State<Db>) -> ApiResult<Json<serde_json::Value>> {
     let (response, switched) = switch_lights(&state, true).await?;
-    if load::<schedule::Settings>(&state.db.lock().unwrap(), SCHEDULE)?.enabled {
+    if load::<schedule::Settings>(&state.db.lock().expect(UNPOISONED), SCHEDULE)?.enabled {
         adjust(&state, (state.clock)(), "lights_on", &switched).await;
     }
     Ok(response)
@@ -2019,7 +2026,7 @@ async fn boost(
             )
         })?
         .label;
-    let id = labels(&state.db.lock().unwrap())?
+    let id = labels(&state.db.lock().expect(UNPOISONED))?
         .into_iter()
         .find(|l| l.name == name.trim())
         .ok_or_else(label_not_found)?
@@ -2074,14 +2081,20 @@ async fn label_toggle(
 /// Runs the label switches due at `unix`'s minute, once per minute.
 async fn run_schedules(state: &AppState, unix: i64) {
     let minute = unix.div_euclid(60);
-    if state.last_schedule.lock().unwrap().replace(minute) == Some(minute) {
+    if state
+        .last_schedule
+        .lock()
+        .expect(UNPOISONED)
+        .replace(minute)
+        == Some(minute)
+    {
         return;
     }
     let (_, at) = schedule::local(unix);
     let due = state
         .db
         .lock()
-        .unwrap()
+        .expect(UNPOISONED)
         .prepare("SELECT label_id, \"on\" FROM label_schedules WHERE minute = ?1 ORDER BY label_id")
         .and_then(|mut statement| {
             statement
@@ -2114,7 +2127,7 @@ async fn run_schedules(state: &AppState, unix: i64) {
 #[allow(clippy::too_many_lines)]
 async fn switch_label(state: &AppState, id: i64, op: Op) -> ApiResult<serde_json::Value> {
     let (settings, devices, labels) = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock().expect(UNPOISONED);
         (
             load::<schedule::Settings>(&db, SCHEDULE)?,
             ledger(&db)?,
@@ -2220,7 +2233,7 @@ async fn switch_label(state: &AppState, id: i64, op: Op) -> ApiResult<serde_json
                 state
                     .db
                     .lock()
-                    .unwrap()
+                    .expect(UNPOISONED)
                     .execute("UPDATE labels SET \"on\" = 1 WHERE id = ?1", [id])?;
                 let adjusted = results.iter().any(|(light, _)| {
                     on.contains(&key(light))
@@ -2234,7 +2247,7 @@ async fn switch_label(state: &AppState, id: i64, op: Op) -> ApiResult<serde_json
         }
         "off" => {
             {
-                let db = state.db.lock().unwrap();
+                let db = state.db.lock().expect(UNPOISONED);
                 db.execute("UPDATE labels SET \"on\" = 0 WHERE id = ?1", [id])?;
                 for device in &members {
                     db.execute(
@@ -2255,7 +2268,7 @@ async fn switch_label(state: &AppState, id: i64, op: Op) -> ApiResult<serde_json
         }
         _ => {
             let after = {
-                let db = state.db.lock().unwrap();
+                let db = state.db.lock().expect(UNPOISONED);
                 db.execute("UPDATE labels SET \"on\" = 0 WHERE id = ?1", [id])?;
                 self::labels(&db)?
             };
@@ -2305,12 +2318,12 @@ async fn switch_label(state: &AppState, id: i64, op: Op) -> ApiResult<serde_json
         }
     };
     if let Some(tuned) = &tuned {
-        let mut memory = state.sent.lock().unwrap();
+        let mut memory = state.sent.lock().expect(UNPOISONED);
         for (light, decision) in &tuned.lights {
             decide(&mut memory, light, *decision, &mut json!({}));
         }
     }
-    let label = find_label(&state.db.lock().unwrap(), id)?;
+    let label = find_label(&state.db.lock().expect(UNPOISONED), id)?;
     let (lights, outcomes): (Vec<_>, Vec<_>) = results.into_iter().unzip();
     let (names, _) = match_ledger(&devices, &nodes, &lights);
     let missing: Vec<_> = members
@@ -2352,7 +2365,7 @@ async fn switch_lights(
 ) -> ApiResult<(Json<serde_json::Value>, Vec<(u64, u16)>)> {
     let url = matter_url(state)?;
     let (devices, labels) = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock().expect(UNPOISONED);
         if on {
             db.execute(
                 "UPDATE labels SET \"on\" = 1 WHERE override_level IS NULL",
@@ -2439,7 +2452,7 @@ fn store<T: Serialize>(db: &Connection, key: &str, value: &T) -> rusqlite::Resul
 /// switched on, it gets all values.
 async fn adjust(state: &AppState, unix: i64, trigger: &'static str, switched_on: &[(u64, u16)]) {
     let loaded = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock().expect(UNPOISONED);
         load::<schedule::Settings>(&db, SCHEDULE)
             .and_then(|settings| Ok((settings, ledger(&db)?, labels(&db)?)))
     };
@@ -2455,7 +2468,7 @@ async fn adjust(state: &AppState, unix: i64, trigger: &'static str, switched_on:
             run["sunset"] = json!(schedule::clock(sun.1));
             run["level"] = json!(goal.0);
             run["kelvin"] = json!(goal.1);
-            let sent = state.sent.lock().unwrap().clone();
+            let sent = state.sent.lock().expect(UNPOISONED).clone();
             let goal_of = |nodes: &[serde_json::Value], light: &matter::Light| {
                 let labels = labels_of(devices, nodes, light, labels);
                 let rule = schedule::rule(labels.iter().map(|l| &l.traits));
@@ -2498,7 +2511,7 @@ async fn adjust(state: &AppState, unix: i64, trigger: &'static str, switched_on:
             let lights: Vec<_> = tuned.lights.iter().map(|(l, _)| l.clone()).collect();
             let devices = loaded.map(|(_, devices, _)| devices).unwrap_or_default();
             let (names, _) = match_ledger(&devices, &tuned.nodes, &lights);
-            let mut memory = state.sent.lock().unwrap();
+            let mut memory = state.sent.lock().expect(UNPOISONED);
             let entries: Vec<_> = tuned
                 .lights
                 .iter()
@@ -2528,7 +2541,7 @@ async fn adjust(state: &AppState, unix: i64, trigger: &'static str, switched_on:
             run["lights"] = json!([]);
         }
     }
-    let mut runs = state.runs.lock().unwrap();
+    let mut runs = state.runs.lock().expect(UNPOISONED);
     runs.push_front(run);
     runs.truncate(RUNS_KEPT);
 }
@@ -2586,7 +2599,7 @@ struct LabelledDevice {
 /// The schedule's settings, each label with its devices and the latest runs.
 async fn get_schedule(State(state): State<Db>) -> ApiResult<Json<serde_json::Value>> {
     let (settings, labels) = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock().expect(UNPOISONED);
         let devices = ledger(&db)?;
         let labels: Vec<_> = labels(&db)?
             .into_iter()
@@ -2607,7 +2620,13 @@ async fn get_schedule(State(state): State<Db>) -> ApiResult<Json<serde_json::Val
             .collect();
         (load::<schedule::Settings>(&db, SCHEDULE)?, labels)
     };
-    let runs: Vec<_> = state.runs.lock().unwrap().iter().cloned().collect();
+    let runs: Vec<_> = state
+        .runs
+        .lock()
+        .expect(UNPOISONED)
+        .iter()
+        .cloned()
+        .collect();
     Ok(Json(json!({
         "settings": settings,
         "labels": labels,
@@ -2622,7 +2641,7 @@ async fn update_schedule(
 ) -> ApiResult<Json<serde_json::Value>> {
     let invalid = |message: String| ApiError(StatusCode::BAD_REQUEST, "invalid_schedule", message);
     {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock().expect(UNPOISONED);
         let mut settings = json!(load::<schedule::Settings>(&db, SCHEDULE)?);
         let fields = input
             .as_object()
