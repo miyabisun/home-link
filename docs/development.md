@@ -22,13 +22,18 @@ cargo run --locked
 ```
 
 `http://127.0.0.1:3000` で待ち受け、カレントディレクトリの `home-link.db` にデータを保存します。
-変更後は次の検証を通してください。CIも同じ内容を実行します。
+変更後は、commitの前に次の検証を手元で通してください。CIは検証を実行しません。
 
 ```sh
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --locked
+cargo build --locked
+scripts/smoke.sh
 ```
+
+`scripts/smoke.sh` は、ビルドした `target/debug/home-link` を一時ディレクトリへ写して起動し、
+`/healthz`・`/api/health`（`Cargo.toml` の版）・labelの作成・404・組み込んだ画面とJSが返ることをHTTPで確かめます。
 
 `tests/api.rs` はメモリ上のSQLiteでAPIの要求と応答を検証します。
 `src/onboarding.rs` はMatterのQRコード（Base38）と手動ペアリングコード（Verhoeff）の検証、
@@ -74,7 +79,7 @@ APIを `cargo run` で3000番に立てたまま、Viteの開発サーバーで�
 npm --prefix client run dev
 ```
 
-変更後は次の検証を通してください。CIも同じ内容を実行します。
+変更後は、commitの前に次の検証とE2Eテストを手元で通してください。
 
 ```sh
 npm --prefix client run format:check
