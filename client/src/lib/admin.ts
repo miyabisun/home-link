@@ -140,3 +140,39 @@ export function switchProblem(result: {
     .map(([name, count]) => `${name} ${count}`);
   return parts.length ? parts.join("・") : null;
 }
+
+export interface MeterView {
+  address: string | null;
+  reading: object | null;
+  received_at: number | null;
+}
+
+/** The server withholds a reading once it is too old, but keeps when it came. */
+export function meterState(
+  meter: MeterView,
+): "unset" | "waiting" | "stale" | "fresh" {
+  if (meter.address === null) return "unset";
+  if (meter.reading !== null) return "fresh";
+  return meter.received_at === null ? "waiting" : "stale";
+}
+
+const TIME = new Intl.DateTimeFormat("ja-JP", {
+  timeZone: "Asia/Tokyo",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hourCycle: "h23",
+});
+const DATE_TIME = new Intl.DateTimeFormat("ja-JP", {
+  timeZone: "Asia/Tokyo",
+  month: "numeric",
+  day: "numeric",
+  hour: "2-digit",
+  minute: "2-digit",
+  hourCycle: "h23",
+});
+
+/** A fresh reading came minutes ago, so its time is enough; a stale one needs the day. */
+export function receivedTime(unix: number, stale: boolean): string {
+  return (stale ? DATE_TIME : TIME).format(unix * 1000);
+}

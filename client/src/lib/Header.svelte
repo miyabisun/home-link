@@ -59,6 +59,9 @@
         <a class="menu-item" href="/labels" onclick={() => (menuOpen = false)}>
           ラベル
         </a>
+        <a class="menu-item" href="/meter" onclick={() => (menuOpen = false)}>
+          温度計
+        </a>
       </nav>
     {/if}
   </div>

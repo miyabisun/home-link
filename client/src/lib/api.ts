@@ -1,4 +1,9 @@
-import { errorMessage, type LabelTraits, type Switch } from "./admin";
+import {
+  errorMessage,
+  type LabelTraits,
+  type MeterView,
+  type Switch,
+} from "./admin";
 
 export interface LabelRef {
   id: number;
@@ -24,6 +29,15 @@ export interface Label extends LabelTraits {
   on: boolean | null;
   schedule: Switch[];
   device_count: number;
+}
+
+export interface Meter extends MeterView {
+  reading: {
+    temperature: number;
+    humidity: number;
+    co2: number;
+    battery: number;
+  } | null;
 }
 
 export class ApiError extends Error {
@@ -85,6 +99,8 @@ export const api = {
     patch: Partial<LabelTraits & { name: string; schedule: Switch[] }>,
   ) => request<Label>("PATCH", `/api/labels/${id}`, patch),
   deleteLabel: (id: number) => request<null>("DELETE", `/api/labels/${id}`),
+  meter: (signal?: AbortSignal) =>
+    request<Meter>("GET", "/api/meter", undefined, signal),
   toggleLabel: (id: number) =>
     request<{
       on: boolean | null;

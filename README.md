@@ -6,6 +6,7 @@
 機器とlabelの管理（名前の変更、labelの作成と割り当て、自動調光連動・固定の値・スケジュールの設定、台帳からの削除）は、
 home-linkのサーバーが出すWebの管理画面で行います。labelの操作と設定は、APIのほかMCP（AIエージェント向けの道具）からも行えます。
 スマートプラグなど照明以外のMatterの機器は、1台ずつ入り切りもできます。
+部屋のSwitchBot CO2センサー（温湿度計）の温度・湿度・CO2を、サーバーのBluetoothで受けて画面とAPIで示します。
 玄関のSESAME 5なども、ホーム画面のボタン1つで家の外から解錠・施錠できます（CANDY HOUSEのWeb API経由）。
 機器に印刷されたMatterのQRコードをAndroidアプリで読み取り、名前とlabelを付けて登録します。
 QRコードが無い機器は、印字された11桁の数字（Matterの手動ペアリングコード）を入力して登録します。
@@ -63,9 +64,23 @@ curl http://127.0.0.1:5011/healthz
 | `SESAME_API_KEY` | なし | CANDY HOUSEのWeb APIのAPIキー（[CANDY HOUSEのパートナー向けページ](https://partners.candyhouse.co/)で発行）。 |
 | `SESAME_UUID` | なし | 解錠するSESAMEのUUID（SESAMEアプリの機器の画面にあります）。 |
 | `SESAME_SECRET_KEY` | なし | SESAMEの秘密鍵（32桁の16進数）。SESAMEアプリで共有する鍵のQRコードを上のページで読み取ると得られます。 |
+| `SWITCHBOT_METER_ADDRESS` | なし | 受信するSwitchBot CO2センサー（W4900010）のBluetoothアドレス（例: `AA:BB:CC:DD:EE:01`）。未設定なら受信しません。 |
 
 `SESAME_` の3つは、解錠と施錠のAPIだけが使います。どれかが無いか形式が違うと、この2つは503 `sesame_not_configured` を返し、ほかの機能はそのまま動きます。
 SESAMEはWi-Fiモジュールでインターネットにつながっている必要があります。
+
+温度計は、センサーが流し続けるBluetoothの広告を、接続せずにホストのBlueZ（システムのD-Bus）から受けます。
+コンテナにはホストのD-Busのsocketを渡します。BluetoothのアダプタはBlueZが扱い、コンテナへ渡す必要はありません。
+
+```sh
+docker run -d --name home-link -p 5011:3000 -v home-link-data:/data \
+  -v /run/dbus/system_bus_socket:/run/dbus/system_bus_socket \
+  -e SWITCHBOT_METER_ADDRESS=AA:BB:CC:DD:EE:01 ghcr.io/miyabisun/home-link:latest
+```
+
+- 受けた値は5分間だけ今の値として扱い、それより古い値は返しません（受けた時刻は残します）。
+- アダプタが外れたり、BlueZやD-Busに届かなかったりしても、ほかの機能はそのまま動き、1分ごとに受信をやり直します。
+- 機器の登録（`POST /api/commission` など）の間は受信を止め、BluetoothをBLE Proxyに譲ります。終わると受信に戻ります。
 
 ## Webの管理画面
 
@@ -78,6 +93,7 @@ SESAMEはWi-Fiモジュールでインターネットにつながっている必
 | 機器の画面 | 名前の変更、labelの割り当て（チェックで付け外し）、無視の設定、プラグの入り切り、台帳からの削除（確認してから） |
 | ラベル（右上のメニュー） | labelの一覧と作成。一覧は固定・自動調光の別、機器の台数、入っているかを示します。名前を入れて「追加」で作り、そのlabelの画面を開きます |
 | labelの画面 | 名前の変更、入り切り、調光（なし・自動調光・固定）、固定の明るさ（%）と色温度（K）、毎日の時刻での入・切、機器の割り当て、削除（確認してから） |
+| 温度計（右上のメニュー） | 温度計の今の温度・湿度・CO2・電池と受けた時刻。受信が途絶えたときは、最後に受けた時刻だけを示します |
 
 変えた値はその場でAPIへ送り、保存ボタンはありません。値の誤りはその入力の下に、サーバーが受け付けなかった理由は画面の上部に示します。
 テーマは右上のメニューの「テーマ設定」で、自動（OSに従う）・ライト・ダークから選べます。
@@ -246,6 +262,7 @@ Thread網の資格情報（dataset）は、matterjs-serverに `set_thread_datase
 | `PUT /api/wifi/devices` | 機器に渡すWi-Fiの指定。本文は `{"id": 2}` | 404 `wifi_not_found` |
 | `DELETE /api/wifi/{id}` | Wi-Fiの削除。機器に渡すものを消すと、残りの最初のものを渡します | 404 `wifi_not_found` |
 | `POST /api/commission` | 0.1.32までのアプリの登録。Wi-FiかThreadかを指定して機器をmatterjs-serverへBluetoothで登録（commissioning）し、台帳に登録 | 400 `missing_setup_code`・`invalid_qr_payload`・`invalid_manual_code`・`invalid_network`・`invalid_device_name`、409 `wifi_not_set`、422 `device_not_found`・`wrong_code`・`wifi_failed`・`thread_failed`・`commission_failed`、504 `commission_timeout`、502 `matter_server_unreachable`、503 `matter_server_not_configured`・`bluetooth_unavailable`・`thread_not_ready` |
+| `GET /api/meter` | 温度計の今の値。`{"address":"AA:BB:CC:DD:EE:01","reading":{"temperature":26.7,"humidity":57,"co2":717,"battery":74},"received_at":1792143307,"fresh_for":300}`。`received_at` はUnix秒で、それから `fresh_for` 秒を過ぎると `reading` は `null` になります。未設定なら `address` も `null` です | |
 | `GET /api/thread` | Threadの機器を登録できるか（matterjs-serverがThread網のdatasetを持つか）を `{"ready": true}` で返します | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `GET /api/status` | 台帳の機器ごとに、matterjs-serverで見えるか（`visible`）と今の `node_id`・`endpoint` | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `GET /api/lights` | 照明ごとの今の状態（`on`・`off`・`no_response`・`ignored`）と、無視の照明を除いた件数 | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |

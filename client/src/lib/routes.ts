@@ -13,6 +13,7 @@ export const routes: RouteDef[] = [
   { pattern: /^\/devices\/([^/]+)$/, params: ["id"] },
   { pattern: /^\/labels$/, params: [] },
   { pattern: /^\/labels\/([^/]+)$/, params: ["id"] },
+  { pattern: /^\/meter$/, params: [] },
 ];
 
 export function matchRoute(pathname: string): RouteMatch {

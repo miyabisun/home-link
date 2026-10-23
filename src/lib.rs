@@ -1,6 +1,7 @@
 pub mod commission;
 pub mod matter;
 mod mcp;
+pub mod meter;
 pub mod onboarding;
 pub mod schedule;
 pub mod sesame;
@@ -365,6 +366,8 @@ struct AppState {
     sesame: Result<sesame::Config, &'static str>,
     /// The minute, in Unix minutes, whose label schedules last ran.
     last_schedule: Mutex<Option<i64>>,
+    /// The room's `SwitchBot` CO2 meter, if one is configured.
+    meter: meter::Meter,
 }
 
 const COMMISSION_TIMEOUT: Duration = Duration::from_mins(5);
@@ -399,7 +402,25 @@ impl Home {
             clock: now,
             sesame: sesame::Config::new(None, None, None, sesame::API_URL),
             last_schedule: Mutex::new(None),
+            meter: meter::Meter::new(None),
         }))
+    }
+
+    /// Sets the `SwitchBot` CO2 meter, by its Bluetooth address, that [`Self::receive_meter`] listens to.
+    ///
+    /// # Panics
+    /// Panics once the router or a clone shares this `Home`.
+    #[must_use]
+    pub fn with_meter(mut self, address: String) -> Self {
+        Arc::get_mut(&mut self.0)
+            .expect("set before the Home is shared")
+            .meter = meter::Meter::new(Some(address));
+        self
+    }
+
+    /// Receives the meter's advertisements through `BlueZ` forever; returns at once without a meter.
+    pub async fn receive_meter(self) {
+        meter::receive(&self.0.meter, self.0.clock).await;
     }
 
     /// Sets the SESAME that `POST /api/door/unlock` and `/lock` act on, or why there is none.
@@ -517,6 +538,7 @@ fn router(state: Db) -> Router {
         .route("/wifi/{id}", axum::routing::delete(delete_wifi))
         .route("/commission", axum::routing::post(commission))
         .route("/thread", get(thread))
+        .route("/meter", get(meter_reading))
         .route("/status", get(status))
         .route("/lights", get(light_states))
         .route("/lights/on", axum::routing::post(lights_on))
@@ -1565,12 +1587,14 @@ async fn commission(
             password: &password,
         }
     };
+    let bluetooth = state.meter.hold();
     let commissioned = commission::commission(url, &code, &network, state.commission_timeout)
         .await
         .map_err(|error| match error {
             commission::Error::Unreachable(error) => matter_unreachable(error),
             commission::Error::Failed(failure) => commission_failed(failure, &ssid),
         })?;
+    drop(bluetooth);
     let db = state.db.lock().expect(UNPOISONED);
     let (registered, device) = record(&db, &name, &code, &commissioned)?;
     tracing::info!(
@@ -1619,12 +1643,14 @@ async fn commission_device(
             .map(|(ssid, password)| (ssid.as_str(), password.as_str())),
     );
     let ssid = wifi.as_ref().map_or("", |(ssid, _)| ssid.as_str());
+    let bluetooth = state.meter.hold();
     let commissioned = commission::commission(url, &code, &network, state.commission_timeout)
         .await
         .map_err(|error| match error {
             commission::Error::Unreachable(error) => matter_unreachable(error),
             commission::Error::Failed(failure) => commission_failed(failure, ssid),
         })?;
+    drop(bluetooth);
     let device = connect_row(&state.db.lock().expect(UNPOISONED), id, &commissioned)?;
     tracing::info!(
         node_id = commissioned.node_id,
@@ -1742,6 +1768,11 @@ fn commission_failed(failure: commission::Failure, ssid: &str) -> ApiError {
 }
 
 /// Whether Thread devices can be commissioned: matterjs-server holds a dataset.
+/// The meter's latest reading while it is fresh, and when it was received.
+async fn meter_reading(State(state): State<Db>) -> Json<serde_json::Value> {
+    Json(state.meter.view((state.clock)()))
+}
+
 async fn thread(State(state): State<Db>) -> ApiResult<Json<serde_json::Value>> {
     let ready = commission::thread_ready(matter_url(&state)?, THREAD_TIMEOUT)
         .await

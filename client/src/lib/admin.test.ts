@@ -9,8 +9,10 @@ import {
   labelNameError,
   labelSummary,
   levelOf,
+  meterState,
   overrideInput,
   percentOf,
+  receivedTime,
   scheduleInput,
   stateText,
   switchProblem,
@@ -189,5 +191,30 @@ describe("switch results", () => {
     expect(switchProblem({ no_response: 0, failed: 1, missing: 0 })).toBe(
       "失敗 1",
     );
+  });
+});
+
+describe("the meter", () => {
+  const reading = { temperature: 26.7, humidity: 57, co2: 717, battery: 74 };
+  const address = "AA:BB:CC:DD:EE:01";
+
+  it("tells unset, waiting, stale and fresh apart", () => {
+    expect(
+      meterState({ address: null, reading: null, received_at: null }),
+    ).toBe("unset");
+    expect(meterState({ address, reading: null, received_at: null })).toBe(
+      "waiting",
+    );
+    expect(meterState({ address, reading: null, received_at: 1 })).toBe(
+      "stale",
+    );
+    expect(meterState({ address, reading, received_at: 1 })).toBe("fresh");
+  });
+
+  it("shows the time of a fresh reading and the date of a stale one, in Tokyo", () => {
+    // 2026-10-17 18:55:07 in Tokyo.
+    const unix = Date.UTC(2026, 9, 17, 9, 55, 7) / 1000;
+    expect(receivedTime(unix, false)).toBe("18:55:07");
+    expect(receivedTime(unix, true)).toBe("10/17 18:55");
   });
 });

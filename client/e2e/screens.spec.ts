@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 
 // Every screen at a desk and a phone width, in both themes: nothing runs off to the side,
 // the page itself scrolls, and the theme follows the OS. Images go to test-results/screens.
@@ -13,6 +13,37 @@ const schemes = [
 
 let labelId = 0;
 let deviceId = 0;
+
+// The E2E home-link has no meter; these stand in for what GET /api/meter returns with one.
+const address = "AA:BB:CC:DD:EE:01";
+const now = () => Math.floor(Date.now() / 1000);
+const meters = {
+  fresh: () => ({
+    address,
+    reading: { temperature: 26.7, humidity: 57, co2: 717, battery: 74 },
+    received_at: now() - 3,
+    fresh_for: 300,
+  }),
+  stale: () => ({
+    address,
+    reading: null,
+    received_at: now() - 3600,
+    fresh_for: 300,
+  }),
+  waiting: () => ({
+    address,
+    reading: null,
+    received_at: null,
+    fresh_for: 300,
+  }),
+};
+
+async function meterAs(page: Page, kind: keyof typeof meters) {
+  await page.unroute("/api/meter");
+  await page.route("/api/meter", (route) =>
+    route.fulfill({ json: meters[kind]() }),
+  );
+}
 
 test.beforeAll(async ({ request }) => {
   const create = async (body: object) => {
@@ -44,11 +75,13 @@ for (const size of widths) {
     test(`screens at ${size.width}px in ${scheme}`, async ({ page }) => {
       await page.setViewportSize(size);
       await page.emulateMedia({ colorScheme: scheme });
+      await meterAs(page, "fresh");
       const screens = [
         ["devices", "/"],
         ["device", `/devices/${deviceId}`],
         ["labels", "/labels"],
         ["label", `/labels/${labelId}`],
+        ["meter", "/meter"],
       ];
       for (const [name, path] of screens) {
         await page.goto(path);
@@ -128,5 +161,48 @@ test("the delete confirmation and an input error stay on a phone screen", async 
     });
     await page.keyboard.press("Escape");
     await expect(dialog).toBeHidden();
+  }
+});
+
+test("the meter shows its values, a stopped reception, and having none", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  for (const scheme of ["light", "dark"] as const) {
+    await page.emulateMedia({ colorScheme: scheme });
+    await meterAs(page, "fresh");
+    await page.goto("/meter");
+    const values = page.locator(".reading dd");
+    await expect(values).toHaveText(["26.7℃", "57%", "717ppm", "74%"]);
+    await expect(page.locator(".content > .note")).toHaveText(
+      /^\d\d:\d\d:\d\d 受信$/,
+    );
+
+    await meterAs(page, "stale");
+    await page.goto("/meter");
+    await expect(page.locator(".state")).toHaveText("受信が途絶えています");
+    await expect(values).toHaveCount(0);
+    await expect(page.locator(".note")).toHaveText(
+      /^最後の受信 \d+\/\d+ \d\d:\d\d$/,
+    );
+    await page.screenshot({
+      path: `test-results/screens/meter-stale-390-${scheme}.png`,
+    });
+
+    await meterAs(page, "waiting");
+    await page.goto("/meter");
+    await expect(page.locator(".state")).toHaveText("まだ受信していません");
+
+    // The E2E home-link itself has no meter configured.
+    await page.unroute("/api/meter");
+    await page.goto("/");
+    await page.getByRole("button", { name: "メニュー", exact: true }).click();
+    await page.getByRole("link", { name: "温度計" }).click();
+    await expect(page.locator(".state")).toHaveText(
+      "温度計が設定されていません",
+    );
+    await page.screenshot({
+      path: `test-results/screens/meter-unset-390-${scheme}.png`,
+    });
   }
 });

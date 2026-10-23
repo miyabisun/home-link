@@ -57,6 +57,9 @@ mockの `server_info` の `thread_credentials_set` を切り替え、Threadで�
 Thread網が未準備のときの拒否と `GET /api/thread` も検証します。
 Wi-Fiの差し替えは、`device_command` を機器のように受けるmockで、成功・ConnectNetworkの応答が届かない場合・新しいWi-Fiを拒んだ場合・
 fail-safeの後に元のWi-Fiで応答する場合・応答が無い場合を検証し、パスワードが応答・ログ・Wi-Fiの表以外のDBに残らないことも確かめます。
+`src/meter.rs` はSwitchBot CO2センサーの広告（サービスデータ `fd3d` とメーカーデータ）の読み取り、
+受けた値を5分で古いとする扱い、機器の登録の間に受信を止めてBluetoothを譲る判断と、そのテストを持ちます。
+BlueZのD-Busから受ける部分はテストしません。実際のセンサーとアダプタで、受信・登録の間の停止と再開を確かめます。
 `src/schedule.rs` は自動調整の目標値（日の出・日の入り、朝・昼・夕・夜の境界と線形の補間、範囲への丸め）、
 照明ごとに送るか・送らない理由（前回と同じ値を含む）、1台に付いたlabelから上書き・自動調整・対象外を決める規則、
 スケジュールの時刻の読み取りを決める純粋な処理と、そのテストを持ちます。
@@ -95,6 +98,7 @@ npm --prefix client run lint:design
 E2Eテストは、ChromiumとPlaywrightで、ビルドしたhome-link（`target/debug/home-link`）とmockのmatterjs-serverを相手に動きます。
 `client/e2e/serve.mjs` が一時ディレクトリの新しいDBでhome-linkを起動し、照明とプラグを1台ずつ返すmockを立て、台帳に機器を入れます。
 テストは画面を操作し、APIを通じてSQLiteのファイルに入った値を読んで確かめます（機器の名前・label・無視・削除、labelの作成・名前・調光・固定の値・スケジュール・機器・削除・入り切り）。
+温度計の画面は、E2Eのhome-linkに温度計が無いため、`GET /api/meter` の応答をPlaywrightで差し替えて、今の値・途絶え・未受信を確かめます。
 `screens.spec.ts` は幅1280と390の明暗で全画面を撮り（`client/test-results/screens/`）、横のはみ出しと本文の内側の縦スクロールが無いことを確かめます。
 
 ```sh

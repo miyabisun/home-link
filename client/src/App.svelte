@@ -5,6 +5,7 @@
   import Devices from "./pages/Devices.svelte";
   import Label from "./pages/Label.svelte";
   import Labels from "./pages/Labels.svelte";
+  import Meter from "./pages/Meter.svelte";
 
   $effect(() => initRouter());
 </script>
@@ -22,6 +23,8 @@
     <Labels />
   {:else if router.index === 3}
     {#key router.params.id}<Label id={router.params.id} />{/key}
+  {:else if router.index === 4}
+    <Meter />
   {:else}
     <Devices />
   {/if}

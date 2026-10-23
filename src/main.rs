@@ -32,7 +32,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Err(reason) => info!(reason, "SESAME unlock disabled"),
     }
 
-    let home = home_link::Home::new(db, matter_url.clone()).with_sesame(sesame);
+    let mut home = home_link::Home::new(db, matter_url.clone()).with_sesame(sesame);
+    match std::env::var("SWITCHBOT_METER_ADDRESS")
+        .ok()
+        .filter(|text| !text.is_empty())
+    {
+        None => info!("SwitchBot meter unset"),
+        Some(text) => match home_link::meter::address(&text) {
+            Some(address) => {
+                info!(%address, "SwitchBot meter");
+                home = home.with_meter(address);
+            }
+            None => {
+                tracing::warn!(
+                    "SWITCHBOT_METER_ADDRESS is not a Bluetooth address; meter disabled"
+                );
+            }
+        },
+    }
+    tokio::spawn(home.clone().receive_meter());
     if matter_url.is_some() {
         tokio::spawn(home.clone().every_ten_minutes());
         tokio::spawn(home.clone().every_minute());
