@@ -567,6 +567,70 @@ class RegisterScreenTest {
         }
     }
 
+    @Test fun theAirconWidgetSwitchesTheControlAndShowsItsState() {
+        shell("appwidget grantbind --package ${context.packageName} --user 0")
+        val host = android.appwidget.AppWidgetHost(context, 8)
+        val widget = host.allocateAppWidgetId()
+        val manager = AppWidgetManager.getInstance(context)
+        try {
+            assertTrue(manager.bindAppWidgetIdIfAllowed(widget, ComponentName(context, AirconWidget::class.java)))
+            host.startListening()
+            ActivityScenario.launch(MainActivity::class.java).use { screen ->
+                lateinit var shown: android.appwidget.AppWidgetHostView
+                screen.onActivity { activity ->
+                    shown = host.createView(activity, widget, manager.getAppWidgetInfo(widget))
+                    val size = (110 * activity.resources.displayMetrics.density).toInt()
+                    activity.addContentView(shown, android.widget.FrameLayout.LayoutParams(size, size,
+                        android.view.Gravity.CENTER))
+                }
+                val words = { shown.findViewById<TextView>(R.id.label_button_text).text.toString() }
+                val press = { screen.onActivity { shown.findViewById<View>(R.id.label_button).performClick() } }
+                // Placed: home-link's word, off.
+                context.sendBroadcast(android.content.Intent(AppWidgetManager.ACTION_APPWIDGET_UPDATE)
+                    .setComponent(ComponentName(context, AirconWidget::class.java))
+                    .putExtra(AppWidgetManager.EXTRA_APPWIDGET_IDS, intArrayOf(widget)))
+                eventually(screen) { words() == "エアコン" }
+                captureWidget(shown, "aircon-off")
+
+                press()
+                eventually(screen) { words() == "エアコン中" }
+                assertEquals(1, api.airconToggles.get())
+                assertTrue(api.airconOn)
+                captureWidget(shown, "aircon-on")
+
+                // Off again, as it was before.
+                press()
+                eventually(screen) { words() == "エアコン" }
+                assertFalse(api.airconOn)
+
+                // Unreachable: the short failure, then the button as home-link has it.
+                api.airconFailure = ApiError.UNREACHABLE
+                press()
+                eventually(screen) { words() == "接続不可" }
+                captureWidget(shown, "aircon-failed")
+                Thread.sleep(5_000)
+                eventually(screen) { words() == "エアコン" }
+                assertEquals(3, api.airconToggles.get())
+            }
+        } finally {
+            host.stopListening()
+            host.deleteAppWidgetId(widget)
+        }
+    }
+
+    /** Saves the screen with the widget `view` on it, asserting its button keeps a 48dp target and unclipped words. */
+    private fun captureWidget(view: View, name: String) {
+        InstrumentationRegistry.getInstrumentation().waitForIdleSync()
+        val button = view.findViewById<View>(R.id.label_button)
+        val minimum = (48 * view.resources.displayMetrics.density).toInt()
+        assertTrue("Small target", button.width >= minimum && button.height >= minimum)
+        val text = view.findViewById<TextView>(R.id.label_button_text)
+        val layout = text.layout
+        if (layout != null) for (line in 0 until layout.lineCount) assertEquals("Ellipsis: ${text.text}", 0, layout.getEllipsisCount(line))
+        val prefix = InstrumentationRegistry.getArguments().getString("capturePrefix", "")
+        shell("screencap -p /data/local/tmp/$prefix$name.png")
+    }
+
     @Test fun theWifiForDevicesIsSavedChosenAndDeletedInTheSettings() {
         val home = SavedNetwork(1, "home-2g", forDevices = false)
         val annex = SavedNetwork(2, "離れの2.4GHz（物置と作業部屋）", forDevices = true)
@@ -1100,6 +1164,20 @@ private class FakeApi : HomeLinkApi {
     @Volatile var labelGate: CountDownLatch? = null
     /** What a label switch reports; null switches every device. */
     @Volatile var labelCounts: SwitchResult? = null
+
+    /** home-link's air conditioner switch, and what a toggle fails with instead of switching it. */
+    @Volatile var airconOn = false
+    @Volatile var airconFailure: ApiError? = null
+    val airconToggles = java.util.concurrent.atomic.AtomicInteger()
+
+    override fun aircon(): ApiResult<Boolean> = ApiResult.Ok(airconOn)
+
+    override fun toggleAircon(): ApiResult<Boolean> {
+        airconToggles.incrementAndGet()
+        airconFailure?.let { return ApiResult.Failed(it) }
+        airconOn = !airconOn
+        return ApiResult.Ok(airconOn)
+    }
 
     override fun switchLabel(id: Long, op: LabelOp): ApiResult<LabelResult> {
         labelGate?.await()

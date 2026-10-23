@@ -38,6 +38,15 @@ const meters = {
   }),
 };
 
+// The aircon page as it reads with a meter, while the E2E home-link has none.
+async function airconWithMeter(page: Page) {
+  await page.route("/api/aircon", async (route) => {
+    const json = await (await route.fetch()).json();
+    json.reading = meters.fresh().reading;
+    await route.fulfill({ json });
+  });
+}
+
 async function meterAs(page: Page, kind: keyof typeof meters) {
   await page.unroute("/api/meter");
   await page.route("/api/meter", (route) =>
@@ -76,12 +85,14 @@ for (const size of widths) {
       await page.setViewportSize(size);
       await page.emulateMedia({ colorScheme: scheme });
       await meterAs(page, "fresh");
+      await airconWithMeter(page);
       const screens = [
         ["devices", "/"],
         ["device", `/devices/${deviceId}`],
         ["labels", "/labels"],
         ["label", `/labels/${labelId}`],
         ["meter", "/meter"],
+        ["aircon", "/aircon"],
       ];
       for (const [name, path] of screens) {
         await page.goto(path);

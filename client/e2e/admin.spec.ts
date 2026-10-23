@@ -42,7 +42,7 @@ test("the device list shows names and the states that need attention", async ({
 }) => {
   await page.goto("/");
   const cards = page.locator(".card");
-  await expect(cards).toHaveCount(4);
+  await expect(cards).toHaveCount(5);
   await expect(cards.nth(0)).toContainText("居間の照明");
   await expect(cards.nth(1)).toContainText("P110M");
   await expect(cards.nth(2)).toContainText("押入れ1");
@@ -178,7 +178,7 @@ test("a device is renamed, labelled, ignored, switched and deleted", async ({
     .getByRole("button", { name: "削除", exact: true })
     .click();
   await expect(page).toHaveURL(/\/$/);
-  await expect(page.locator(".card")).toHaveCount(3);
+  await expect(page.locator(".card")).toHaveCount(4);
   expect(sql("SELECT id FROM devices WHERE id = ?", id)).toEqual([]);
   expect(sql("SELECT * FROM device_labels WHERE device_id = ?", id)).toEqual(
     [],
@@ -199,4 +199,51 @@ test("labels keep their names unique and are deleted", async ({ page }) => {
     .click();
   await expect(page).toHaveURL(/\/labels$/);
   expect(labelRow("常夜灯")).toBeUndefined();
+});
+
+const airconSettings = () =>
+  sql("SELECT value FROM settings WHERE key = 'aircon'").map((row) =>
+    JSON.parse((row as { value: string }).value),
+  )[0];
+
+test("the air conditioner is switched off and on and gets a target", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "メニュー", exact: true }).click();
+  await page
+    .locator("nav.menu")
+    .getByRole("link", { name: "エアコン" })
+    .click();
+  await expect(page.locator("h1")).toHaveText("エアコン");
+  const values = page.locator(".reading dd");
+  // The E2E home-link has no meter: no reading, and the air conditioner as it is.
+  await expect(values).toHaveText(["—", "—", "冷房 25℃"]);
+  const power = page.getByRole("button", { name: "入り切り" });
+  await expect(power).toHaveAttribute("aria-pressed", "true");
+
+  await power.click();
+  await expect(power).toHaveText("切");
+  await expect(power).toHaveAttribute("aria-pressed", "false");
+  await expect(values.nth(2)).toHaveText("切");
+  expect(airconSettings()).toEqual({ on: false, target: 25 });
+
+  const target = page.getByLabel("目標");
+  await target.fill("31");
+  await commit(page);
+  await expect(page.getByRole("alert")).toHaveText("18〜30℃");
+  expect(airconSettings().target).toBe(25);
+  await target.fill("23");
+  await commit(page);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await expect.poll(() => airconSettings().target).toBe(23);
+
+  await power.click();
+  await expect(power).toHaveText("入");
+  expect(airconSettings()).toEqual({ on: true, target: 23 });
+  // Still no reading: switching on waits for one before sending.
+  await expect(values.nth(2)).toHaveText("切");
+  await page.reload();
+  await expect(target).toHaveValue("23");
+  await expect(power).toHaveAttribute("aria-pressed", "true");
 });

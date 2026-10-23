@@ -29,6 +29,16 @@ class ButtonFaceTest {
         assertEquals(ButtonFace("仕事", R.drawable.ic_power, Tone.PLAIN), buttonFace("仕事", R.drawable.ic_power, boosted = null, label = null))
     }
 
+    @Test fun theAirconReadsOnWithItsOwnIcon() {
+        assertEquals(ButtonFace("エアコン中", R.drawable.ic_aircon_on, Tone.ACTIVE), airconFace(on = true, press = null))
+        assertEquals(ButtonFace("エアコン", R.drawable.ic_power, Tone.PLAIN), airconFace(on = false, press = null))
+        assertEquals(ButtonFace("エアコン", R.drawable.ic_power, Tone.PLAIN), airconFace(on = null, press = null))
+        assertEquals(ButtonFace("送信中…", R.drawable.ic_power, Tone.PLAIN),
+            airconFace(on = true, press = LightsMessage("送信中…", failed = false), sending = true))
+        assertEquals(ButtonFace("接続不可", R.drawable.ic_error, Tone.FAILED),
+            airconFace(on = true, press = failureLabel(ApiError.UNREACHABLE)))
+    }
+
     @Test fun aPressShowsItsProgressThenItsShortResult() {
         val sending = LightsMessage("送信中…", failed = false)
         assertEquals(ButtonFace("送信中…", R.drawable.ic_power, Tone.PLAIN),

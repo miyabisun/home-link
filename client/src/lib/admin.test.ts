@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  airconText,
   deviceName,
   deviceNameError,
   dimming,
@@ -10,6 +11,7 @@ import {
   labelSummary,
   levelOf,
   meterState,
+  targetError,
   overrideInput,
   percentOf,
   receivedTime,
@@ -216,5 +218,41 @@ describe("the meter", () => {
     const unix = Date.UTC(2026, 9, 17, 9, 55, 7) / 1000;
     expect(receivedTime(unix, false)).toBe("18:55:07");
     expect(receivedTime(unix, true)).toBe("10/17 18:55");
+  });
+});
+
+describe("the air conditioner", () => {
+  const device = {
+    state: "connected" as const,
+    on: true,
+    mode: "cool",
+    setpoint: 25,
+  };
+
+  it("names its mode and setpoint while on", () => {
+    expect(airconText(device)).toBe("冷房 25℃");
+    expect(airconText({ ...device, mode: "heat", setpoint: 22 })).toBe(
+      "暖房 22℃",
+    );
+    expect(airconText({ ...device, mode: "dry", setpoint: 24.5 })).toBe(
+      "除湿 25℃",
+    );
+    expect(airconText({ ...device, mode: "fan_only" })).toBe("送風");
+    expect(airconText({ ...device, mode: "auto", setpoint: null })).toBe(
+      "自動",
+    );
+  });
+
+  it("is off, unanswered or absent", () => {
+    expect(airconText({ ...device, on: false })).toBe("切");
+    expect(airconText({ ...device, mode: "off" })).toBe("切");
+    expect(airconText({ ...device, state: "no_response" })).toBe("応答なし");
+    expect(airconText(null)).toBe("未登録");
+  });
+
+  it("takes a whole target from 18 to 30", () => {
+    for (const ok of ["18", "25", "30"]) expect(targetError(ok)).toBeNull();
+    for (const bad of ["17", "31", "24.5", "", "a"])
+      expect(targetError(bad)).toBe("18〜30℃");
   });
 });

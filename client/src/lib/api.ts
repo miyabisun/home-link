@@ -1,4 +1,5 @@
 import {
+  type AirconDevice,
   errorMessage,
   type LabelTraits,
   type MeterView,
@@ -16,7 +17,7 @@ export interface Device {
   vendor: string | null;
   product_name: string | null;
   state: "unconnected" | "connected" | "no_response" | null;
-  kind: "light" | "plug" | "other" | null;
+  kind: "light" | "plug" | "aircon" | "other" | null;
   on: boolean | null;
   wifi_ssid: string | null;
   labels: LabelRef[];
@@ -38,6 +39,13 @@ export interface Meter extends MeterView {
     co2: number;
     battery: number;
   } | null;
+}
+
+export interface Aircon {
+  on: boolean;
+  target: number;
+  device: (AirconDevice & { id: number; name: string }) | null;
+  reading: Meter["reading"];
 }
 
 export class ApiError extends Error {
@@ -101,6 +109,10 @@ export const api = {
   deleteLabel: (id: number) => request<null>("DELETE", `/api/labels/${id}`),
   meter: (signal?: AbortSignal) =>
     request<Meter>("GET", "/api/meter", undefined, signal),
+  aircon: (signal?: AbortSignal) =>
+    request<Aircon>("GET", "/api/aircon", undefined, signal),
+  updateAircon: (patch: Partial<{ on: boolean; target: number }>) =>
+    request<Aircon>("PUT", "/api/aircon", patch),
   toggleLabel: (id: number) =>
     request<{
       on: boolean | null;

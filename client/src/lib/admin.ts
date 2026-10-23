@@ -176,3 +176,41 @@ const DATE_TIME = new Intl.DateTimeFormat("ja-JP", {
 export function receivedTime(unix: number, stale: boolean): string {
   return (stale ? DATE_TIME : TIME).format(unix * 1000);
 }
+
+export interface AirconDevice {
+  state: "connected" | "no_response";
+  on: boolean | null;
+  mode: string | null;
+  setpoint: number | null;
+}
+
+const MODES: Record<string, string> = {
+  cool: "冷房",
+  heat: "暖房",
+  dry: "除湿",
+  fan_only: "送風",
+  auto: "自動",
+};
+
+/** The air conditioner sends whole degrees, so the setpoint shows rounded. */
+export function airconText(device: AirconDevice | null): string {
+  if (device === null) return "未登録";
+  if (device.state === "no_response") return "応答なし";
+  const mode = device.mode && MODES[device.mode];
+  if (!device.on || !mode) return "切";
+  if (device.setpoint === null || device.mode === "fan_only") return mode;
+  return `${mode} ${Math.round(device.setpoint)}℃`;
+}
+
+export const TARGET_MIN = 18;
+export const TARGET_MAX = 30;
+
+export function targetError(value: string): string | null {
+  const target = Number(value);
+  const ok =
+    value.trim() !== "" &&
+    Number.isInteger(target) &&
+    target >= TARGET_MIN &&
+    target <= TARGET_MAX;
+  return ok ? null : `${TARGET_MIN}〜${TARGET_MAX}℃`;
+}

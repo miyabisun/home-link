@@ -1,6 +1,7 @@
 <script lang="ts">
   import Header from "./lib/Header.svelte";
   import { initRouter, router } from "./lib/router.svelte";
+  import Aircon from "./pages/Aircon.svelte";
   import Device from "./pages/Device.svelte";
   import Devices from "./pages/Devices.svelte";
   import Label from "./pages/Label.svelte";
@@ -25,6 +26,8 @@
     {#key router.params.id}<Label id={router.params.id} />{/key}
   {:else if router.index === 4}
     <Meter />
+  {:else if router.index === 5}
+    <Aircon />
   {:else}
     <Devices />
   {/if}

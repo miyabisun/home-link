@@ -61,11 +61,16 @@ const LIGHT_TYPES: [u64; 4] = [0x0100, 0x0101, 0x010C, 0x010D];
 /// On/Off and Dimmable Plug-in Unit device types.
 const PLUG_TYPES: [u64; 2] = [0x010A, 0x010B];
 
+/// The Room Air Conditioner device type.
+const AIRCON_TYPES: [u64; 1] = [0x0072];
+
 /// What a device is, by the Matter device types of its endpoints.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Light,
     Plug,
+    /// Driven by the air conditioner's own control, not switched as a plug or with labels.
+    Aircon,
     Other,
 }
 
@@ -110,7 +115,12 @@ pub fn kind(nodes: &[Value], node_id: u64, endpoint: u16) -> Option<(Kind, Optio
     if parts.iter().any(|(_, types)| has_type(types, &LIGHT_TYPES)) {
         return Some((Kind::Light, None));
     }
-    let kind = if parts.iter().any(|(_, types)| has_type(types, &PLUG_TYPES)) {
+    let kind = if parts
+        .iter()
+        .any(|(_, types)| has_type(types, &AIRCON_TYPES))
+    {
+        Kind::Aircon
+    } else if parts.iter().any(|(_, types)| has_type(types, &PLUG_TYPES)) {
         Kind::Plug
     } else {
         Kind::Other
@@ -445,6 +455,57 @@ pub async fn switch_one(
     let reply = request(&mut ws, command).await.map_err(|e| e.0);
     let _ = ws.close(None).await;
     Ok(reply?.map(|reply| reply.get("error_code").is_none()))
+}
+
+/// Writes `steps` to `endpoint` of `node_id` in order, stopping at the first one refused or
+/// unanswered: `Some(true)` once all are accepted, `Some(false)` on a refusal and `None`
+/// without an answer in time.
+///
+/// # Errors
+/// Fails when the server cannot be reached or drops the connection.
+pub async fn drive(
+    url: &str,
+    node_id: u64,
+    endpoint: u16,
+    steps: &[crate::aircon::Step],
+) -> Result<Option<bool>, String> {
+    let mut ws = connect(url).await?;
+    let result = async {
+        for step in steps {
+            let command = match *step {
+                crate::aircon::Step::Write(path, value) => json!({
+                    "command": "write_attribute",
+                    "args": { "node_id": node_id, "attribute_path": format!("{endpoint}/{path}"), "value": value },
+                }),
+                crate::aircon::Step::Switch(on) => json!({
+                    "command": "device_command",
+                    "args": {
+                        "node_id": node_id,
+                        "endpoint_id": endpoint,
+                        "cluster_id": 6,
+                        "command_name": if on { "On" } else { "Off" },
+                        "payload": {},
+                    },
+                }),
+            };
+            let Some(reply) = request(&mut ws, command).await? else {
+                return Ok(None);
+            };
+            // A write answers with each attribute's status; anything but 0 refused it.
+            let refused = reply.get("error_code").is_some()
+                || reply["result"]
+                    .as_array()
+                    .is_some_and(|statuses| statuses.iter().any(|s| s["Status"].as_u64().is_some_and(|s| s != 0)));
+            if refused {
+                return Ok(Some(false));
+            }
+        }
+        Ok(Some(true))
+    }
+    .await
+    .map_err(|e: Dropped| e.0);
+    let _ = ws.close(None).await;
+    result
 }
 
 /// What became of one light in an adjustment.

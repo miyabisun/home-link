@@ -11,7 +11,8 @@ const binary =
   process.env.HOME_LINK_BIN ??
   new URL("../../target/debug/home-link", import.meta.url).pathname;
 
-// A light and a plug as matterjs-server lists them; On/Off follows the commands sent.
+// A light, a plug and an air conditioner as matterjs-server lists them; On/Off and the
+// written attributes follow the commands sent.
 const nodes = [
   {
     node_id: 1,
@@ -35,6 +36,21 @@ const nodes = [
       "1/6/0": false,
     },
   },
+  {
+    node_id: 3,
+    available: true,
+    attributes: {
+      "0/40/1": "Airco",
+      "0/40/15": "E2E-AIRCON-1",
+      "0/40/3": "Room Air Conditioner",
+      "1/29/0": [{ 0: 114, 1: 1 }],
+      "1/6/0": true,
+      "1/513/28": 3,
+      "1/513/17": 2500,
+      "1/513/18": 2300,
+      "1/514/0": 5,
+    },
+  },
 ];
 
 // Plain GETs answer once the ledger is seeded: the tests wait on that.
@@ -51,6 +67,9 @@ matter.on("connection", (ws) => {
       result = Object.fromEntries(
         args.attribute_path.map((p) => [p, node?.attributes[p]]),
       );
+    } else if (command === "write_attribute" && node) {
+      node.attributes[args.attribute_path] = args.value;
+      result = [{ Path: {}, Status: 0 }];
     } else if (command === "device_command" && node) {
       if (args.cluster_id === 6)
         node.attributes[`${args.endpoint_id}/6/0`] = args.command_name === "On";
@@ -110,5 +129,6 @@ insert.run(
   "E2E-GONE",
   null,
 );
+insert.run("エアコン", "Airco", "E2E-AIRCON-1", null);
 db.close();
 http.listen(Number(MATTER_PORT), "127.0.0.1");

@@ -62,6 +62,9 @@
         <a class="menu-item" href="/meter" onclick={() => (menuOpen = false)}>
           温度計
         </a>
+        <a class="menu-item" href="/aircon" onclick={() => (menuOpen = false)}>
+          エアコン
+        </a>
       </nav>
     {/if}
   </div>

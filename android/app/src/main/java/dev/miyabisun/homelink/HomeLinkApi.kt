@@ -74,6 +74,10 @@ interface HomeLinkApi {
     fun labels(): ApiResult<List<Label>>
     /** Switches label `id`'s lights and plugs on or off, or toggles them. */
     fun switchLabel(id: Long, op: LabelOp): ApiResult<LabelResult>
+    /** Whether the air conditioner's control is on: off holds it off until switched on again. */
+    fun aircon(): ApiResult<Boolean>
+    /** Switches the air conditioner's control the other way; its new state. */
+    fun toggleAircon(): ApiResult<Boolean>
     /**
      * Has matterjs-server commission ledger device `id` by its code over the BLE proxy this phone holds open;
      * home-link hands over its Wi-Fi for devices, and matterjs-server picks Wi-Fi or Thread. Takes up to minutes.
@@ -134,6 +138,13 @@ class HttpHomeLinkApi(private val baseUrl: () -> String?) : HomeLinkApi {
             val json = JSONObject(body)
             LabelResult(json.getString("action"), if (json.isNull("on")) null else json.getBoolean("on"), counts(json))
         }
+
+    override fun aircon(): ApiResult<Boolean> =
+        call("GET", "/api/aircon", null, readTimeout = 3_000) { JSONObject(it).getBoolean("on") }
+
+    // home-link answers once the switch is kept; the wait stays within one widget press's receiver.
+    override fun toggleAircon(): ApiResult<Boolean> =
+        call("POST", "/api/aircon/toggle", null, readTimeout = 8_000) { JSONObject(it).getBoolean("on") }
 
     private fun label(json: JSONObject): Label {
         val schedule = json.optJSONArray("schedule") ?: JSONArray()

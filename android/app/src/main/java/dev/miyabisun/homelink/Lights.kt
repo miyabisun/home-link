@@ -35,11 +35,12 @@ data class ButtonFace(val text: String, val icon: Int, val tone: Tone)
 
 /**
  * The face of the widget button `name` with `icon`: a press's short `label` (keeping `icon` while `sending`),
- * else "<name>中" with its own icon while the server says its label is `boosted`. An unknown (null)
+ * else "<name>中" with `activeIcon` while the server says its label is `boosted`. An unknown (null)
  * state reads as off, so the widget never claims a state it could not read.
  */
-fun buttonFace(name: String, icon: Int, boosted: Boolean?, label: LightsMessage?, sending: Boolean = false): ButtonFace = when {
-    label == null -> if (boosted == true) ButtonFace("${name}中", R.drawable.ic_boosted, Tone.ACTIVE) else ButtonFace(name, icon, Tone.PLAIN)
+fun buttonFace(name: String, icon: Int, boosted: Boolean?, label: LightsMessage?, sending: Boolean = false,
+               activeIcon: Int = R.drawable.ic_boosted): ButtonFace = when {
+    label == null -> if (boosted == true) ButtonFace("${name}中", activeIcon, Tone.ACTIVE) else ButtonFace(name, icon, Tone.PLAIN)
     sending -> ButtonFace(label.text, icon, Tone.PLAIN)
     label.failed -> ButtonFace(label.text, R.drawable.ic_error, Tone.FAILED)
     else -> ButtonFace(label.text, R.drawable.ic_success, Tone.PLAIN)

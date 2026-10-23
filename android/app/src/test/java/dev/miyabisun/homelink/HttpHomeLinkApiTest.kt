@@ -64,6 +64,17 @@ class HttpHomeLinkApiTest {
         assertEquals(ApiResult.Failed(ApiError.DEVICE_NOT_FOUND), api.device(9))
     }
 
+    @Test fun readsAndTogglesTheAirconSwitch() {
+        respond("/api/aircon", 200, """{"on":false,"target":25,"device":null,"reading":null,"sent":null,"runs":[]}""")
+        assertEquals(ApiResult.Ok(false), api.aircon())
+        assertEquals("GET /api/aircon", requests.last())
+        respond("/api/aircon/toggle", 200, """{"on":true}""")
+        assertEquals(ApiResult.Ok(true), api.toggleAircon())
+        assertEquals("POST /api/aircon/toggle", requests.last())
+        respond("/api/aircon/toggle", 500, """{"error":"internal"}""")
+        assertEquals(ApiResult.Failed(ApiError.SERVER), api.toggleAircon())
+    }
+
     @Test fun changesANameAndTheLabels() {
         respond("/api/devices/9", 200, ledgerRow)
         assertEquals(ApiResult.Ok(ledgerDevice), api.updateDevice(9, DeviceUpdate.Name("押入れ1")))
