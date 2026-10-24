@@ -314,6 +314,7 @@ Thread網の資格情報（dataset）は、matterjs-serverに `set_thread_datase
 `unconnected` は接続していない（またはmatterjs-serverにもう無い）、`connected` は接続済み、`no_response` はnodeがあるが応答しない機器です。
 matterjs-serverの接続先が無い・接続できないときは `null` です。人が直す状態の欄はありません。
 `wifi_ssid` は、Wi-Fiでつながっている機器が今いるWi-Fiの名前です（Network Commissioningの接続中のネットワーク）。それ以外の機器は `null` です。
+`network` は、機器がつながるネットワーク（`wifi`・`thread`・`ethernet`、ブリッジ配下はブリッジのもの）で、分からなければ `null` です。
 接続していない機器は識別子が無いので、照明の `missing_devices` には入りません。
 
 `POST /api/devices/{id}/commission` は、行に記録したコードで `commission_with_code`（`network_only: false`）を送ります。
@@ -364,9 +365,11 @@ node IDとendpointはmatterjs-serverが振る番号なので台帳には保存�
 照明APIは、要求のたびにmatterjs-serverの全nodeを読み、照明の種類（On/Off・Dimmable・Color Temperature・Extended Colorの各Light）を持ち、
 On/Offの属性があるendpointを照明として扱います。Aqara Hub M3などのブリッジ配下の照明も、endpointごとに1台と数えます。
 nodeが使えない照明と、ブリッジが届かないと報告している照明には命令を送らず、`no_response` とします。
-命令を受け付けた照明だけを `switched` に数え、エラーが返った照明は `failed`、10秒以内に応答の無かった照明は `no_response` です。
-応答の無い照明へは、2秒待ってから全nodeを読み直し、届くようになった照明も含めて同じ要求の中で送り直します（最大3回）。
-途中で接続が切れた場合は、つなぎ直して全部の照明へ送り直します（オン・オフは状態に依らない指定なので、二重に届いても結果は同じです）。
+命令は全部の照明へ一度に送るので、応答しない照明が他の照明を待たせません。
+命令を受け付けた照明だけを `switched` に数え、エラーが返った照明は `failed`、2.5秒以内に応答の無かった照明は `no_response` です。
+応答の無い照明へは、1秒後に全nodeを読み直し、届くようになった照明も含めて同じ要求の中でもう一度送ります。どちらの命令への応答も数えます。
+途中で接続が切れた場合は、2.5秒の間につなぎ直して、まだ応答の無い照明へ送り直します（オン・オフは状態に依らない指定なので、二重に届いても結果は同じです）。
+期限までに受けた結果は、接続が戻らなくても返します。照明ごとの項目の `network` は、その機器がつながるネットワーク（`wifi`・`thread`・`ethernet`、ブリッジ配下はブリッジのもの）です。
 照明の `name` は台帳の機器名で、台帳に無い照明は製品名です。台帳の機器のうちmatterjs-serverに見えないものは `missing_devices` に並び、
 `missing` に数えます。状態の `GET /api/lights` は、matterjs-serverが最後に読んだOn/Offの値を返します。
 

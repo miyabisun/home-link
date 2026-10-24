@@ -6,6 +6,7 @@ import {
   type Outdoor,
   type Place,
   type Switch,
+  type SwitchEntry,
 } from "./admin";
 
 export interface LabelRef {
@@ -22,6 +23,7 @@ export interface Device {
   kind: "light" | "plug" | "aircon" | "other" | null;
   on: boolean | null;
   wifi_ssid: string | null;
+  network: "wifi" | "thread" | "ethernet" | null;
   labels: LabelRef[];
   ignored: boolean;
 }
@@ -142,6 +144,7 @@ export const api = {
       no_response: number;
       failed: number;
       missing: number;
+      devices: SwitchEntry[];
     }>("POST", `/api/labels/${id}/toggle`),
 };
 

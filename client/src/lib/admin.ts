@@ -126,19 +126,50 @@ export function errorMessage(status: number, body: unknown): string {
     : `失敗しました（HTTP ${status}）`;
 }
 
+export const THREAD_DOWN =
+  "Threadの機器が応答していません（Threadの基地を確かめてください）";
+
+/** Only Thread devices fail to answer: the Thread base, not the devices, is the likely fault. */
+export function threadDown(
+  devices: { state: string | null; network: string | null }[],
+): boolean {
+  const down = devices.filter((device) => device.state === "no_response");
+  return down.length > 0 && down.every((device) => device.network === "thread");
+}
+
+export interface SwitchEntry {
+  name: string;
+  result: string;
+  network: string | null;
+}
+
 export function switchProblem(result: {
   no_response: number;
   failed: number;
   missing: number;
+  devices?: SwitchEntry[];
 }): string | null {
+  const names = (outcome: string) => {
+    const named = (result.devices ?? [])
+      .filter((device) => device.result === outcome)
+      .map((device) => device.name);
+    return named.length ? `（${named.join("・")}）` : "";
+  };
   const parts = [
-    ["応答なし", result.no_response],
-    ["失敗", result.failed],
-    ["見つからない", result.missing],
+    ["応答なし", result.no_response, names("no_response")],
+    ["失敗", result.failed, names("failed")],
+    ["見つからない", result.missing, ""],
   ]
     .filter(([, count]) => Number(count) > 0)
-    .map(([name, count]) => `${name} ${count}`);
-  return parts.length ? parts.join("・") : null;
+    .map(([name, count, which]) => `${name} ${count}${which}`);
+  if (!parts.length) return null;
+  const thread = threadDown(
+    (result.devices ?? []).map((device) => ({
+      state: device.result,
+      network: device.network,
+    })),
+  );
+  return parts.join("・") + (thread ? `。${THREAD_DOWN}` : "");
 }
 
 export interface MeterView {

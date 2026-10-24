@@ -804,6 +804,8 @@ struct Device {
     on: Option<bool>,
     /// The Wi-Fi network the device is on, as it reports it.
     wifi_ssid: Option<String>,
+    /// `wifi`, `thread` or `ethernet` as the connected node runs on; a device behind a bridge is on its bridge's.
+    network: Option<&'static str>,
     /// The labels whose values the schedule uses for this light.
     labels: Vec<LabelRef>,
     /// Left out of switching, adjusting and the counts.
@@ -851,6 +853,7 @@ fn device_row(row: &rusqlite::Row, with_payload: bool) -> rusqlite::Result<Devic
         kind: None,
         on: None,
         wifi_ssid: None,
+        network: None,
         created_at: row.get(2)?,
         qr_payload,
         manual_code,
@@ -923,6 +926,7 @@ async fn observe(state: &AppState, devices: &mut [Device]) {
             }
         }
         device.wifi_ssid = wifi_of(device, &nodes).map(|(_, wifi)| wifi.ssid);
+        device.network = place(device, &nodes).and_then(|(node, _)| matter::network(&nodes, node));
     }
 }
 
@@ -2061,6 +2065,7 @@ fn is_ignored(devices: &[Device], nodes: &[serde_json::Value], light: &matter::L
 
 /// Each light with its ledger name (else its product name), and `field`'s value.
 fn light_entries(
+    nodes: &[serde_json::Value],
     lights: &[matter::Light],
     names: Vec<LightName>,
     values: &[&str],
@@ -2075,6 +2080,7 @@ fn light_entries(
                 "node_id": light.node_id,
                 "endpoint": light.endpoint,
                 "name": name,
+                "network": matter::network(nodes, light.node_id),
                 field: value,
             })
         })
@@ -2115,7 +2121,7 @@ async fn light_states(State(state): State<Db>) -> ApiResult<Json<serde_json::Val
         "off": count(&states, "off"),
         "no_response": count(&states, "no_response"),
         "missing": missing.len(),
-        "lights": light_entries(&lights, names, &states, "state"),
+        "lights": light_entries(&nodes, &lights, names, &states, "state"),
         "missing_devices": missing,
     })))
 }
@@ -2483,7 +2489,7 @@ async fn switch_label(state: &AppState, id: i64, op: Op) -> ApiResult<serde_json
         "no_response": count(&outcomes, "no_response"),
         "failed": count(&outcomes, "failed"),
         "missing": missing.len(),
-        "devices": light_entries(&lights, names, &outcomes, "result"),
+        "devices": light_entries(&nodes, &lights, names, &outcomes, "result"),
         "missing_devices": missing,
     }))
 }
@@ -2550,7 +2556,7 @@ async fn switch_lights(
         "no_response": count(&outcomes, "no_response"),
         "failed": count(&outcomes, "failed"),
         "missing": missing.len(),
-        "lights": light_entries(&lights, names, &outcomes, "result"),
+        "lights": light_entries(&nodes, &lights, names, &outcomes, "result"),
         "missing_devices": missing,
     }));
     Ok((response, switched))

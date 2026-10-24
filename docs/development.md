@@ -41,8 +41,9 @@ scripts/smoke.sh
 `src/matter.rs` はmatterjs-serverのWebSocket APIから全nodeを読み、識別子からnodeとendpointを引きます。
 照明の選び方（Descriptorのdevice typeとOn/Off、ブリッジ配下の展開、届くかどうか）も同じファイルで単体テストします。
 状態APIと照明APIのテストは、`tests/api.rs` の中でmatterjs-serverと同じ形で `get_nodes` と `device_command` に応答する
-WebSocketサーバーを立て、全部オン・全部オフ、エラーや無応答の照明、最初のオンに応答しない照明への送り直し、接続断からの再接続を検証します。
-無応答の照明のテストは、応答を待つ10秒の期限まで待ちます。
+WebSocketサーバーを立て、全部オン・全部オフ、エラーや無応答の照明、最初のオンに応答しない照明への送り直し、接続断からの再接続、
+遅れて届く応答と、無応答の照明があっても他の照明の結果が3秒以内に返ることを検証します。
+無応答の照明のテストは、応答を待つ2.5秒の期限まで待ちます。
 機器の種類とプラグの入り切りは、同じmockに照明・プラグ（0x010A・0x010B）・ブリッジ配下のプラグ・センサーを並べ、
 種類と入・切の値、そのnodeとendpointへのOn/Off、応答しない・使えないプラグ、照明と入り切りの無い機器の拒否、
 全部オン・全部オフと自動調整がプラグへ命令を送らないことを検証します。
@@ -119,6 +120,7 @@ E2Eテストは、ChromiumとPlaywrightで、ビルドしたhome-link（`target/
 エアコンの画面は、mockのエアコンを相手に、入・切と目標の温度の変更がSQLiteに入ること、範囲外の目標を示して送らないことを確かめます。
 `serve.mjs` は国土地理院とOpen-Meteoの代わりも立て（`GSI_URL`・`OPEN_METEO_URL`）、住所の登録の成功と失敗、外気温と理由の表示、夜の時刻の保存を確かめます。
 温度計の画面は、E2Eのhome-linkに温度計が無いため、`GET /api/meter` の応答をPlaywrightで差し替えて、今の値・途絶え・未受信を確かめます。
+応答しない機器の表示は、`GET /api/devices` とlabelの入り切りの応答をPlaywrightで差し替え、Threadの機器だけが応答しないときと、Wi-Fiの機器も応答しないときを、幅1280と390、明暗の両方で確かめます。
 `screens.spec.ts` は幅1280と390の明暗で全画面を撮り（`client/test-results/screens/`）、横のはみ出しと本文の内側の縦スクロールが無いことを確かめます。
 
 ```sh

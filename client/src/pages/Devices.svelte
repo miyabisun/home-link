@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { deviceName, stateText } from "../lib/admin";
+  import { deviceName, stateText, THREAD_DOWN, threadDown } from "../lib/admin";
   import { aborted, api, type Device } from "../lib/api";
 
   let devices = $state<Device[]>([]);
@@ -46,6 +46,9 @@
       >
     </div>
   {:else}
+    {#if threadDown(devices)}
+      <p class="error-banner" role="alert">{THREAD_DOWN}</p>
+    {/if}
     <ul class="cards">
       {#each devices as device (device.id)}
         {@const state = stateText(device.state)}

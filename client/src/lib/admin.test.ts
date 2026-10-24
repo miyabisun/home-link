@@ -23,6 +23,8 @@ import {
   stateText,
   switchProblem,
   withLabel,
+  THREAD_DOWN,
+  threadDown,
 } from "./admin";
 
 const label = {
@@ -197,6 +199,73 @@ describe("switch results", () => {
     expect(switchProblem({ no_response: 0, failed: 1, missing: 0 })).toBe(
       "失敗 1",
     );
+  });
+
+  const entry = (name: string, result: string, network: string | null) => ({
+    name,
+    result,
+    network,
+  });
+
+  it("names each device that did not answer", () => {
+    expect(
+      switchProblem({
+        no_response: 2,
+        failed: 1,
+        missing: 0,
+        devices: [
+          entry("読書灯", "switched", "wifi"),
+          entry("台所", "no_response", "wifi"),
+          entry("寝室", "no_response", "thread"),
+          entry("玄関", "failed", "wifi"),
+        ],
+      }),
+    ).toBe("応答なし 2（台所・寝室）・失敗 1（玄関）");
+  });
+
+  it("points to the Thread base when only Thread devices did not answer", () => {
+    expect(
+      switchProblem({
+        no_response: 2,
+        failed: 0,
+        missing: 0,
+        devices: [
+          entry("読書灯", "switched", "wifi"),
+          entry("台所", "no_response", "thread"),
+          entry("寝室", "no_response", "thread"),
+        ],
+      }),
+    ).toBe(`応答なし 2（台所・寝室）。${THREAD_DOWN}`);
+  });
+});
+
+describe("the Thread base", () => {
+  const device = (state: string, network: string | null) => ({
+    state,
+    network,
+  });
+
+  it("is down when every device not answering is on Thread", () => {
+    expect(
+      threadDown([
+        device("connected", "wifi"),
+        device("no_response", "thread"),
+        device("no_response", "thread"),
+      ]),
+    ).toBe(true);
+  });
+
+  it("is not blamed when nothing is down or a device elsewhere is down too", () => {
+    expect(
+      threadDown([device("connected", "wifi"), device("connected", "thread")]),
+    ).toBe(false);
+    expect(
+      threadDown([
+        device("no_response", "wifi"),
+        device("no_response", "thread"),
+      ]),
+    ).toBe(false);
+    expect(threadDown([device("no_response", null)])).toBe(false);
   });
 });
 

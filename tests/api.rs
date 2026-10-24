@@ -6,6 +6,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use axum::{
@@ -275,6 +276,12 @@ struct Fake {
     late_on: Vec<(u64, u64)>,
     /// `(node_id, endpoint)` that leaves its first command unanswered.
     silent_first: Vec<(u64, u64)>,
+    /// `(node_id, endpoint)` answering its commands only after the milliseconds given.
+    delayed: Vec<((u64, u64), u64)>,
+    /// `(node_id, endpoint)` whose On/Off reads are never answered.
+    silent_reads: Vec<(u64, u64)>,
+    /// Only the first `get_nodes` on each connection is answered.
+    nodes_once: bool,
 }
 
 /// Serves `get_nodes` and On/Off `device_command` the way matterjs-server does,
@@ -299,17 +306,41 @@ async fn fake_light_server(
             *count.lock().unwrap() += 1;
             let info = json!({ "fabric_id": 1, "schema_version": 13 });
             ws.send(Message::text(info.to_string())).await.unwrap();
-            while let Some(Ok(Message::Text(text))) = ws.next().await {
+            // Delayed replies with when they are due.
+            let mut later: Vec<(tokio::time::Instant, Value)> = Vec::new();
+            let mut nodes_read = false;
+            loop {
+                let due = later.iter().map(|(at, _)| *at).min();
+                let message = tokio::select! {
+                    message = ws.next() => message,
+                    () = tokio::time::sleep_until(due.unwrap_or_else(tokio::time::Instant::now)), if due.is_some() => {
+                        let now = tokio::time::Instant::now();
+                        for (_, reply) in later.extract_if(.., |(at, _)| *at <= now) {
+                            ws.send(Message::text(reply.to_string())).await.unwrap();
+                        }
+                        continue;
+                    }
+                };
+                let Some(Ok(Message::Text(text))) = message else {
+                    break;
+                };
                 let command: Value = serde_json::from_str(&text).unwrap();
                 let id = command["message_id"].clone();
                 let reply = match command["command"].as_str().unwrap() {
-                    "get_nodes" => json!({ "message_id": id, "result": *nodes.lock().unwrap() }),
+                    "get_nodes" if fake.nodes_once && nodes_read => continue,
+                    "get_nodes" => {
+                        nodes_read = true;
+                        json!({ "message_id": id, "result": *nodes.lock().unwrap() })
+                    }
                     "read_attribute" => {
                         seen.lock().unwrap().push(command.clone());
                         let args = &command["args"];
                         let node_id = args["node_id"].as_u64().unwrap();
                         let path = args["attribute_path"][0].as_str().unwrap().to_owned();
                         let endpoint: u64 = path.split('/').next().unwrap().parse().unwrap();
+                        if fake.silent_reads.contains(&(node_id, endpoint)) {
+                            continue;
+                        }
                         let value = if fake.read_off.contains(&(node_id, endpoint)) {
                             json!(false)
                         } else {
@@ -360,7 +391,13 @@ async fn fake_light_server(
                                     }
                                 }
                             }
-                            json!({ "message_id": id, "result": null })
+                            let reply = json!({ "message_id": id, "result": null });
+                            if let Some((_, ms)) = fake.delayed.iter().find(|(t, _)| *t == target) {
+                                let at = tokio::time::Instant::now() + Duration::from_millis(*ms);
+                                later.push((at, reply));
+                                continue;
+                            }
+                            reply
                         }
                     }
                     "write_attribute" => {
@@ -610,6 +647,160 @@ async fn lights_that_miss_the_first_on_are_sent_it_again() {
         .filter(|c| c["node_id"] == 5 && c["command_name"] == "On")
         .count();
     assert_eq!(to_tapo, 2);
+}
+
+/// Within this a request switching lights answers, however many of them stay silent.
+const ANSWERED_WITHIN: Duration = Duration::from_secs(3);
+
+#[tokio::test]
+async fn a_light_that_answers_late_counts_as_switched() {
+    let fake = Fake {
+        delayed: vec![((5, 1), 2300)],
+        ..Fake::default()
+    };
+    let (addr, _, _) = fake_light_server(home_nodes(), fake).await;
+    let (app, _) = light_app(addr).await;
+
+    let started = tokio::time::Instant::now();
+    let (status, body) = call(&app, "POST", "/api/lights/on", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        started.elapsed() < ANSWERED_WITHIN,
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(body["lights"][2]["result"], "switched", "{body}");
+    assert_eq!(body["switched"], 2, "{body}");
+}
+
+#[tokio::test]
+async fn a_silent_light_does_not_hold_up_the_others() {
+    let fake = Fake {
+        silent: vec![(1, 3)],
+        ..Fake::default()
+    };
+    let (addr, _, _) = fake_light_server(home_nodes(), fake).await;
+    let (app, sql) = light_app(addr).await;
+    let room = create_label(&app, json!({ "name": "room" })).await;
+    for id in [1, 2] {
+        let device = json!({ "id": id });
+        assert_eq!(assign(&app, &device, &[&room]).await.0, StatusCode::OK);
+    }
+    drop(sql);
+
+    for uri in ["/api/lights/off", "/api/labels/1/on", "/api/labels/1/off"] {
+        let started = tokio::time::Instant::now();
+        let (status, body) = call(&app, "POST", uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri} {body}");
+        assert!(
+            started.elapsed() < ANSWERED_WITHIN,
+            "{uri} {:?}",
+            started.elapsed()
+        );
+        let entries = body.get("lights").or(body.get("devices")).unwrap();
+        let outcome = |name: &str| {
+            entries
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["name"] == name)
+                .map(|e| e["result"].clone())
+        };
+        assert_eq!(outcome("台所"), Some(json!("no_response")), "{uri} {body}");
+        assert_eq!(outcome("読書灯"), Some(json!("switched")), "{uri} {body}");
+    }
+}
+
+#[tokio::test]
+async fn results_gathered_before_the_deadline_are_returned() {
+    // The light that stays silent is sent its command again after the nodes are read
+    // again, which never answers.
+    let fake = Fake {
+        silent: vec![(1, 3)],
+        nodes_once: true,
+        ..Fake::default()
+    };
+    let (addr, _, _) = fake_light_server(home_nodes(), fake).await;
+    let (app, _) = light_app(addr).await;
+
+    let started = tokio::time::Instant::now();
+    let (status, body) = call(&app, "POST", "/api/lights/on", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        started.elapsed() < ANSWERED_WITHIN,
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        (&body["switched"], &body["no_response"]),
+        (&json!(1), &json!(3)),
+        "{body}"
+    );
+    assert_eq!(body["lights"][1]["result"], "no_response");
+    assert_eq!(body["lights"][2]["result"], "switched");
+}
+
+#[tokio::test]
+async fn devices_and_switch_results_tell_the_network_each_device_runs_on() {
+    let nodes = json!([
+        { "node_id": 5, "available": true, "attributes": {
+            "0/40/1": "Tapo", "0/40/15": TAPO, "0/49/65532": 1,
+            "1/29/0": [{ "0": 269, "1": 1 }], "1/6/0": false,
+        }},
+        { "node_id": 26, "available": true, "attributes": {
+            "0/40/1": "Aqara", "0/40/15": "t2-thread", "0/49/65532": 2,
+            "1/29/0": [{ "0": 268, "1": 1 }], "1/6/0": false,
+        }},
+    ]);
+    let fake = Fake {
+        silent: vec![(26, 1)],
+        ..Fake::default()
+    };
+    let (addr, _, _) = fake_light_server(nodes, fake).await;
+    let (db, sql) = ledger();
+    let app = home_link::app(db, Some(format!("ws://{addr}/ws")));
+    add_device(
+        &app,
+        &sql,
+        json!({ "vendor": "Tapo", "serial_number": TAPO, "name": "読書灯" }),
+    )
+    .await;
+    add_device(
+        &app,
+        &sql,
+        json!({ "vendor": "Aqara", "serial_number": "t2-thread", "name": "台所" }),
+    )
+    .await;
+
+    let (_, devices) = call(&app, "GET", "/api/devices", None).await;
+    let networks: Vec<_> = devices
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| (d["name"].clone(), d["network"].clone()))
+        .collect();
+    assert_eq!(
+        networks,
+        [
+            (json!("読書灯"), json!("wifi")),
+            (json!("台所"), json!("thread"))
+        ]
+    );
+    let (status, body) = call(&app, "POST", "/api/lights/off", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let entries: Vec<_> = body["lights"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| (l["name"].clone(), l["network"].clone(), l["result"].clone()))
+        .collect();
+    assert_eq!(
+        entries,
+        [
+            (json!("読書灯"), json!("wifi"), json!("switched")),
+            (json!("台所"), json!("thread"), json!("no_response")),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -867,6 +1058,48 @@ async fn scheduled_adjustment_writes_only_to_lights_read_as_on() {
     let (_, body) = call(&app, "GET", "/api/lights/schedule", None).await;
     assert_eq!(body["runs"][0]["lights"][1]["decision"], "unchanged");
     assert_eq!(body["runs"][0]["commands"], 0);
+}
+
+#[tokio::test]
+async fn an_adjustment_is_not_held_up_by_lights_that_never_answer() {
+    // The desk Tapo is on too; the T2 and the other Tapo that are on never answer a read.
+    let mut nodes = tuning_nodes();
+    nodes[2]["attributes"]["1/6/0"] = json!(true);
+    let fake = Fake {
+        silent_reads: vec![(1, 3), (5, 1)],
+        ..Fake::default()
+    };
+    let (addr, commands, _) = fake_light_server(nodes, fake).await;
+    let (home, app, _) = auto_home(addr, None).await;
+    enable(&app).await;
+
+    let started = tokio::time::Instant::now();
+    home.adjust(NIGHT, "scheduled").await;
+    // Each read waits at most a few seconds, all at once rather than one after another.
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        sent_values(&commands),
+        [
+            (json!(6), json!(1), json!(102)),
+            (json!(6), json!(1), json!(333))
+        ]
+    );
+    let (_, body) = call(&app, "GET", "/api/lights/schedule", None).await;
+    assert_eq!(
+        decisions(&body["runs"][0]),
+        [
+            (json!(1), json!(2), json!("no_response")),
+            (json!(1), json!(3), json!("no_response")),
+            (json!(5), json!(1), json!("no_response")),
+            (json!(6), json!(1), json!("sent")),
+            (json!(16), json!(1), json!("no_response")),
+            (json!(30), json!(1), json!("unsupported")),
+        ]
+    );
 }
 
 fn sent_values(commands: &Arc<Mutex<Vec<Value>>>) -> Vec<(Value, Value, Value)> {
