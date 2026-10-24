@@ -15,9 +15,6 @@ const MORNING_FROM: u32 = 5 * 60;
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub enabled: bool,
-    /// Where sunrise and sunset are computed; Tokyo (Shinjuku) unless the user gives a city.
-    pub latitude: f64,
-    pub longitude: f64,
     /// When the morning reaches the day's values, in minutes after midnight.
     pub morning_end_minute: u32,
     /// `CurrentLevel` by day and at night, 1–254.
@@ -36,8 +33,6 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             enabled: false,
-            latitude: 35.6895,
-            longitude: 139.6917,
             morning_end_minute: 10 * 60,
             day_level: 203,
             night_level: 102,
@@ -52,9 +47,7 @@ impl Settings {
     /// Why the settings cannot be used, if they cannot.
     #[must_use]
     pub fn invalid(&self) -> Option<&'static str> {
-        if !(-90.0..=90.0).contains(&self.latitude) || !(-180.0..=180.0).contains(&self.longitude) {
-            Some("緯度は-90〜90、経度は-180〜180で指定してください")
-        } else if !(1..=254).contains(&self.day_level) || !(1..=254).contains(&self.night_level) {
+        if !(1..=254).contains(&self.day_level) || !(1..=254).contains(&self.night_level) {
             Some("明るさは1〜254で指定してください")
         } else if !(1000..=10000).contains(&self.warm_kelvin)
             || !(1000..=10000).contains(&self.cool_kelvin)
@@ -188,7 +181,7 @@ fn civil_year(days: i64) -> i64 {
     civil(days).0
 }
 
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+pub(crate) fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let year = if month <= 2 { year - 1 } else { year };
     let era = year.div_euclid(400);
     let yoe = year.rem_euclid(400);
@@ -643,10 +636,6 @@ mod tests {
     fn settings_are_validated() {
         assert_eq!(Settings::default().invalid(), None);
         for bad in [
-            Settings {
-                latitude: 91.0,
-                ..Settings::default()
-            },
             Settings {
                 night_level: 0,
                 ..Settings::default()

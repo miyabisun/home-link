@@ -53,8 +53,48 @@ const nodes = [
   },
 ];
 
+// GSI's address search and Open-Meteo: an address with 見つからない is not found, any
+// other is the one GSI found for 東京都新宿区西新宿2-8-1; it is 30.2℃ outside now.
+function outside(url, response) {
+  response.setHeader("content-type", "application/json");
+  if (url.pathname === "/gsi") {
+    const missing = (url.searchParams.get("q") ?? "").includes("見つからない");
+    response.end(
+      missing
+        ? "[]"
+        : JSON.stringify([
+            {
+              geometry: { coordinates: [139.691772, 35.689629], type: "Point" },
+              type: "Feature",
+              properties: {
+                addressCode: "",
+                title: "東京都新宿区西新宿二丁目８番",
+              },
+            },
+          ]),
+    );
+  } else {
+    const quarter = new Date(Math.floor(Date.now() / 900_000) * 900_000);
+    response.end(
+      JSON.stringify({
+        utc_offset_seconds: 0,
+        current: {
+          time: quarter.toISOString().slice(0, 16),
+          interval: 900,
+          temperature_2m: 30.2,
+        },
+      }),
+    );
+  }
+}
+
 // Plain GETs answer once the ledger is seeded: the tests wait on that.
-const http = createServer((_, response) => response.end("ok"));
+const http = createServer((request, response) => {
+  const url = new URL(request.url ?? "/", "http://localhost");
+  if (url.pathname === "/gsi" || url.pathname === "/meteo")
+    outside(url, response);
+  else response.end("ok");
+});
 const matter = new WebSocketServer({ server: http });
 matter.on("connection", (ws) => {
   ws.send(JSON.stringify({ fabric_id: 1, schema_version: 13 }));
@@ -96,6 +136,8 @@ const server = spawn(binary, {
     PORT,
     DATABASE_PATH: E2E_DB,
     MATTER_SERVER_URL: `ws://127.0.0.1:${MATTER_PORT}/ws`,
+    GSI_URL: `http://127.0.0.1:${MATTER_PORT}/gsi`,
+    OPEN_METEO_URL: `http://127.0.0.1:${MATTER_PORT}/meteo`,
     LOG_LEVEL: "warn",
   },
 });

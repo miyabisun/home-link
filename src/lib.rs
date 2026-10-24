@@ -4,6 +4,7 @@ pub mod matter;
 mod mcp;
 pub mod meter;
 pub mod onboarding;
+pub mod outside;
 pub mod schedule;
 pub mod sesame;
 
@@ -271,7 +272,51 @@ pub fn open_db(path: &str) -> rusqlite::Result<Connection> {
             PRAGMA foreign_keys = ON;",
         )?;
     }
+    if version < 11 {
+        migrate_to_the_home_location(&db)?;
+    }
     Ok(db)
+}
+
+/// Version 11 keeps the air conditioner's runs for two weeks, and moves the light schedule's
+/// coordinates, when they were changed, to the home's location, their one place since.
+fn migrate_to_the_home_location(db: &Connection) -> rusqlite::Result<()> {
+    let schedule: Option<String> = db
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            [SCHEDULE],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let place = schedule
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+        .and_then(|value| Some((value["latitude"].as_f64()?, value["longitude"].as_f64()?)));
+    let tokyo = outside::Location::default();
+    db.execute_batch("BEGIN;")?;
+    if let Some((latitude, longitude)) =
+        place.filter(|&place| place != (tokyo.latitude, tokyo.longitude))
+    {
+        store(
+            db,
+            LOCATION,
+            &outside::Location {
+                latitude,
+                longitude,
+                ..tokyo
+            },
+        )?;
+    }
+    db.execute_batch(
+        "UPDATE settings SET value = json_remove(value, '$.latitude', '$.longitude')
+            WHERE key = 'light_schedule';
+        CREATE TABLE IF NOT EXISTS aircon_runs (
+            at INTEGER NOT NULL,
+            run TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS aircon_runs_at ON aircon_runs (at);
+        PRAGMA user_version = 11;
+        COMMIT;",
+    )
 }
 
 /// Version 9 makes labels the one way to switch, hold and adjust lights, keeping how
@@ -369,10 +414,27 @@ struct AppState {
     last_schedule: Mutex<Option<i64>>,
     /// The room's `SwitchBot` CO2 meter, if one is configured.
     meter: meter::Meter,
-    /// The air conditioner's latest runs, newest first; kept in memory only.
-    aircon_runs: Mutex<VecDeque<serde_json::Value>>,
     /// Held through one run so a switch and the loop do not send at once.
     aircon_busy: tokio::sync::Mutex<()>,
+    /// GSI's address search and Open-Meteo, unless the outside is not reached.
+    outside: Option<Outside>,
+    /// The latest temperature outside; kept in memory only.
+    outdoor: Mutex<Option<Outdoor>>,
+}
+
+/// Where the home's place and the temperature outside are asked for.
+#[derive(Clone, Debug)]
+pub struct Outside {
+    pub gsi_url: String,
+    pub open_meteo_url: String,
+}
+
+/// A temperature outside, the Unix second it is for, and when it was fetched.
+#[derive(Clone, Copy, Debug)]
+struct Outdoor {
+    celsius: f64,
+    at: i64,
+    fetched_at: i64,
 }
 
 const COMMISSION_TIMEOUT: Duration = Duration::from_mins(5);
@@ -408,8 +470,9 @@ impl Home {
             sesame: sesame::Config::new(None, None, None, sesame::API_URL),
             last_schedule: Mutex::new(None),
             meter: meter::Meter::new(None),
-            aircon_runs: Mutex::new(VecDeque::new()),
             aircon_busy: tokio::sync::Mutex::new(()),
+            outside: None,
+            outdoor: Mutex::new(None),
         }))
     }
 
@@ -444,6 +507,18 @@ impl Home {
         Arc::get_mut(&mut self.0)
             .expect("set before the Home is shared")
             .sesame = sesame;
+        self
+    }
+
+    /// Sets where the home's address is searched and the temperature outside asked for.
+    ///
+    /// # Panics
+    /// Panics once the router or a clone shares this `Home`.
+    #[must_use]
+    pub fn with_outside(mut self, outside: Outside) -> Self {
+        Arc::get_mut(&mut self.0)
+            .expect("set before the Home is shared")
+            .outside = Some(outside);
         self
     }
 
@@ -559,6 +634,8 @@ fn router(state: Db) -> Router {
         .route("/meter", get(meter_reading))
         .route("/aircon", get(get_aircon).put(update_aircon))
         .route("/aircon/toggle", axum::routing::post(toggle_aircon))
+        .route("/aircon/runs", get(aircon_runs))
+        .route("/location", get(get_location).put(update_location))
         .route("/status", get(status))
         .route("/lights", get(light_states))
         .route("/lights/on", axum::routing::post(lights_on))
@@ -2338,9 +2415,10 @@ async fn switch_label(state: &AppState, id: i64, op: Op) -> ApiResult<serde_json
                 .map_err(matter_unreachable)?;
             let mine: Vec<_> = switched.iter().map(|(light, _)| key(light)).collect();
             let (day, minute) = schedule::local((state.clock)());
+            let home = load::<outside::Location>(&state.db.lock().expect(UNPOISONED), LOCATION)?;
             let goal = schedule::target(
                 minute,
-                schedule::sun_times(day, settings.latitude, settings.longitude),
+                schedule::sun_times(day, home.latitude, home.longitude),
                 &settings,
             );
             let tuned = matter::tune(url, &[], 0, |nodes, light| {
@@ -2505,19 +2583,26 @@ fn store<T: Serialize>(db: &Connection, key: &str, value: &T) -> rusqlite::Resul
 /// under no auto label or only under auto labels that are off, nor while the schedule
 /// is disabled, nor what was already sent unless `switched_on` holds the light: just
 /// switched on, it gets all values.
+#[allow(clippy::too_many_lines)]
 async fn adjust(state: &AppState, unix: i64, trigger: &'static str, switched_on: &[(u64, u16)]) {
     let loaded = {
         let db = state.db.lock().expect(UNPOISONED);
-        load::<schedule::Settings>(&db, SCHEDULE)
-            .and_then(|settings| Ok((settings, ledger(&db)?, labels(&db)?)))
+        load::<schedule::Settings>(&db, SCHEDULE).and_then(|settings| {
+            Ok((
+                settings,
+                ledger(&db)?,
+                labels(&db)?,
+                load::<outside::Location>(&db, LOCATION)?,
+            ))
+        })
     };
     let (day, minute) = schedule::local(unix);
     let mut run = json!({ "at": schedule::timestamp(unix), "trigger": trigger, "commands": 0 });
     let result = match (&loaded, &state.matter_url) {
         (Err(error), _) => Err(error.to_string()),
         (_, None) => Err("MATTER_SERVER_URL is not set".into()),
-        (Ok((settings, devices, labels)), Some(url)) => {
-            let sun = schedule::sun_times(day, settings.latitude, settings.longitude);
+        (Ok((settings, devices, labels, home)), Some(url)) => {
+            let sun = schedule::sun_times(day, home.latitude, home.longitude);
             let goal = schedule::target(minute, sun, settings);
             run["sunrise"] = json!(schedule::clock(sun.0));
             run["sunset"] = json!(schedule::clock(sun.1));
@@ -2564,7 +2649,7 @@ async fn adjust(state: &AppState, unix: i64, trigger: &'static str, switched_on:
     match result {
         Ok((tuned, goals)) => {
             let lights: Vec<_> = tuned.lights.iter().map(|(l, _)| l.clone()).collect();
-            let devices = loaded.map(|(_, devices, _)| devices).unwrap_or_default();
+            let devices = loaded.map(|(_, devices, _, _)| devices).unwrap_or_default();
             let (names, _) = match_ledger(&devices, &tuned.nodes, &lights);
             let mut memory = state.sent.lock().expect(UNPOISONED);
             let entries: Vec<_> = tuned
@@ -2717,6 +2802,15 @@ async fn update_schedule(
 const AIRCON: &str = "aircon";
 /// The command last accepted by the air conditioner, kept so a restart does not make it beep.
 const AIRCON_SENT: &str = "aircon_sent";
+/// What the adjustment remembers between runs: corrections, when it last sent, the room's answer.
+const AIRCON_MEMORY: &str = "aircon_memory";
+/// The home's place, for the temperature outside and the lights' sunrise and sunset.
+const LOCATION: &str = "location";
+/// Two weeks of runs every ten minutes are kept, and the latest day served with the state.
+const AIRCON_RUNS_FOR: i64 = 14 * 86_400;
+/// How long a temperature fetched from outside is reused before it is asked for again.
+const OUTDOOR_REUSED_FOR: i64 = 5 * 60;
+const OUTSIDE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The ledger's air conditioner served by matterjs-server, with its node and the endpoint it is driven on.
 // ponytail: the first one; a second room's air conditioner needs a meter of its own.
@@ -2733,15 +2827,82 @@ fn find_aircon<'a>(
     })
 }
 
-/// Decides and sends the air conditioner's command for `unix` and records the run.
+fn outside_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent(outside::USER_AGENT)
+        .timeout(OUTSIDE_TIMEOUT)
+        .build()
+        .unwrap_or_default()
+}
+
+/// The answer's body from `url` with `query`; the error leaves the URL out, as the query may hold the address.
+async fn fetch_outside(url: &str, query: &[(&str, String)]) -> Result<String, String> {
+    let response = outside_client()
+        .get(url)
+        .query(query)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|e| e.without_url().to_string())?;
+    response
+        .text()
+        .await
+        .map_err(|e| e.without_url().to_string())
+}
+
+/// The temperature outside the home for `unix`, fresh or `None`: asked for again once the last
+/// fetch is five minutes old, the last one kept if that fails.
+async fn outdoor(state: &AppState, unix: i64) -> Option<f64> {
+    let outside = state.outside.as_ref()?;
+    let cached = *state.outdoor.lock().expect(UNPOISONED);
+    if cached.is_none_or(|o| !(0..OUTDOOR_REUSED_FOR).contains(&(unix - o.fetched_at))) {
+        let home = load::<outside::Location>(&state.db.lock().expect(UNPOISONED), LOCATION);
+        let fetched = match home {
+            Ok(home) => fetch_outside(
+                &outside.open_meteo_url,
+                &[
+                    ("latitude", home.latitude.to_string()),
+                    ("longitude", home.longitude.to_string()),
+                    ("current", "temperature_2m".into()),
+                ],
+            )
+            .await
+            .and_then(|body| outside::temperature(&body).ok_or_else(|| "unreadable answer".into())),
+            Err(error) => Err(error.to_string()),
+        };
+        match fetched {
+            Ok((celsius, at)) => {
+                *state.outdoor.lock().expect(UNPOISONED) = Some(Outdoor {
+                    celsius,
+                    at,
+                    fetched_at: unix,
+                });
+            }
+            Err(error) => tracing::warn!(%error, "temperature outside unavailable"),
+        }
+    }
+    let latest = *state.outdoor.lock().expect(UNPOISONED);
+    latest
+        .filter(|o| unix - o.at <= outside::FRESH_FOR)
+        .map(|o| o.celsius)
+}
+
+/// Decides and sends the air conditioner's command for `unix`, and records the run for two weeks.
 async fn adjust_aircon(state: &AppState, unix: i64, trigger: &'static str) {
     let _busy = state.aircon_busy.lock().await;
     let reading = state
         .meter
         .reading(unix)
         .map(|r| (r.temperature, r.humidity));
-    let mut run = json!({ "at": schedule::timestamp(unix), "trigger": trigger });
-    let result = match drive_aircon(state, reading, &mut run).await {
+    let outdoor = outdoor(state, unix).await;
+    let mut run = json!({
+        "at": schedule::timestamp(unix),
+        "trigger": trigger,
+        "temperature": reading.map(|r| r.0),
+        "humidity": reading.map(|r| r.1),
+        "outdoor": outdoor,
+    });
+    let result = match drive_aircon(state, unix, trigger, reading, outdoor, &mut run).await {
         Ok(result) => result,
         Err(error) => {
             tracing::warn!(trigger, %error, "aircon adjustment failed");
@@ -2750,45 +2911,96 @@ async fn adjust_aircon(state: &AppState, unix: i64, trigger: &'static str) {
         }
     };
     if result == "sent" {
-        tracing::info!(trigger, command = %run["command"], "aircon sent");
+        tracing::info!(trigger, command = %run["command"], reason = %run["reason"], "aircon sent");
     }
     run["result"] = json!(result);
-    let mut runs = state.aircon_runs.lock().expect(UNPOISONED);
-    runs.push_front(run);
-    runs.truncate(RUNS_KEPT);
+    let db = state.db.lock().expect(UNPOISONED);
+    let kept = db
+        .execute(
+            "INSERT INTO aircon_runs (at, run) VALUES (?1, ?2)",
+            params![unix, run.to_string()],
+        )
+        .and_then(|_| {
+            db.execute(
+                "DELETE FROM aircon_runs WHERE at < ?1",
+                [unix - AIRCON_RUNS_FOR],
+            )
+        });
+    if let Err(error) = kept {
+        tracing::warn!(%error, "aircon run not recorded");
+    }
 }
 
-/// What became of one run: `sent`, `unchanged`, `no_reading`, `no_aircon`, `no_response` or `refused`.
+/// What became of one run: `sent`, `unchanged`, `held`, `no_reading`, `no_aircon`,
+/// `no_response` or `refused`. The memory moves on as the command was accepted or not.
 async fn drive_aircon(
     state: &AppState,
+    unix: i64,
+    trigger: &'static str,
     reading: Option<(f64, u8)>,
+    outdoor: Option<f64>,
     run: &mut serde_json::Value,
 ) -> Result<&'static str, String> {
-    let (settings, last, devices) = {
+    let (settings, last, memory, devices) = {
         let db = state.db.lock().expect(UNPOISONED);
         let loaded = (|| {
             Ok::<_, rusqlite::Error>((
                 load::<aircon::Settings>(&db, AIRCON)?,
                 load::<Option<aircon::Command>>(&db, AIRCON_SENT)?,
+                load::<aircon::Memory>(&db, AIRCON_MEMORY)?,
                 ledger(&db)?,
             ))
         })();
         loaded.map_err(|e| e.to_string())?
     };
-    let Some(command) = aircon::decide(settings, reading, last) else {
-        return Ok(if settings.on && reading.is_none() {
-            "no_reading"
-        } else {
-            "unchanged"
+    let input = aircon::Input {
+        now: unix,
+        room: reading,
+        outdoor,
+        trigger: match trigger {
+            "switch" => aircon::Trigger::Switch,
+            "target" => aircon::Trigger::Target,
+            _ => aircon::Trigger::Loop,
+        },
+    };
+    let decision = aircon::decide(settings, &input, last, &memory);
+    run["reason"] = json!(decision.to_string());
+    run["command"] = json!(decision.command);
+    let keep = |memory: &aircon::Memory| {
+        store(&state.db.lock().expect(UNPOISONED), AIRCON_MEMORY, memory).map_err(|e| e.to_string())
+    };
+    let Some(command) = decision.send else {
+        keep(&decision.kept)?;
+        return Ok(match (decision.why, decision.hold) {
+            (aircon::Why::NoReading, _) => "no_reading",
+            (_, Some(_)) => "held",
+            (_, None) => "unchanged",
         });
     };
-    run["command"] = json!(command);
+    let result = send_aircon(state, &devices, command).await;
+    if matches!(result, Ok("sent")) {
+        let db = state.db.lock().expect(UNPOISONED);
+        store(&db, AIRCON_SENT, &Some(command))
+            .and_then(|()| store(&db, AIRCON_MEMORY, &decision.sent))
+            .map_err(|e| e.to_string())?;
+    } else {
+        keep(&decision.kept)?;
+    }
+    result
+}
+
+/// Puts `command` on the ledger's air conditioner: `sent`, `no_aircon`, `no_response` or `refused`.
+async fn send_aircon(
+    state: &AppState,
+    devices: &[Device],
+    command: aircon::Command,
+) -> Result<&'static str, String> {
     let url = state
         .matter_url
         .as_deref()
         .ok_or("MATTER_SERVER_URL is not set")?;
     let nodes = matter::fetch_nodes(url).await?;
-    let Some((_, node, endpoint)) = find_aircon(&devices, &nodes) else {
+    let Some((_, node, endpoint)) = find_aircon(devices, &nodes) else {
         return Ok("no_aircon");
     };
     if !matter::describe(&nodes, node, endpoint).0 {
@@ -2800,30 +3012,65 @@ async fn drive_aircon(
         .map(|n| &n["attributes"]);
     let cooling =
         attributes.and_then(|a| a[format!("{endpoint}/{}", aircon::COOLING_SETPOINT)].as_i64());
-    match matter::drive(url, node, endpoint, &aircon::steps(command, cooling)).await? {
-        None => Ok("no_response"),
-        Some(false) => Ok("refused"),
-        Some(true) => {
-            store(
-                &state.db.lock().expect(UNPOISONED),
-                AIRCON_SENT,
-                &Some(command),
-            )
-            .map_err(|e| e.to_string())?;
-            Ok("sent")
-        }
-    }
+    Ok(
+        match matter::drive(url, node, endpoint, &aircon::steps(command, cooling)).await? {
+            None => "no_response",
+            Some(false) => "refused",
+            Some(true) => "sent",
+        },
+    )
 }
 
-/// The air conditioner's switch and target, its state as matterjs-server serves it, the
-/// meter's fresh reading, the command last sent and the latest runs.
+/// The runs recorded by `sql` with `param`, as JSON.
+fn recorded_runs(
+    db: &Connection,
+    sql: &str,
+    param: i64,
+) -> rusqlite::Result<Vec<serde_json::Value>> {
+    let runs = db
+        .prepare(sql)?
+        .query_map([param], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(runs
+        .iter()
+        .filter_map(|run| serde_json::from_str(run).ok())
+        .collect())
+}
+
+#[derive(Deserialize)]
+struct RunsQuery {
+    since: Option<i64>,
+}
+
+/// The two weeks of runs, oldest first, from `since` (Unix seconds) if given.
+async fn aircon_runs(
+    State(state): State<Db>,
+    axum::extract::Query(query): axum::extract::Query<RunsQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let runs = recorded_runs(
+        &state.db.lock().expect(UNPOISONED),
+        "SELECT run FROM aircon_runs WHERE at >= ?1 ORDER BY rowid",
+        query.since.unwrap_or(0),
+    )?;
+    Ok(Json(json!({ "runs": runs })))
+}
+
+/// The air conditioner's switch, target and night, its state as matterjs-server serves it,
+/// the meter's fresh reading, the outside and the home's place, the command last sent with
+/// the latest reason, and the latest runs.
 async fn get_aircon(State(state): State<Db>) -> ApiResult<Json<serde_json::Value>> {
-    let (settings, sent, devices) = {
+    let (settings, sent, devices, home, runs) = {
         let db = state.db.lock().expect(UNPOISONED);
         (
             load::<aircon::Settings>(&db, AIRCON)?,
             load::<Option<aircon::Command>>(&db, AIRCON_SENT)?,
             ledger(&db)?,
+            load::<outside::Location>(&db, LOCATION)?,
+            recorded_runs(
+                &db,
+                "SELECT run FROM aircon_runs ORDER BY rowid DESC LIMIT ?1",
+                i64::try_from(RUNS_KEPT).unwrap_or(i64::MAX),
+            )?,
         )
     };
     let mut device = serde_json::Value::Null;
@@ -2865,24 +3112,42 @@ async fn get_aircon(State(state): State<Db>) -> ApiResult<Json<serde_json::Value
             }
         }
     }
-    let runs: Vec<_> = state
-        .aircon_runs
-        .lock()
-        .expect(UNPOISONED)
-        .iter()
-        .cloned()
-        .collect();
+    let now = (state.clock)();
+    let outdoor = state.outdoor.lock().expect(UNPOISONED).map(|o| {
+        json!({
+            "temperature": o.celsius,
+            "at": schedule::timestamp(o.at),
+            "fetched_at": schedule::timestamp(o.fetched_at),
+            "fresh": now - o.at <= outside::FRESH_FOR,
+        })
+    });
+    let setpoint = match sent {
+        Some(aircon::Command::On { celsius, .. }) => Some(celsius),
+        _ => None,
+    };
     Ok(Json(json!({
         "on": settings.on,
         "target": settings.target,
+        "night_from": settings.night_from,
+        "night_until": settings.night_until,
         "device": device,
-        "reading": state.meter.reading((state.clock)()),
+        "reading": state.meter.reading(now),
+        "outdoor": outdoor,
+        "location": {
+            "name": home.name,
+            "latitude": home.latitude,
+            "longitude": home.longitude,
+            "registered": home.name.is_some(),
+        },
         "sent": sent,
+        "setpoint": setpoint,
+        "reason": runs.first().map(|run| run["reason"].clone()),
         "runs": runs,
     })))
 }
 
-/// Merges `on` and `target` into the settings and sends what they call for at once.
+/// Merges `on`, `target`, `night_from` and `night_until` into the settings and sends what
+/// they call for at once.
 async fn update_aircon(
     State(state): State<Db>,
     Json(input): Json<serde_json::Value>,
@@ -2907,14 +3172,31 @@ async fn update_aircon(
                 .filter(|t| aircon::TARGETS.contains(t))
                 .ok_or_else(|| invalid("目標の温度は18〜30℃の整数です"))?;
         }
+        for (key, end) in [
+            ("night_from", &mut settings.night_from),
+            ("night_until", &mut settings.night_until),
+        ] {
+            if let Some(minute) = fields.get(key) {
+                *end = minute
+                    .as_u64()
+                    .and_then(|m| u16::try_from(m).ok())
+                    .filter(|m| *m < aircon::MINUTES_A_DAY)
+                    .ok_or_else(|| invalid("夜の時刻は0時からの分（0〜1439）です"))?;
+            }
+        }
         store(&db, AIRCON, &settings)?;
         if fields.contains_key("on") {
             "switch"
-        } else {
+        } else if fields.contains_key("target") {
             "target"
+        } else {
+            "scheduled"
         }
     };
-    adjust_aircon(&state, (state.clock)(), trigger).await;
+    // Only the night changed: nothing to send until the loop's next run.
+    if trigger != "scheduled" {
+        adjust_aircon(&state, (state.clock)(), trigger).await;
+    }
     get_aircon(State(state)).await
 }
 
@@ -2931,4 +3213,72 @@ async fn toggle_aircon(State(state): State<Db>) -> ApiResult<Json<serde_json::Va
     };
     tokio::spawn(async move { adjust_aircon(&state, (state.clock)(), "switch").await });
     Ok(Json(json!({ "on": on })))
+}
+
+/// The home's place: the address registered, the place found for it and its coordinates.
+async fn get_location(State(state): State<Db>) -> ApiResult<Json<serde_json::Value>> {
+    let home = load::<outside::Location>(&state.db.lock().expect(UNPOISONED), LOCATION)?;
+    let registered = home.name.is_some();
+    let mut view = json!(home);
+    view["registered"] = json!(registered);
+    Ok(Json(view))
+}
+
+/// The longest address searched for, in characters.
+const MAX_ADDRESS_CHARS: usize = 200;
+
+/// Registers the home's `address` as the first place GSI's address search finds for it; the
+/// last place stays when none is found or the search is not reached.
+async fn update_location(
+    State(state): State<Db>,
+    Json(input): Json<serde_json::Value>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let address = input["address"]
+        .as_str()
+        .map(str::trim)
+        .filter(|a| !a.is_empty() && a.chars().count() <= MAX_ADDRESS_CHARS)
+        .ok_or_else(|| {
+            ApiError(
+                StatusCode::BAD_REQUEST,
+                "invalid_location",
+                format!("住所は1〜{MAX_ADDRESS_CHARS}文字で入力してください"),
+            )
+        })?;
+    let outside = state.outside.as_ref().ok_or_else(|| {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "outside_unavailable",
+            "住所検索の接続先が設定されていません".into(),
+        )
+    })?;
+    let body = fetch_outside(&outside.gsi_url, &[("q", address.to_owned())])
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "address search unreachable");
+            ApiError(
+                StatusCode::BAD_GATEWAY,
+                "address_search_unreachable",
+                "住所検索（国土地理院）に接続できませんでした。前の位置のままです".into(),
+            )
+        })?;
+    let (name, latitude, longitude) = outside::place(&body).ok_or_else(|| {
+        ApiError(
+            StatusCode::NOT_FOUND,
+            "address_not_found",
+            "住所が見つかりませんでした。前の位置のままです".into(),
+        )
+    })?;
+    store(
+        &state.db.lock().expect(UNPOISONED),
+        LOCATION,
+        &outside::Location {
+            address: Some(address.to_owned()),
+            name: Some(name),
+            latitude,
+            longitude,
+        },
+    )?;
+    // The next run asks for the new place's temperature.
+    *state.outdoor.lock().expect(UNPOISONED) = None;
+    get_location(State(state)).await
 }

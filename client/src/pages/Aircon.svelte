@@ -1,6 +1,10 @@
 <script lang="ts">
   import {
     airconText,
+    nightMinute,
+    nightTime,
+    outdoorText,
+    placeText,
     TARGET_MAX,
     TARGET_MIN,
     targetError,
@@ -17,10 +21,18 @@
   let targetProblem = $state("");
   let error = $state("");
   let sending = $state(false);
+  let address = $state("");
+  let addressProblem = $state("");
+  let locating = $state(false);
+  // The settings start open until the home's place is registered.
+  let settingsOpen = $state<boolean | undefined>();
   let controller: AbortController | undefined;
+
+  const outdoor = $derived(aircon ? outdoorText(aircon.outdoor) : null);
 
   function show(next: Aircon) {
     aircon = next;
+    settingsOpen ??= !next.location.registered;
     // A target being typed is not overwritten by a reload.
     if (document.activeElement?.id !== "aircon-target") target = next.target;
   }
@@ -42,6 +54,10 @@
 
   $effect(() => {
     void load();
+    void api.location().then(
+      (location) => (address = location.address ?? ""),
+      () => {},
+    );
     const timer = setInterval(() => {
       if (document.visibilityState === "visible") void load();
     }, REFRESH_MS);
@@ -63,6 +79,25 @@
       error = (e as Error).message;
     }
     sending = false;
+  }
+
+  async function saveAddress() {
+    if (!address.trim()) return;
+    locating = true;
+    addressProblem = "";
+    try {
+      await api.updateLocation(address);
+      await load();
+    } catch (e) {
+      addressProblem = (e as Error).message;
+    }
+    locating = false;
+  }
+
+  function saveNight(key: "night_from" | "night_until", time: string) {
+    const minute = nightMinute(time);
+    if (minute !== null && aircon && minute !== aircon[key])
+      void update({ [key]: minute });
   }
 
   function saveTarget() {
@@ -142,13 +177,71 @@
             >{:else}—{/if}
         </dd>
       </div>
-      <div class="reading wide">
+      <div class="reading">
+        <dt>
+          外気温{#if outdoor}<time>{outdoor.time}</time>{/if}
+        </dt>
+        <dd>
+          {#if outdoor}{outdoor.celsius}<span>℃</span>{:else}—{/if}
+        </dd>
+      </div>
+      <div class="reading">
         <dt>{aircon.device?.name || "エアコン"}</dt>
         <dd class="text" class:danger={aircon.device?.state === "no_response"}>
           {airconText(aircon.device)}
         </dd>
       </div>
     </dl>
+    {#if aircon.reason}<p class="reason" aria-live="polite">
+        {aircon.reason}
+      </p>{/if}
+
+    <details class="settings" bind:open={settingsOpen}>
+      <summary>設定</summary>
+      <div class="field">
+        <label for="aircon-address">住所</label>
+        <input
+          id="aircon-address"
+          type="text"
+          autocomplete="street-address"
+          bind:value={address}
+          disabled={locating}
+          aria-invalid={addressProblem ? "true" : undefined}
+          aria-describedby="aircon-place"
+          onchange={() => void saveAddress()}
+        />
+        {#if addressProblem}<p class="field-error" role="alert">
+            {addressProblem}
+          </p>{/if}
+        <p class="place" id="aircon-place">
+          {#if locating}<span class="spinner" aria-hidden="true"></span>{/if}
+          {placeText(aircon.location)}
+          <span class="coords"
+            >{aircon.location.latitude.toFixed(4)}, {aircon.location.longitude.toFixed(
+              4,
+            )}</span
+          >
+        </p>
+      </div>
+      <fieldset class="field">
+        <legend>夜</legend>
+        <div class="night">
+          <input
+            type="time"
+            aria-label="夜の始まり"
+            value={nightTime(aircon.night_from)}
+            onchange={(e) => saveNight("night_from", e.currentTarget.value)}
+          />
+          <span>〜</span>
+          <input
+            type="time"
+            aria-label="夜の終わり"
+            value={nightTime(aircon.night_until)}
+            onchange={(e) => saveNight("night_until", e.currentTarget.value)}
+          />
+        </div>
+      </fieldset>
+    </details>
   {/if}
 </section>
 
@@ -187,15 +280,45 @@
     gap: var(--sp-2)
     margin: 0
 
-  .wide
-    grid-column: 1 / -1
-
   @media (min-width: 768px)
     .readings
-      grid-template-columns: repeat(3, minmax(0, 1fr))
+      grid-template-columns: repeat(4, minmax(0, 1fr))
 
-    .wide
-      grid-column: auto
+  .reason
+    margin: var(--sp-3) 0 0
+    font-size: var(--fs-sm)
+    overflow-wrap: anywhere
+
+  .settings
+    margin-top: var(--sp-4)
+
+    summary
+      padding: var(--sp-3) 0
+      cursor: pointer
+      color: var(--c-muted)
+      font-size: var(--fs-sm)
+
+  .place
+    margin: var(--sp-1) 0 0
+    font-size: var(--fs-sm)
+    overflow-wrap: anywhere
+
+  .coords
+    margin-left: var(--sp-1)
+    color: var(--c-muted)
+    font-variant-numeric: tabular-nums
+
+  .night
+    display: flex
+    align-items: center
+    gap: var(--sp-2)
+
+    span
+      color: var(--c-muted)
+
+  dt time
+    margin-left: var(--sp-1)
+    font-variant-numeric: tabular-nums
 
   .reading
     padding: 10px

@@ -3,6 +3,8 @@ import {
   errorMessage,
   type LabelTraits,
   type MeterView,
+  type Outdoor,
+  type Place,
   type Switch,
 } from "./admin";
 
@@ -44,8 +46,19 @@ export interface Meter extends MeterView {
 export interface Aircon {
   on: boolean;
   target: number;
+  /** The night in minutes after midnight. */
+  night_from: number;
+  night_until: number;
   device: (AirconDevice & { id: number; name: string }) | null;
   reading: Meter["reading"];
+  outdoor: Outdoor | null;
+  location: Place;
+  /** Why the latest run did what it did. */
+  reason: string | null;
+}
+
+export interface Location extends Place {
+  address: string | null;
 }
 
 export class ApiError extends Error {
@@ -111,8 +124,18 @@ export const api = {
     request<Meter>("GET", "/api/meter", undefined, signal),
   aircon: (signal?: AbortSignal) =>
     request<Aircon>("GET", "/api/aircon", undefined, signal),
-  updateAircon: (patch: Partial<{ on: boolean; target: number }>) =>
-    request<Aircon>("PUT", "/api/aircon", patch),
+  updateAircon: (
+    patch: Partial<{
+      on: boolean;
+      target: number;
+      night_from: number;
+      night_until: number;
+    }>,
+  ) => request<Aircon>("PUT", "/api/aircon", patch),
+  location: (signal?: AbortSignal) =>
+    request<Location>("GET", "/api/location", undefined, signal),
+  updateLocation: (address: string) =>
+    request<Location>("PUT", "/api/location", { address }),
   toggleLabel: (id: number) =>
     request<{
       on: boolean | null;

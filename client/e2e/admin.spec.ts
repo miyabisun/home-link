@@ -218,15 +218,15 @@ test("the air conditioner is switched off and on and gets a target", async ({
   await expect(page.locator("h1")).toHaveText("エアコン");
   const values = page.locator(".reading dd");
   // The E2E home-link has no meter: no reading, and the air conditioner as it is.
-  await expect(values).toHaveText(["—", "—", "冷房 25℃"]);
+  await expect(values).toHaveText(["—", "—", /^(—|30\.2℃)$/, "冷房 25℃"]);
   const power = page.getByRole("button", { name: "入り切り" });
   await expect(power).toHaveAttribute("aria-pressed", "true");
 
   await power.click();
   await expect(power).toHaveText("切");
   await expect(power).toHaveAttribute("aria-pressed", "false");
-  await expect(values.nth(2)).toHaveText("切");
-  expect(airconSettings()).toEqual({ on: false, target: 25 });
+  await expect(values.nth(3)).toHaveText("切");
+  expect(airconSettings()).toMatchObject({ on: false, target: 25 });
 
   const target = page.getByLabel("目標");
   await target.fill("31");
@@ -240,10 +240,66 @@ test("the air conditioner is switched off and on and gets a target", async ({
 
   await power.click();
   await expect(power).toHaveText("入");
-  expect(airconSettings()).toEqual({ on: true, target: 23 });
+  expect(airconSettings()).toMatchObject({ on: true, target: 23 });
   // Still no reading: switching on waits for one before sending.
-  await expect(values.nth(2)).toHaveText("切");
+  await expect(values.nth(3)).toHaveText("切");
   await page.reload();
   await expect(target).toHaveValue("23");
   await expect(power).toHaveAttribute("aria-pressed", "true");
+});
+
+const location = () =>
+  sql("SELECT value FROM settings WHERE key = 'location'").map((row) =>
+    JSON.parse((row as { value: string }).value),
+  )[0];
+
+test("the home's address is registered and the outside shows with the reason", async ({
+  page,
+}) => {
+  await page.goto("/aircon");
+  // Unregistered, the settings are open.
+  const place = page.locator("#aircon-place");
+  await expect(place).toContainText("未登録");
+  const address = page.getByLabel("住所");
+
+  await address.fill("見つからない町1-1");
+  await commit(page);
+  await expect(page.getByRole("alert")).toHaveText(
+    "住所が見つかりませんでした。前の位置のままです",
+  );
+  await expect(place).toContainText("未登録");
+  expect(location()).toBeUndefined();
+
+  await address.fill("東京都新宿区西新宿2-8-1");
+  await commit(page);
+  await expect(place).toContainText("東京都新宿区西新宿二丁目８番");
+  await expect(place).toContainText("35.6896, 139.6918");
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  expect(location()).toMatchObject({
+    address: "東京都新宿区西新宿2-8-1",
+    name: "東京都新宿区西新宿二丁目８番",
+    latitude: 35.689629,
+    longitude: 139.691772,
+  });
+
+  // A run asks for the outside of the registered place and says why.
+  const target = page.getByLabel("目標");
+  await target.fill("24");
+  await commit(page);
+  const outside = page.locator(".reading").nth(2);
+  await expect(outside.locator("dd")).toHaveText("30.2℃");
+  await expect(outside.locator("dt")).toHaveText(/^外気温\d\d:\d\d$/);
+  await expect(page.locator(".reason")).toHaveText(
+    "温度計の新しい値が無いため、変えない",
+  );
+
+  // The night is moved and kept; a reload shows it, the settings closed once registered.
+  await page.getByLabel("夜の始まり").fill("23:00");
+  await commit(page);
+  await expect.poll(() => airconSettings().night_from).toBe(1380);
+  await page.reload();
+  await expect(page.locator("details.settings")).not.toHaveAttribute("open");
+  await page.getByText("設定", { exact: true }).click();
+  await expect(page.getByLabel("夜の始まり")).toHaveValue("23:00");
+  await expect(page.getByLabel("住所")).toHaveValue("東京都新宿区西新宿2-8-1");
 });

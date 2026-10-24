@@ -8,7 +8,7 @@ home-linkのサーバーが出すWebの管理画面で行います。labelの操
 スマートプラグなど照明以外のMatterの機器は、1台ずつ入り切りもできます。
 部屋のSwitchBot CO2センサー（温湿度計）の温度・湿度・CO2を、サーバーのBluetoothで受けて画面とAPIで示します。
 同じ部屋のMatterのエアコン（Room Air Conditioner）へは、home-linkが運転モードと設定温度を送ります。
-温度計が目標の温度（既定25℃）の前後になるように決めます。
+温度計が目標の温度（既定25℃）の前後になるように、登録した住所の外気温も見て決めます。
 長く家を空けるときは、ホーム画面のボタンで切り、帰る前に入れ直せます。
 玄関のSESAME 5なども、ホーム画面のボタン1つで家の外から解錠・施錠できます（CANDY HOUSEのWeb API経由）。
 機器に印刷されたMatterのQRコードをAndroidアプリで読み取り、名前とlabelを付けて登録します。
@@ -68,6 +68,8 @@ curl http://127.0.0.1:5011/healthz
 | `SESAME_UUID` | なし | 解錠するSESAMEのUUID（SESAMEアプリの機器の画面にあります）。 |
 | `SESAME_SECRET_KEY` | なし | SESAMEの秘密鍵（32桁の16進数）。SESAMEアプリで共有する鍵のQRコードを上のページで読み取ると得られます。 |
 | `SWITCHBOT_METER_ADDRESS` | なし | 受信するSwitchBot CO2センサー（W4900010）のBluetoothアドレス（例: `AA:BB:CC:DD:EE:01`）。未設定なら受信しません。 |
+| `GSI_URL` | `https://msearch.gsi.go.jp/address-search/AddressSearch` | 住所から座標を引く国土地理院の住所検索API。試験で差し替えるときだけ設定します。 |
+| `OPEN_METEO_URL` | `https://api.open-meteo.com/v1/forecast` | 外気温を取るOpen-MeteoのAPI。試験で差し替えるときだけ設定します。 |
 
 `SESAME_` の3つは、解錠と施錠のAPIだけが使います。どれかが無いか形式が違うと、この2つは503 `sesame_not_configured` を返し、ほかの機能はそのまま動きます。
 SESAMEはWi-Fiモジュールでインターネットにつながっている必要があります。
@@ -97,7 +99,7 @@ docker run -d --name home-link -p 5011:3000 -v home-link-data:/data \
 | ラベル（右上のメニュー） | labelの一覧と作成。一覧は固定・自動調光の別、機器の台数、入っているかを示します。名前を入れて「追加」で作り、そのlabelの画面を開きます |
 | labelの画面 | 名前の変更、入り切り、調光（なし・自動調光・固定）、固定の明るさ（%）と色温度（K）、毎日の時刻での入・切、機器の割り当て、削除（確認してから） |
 | 温度計（右上のメニュー） | 温度計の今の温度・湿度・CO2・電池と受けた時刻。受信が途絶えたときは、最後に受けた時刻だけを示します |
-| エアコン（右上のメニュー） | 目標の温度（18〜30℃）の変更、自動調整の入・切、室温と湿度、エアコンの今の運転（「冷房 25℃」「切」など） |
+| エアコン（右上のメニュー） | 目標の温度（18〜30℃）の変更、自動調整の入・切、室温・湿度・外気温とその時刻、エアコンの今の運転（「冷房 25℃」「切」など）、直近の判断の理由。「設定」に家の住所の登録と夜の時間帯 |
 
 変えた値はその場でAPIへ送り、保存ボタンはありません。値の誤りはその入力の下に、サーバーが受け付けなかった理由は画面の上部に示します。
 テーマは右上のメニューの「テーマ設定」で、自動（OSに従う）・ライト・ダークから選べます。
@@ -278,8 +280,11 @@ Thread網の資格情報（dataset）は、matterjs-serverに `set_thread_datase
 | `DELETE /api/wifi/{id}` | Wi-Fiの削除。機器に渡すものを消すと、残りの最初のものを渡します | 404 `wifi_not_found` |
 | `POST /api/commission` | 0.1.32までのアプリの登録。Wi-FiかThreadかを指定して機器をmatterjs-serverへBluetoothで登録（commissioning）し、台帳に登録 | 400 `missing_setup_code`・`invalid_qr_payload`・`invalid_manual_code`・`invalid_network`・`invalid_device_name`、409 `wifi_not_set`、422 `device_not_found`・`wrong_code`・`wifi_failed`・`thread_failed`・`commission_failed`、504 `commission_timeout`、502 `matter_server_unreachable`、503 `matter_server_not_configured`・`bluetooth_unavailable`・`thread_not_ready` |
 | `GET /api/meter` | 温度計の今の値。`{"address":"AA:BB:CC:DD:EE:01","reading":{"temperature":26.7,"humidity":57,"co2":717,"battery":74},"received_at":1792143307,"fresh_for":300}`。`received_at` はUnix秒で、それから `fresh_for` 秒を過ぎると `reading` は `null` になります。未設定なら `address` も `null` です | |
-| `GET /api/aircon` | エアコンの自動調整。入・切 `on`、目標の温度 `target`、台帳のエアコンの今の状態 `device`（`{"id","name","state","on","mode","setpoint"}`。`mode` は `cool`・`heat`・`dry`・`fan_only`・`auto`・`off`、`setpoint` は今の運転の設定温度℃。matterjs-serverから読めないかエアコンが無ければ `null`）、温度計の値 `reading`（`GET /api/meter` と同じ、古ければ `null`）、最後にエアコンが受け付けた命令 `sent`、直近の実行 `runs` | |
-| `PUT /api/aircon` | 送った項目だけを変え、その場でエアコンへ反映します。本文は `{"on": false}`、`{"target": 24}`（18〜30の整数）など。応答は `GET /api/aircon` と同じです | 400 `invalid_aircon` |
+| `GET /api/aircon` | エアコンの自動調整。入・切 `on`、目標の温度 `target`、夜の時間帯 `night_from`・`night_until`（0時からの分）、台帳のエアコンの今の状態 `device`（`{"id","name","state","on","mode","setpoint"}`。`mode` は `cool`・`heat`・`dry`・`fan_only`・`auto`・`off`、`setpoint` は今の運転の設定温度℃。matterjs-serverから読めないかエアコンが無ければ `null`）、温度計の値 `reading`（`GET /api/meter` と同じ、古ければ `null`）、外気温 `outdoor`（`{"temperature","at","fetched_at","fresh"}`。`at` はその値の時刻、`fresh` は2時間以内か。まだ取っていなければ `null`）、家の位置 `location`（`{"name","latitude","longitude","registered"}`）、最後にエアコンが受け付けた命令 `sent` とその設定温度 `setpoint`（補正後）、直近の判断の理由 `reason`、直近の実行 `runs`（新しい順に144回分） | |
+| `PUT /api/aircon` | 送った項目だけを変えます。本文は `{"on": false}`、`{"target": 24}`（18〜30の整数）、`{"night_from": 1320, "night_until": 420}`（0〜1439）など。入・切と目標はその場でエアコンへ反映します。応答は `GET /api/aircon` と同じです | 400 `invalid_aircon` |
+| `GET /api/aircon/runs` | 14日分の実行の記録（古い順）。`?since=`（Unix秒）でそれ以降に絞れます。各回は時刻 `at`、きっかけ `trigger`、室温 `temperature`・湿度 `humidity`・外気温 `outdoor`、決めた命令 `command`、結果 `result`、理由 `reason` を持ちます | |
+| `GET /api/location` | 家の位置。登録した住所 `address`、見つかった場所の名前 `name`、`latitude`・`longitude`、登録済みか `registered`。未登録なら東京（新宿）の座標です | |
+| `PUT /api/location` | 本文 `{"address": "東京都新宿区西新宿2-8-1"}` の住所を国土地理院の住所検索で引き、最初の候補を家の位置にします。見つからないときと届かないときは前の位置のままです。応答は `GET /api/location` と同じです | 400 `invalid_location`、404 `address_not_found`、502 `address_search_unreachable` |
 | `POST /api/aircon/toggle` | 入・切を切り替えます（ウィジェットのボタン）。保存してすぐ `{"on": true}` を返し、エアコンへはその後に送ります | |
 | `GET /api/thread` | Threadの機器を登録できるか（matterjs-serverがThread網のdatasetを持つか）を `{"ready": true}` で返します | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `GET /api/status` | 台帳の機器ごとに、matterjs-serverで見えるか（`visible`）と今の `node_id`・`endpoint` | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
@@ -432,16 +437,28 @@ curl -X POST http://home-link.example:5011/api/labels/2/toggle
 
 ### エアコンの自動調整
 
-10分ごと（毎時0分・10分・…）に、温度計の値から台帳のエアコン（無視していない最初の1台）へ送る状態を決めます。
-自動調整が入っている間、エアコンは入ったままにし、運転モードと設定温度（目標の温度）を次のように選びます。
+10分ごと（毎時0分・10分・…）に、温度計の値と外気温から台帳のエアコン（無視していない最初の1台）へ送る状態を決めます。
+外気温は、Webの管理画面で登録した住所の座標で、Open-Meteoから取ります（未登録なら東京・新宿）。
+住所はhome-linkのデータベースにだけ保存し、ログには出しません。
 
-| 室温 | 運転 |
+外気温で、エアコンが無いとき部屋がどちらへ動くかを見て、運転を選びます（目標25℃の場合）。
+
+| 外気温 | 運転 |
 | --- | --- |
-| 目標−1℃以下 | 暖房 |
-| 目標+1℃以上 | 冷房 |
-| その間で湿度65%以上 | 除湿（湿度55%以下に下がるまで。暖房中は暖房のまま） |
-| その間 | それまでの運転のまま。入れた直後は、目標より低ければ暖房、そうでなければ冷房 |
+| 目標+2℃以上（27℃以上） | 暖房は入れない。冷房は目標に届いても切らず、保持はエアコンの温度調節に任せる |
+| 目標以上（25〜27℃） | 暖房は入れない。冷房は目標に届いたら切る |
+| 目標−5℃より上（20〜25℃） | 室温が帯（目標±1℃）を出た側の運転で入れ、目標に届いたら切る |
+| 目標−5℃以下（20℃以下） | 冷房・除湿は入れない。暖房は目標に届いても切らない |
 
+- 帯の中で湿度が65%以上なら除湿します（55%以下に下がるまで）。外気温が目標−5℃以下のときは除湿しません。
+- 同じ運転が30分続き、温度計の30分の平均と今の値が目標から0.5℃以上離れていれば、設定温度を1℃動かします（目標±3℃まで）。
+  補正は運転ごとに保存し、再起動しても保ちます。
+- 運転・停止はそれぞれ30分以上続けます。自動の送信は30分に1回までです。入・切と目標の変更はすぐ送ります。
+- 夜（既定22:00〜翌7:00、`night_from`・`night_until` で変更）は、室温が帯を出たときの切り替えと送り直しだけを送ります。
+- 入れた直後は、外気温が目標+2℃以上か目標−5℃以下なら、帯の中でもすぐその側の運転で入れます。
+- 帯の外で冷房（暖房）を送って30分たっても室温が下がらない（上がらない）ときは、同じ状態を1回だけ送り直します。
+  それでも動かなければ、理由に「エアコンが信号を受けていない可能性」を示し、それ以上は送りません。
+- 外気温が古い（2時間以上前の値）か取れないときは、室温だけで決め、自分では切りません。
 - 風量は自動です。設定温度はエアコンの範囲（16〜32℃）に収まるよう、使わない側の設定温度を2℃離して送ります。
 - エアコンは信号のたびに鳴るので、前にエアコンが受け付けた状態と同じなら送りません。受け付けた状態は保存し、再起動しても送り直しません。
 - 温度計の値が古い（5分以上受けていない）か温度計が無いときは、エアコンを変えません。
@@ -450,9 +467,14 @@ curl -X POST http://home-link.example:5011/api/labels/2/toggle
 
 ```sh
 curl -s -X PUT localhost:5011/api/aircon -H 'content-type: application/json' -d '{"target":24}'
-# {"on":true,"target":24,"device":{"id":23,"name":"エアコン","state":"connected","on":true,"mode":"cool","setpoint":24.0},
-#  "reading":{"temperature":26.7,"humidity":57,"co2":717,"battery":74},"sent":{"power":"on","mode":"cool","celsius":24},
-#  "runs":[{"at":"2026-10-23T14:00:00+09:00","trigger":"target","command":{"power":"on","mode":"cool","celsius":24},"result":"sent"},…]}
+# {"on":true,"target":24,"night_from":1320,"night_until":420,
+#  "device":{"id":23,"name":"エアコン","state":"connected","on":true,"mode":"cool","setpoint":24.0},
+#  "reading":{"temperature":26.7,"humidity":57,"co2":717,"battery":74},
+#  "outdoor":{"temperature":30.2,"at":"2026-10-23T14:00:00+09:00","fetched_at":"2026-10-23T14:00:12+09:00","fresh":true},
+#  "location":{"name":"東京都新宿区西新宿二丁目８番","latitude":35.689629,"longitude":139.691772,"registered":true},
+#  "sent":{"power":"on","mode":"cool","celsius":24},"setpoint":24,"reason":"室温26.7℃が24℃より1℃以上高いため、冷房にする",
+#  "runs":[{"at":"2026-10-23T14:00:12+09:00","trigger":"target","temperature":26.7,"humidity":57,"outdoor":30.2,
+#           "command":{"power":"on","mode":"cool","celsius":24},"reason":"室温26.7℃が24℃より1℃以上高いため、冷房にする","result":"sent"},…]}
 ```
 
 `runs` の `result` は次のどれかです。
@@ -461,6 +483,7 @@ curl -s -X PUT localhost:5011/api/aircon -H 'content-type: application/json' -d 
 | --- | --- |
 | `sent` | エアコンが受け付けた |
 | `unchanged` | 送る必要が無かった |
+| `held` | 変える必要はあるが、30分の間隔・夜・受けていない可能性のため送らなかった（`reason` に理由） |
 | `no_reading` | 温度計の値が無い |
 | `no_aircon` | エアコンが見つからない |
 | `no_response`・`refused`・`failed` | 届かなかった・断られた・matterjs-serverに届かない。次の回に送り直します |
@@ -479,7 +502,7 @@ curl -s -X PUT localhost:5011/api/aircon -H 'content-type: application/json' -d 
 | 深夜: 0時 → 翌朝の開始 | `night_level` の `late_night_percent`%（既定は半分、1以上） | `warm_kelvin` |
 
 - 朝の上昇は、深夜の値ではなく通常の `night_level` から始まります。
-- 日の出・日の入りは `latitude`・`longitude` とAsia/Tokyoの時刻で計算します。既定は東京（新宿）です。
+- 日の出・日の入りは、家の位置（`PUT /api/location`、未登録なら東京・新宿）とAsia/Tokyoの時刻で計算します。
 - 値は全体の設定だけを使います。labelごとの値はありません。
 - 色温度と明るさは、照明ごとに報告された範囲へ収めます。色温度に対応しない照明へは色温度を、調光しない照明へは明るさを送りません。
 - 定時の1回の変化は30秒（`transitionTime` 300）かけて移します。
@@ -488,7 +511,6 @@ curl -s -X PUT localhost:5011/api/aircon -H 'content-type: application/json' -d 
 | 設定 | 既定値 | 内容 |
 | --- | --- | --- |
 | `enabled` | `false` | 自動調整を行うか |
-| `latitude`・`longitude` | `35.6895`・`139.6917` | 日の出・日の入りを計算する地点 |
 | `morning_end_minute` | `600`（10:00） | 朝の上昇が昼の値に達する時刻（0時からの分、301〜1319） |
 | `day_level`・`night_level` | `203`・`102` | 昼と夜の明るさ（1〜254） |
 | `warm_kelvin`・`cool_kelvin` | `3000`・`5000` | 夜と昼の色温度（K）。`warm_kelvin` は `cool_kelvin` 以下 |
@@ -515,7 +537,7 @@ curl -s -X PUT localhost:5011/api/aircon -H 'content-type: application/json' -d 
 
 ```sh
 curl -X PUT http://home-link.example:5011/api/lights/schedule -H 'content-type: application/json' -d '{"enabled":true}'
-# {"settings":{"enabled":true,"latitude":35.6895,"longitude":139.6917,"morning_end_minute":600,"day_level":203,"night_level":102,"warm_kelvin":3000,"cool_kelvin":5000,"late_night_percent":50},
+# {"settings":{"enabled":true,"morning_end_minute":600,"day_level":203,"night_level":102,"warm_kelvin":3000,"cool_kelvin":5000,"late_night_percent":50},
 #  "labels":[{"id":1,"name":"ambient","auto":true,…,"devices":[{"id":5,"name":"リビング1"},…]},…],"runs":[…]}
 
 curl http://home-link.example:5011/api/lights/schedule

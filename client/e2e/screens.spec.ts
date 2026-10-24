@@ -43,6 +43,19 @@ async function airconWithMeter(page: Page) {
   await page.route("/api/aircon", async (route) => {
     const json = await (await route.fetch()).json();
     json.reading = meters.fresh().reading;
+    json.outdoor = {
+      temperature: 30.2,
+      at: "2026-10-24T16:15:00+09:00",
+      fetched_at: "2026-10-24T16:20:03+09:00",
+      fresh: true,
+    };
+    json.location = {
+      name: "東京都新宿区西新宿二丁目８番",
+      latitude: 35.689629,
+      longitude: 139.691772,
+      registered: true,
+    };
+    json.reason = "外が30.2℃のため、25℃に下がっても冷房を続ける";
     await route.fulfill({ json });
   });
 }
@@ -121,6 +134,21 @@ for (const size of widths) {
           fullPage: true,
         });
       }
+      // The air conditioner's settings, opened.
+      await page.goto("/aircon");
+      await page.getByText("設定", { exact: true }).click();
+      await expect(page.getByLabel("夜の始まり")).toBeVisible();
+      expect(
+        await page.evaluate(
+          () =>
+            document.documentElement.scrollWidth -
+            document.documentElement.clientWidth,
+        ),
+      ).toBe(0);
+      await page.screenshot({
+        path: `test-results/screens/aircon-settings-${size.width}-${scheme}.png`,
+        fullPage: true,
+      });
     });
   }
 }

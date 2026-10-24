@@ -2,6 +2,10 @@ import { describe, expect, it } from "vitest";
 
 import {
   airconText,
+  nightMinute,
+  nightTime,
+  outdoorText,
+  placeText,
   deviceName,
   deviceNameError,
   dimming,
@@ -254,5 +258,44 @@ describe("the air conditioner", () => {
     for (const ok of ["18", "25", "30"]) expect(targetError(ok)).toBeNull();
     for (const bad of ["17", "31", "24.5", "", "a"])
       expect(targetError(bad)).toBe("18〜30℃");
+  });
+});
+
+describe("the outside and the night", () => {
+  it("shows a fresh outside temperature with its time, and nothing stale", () => {
+    const outdoor = {
+      temperature: 30.24,
+      at: "2026-10-24T16:15:00+09:00",
+      fetched_at: "2026-10-24T16:20:03+09:00",
+      fresh: true,
+    };
+    expect(outdoorText(outdoor)).toEqual({ celsius: "30.2", time: "16:15" });
+    expect(outdoorText({ ...outdoor, fresh: false })).toBeNull();
+    expect(outdoorText(null)).toBeNull();
+  });
+
+  it("names the registered place, or says it is not registered", () => {
+    const place = { latitude: 35.6895, longitude: 139.6917 };
+    expect(
+      placeText({
+        ...place,
+        name: "東京都新宿区西新宿二丁目８番",
+        registered: true,
+      }),
+    ).toBe("東京都新宿区西新宿二丁目８番");
+    expect(placeText({ ...place, name: null, registered: false })).toBe(
+      "未登録",
+    );
+  });
+
+  it("turns the night's minutes into times and back", () => {
+    expect(nightTime(1320)).toBe("22:00");
+    expect(nightTime(420)).toBe("07:00");
+    expect(nightTime(5)).toBe("00:05");
+    expect(nightMinute("22:00")).toBe(1320);
+    expect(nightMinute("00:05")).toBe(5);
+    expect(nightMinute("23:59")).toBe(1439);
+    for (const bad of ["", "24:00", "7:00", "aa:bb"])
+      expect(nightMinute(bad)).toBeNull();
   });
 });

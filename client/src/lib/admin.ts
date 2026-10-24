@@ -214,3 +214,44 @@ export function targetError(value: string): string | null {
     target <= TARGET_MAX;
   return ok ? null : `${TARGET_MIN}〜${TARGET_MAX}℃`;
 }
+
+export interface Outdoor {
+  temperature: number;
+  /** The quarter hour the temperature is for, in Asia/Tokyo. */
+  at: string;
+  fetched_at: string;
+  fresh: boolean;
+}
+
+export interface Place {
+  name: string | null;
+  latitude: number;
+  longitude: number;
+  registered: boolean;
+}
+
+/** A fresh outside temperature to a tenth and its time; nothing once it is two hours old. */
+export function outdoorText(
+  outdoor: Outdoor | null,
+): { celsius: string; time: string } | null {
+  if (!outdoor?.fresh) return null;
+  return {
+    celsius: outdoor.temperature.toFixed(1),
+    time: outdoor.at.slice(11, 16),
+  };
+}
+
+export function placeText(place: Place): string {
+  return place.registered && place.name ? place.name : "未登録";
+}
+
+/** Minutes after midnight as `HH:MM`, the value of a time input. */
+export function nightTime(minute: number): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${pad(Math.floor(minute / 60))}:${pad(minute % 60)}`;
+}
+
+export function nightMinute(time: string): number | null {
+  const match = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(time);
+  return match ? Number(match[1]) * 60 + Number(match[2]) : null;
+}

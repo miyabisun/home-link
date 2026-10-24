@@ -32,7 +32,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Err(reason) => info!(reason, "SESAME unlock disabled"),
     }
 
-    let mut home = home_link::Home::new(db, matter_url.clone()).with_sesame(sesame);
+    let outside = |name, default: &str| {
+        std::env::var(name)
+            .ok()
+            .filter(|url| !url.is_empty())
+            .unwrap_or_else(|| default.into())
+    };
+    let mut home = home_link::Home::new(db, matter_url.clone())
+        .with_sesame(sesame)
+        .with_outside(home_link::Outside {
+            gsi_url: outside("GSI_URL", home_link::outside::GSI_URL),
+            open_meteo_url: outside("OPEN_METEO_URL", home_link::outside::OPEN_METEO_URL),
+        });
     match std::env::var("SWITCHBOT_METER_ADDRESS")
         .ok()
         .filter(|text| !text.is_empty())

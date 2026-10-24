@@ -1424,7 +1424,7 @@ async fn schedule_settings_merge_and_are_validated() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         body["settings"],
-        json!({ "enabled": false, "latitude": 35.6895, "longitude": 139.6917,
+        json!({ "enabled": false,
                 "morning_end_minute": 600, "day_level": 203, "night_level": 102,
                 "warm_kelvin": 3000, "cool_kelvin": 5000, "late_night_percent": 50 })
     );
@@ -1435,7 +1435,7 @@ async fn schedule_settings_merge_and_are_validated() {
         &app,
         "PUT",
         "/api/lights/schedule",
-        Some(json!({ "night_level": 20, "latitude": 34.69, "longitude": 135.50 })),
+        Some(json!({ "night_level": 20 })),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -1445,7 +1445,8 @@ async fn schedule_settings_merge_and_are_validated() {
     for bad in [
         json!({ "night_level": 0 }),
         json!({ "warm_kelvin": 6000 }),
-        json!({ "latitude": 91 }),
+        // The coordinates are the home's location's since 0.1.48.
+        json!({ "latitude": 34.69 }),
         json!({ "morning_end_minute": 1320 }),
         json!({ "late_night_percent": 0 }),
         json!({ "late_night_percent": 101 }),
@@ -4953,7 +4954,7 @@ fn opening_a_v0_1_39_ledger_drops_rooms_and_keeps_everything_else() {
         let version: i64 = db
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
         let broken: i64 = db
             .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
                 r.get(0)
@@ -5260,14 +5261,16 @@ async fn the_aircon_follows_the_meter_unless_switched_off() {
     home.record_meter(HOT, NIGHT + 600);
     home.adjust_aircon(NIGHT + 600).await;
     assert_eq!(sent(&commands), Vec::<Value>::new());
-    home.record_meter(
-        home_link::meter::Reading {
-            temperature: 21.5,
-            ..HOT
-        },
-        NIGHT + 1200,
-    );
+    // Changing over waits half an hour from the last command.
+    let chilly = home_link::meter::Reading {
+        temperature: 21.5,
+        ..HOT
+    };
+    home.record_meter(chilly, NIGHT + 1200);
     home.adjust_aircon(NIGHT + 1200).await;
+    assert_eq!(sent(&commands), Vec::<Value>::new());
+    home.record_meter(chilly, NIGHT + 1800);
+    home.adjust_aircon(NIGHT + 1800).await;
     assert_eq!(
         aircon_writes(&commands),
         [
@@ -5290,8 +5293,13 @@ async fn the_aircon_follows_the_meter_unless_switched_off() {
         .map(|r| r["result"].clone())
         .collect();
     assert_eq!(
-        results[..3],
-        [json!("sent"), json!("sent"), json!("unchanged")]
+        results[..4],
+        [
+            json!("sent"),
+            json!("sent"),
+            json!("held"),
+            json!("unchanged")
+        ]
     );
     let _ = std::fs::remove_file(&path);
 }
@@ -5373,4 +5381,418 @@ async fn the_aircon_is_left_to_its_own_switch() {
         (&view["device"], &view["runs"][0]["result"]),
         (&Value::Null, &json!("no_aircon"))
     );
+}
+
+/// What the stand-in for GSI and Open-Meteo was asked: path, query and User-Agent.
+type Asked = Arc<Mutex<Vec<(String, String, String)>>>;
+
+/// The temperature outside the stand-in answers with, in tenths of a degree, and how many
+/// seconds before the clock its time is; a failing Open-Meteo below -1000.
+static OUTSIDE_TENTHS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(300);
+static OUTSIDE_AGE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static OUTSIDE_CLOCK: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(NIGHT);
+
+fn outside_clock() -> i64 {
+    OUTSIDE_CLOCK.load(Ordering::Relaxed)
+}
+
+/// GSI's answer for 沖縄県那覇市泉崎1-1-1, as GSI shapes it.
+const NAHA: &str = r#"[{"geometry":{"coordinates":[127.681229,26.212312],"type":"Point"},"type":"Feature","properties":{"addressCode":"","title":"沖縄県那覇市泉崎一丁目"}}]"#;
+
+/// GSI's address search and Open-Meteo on loopback: 那覇 for an address with 那覇, nothing
+/// for one with 見つからない, a server error for one with 落ちる.
+async fn fake_outside() -> (home_link::Outside, Asked) {
+    let asked = Asked::default();
+    let log = asked.clone();
+    let record = move |uri: &axum::http::Uri, headers: &axum::http::HeaderMap| {
+        let agent = headers["user-agent"]
+            .to_str()
+            .unwrap_or_default()
+            .to_owned();
+        log.lock().unwrap().push((
+            uri.path().to_owned(),
+            uri.query().unwrap_or_default().to_owned(),
+            agent,
+        ));
+    };
+    let gsi_record = record.clone();
+    let app = Router::new()
+        .route(
+            "/gsi",
+            axum::routing::get(
+                move |uri: axum::http::Uri, headers: axum::http::HeaderMap| async move {
+                    gsi_record(&uri, &headers);
+                    let query = uri.query().unwrap_or_default().to_owned();
+                    let query = percent_decode(&query);
+                    if query.contains("落ちる") {
+                        (StatusCode::INTERNAL_SERVER_ERROR, String::new())
+                    } else if query.contains("那覇") {
+                        (StatusCode::OK, NAHA.to_owned())
+                    } else {
+                        (StatusCode::OK, "[]".to_owned())
+                    }
+                },
+            ),
+        )
+        .route(
+            "/meteo",
+            axum::routing::get(
+                move |uri: axum::http::Uri, headers: axum::http::HeaderMap| async move {
+                    record(&uri, &headers);
+                    let tenths = OUTSIDE_TENTHS.load(Ordering::Relaxed);
+                    if tenths < -1000 {
+                        return (StatusCode::INTERNAL_SERVER_ERROR, String::new());
+                    }
+                    // The quarter hour the clock is in, `age` seconds before, in GMT.
+                    let at = outside_clock() - OUTSIDE_AGE.load(Ordering::Relaxed);
+                    let at = at - at.rem_euclid(900);
+                    let local = home_link::schedule::timestamp(at - 9 * 3600);
+                    #[allow(clippy::cast_precision_loss)]
+                    let celsius = tenths as f64 / 10.0;
+                    (
+                        StatusCode::OK,
+                        json!({ "utc_offset_seconds": 0, "timezone": "GMT",
+                                "current": { "time": &local[..16], "interval": 900, "temperature_2m": celsius } })
+                        .to_string(),
+                    )
+                },
+            ),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (
+        home_link::Outside {
+            gsi_url: format!("http://{addr}/gsi"),
+            open_meteo_url: format!("http://{addr}/meteo"),
+        },
+        asked,
+    )
+}
+
+/// `%XX` escapes and `+` decoded, enough for the address in a query.
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                out.push(u8::from_str_radix(&text[i + 1..i + 3], 16).unwrap());
+                i += 3;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).unwrap()
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn the_aircon_follows_the_outside_of_the_registered_address() {
+    let (addr, commands, _) = fake_light_server(aircon_nodes(), Fake::default()).await;
+    let (outside, asked) = fake_outside().await;
+    let path = std::env::temp_dir().join(format!("home-link-outside-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let home = home_link::Home::new(
+        home_link::open_db(path.to_str().unwrap()).unwrap(),
+        Some(format!("ws://{addr}/ws")),
+    )
+    .with_clock(outside_clock)
+    .with_outside(outside);
+    let app = home.router();
+    let sql = home_link::open_db(path.to_str().unwrap()).unwrap();
+    add_device(
+        &app,
+        &sql,
+        json!({ "vendor": "Airco", "serial_number": "ac-1", "name": "エアコン" }),
+    )
+    .await;
+
+    // Unregistered: Shinjuku.
+    let (status, location) = call(&app, "GET", "/api/location", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        location,
+        json!({ "address": null, "name": null, "latitude": 35.6895, "longitude": 139.6917, "registered": false })
+    );
+
+    // Not found, unreachable or blank: the last place stays.
+    for (address, status, error) in [
+        (
+            "見つからない町1-1",
+            StatusCode::NOT_FOUND,
+            "address_not_found",
+        ),
+        (
+            "落ちる町1-1",
+            StatusCode::BAD_GATEWAY,
+            "address_search_unreachable",
+        ),
+        ("  ", StatusCode::BAD_REQUEST, "invalid_location"),
+    ] {
+        let (got, body) = call(
+            &app,
+            "PUT",
+            "/api/location",
+            Some(json!({ "address": address })),
+        )
+        .await;
+        assert_eq!(
+            (got, body["error"].as_str()),
+            (status, Some(error)),
+            "{address}: {body}"
+        );
+    }
+    let (_, unchanged) = call(&app, "GET", "/api/location", None).await;
+    assert_eq!(unchanged, location);
+
+    let (status, location) = call(
+        &app,
+        "PUT",
+        "/api/location",
+        Some(json!({ "address": "沖縄県那覇市泉崎1-1-1" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{location}");
+    assert_eq!(
+        location,
+        json!({ "address": "沖縄県那覇市泉崎1-1-1", "name": "沖縄県那覇市泉崎一丁目",
+                "latitude": 26.212_312, "longitude": 127.681_229, "registered": true })
+    );
+
+    // Hot outside: cooling, asked for the registered place with Chrome's User-Agent.
+    OUTSIDE_TENTHS.store(300, Ordering::Relaxed);
+    home.record_meter(HOT, NIGHT);
+    home.adjust_aircon(NIGHT).await;
+    assert_eq!(aircon_writes(&commands), cool(25, 2600));
+    commands.lock().unwrap().clear();
+    let meteo: Vec<_> = asked
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(path, ..)| path == "/meteo")
+        .cloned()
+        .collect();
+    let (_, query, agent) = &meteo[0];
+    assert!(
+        query.contains("latitude=26.212312") && query.contains("longitude=127.681229"),
+        "{query}"
+    );
+    assert!(query.contains("current=temperature_2m"), "{query}");
+    assert!(
+        agent.contains("Windows NT 10.0") && agent.contains("Chrome/157.0.0.0"),
+        "{agent}"
+    );
+    let gsi = asked
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(path, ..)| path == "/gsi")
+        .cloned()
+        .unwrap();
+    assert!(gsi.2.contains("Chrome/"), "{gsi:?}");
+
+    // The room at 24.5℃ half an hour on: neither heating nor stopping with 30℃ outside.
+    let cooled = home_link::meter::Reading {
+        temperature: 24.5,
+        ..HOT
+    };
+    OUTSIDE_CLOCK.store(NIGHT + 1800, Ordering::Relaxed);
+    home.record_meter(cooled, NIGHT + 1800);
+    home.adjust_aircon(NIGHT + 1800).await;
+    assert_eq!(sent(&commands), Vec::<Value>::new());
+    let (_, view) = call(&app, "GET", "/api/aircon", None).await;
+    assert_eq!(view["outdoor"]["temperature"], 30.0, "{view}");
+    assert_eq!(view["outdoor"]["fresh"], true);
+    assert_eq!(view["outdoor"]["at"], "2026-10-05T23:30:00+09:00");
+    assert_eq!(
+        view["location"],
+        json!({ "name": "沖縄県那覇市泉崎一丁目", "latitude": 26.212_312, "longitude": 127.681_229, "registered": true })
+    );
+    assert_eq!(view["setpoint"], 25);
+    assert_eq!(
+        (&view["night_from"], &view["night_until"]),
+        (&json!(1320), &json!(420))
+    );
+    assert_eq!(
+        view["reason"],
+        "外が30.0℃のため、25℃に下がっても冷房を続ける"
+    );
+
+    // Two weeks of runs, oldest first, with what each saw and why.
+    let (status, body) = call(&app, "GET", "/api/aircon/runs", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let runs = body["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 2, "{body}");
+    assert_eq!(
+        (
+            &runs[0]["temperature"],
+            &runs[0]["humidity"],
+            &runs[0]["outdoor"],
+            &runs[0]["result"]
+        ),
+        (&json!(28.0), &json!(50), &json!(30.0), &json!("sent"))
+    );
+    assert_eq!(
+        runs[0]["command"],
+        json!({ "power": "on", "mode": "cool", "celsius": 25 })
+    );
+    assert_eq!(
+        runs[0]["reason"],
+        "室温28.0℃が25℃より1℃以上高いため、冷房にする"
+    );
+    assert_eq!(
+        (&runs[1]["temperature"], &runs[1]["result"]),
+        (&json!(24.5), &json!("unchanged"))
+    );
+    let (_, later) = call(
+        &app,
+        "GET",
+        &format!("/api/aircon/runs?since={}", NIGHT + 1),
+        None,
+    )
+    .await;
+    assert_eq!(later["runs"].as_array().unwrap().len(), 1);
+
+    // Without the outside (Open-Meteo failing, the last value two hours old): the room alone.
+    OUTSIDE_TENTHS.store(-2000, Ordering::Relaxed);
+    let chilly = home_link::meter::Reading {
+        temperature: 23.9,
+        ..HOT
+    };
+    let late = NIGHT + 1800 + 2 * 3600 + 900;
+    OUTSIDE_CLOCK.store(late, Ordering::Relaxed);
+    home.record_meter(chilly, late);
+    home.adjust_aircon(late).await;
+    assert_eq!(
+        aircon_writes(&commands),
+        [
+            "1/513/17=2700",
+            "1/513/18=2500",
+            "1/513/28=4",
+            "1/514/0=5",
+            "On"
+        ]
+    );
+    let (_, view) = call(&app, "GET", "/api/aircon", None).await;
+    assert_eq!(view["outdoor"]["fresh"], false);
+    assert!(
+        view["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("外気温が無いため室温だけで判断"),
+        "{view}"
+    );
+    OUTSIDE_TENTHS.store(300, Ordering::Relaxed);
+
+    // The night may be moved; out of range is refused.
+    let (status, view) = call(
+        &app,
+        "PUT",
+        "/api/aircon",
+        Some(json!({ "night_from": 1380, "night_until": 360 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(
+        (&view["night_from"], &view["night_until"]),
+        (&json!(1380), &json!(360))
+    );
+    for bad in [
+        json!({ "night_from": 1440 }),
+        json!({ "night_until": -1 }),
+        json!({ "night_until": "6:00" }),
+    ] {
+        let (status, error) = call(&app, "PUT", "/api/aircon", Some(bad.clone())).await;
+        assert_eq!(
+            (status, error["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_aircon")),
+            "{bad}"
+        );
+    }
+
+    // The lights' sunrise and sunset come from the registered place.
+    home.adjust(NIGHT, "scheduled").await;
+    let (_, schedule) = call(&app, "GET", "/api/lights/schedule", None).await;
+    let (day, _) = home_link::schedule::local(NIGHT);
+    let (rise, set) = home_link::schedule::sun_times(day, 26.212_312, 127.681_229);
+    assert_eq!(
+        (
+            &schedule["runs"][0]["sunrise"],
+            &schedule["runs"][0]["sunset"]
+        ),
+        (
+            &json!(home_link::schedule::clock(rise)),
+            &json!(home_link::schedule::clock(set))
+        )
+    );
+    assert_ne!(
+        home_link::schedule::sun_times(day, 35.6895, 139.6917),
+        (rise, set)
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn moves_changed_schedule_coordinates_to_the_home_location() {
+    let path = std::env::temp_dir().join(format!("home-link-location-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    for (place, moved) in [
+        ((34.69, 135.5), Some((34.69, 135.5))),
+        ((35.6895, 139.6917), None),
+    ] {
+        {
+            // A 0.1.47 database: user_version 10, coordinates in the light schedule.
+            let db = home_link::open_db(path.to_str().unwrap()).unwrap();
+            db.execute_batch(
+                "DROP TABLE aircon_runs; DELETE FROM settings; PRAGMA user_version = 10;",
+            )
+            .unwrap();
+            let schedule = json!({ "enabled": true, "latitude": place.0, "longitude": place.1,
+                "morning_end_minute": 540, "day_level": 203, "night_level": 102,
+                "warm_kelvin": 3000, "cool_kelvin": 5000, "late_night_percent": 50 });
+            db.execute(
+                "INSERT INTO settings (key, value) VALUES ('light_schedule', ?1)",
+                [schedule.to_string()],
+            )
+            .unwrap();
+        }
+        let db = home_link::open_db(path.to_str().unwrap()).unwrap();
+        let read = |key: &str| -> Option<Value> {
+            db.query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
+                row.get::<_, String>(0)
+            })
+            .ok()
+            .map(|v| serde_json::from_str(&v).unwrap())
+        };
+        let schedule = read("light_schedule").unwrap();
+        assert_eq!(schedule.get("latitude"), None, "{schedule}");
+        assert_eq!(
+            (&schedule["enabled"], &schedule["morning_end_minute"]),
+            (&json!(true), &json!(540))
+        );
+        let location = read("location");
+        assert_eq!(
+            location.map(|l| (
+                l["latitude"].as_f64().unwrap(),
+                l["longitude"].as_f64().unwrap(),
+                l["name"].clone()
+            )),
+            moved.map(|(lat, lon)| (lat, lon, Value::Null))
+        );
+        let version: i64 = db
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 11);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
 }
