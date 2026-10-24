@@ -5304,6 +5304,129 @@ async fn the_aircon_follows_the_meter_unless_switched_off() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// Everything logged on this thread, as the container's log shows it.
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Captured {
+    fn lines(&self, name: &str) -> Vec<String> {
+        String::from_utf8(self.0.lock().unwrap().clone())
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains(name))
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+#[tokio::test]
+async fn each_aircon_run_is_logged_on_one_line_without_the_address() {
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let _logging = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish(),
+    );
+    // GSI finds the address; Open-Meteo fails, so the room alone decides.
+    let outside = Router::new()
+        .route("/gsi", axum::routing::get(|| async { NAHA }))
+        .route(
+            "/meteo",
+            axum::routing::get(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let outside_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, outside).await.unwrap() });
+    let (addr, _, _) = fake_light_server(aircon_nodes(), Fake::default()).await;
+    let (db, sql) = ledger();
+    let home = home_link::Home::new(db, Some(format!("ws://{addr}/ws")))
+        .with_clock(|| NIGHT)
+        .with_outside(home_link::Outside {
+            gsi_url: format!("http://{outside_addr}/gsi"),
+            open_meteo_url: format!("http://{outside_addr}/meteo"),
+        });
+    let app = home.router();
+    add_device(
+        &app,
+        &sql,
+        json!({ "vendor": "Airco", "serial_number": "ac-1", "name": "エアコン" }),
+    )
+    .await;
+    let (status, _) = call(
+        &app,
+        "PUT",
+        "/api/location",
+        Some(json!({ "address": "沖縄県那覇市泉崎1-1-1" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // No reading, sent, unchanged, then held for half an hour.
+    home.adjust_aircon(NIGHT).await;
+    home.record_meter(HOT, NIGHT);
+    home.adjust_aircon(NIGHT).await;
+    home.record_meter(HOT, NIGHT + 600);
+    home.adjust_aircon(NIGHT + 600).await;
+    let chilly = home_link::meter::Reading {
+        temperature: 21.5,
+        ..HOT
+    };
+    home.record_meter(chilly, NIGHT + 1200);
+    home.adjust_aircon(NIGHT + 1200).await;
+    // Failed: no matterjs-server to send to.
+    let unset = home_link::Home::new(home_link::open_db(":memory:").unwrap(), None);
+    unset.record_meter(HOT, NIGHT);
+    unset.adjust_aircon(NIGHT).await;
+
+    let lines = captured.lines("aircon adjusted");
+    assert_eq!(lines.len(), 5, "{lines:#?}");
+    for (line, result) in lines
+        .iter()
+        .zip(["no_reading", "sent", "unchanged", "held", "failed"])
+    {
+        assert!(line.contains(" INFO "), "{line}");
+        assert!(line.contains("trigger=\"scheduled\""), "{line}");
+        assert!(line.contains(&format!("result=\"{result}\"")), "{line}");
+        assert!(line.contains("reason=\""), "{line}");
+        assert!(!line.contains("reason=\"\""), "{line}");
+    }
+    assert!(
+        lines[0].contains("command=null temperature=null"),
+        "{}",
+        lines[0]
+    );
+    assert!(
+        lines[1].contains(r#"command={"celsius":25,"mode":"cool","power":"on"} temperature=28.0 humidity=50 outdoor=null"#),
+        "{}",
+        lines[1]
+    );
+    assert!(
+        lines[1].contains("reason=\"外気温が無いため室温だけで判断"),
+        "{}",
+        lines[1]
+    );
+    assert!(lines[3].contains("temperature=21.5"), "{}", lines[3]);
+    // A sent run is that one line; a failed one keeps its warning beside it.
+    assert_eq!(captured.lines("aircon sent"), Vec::<String>::new());
+    assert_eq!(captured.lines("aircon adjustment failed").len(), 1);
+    for place in ["泉崎", "那覇", "26.21", "127.68"] {
+        assert_eq!(captured.lines(place), Vec::<String>::new(), "{place}");
+    }
+}
+
 #[tokio::test]
 async fn the_aircon_is_left_to_its_own_switch() {
     let (addr, commands, _) = fake_light_server(aircon_nodes(), Fake::default()).await;

@@ -2887,7 +2887,8 @@ async fn outdoor(state: &AppState, unix: i64) -> Option<f64> {
         .map(|o| o.celsius)
 }
 
-/// Decides and sends the air conditioner's command for `unix`, and records the run for two weeks.
+/// Decides and sends the air conditioner's command for `unix`, logs the run on one line
+/// (`aircon adjusted`, sent or not) and records it for two weeks.
 async fn adjust_aircon(state: &AppState, unix: i64, trigger: &'static str) {
     let _busy = state.aircon_busy.lock().await;
     let reading = state
@@ -2910,9 +2911,16 @@ async fn adjust_aircon(state: &AppState, unix: i64, trigger: &'static str) {
             "failed"
         }
     };
-    if result == "sent" {
-        tracing::info!(trigger, command = %run["command"], reason = %run["reason"], "aircon sent");
-    }
+    tracing::info!(
+        trigger,
+        result,
+        command = %run["command"],
+        temperature = %run["temperature"],
+        humidity = %run["humidity"],
+        outdoor = %run["outdoor"],
+        reason = run["reason"].as_str().unwrap_or_default(),
+        "aircon adjusted"
+    );
     run["result"] = json!(result);
     let db = state.db.lock().expect(UNPOISONED);
     let kept = db
