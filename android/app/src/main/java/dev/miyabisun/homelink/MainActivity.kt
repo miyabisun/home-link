@@ -571,7 +571,7 @@ class MainActivity : Activity() {
                 settings("接続先の設定ファイルの${file.line}行目が「キー: 値」の形ではありません。「接続先を設定」で直してください")
             homeLink.isEmpty() -> settings("接続先が未設定です。home-linkのURLを設定してください")
             file.endpoints.homeLinkUrl == null -> settings("home-linkのURL「$homeLink」はURLではありません。「接続先を設定」で直してください")
-            lanMissing() -> Notice("LANへの接続が許可されていないため、LANの接続先へ送れません。許可してください",
+            !lanAllowed() && needsLan(file.endpoints) -> Notice("LANへの接続が許可されていないため、LANの接続先へ送れません。許可してください",
                 if (lanAskedOut) "設定アプリで許可" else "LANへの接続を許可", R.drawable.ic_settings, ::askLan)
             else -> form.readError?.let { Notice(resultText(Status.Failed(it)).orEmpty(), "再接続", 0, ::reload) }
         }

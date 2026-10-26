@@ -63,10 +63,13 @@ class RegisterScreenTest {
         MainActivity.wifiStoreFactory = null
         SettingsActivity.wifiReaderFactory = null
         // A connection a failed test left running, or its outcome, would carry over to the next screen.
-        DeviceWork.of(context).run {
-            cancel()
-            take()
-            settle()
+        // On the main thread, as the screens call it.
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            DeviceWork.of(context).run {
+                cancel()
+                take()
+                settle()
+            }
         }
         endpointsFile.delete()
     }
