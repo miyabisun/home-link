@@ -11,5 +11,5 @@
     <string name="door_lock">施錠</string>
     <string name="door_lock_widget_name">玄関の施錠</string>
     <string name="door_lock_widget_description">玄関のSESAMEを施錠します</string>
-    <string name="door_channel">玄関の解錠・施錠</string>
+    <string name="press_channel">ウィジェットの送信</string>
 </resources>

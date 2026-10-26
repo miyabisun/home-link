@@ -571,15 +571,10 @@ class MainActivity : Activity() {
                     "接続できません。家のWi-Fiにつないでから、もう一度お試しください"
                 BleProblem.PROXY_VERSION -> "matterjs-serverのBluetooth中継の版が合いません。アプリを更新してください"
             }
+            // Registering's own failures; any other is worded as everywhere else.
             is Status.Failed -> when (status.error) {
-                ApiError.NOT_CONFIGURED -> NOT_CONFIGURED
-                ApiError.UNREACHABLE, ApiError.TIMEOUT -> "home-link（${authority(endpoints.homeLinkUrl)}）に接続できません。$CHECK_ENDPOINT"
                 ApiError.INVALID_NAME -> "名前は${MAX_NAME}文字以内で入力してください"
                 ApiError.INVALID_QR, ApiError.INVALID_MANUAL -> null
-                ApiError.SERVER, ApiError.MATTER_UNREACHABLE, ApiError.MATTER_NOT_CONFIGURED,
-                ApiError.LABEL_NOT_FOUND, ApiError.LABEL_HAS_NO_DEVICES, ApiError.DUPLICATE_LABEL, ApiError.INVALID_LABEL, ApiError.INVALID_WIFI, ApiError.WIFI_NOT_FOUND,
-                ApiError.WIFI_NOT_SET, ApiError.NOT_ON_WIFI, ApiError.SESAME_NOT_CONFIGURED, ApiError.SESAME_REJECTED, ApiError.SESAME_UNREACHABLE ->
-                    "home-linkでエラーが発生しました。時間をおいてお試しください"
                 ApiError.DEVICE_NOT_FOUND -> "機器が見つかりませんでした。機器をペアリング待ちにし、" +
                     "電話を近づけてから「接続」を押し直してください"
                 ApiError.WRONG_CODE -> "機器がコードを受け付けませんでした。機器のコードを読み取り直すか、入力し直してください"
@@ -594,6 +589,7 @@ class MainActivity : Activity() {
                 ApiError.WIFI_REVERTED -> "${ssid}につながらず、元のWi-Fiに戻りました"
                 ApiError.WIFI_REVERTING -> "${ssid}につながらず、応答がありません。元のWi-Fiへ戻ります"
                 ApiError.SWITCH_FAILED -> "機器が入り切りを受け付けませんでした"
+                else -> failure(status.error, authority(endpoints.homeLinkUrl)).text
             }
             else -> null
         }

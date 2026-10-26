@@ -1,5 +1,9 @@
 package dev.miyabisun.homelink
 
+import okhttp3.Call
+import okhttp3.Connection
+import okhttp3.ConnectionPool
+import okhttp3.EventListener
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -8,15 +12,16 @@ import org.json.JSONArray
 import org.json.JSONException
 import org.json.JSONObject
 import java.io.IOException
-import java.net.SocketTimeoutException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 enum class ApiError { NOT_CONFIGURED, UNREACHABLE, TIMEOUT, INVALID_QR, INVALID_MANUAL, INVALID_NAME,
     MATTER_UNREACHABLE, MATTER_NOT_CONFIGURED, SERVER,
     DEVICE_NOT_FOUND, WRONG_CODE, WIFI_FAILED, COMMISSION_TIMEOUT, COMMISSION_FAILED, BLUETOOTH_UNAVAILABLE, INVALID_WIFI,
     THREAD_FAILED, WIFI_NOT_SET, WIFI_NOT_FOUND, LABEL_NOT_FOUND, LABEL_HAS_NO_DEVICES, DUPLICATE_LABEL, INVALID_LABEL,
     WIFI_REVERTED, WIFI_REVERTING, NOT_ON_WIFI,
-    SESAME_NOT_CONFIGURED, SESAME_REJECTED, SESAME_UNREACHABLE, SWITCH_FAILED }
+    SESAME_NOT_CONFIGURED, SESAME_REJECTED, SESAME_UNREACHABLE, SWITCH_FAILED, NO_NETWORK, BLOCKED,
+    CONNECT_TIMEOUT, HTTP_DENIED, HTTP_NOT_FOUND, HTTP_GATEWAY, BAD_ANSWER }
 
 /** A Wi-Fi network to save on home-link for new devices. */
 data class WifiNetwork(val ssid: String, val password: String)
@@ -97,14 +102,42 @@ interface HomeLinkApi {
     fun door(command: DoorCommand): ApiResult<Unit>
 }
 
-/** Calls home-link at the URL `baseUrl` gives for each request; none sends nothing. */
-class HttpHomeLinkApi(private val baseUrl: () -> String?) : HomeLinkApi {
-    constructor(baseUrl: String) : this({ baseUrl })
+/** A phone taken as always online, waiting by sleeping: for tests and the JVM. */
+object SteadyLink : PhoneLink {
+    override fun state() = Link.USABLE
+    override fun await(ms: Long) = Thread.sleep(ms)
+}
+
+/** Ends an attempt that connected after another URL had: it must not send. */
+private class Yielded : IOException("another URL connected first")
+
+/**
+ * Calls home-link at the URLs `baseUrls` gives for each request: the primary, racing the fallbacks while it cannot
+ * connect. None sends nothing. `link` is the phone's network, `log` takes a line for each failed attempt, and `now`
+ * is a monotonic clock in ms.
+ */
+class HttpHomeLinkApi(private val baseUrls: () -> List<String>, private val link: PhoneLink = SteadyLink,
+                      private val log: (String) -> Unit = {}, now: () -> Long = { System.nanoTime() / 1_000_000 }) : HomeLinkApi {
+    constructor(baseUrl: String) : this({ listOf(baseUrl) })
+
+    private val reach = Reach(link, now = now)
 
     private companion object {
-        val CLIENT = OkHttpClient.Builder().retryOnConnectionFailure(false).build()
+        /**
+         * Keeps no connection for a later request: one left from before a network switch fails, or hangs, when used
+         * again, and a request never retries on its own. Each request connects afresh.
+         */
+        val CLIENT = OkHttpClient.Builder().retryOnConnectionFailure(false)
+            .connectionPool(ConnectionPool(0, 1, TimeUnit.SECONDS)).build()
         val JSON = "application/json".toMediaType()
         val EMPTY = ByteArray(0).toRequestBody()
+        /**
+         * How long a request keeps trying to connect: over mobile data or a network switching, a path to home-link
+         * may take a while to come up.
+         */
+        const val PATIENCE_MS = 15_000L
+        /** For a widget's read in a broadcast receiver, which has 10 s in all. */
+        const val RECEIVER_MS = 5_000L
     }
 
     override fun devices(): ApiResult<List<Device>> = call("GET", "/api/devices", null) { body ->
@@ -127,8 +160,8 @@ class HttpHomeLinkApi(private val baseUrl: () -> String?) : HomeLinkApi {
         return call("PATCH", "/api/devices/$id", body) { device(JSONObject(it)) }
     }
 
-    // A short wait: a widget reads this within the time a broadcast receiver may run.
-    override fun labels(): ApiResult<List<Label>> = call("GET", "/api/labels", null, readTimeout = 3_000) { body ->
+    // A widget reads this within the time a broadcast receiver may run.
+    override fun labels(): ApiResult<List<Label>> = call("GET", "/api/labels", null, readTimeout = 3_000, patience = RECEIVER_MS) { body ->
         val array = JSONArray(body)
         (0 until array.length()).map { label(array.getJSONObject(it)) }
     }
@@ -140,9 +173,9 @@ class HttpHomeLinkApi(private val baseUrl: () -> String?) : HomeLinkApi {
         }
 
     override fun aircon(): ApiResult<Boolean> =
-        call("GET", "/api/aircon", null, readTimeout = 3_000) { JSONObject(it).getBoolean("on") }
+        call("GET", "/api/aircon", null, readTimeout = 3_000, patience = RECEIVER_MS) { JSONObject(it).getBoolean("on") }
 
-    // home-link answers once the switch is kept; the wait stays within one widget press's receiver.
+    // home-link answers once the switch is kept.
     override fun toggleAircon(): ApiResult<Boolean> =
         call("POST", "/api/aircon/toggle", null, readTimeout = 8_000) { JSONObject(it).getBoolean("on") }
 
@@ -210,9 +243,7 @@ class HttpHomeLinkApi(private val baseUrl: () -> String?) : HomeLinkApi {
     private fun savedNetwork(json: JSONObject) =
         SavedNetwork(json.getLong("id"), json.getString("ssid"), json.getBoolean("for_devices"))
 
-    // Longer than the lights' wait: over mobile data, a path to home-link may take a while to set up.
-    override fun door(command: DoorCommand): ApiResult<Unit> =
-        call("POST", "/api/door/${command.path}", null, connectTimeout = 15_000, timedOut = ApiError.TIMEOUT) { }
+    override fun door(command: DoorCommand): ApiResult<Unit> = call("POST", "/api/door/${command.path}", null) { }
 
     private fun counts(json: JSONObject): SwitchResult {
         val missing = json.getJSONArray("missing_devices")
@@ -225,63 +256,85 @@ class HttpHomeLinkApi(private val baseUrl: () -> String?) : HomeLinkApi {
         )
     }
 
+    /**
+     * Sends one request, connecting for up to `patience` ms as [Reach] does; once connected, it waits `readTimeout`
+     * for each read of the answer. Every failed attempt is logged with the phone's network.
+     */
     private fun <T> call(method: String, path: String, body: JSONObject?, readTimeout: Int = 20_000,
-                         connectTimeout: Int = 5_000, timedOut: ApiError = ApiError.UNREACHABLE,
-                         parse: (String) -> T): ApiResult<T> {
-        val base = baseUrl()?.trimEnd('/') ?: return ApiResult.Failed(ApiError.NOT_CONFIGURED)
-        // OkHttp, unlike the JDK's HttpURLConnection, sends PATCH.
-        val request = try {
-            Request.Builder().url(base + path).header("accept", "application/json")
-                .method(method, body?.toString()?.toRequestBody(JSON) ?: if (method == "POST") EMPTY else null).build()
-        } catch (_: IllegalArgumentException) {
-            return ApiResult.Failed(ApiError.UNREACHABLE)
-        }
-        val client = CLIENT.newBuilder().connectTimeout(connectTimeout.toLong(), TimeUnit.MILLISECONDS)
-            // Switching a label waits up to 10 s for every device's answer.
-            .readTimeout(readTimeout.toLong(), TimeUnit.MILLISECONDS).build()
-        return try {
-            client.newCall(request).execute().use { response ->
-                val text = response.body?.string().orEmpty()
-                if (response.isSuccessful) ApiResult.Ok(parse(text)) else ApiResult.Failed(error(text))
+                         patience: Long = PATIENCE_MS, parse: (String) -> T): ApiResult<T> =
+        reach.send(baseUrls().map { it.trimEnd('/') }, patience) { base, connectMs, race ->
+            // OkHttp, unlike the JDK's HttpURLConnection, sends PATCH.
+            val request = try {
+                Request.Builder().url(base + path).header("accept", "application/json")
+                    .method(method, body?.toString()?.toRequestBody(JSON) ?: if (method == "POST") EMPTY else null).build()
+            } catch (_: IllegalArgumentException) {
+                return@send Attempt.Missed(Miss.UNRESOLVED)
             }
-        } catch (_: SocketTimeoutException) {
-            ApiResult.Failed(timedOut)
-        } catch (_: IOException) {
-            ApiResult.Failed(ApiError.UNREACHABLE)
-        } catch (_: JSONException) {
-            ApiResult.Failed(ApiError.SERVER)
+            val connected = AtomicBoolean()
+            val client = CLIENT.newBuilder().connectTimeout(connectMs, TimeUnit.MILLISECONDS)
+                // Switching a label waits up to 10 s for every device's answer.
+                .readTimeout(readTimeout.toLong(), TimeUnit.MILLISECONDS)
+                // Name lookups have no timeout of their own; this bounds one that hangs while the network changes.
+                .callTimeout(connectMs + readTimeout, TimeUnit.MILLISECONDS)
+                .eventListener(object : EventListener() {
+                    // Before anything is written: only the first URL to connect may send.
+                    override fun connectionAcquired(call: Call, connection: Connection) {
+                        if (!race.claim()) throw Yielded()
+                        connected.set(true)
+                    }
+                }).build()
+            val call = client.newCall(request)
+            race.onCancel { if (!connected.get()) call.cancel() }
+            try {
+                call.execute().use { response ->
+                    val text = response.body?.string().orEmpty()
+                    Attempt.Answered(if (response.isSuccessful) ApiResult.Ok(parse(text)) else ApiResult.Failed(apiError(response.code, text)))
+                }
+            } catch (e: IOException) {
+                if (e is Yielded || e.cause is Yielded || (call.isCanceled() && !connected.get())) return@send Attempt.Yielded
+                miss(e, connected.get()).also { log("$method ${request.url.host}:${request.url.port}$path: ${e.javaClass.simpleName} ${e.message} → $it, phone ${link.state()}") }
+                    .let { Attempt.Missed(it) }
+            } catch (_: JSONException) {
+                log("$method ${request.url.host}:${request.url.port}$path: an answer that is not home-link's JSON")
+                Attempt.Answered(ApiResult.Failed(ApiError.BAD_ANSWER))
+            }
         }
-    }
+}
 
-    private fun error(body: String): ApiError {
-        val code = try { JSONObject(body).optString("error") } catch (_: JSONException) { "" }
-        return when (code) {
-            "invalid_qr_payload" -> ApiError.INVALID_QR
-            "invalid_manual_code" -> ApiError.INVALID_MANUAL
-            "invalid_device_name", "invalid_label_name" -> ApiError.INVALID_NAME
-            "matter_server_unreachable" -> ApiError.MATTER_UNREACHABLE
-            "matter_server_not_configured" -> ApiError.MATTER_NOT_CONFIGURED
-            "device_not_found" -> ApiError.DEVICE_NOT_FOUND
-            "wrong_code" -> ApiError.WRONG_CODE
-            "wifi_failed" -> ApiError.WIFI_FAILED
-            "commission_timeout" -> ApiError.COMMISSION_TIMEOUT
-            "commission_failed" -> ApiError.COMMISSION_FAILED
-            "bluetooth_unavailable" -> ApiError.BLUETOOTH_UNAVAILABLE
-            "invalid_wifi" -> ApiError.INVALID_WIFI
-            "thread_failed" -> ApiError.THREAD_FAILED
-            "wifi_not_set" -> ApiError.WIFI_NOT_SET
-            "wifi_not_found" -> ApiError.WIFI_NOT_FOUND
-            "label_not_found" -> ApiError.LABEL_NOT_FOUND
-            "label_has_no_devices" -> ApiError.LABEL_HAS_NO_DEVICES
-            "duplicate_label_name" -> ApiError.DUPLICATE_LABEL
-            "invalid_label" -> ApiError.INVALID_LABEL
-            "sesame_not_configured" -> ApiError.SESAME_NOT_CONFIGURED
-            "sesame_rejected" -> ApiError.SESAME_REJECTED
-            "sesame_unreachable" -> ApiError.SESAME_UNREACHABLE
-            "wifi_reverted" -> ApiError.WIFI_REVERTED
-            "wifi_reverting" -> ApiError.WIFI_REVERTING
-            "not_on_wifi" -> ApiError.NOT_ON_WIFI
-            "not_switchable", "not_connected", "switch_failed" -> ApiError.SWITCH_FAILED
+/** What a failed answer means: home-link's own error code, else what its status says answered instead. */
+internal fun apiError(status: Int, body: String): ApiError {
+    val code = try { JSONObject(body).optString("error") } catch (_: JSONException) { "" }
+    return when (code) {
+        "invalid_qr_payload" -> ApiError.INVALID_QR
+        "invalid_manual_code" -> ApiError.INVALID_MANUAL
+        "invalid_device_name", "invalid_label_name" -> ApiError.INVALID_NAME
+        "matter_server_unreachable" -> ApiError.MATTER_UNREACHABLE
+        "matter_server_not_configured" -> ApiError.MATTER_NOT_CONFIGURED
+        "device_not_found" -> ApiError.DEVICE_NOT_FOUND
+        "wrong_code" -> ApiError.WRONG_CODE
+        "wifi_failed" -> ApiError.WIFI_FAILED
+        "commission_timeout" -> ApiError.COMMISSION_TIMEOUT
+        "commission_failed" -> ApiError.COMMISSION_FAILED
+        "bluetooth_unavailable" -> ApiError.BLUETOOTH_UNAVAILABLE
+        "invalid_wifi" -> ApiError.INVALID_WIFI
+        "thread_failed" -> ApiError.THREAD_FAILED
+        "wifi_not_set" -> ApiError.WIFI_NOT_SET
+        "wifi_not_found" -> ApiError.WIFI_NOT_FOUND
+        "label_not_found" -> ApiError.LABEL_NOT_FOUND
+        "label_has_no_devices" -> ApiError.LABEL_HAS_NO_DEVICES
+        "duplicate_label_name" -> ApiError.DUPLICATE_LABEL
+        "invalid_label" -> ApiError.INVALID_LABEL
+        "sesame_not_configured" -> ApiError.SESAME_NOT_CONFIGURED
+        "sesame_rejected" -> ApiError.SESAME_REJECTED
+        "sesame_unreachable" -> ApiError.SESAME_UNREACHABLE
+        "wifi_reverted" -> ApiError.WIFI_REVERTED
+        "wifi_reverting" -> ApiError.WIFI_REVERTING
+        "not_on_wifi" -> ApiError.NOT_ON_WIFI
+        "not_switchable", "not_connected", "switch_failed" -> ApiError.SWITCH_FAILED
+        else -> when (status) {
+            401, 403 -> ApiError.HTTP_DENIED
+            404 -> ApiError.HTTP_NOT_FOUND
+            502, 503, 504 -> ApiError.HTTP_GATEWAY
             else -> ApiError.SERVER
         }
     }

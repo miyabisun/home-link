@@ -158,7 +158,23 @@ package IDは `dev.miyabisun.homelink` です。
 接続先のホストは決まっていないため、平文HTTPはすべてのホストに許可しています（`app/src/main/res/xml/network_security_config.xml`）。
 
 JVMテストは、JDKの一時HTTPサーバーを相手にAPIクライアントを検証します。
-接続先のYAMLの読み書きとURLの検査は `EndpointsTest` で、接続先が無いときに何も送らないことは `HttpHomeLinkApiTest` で検証します。入力の状態の扱いも単体で検証します。
+接続先のYAMLの読み書きとURLの検査は `EndpointsTest` で検証します。予備のURLの一覧の3つの書き方と、予備の無い0.1.50までの形も扱います。
+接続先が無いときに何も送らないことは `HttpHomeLinkApiTest` で検証します。入力の状態の扱いも単体で検証します。
+
+要求の送り方は `Reach` が決め、`ReachTest` が時計と回線をfakeにして次を検証します。
+
+- 送る前の失敗（名前解決・接続の拒否・接続の時間切れ）だけを送り直し、応答待ちの時間切れと送った後の切断は送り直さない
+- 15秒を過ぎたら、止まった所（回線なし・通信制限・接続不可・時間切れ）を返す
+- 主のURLが1秒で接続できないか先に失敗したら予備へも接続を始め、先に接続できた1つだけが送る
+
+`HttpHomeLinkApiTest` は、実際のHTTPで次を検証します。
+
+- 接続を断られた主と、受付待ちの列が埋まって接続できない主から、予備へ1回だけ送る
+- 要求を受けて応答しない主から、予備へ送らない
+- 前の要求の接続を使い回さない
+- 401・403・404・502〜504・JSONでない応答を区別し、失敗をログに残す
+
+ボタンの短い表示と読み上げの文は `ButtonFaceTest`・`LabelsTest`・`DoorMessageTest` で検証します。入・切・不明の状態の扱いは `LabelsTest` で検証します。
 `BleProxyTest` は、OkHttpのMockWebServerでmatterjs-serverの `/ble` を、fakeでBLEの層を置き換え、
 BLE Proxy Protocol v1のhello、各命令とその失敗、`device_discovered` などのevent、binary frame（`WRITE_DATA` と `NOTIFICATION`）を検証します。
 pingへのpongはOkHttpが自動で返します（実サーバーへ75秒接続して切られないことを確認済み）。
@@ -193,9 +209,29 @@ Keystoreからの移行は、0.1.31のAPKでWi-Fiを保存してから新しいA
 エミュレータで、fakeのhome-linkか本物のAPIサーバーとmatterjs-server互換のmockを相手に、ウィジェットを配置して押して確かめます。
 labelのウィジェットは、4種類を置いて設定の画面でlabelと名前を選び、各ボタンの要求が届くこと、切り替えの状態の表示、
 0.1.37までの照明のウィジェットを置いた端末へ上書きインストールしても落ちないことを確かめます。
-玄関のウィジェットは、Wi-Fiを切ってモバイル回線だけにし、データセーバーを入れて（`adb shell svc wifi disable`、
-`adb shell cmd netpolicy set restrict-background true`）、fakeのhome-linkへ要求が届くことを確かめます。
-broadcast receiverから送ると、この状態では名前解決から止められて「接続不可」になります。
+すべてのウィジェットの押下は、短いフォアグラウンドサービス（`PressService`）から送ります。
+Wi-Fiを切ってモバイル回線だけにし、データセーバーを入れます。
+
+```sh
+adb shell svc wifi disable
+adb shell cmd netpolicy set restrict-background true
+```
+
+この状態で、各ウィジェットの要求がfakeのhome-linkへ1回だけ届くことを確かめます。
+broadcast receiverから送ると、名前解決から止められて「接続不可」になります（0.1.50までの照明とエアコンのウィジェット）。
+充電中のバッテリーセーバーは入らないため、充電を外してから入れます。
+`dumpsys power` の「Battery Saver is currently: ON」を確かめてから押します。
+
+```sh
+adb shell dumpsys battery unplug
+adb shell settings put global low_power 1
+```
+予備のURLは、主を応答の無いアドレス（`http://192.0.2.1:PORT`）に、予備をfakeにします。押してから約1秒で、予備へ1回だけ届くことを確かめます。
+ほかに次も確かめます。
+
+- 回線が無い状態（`svc data disable`）で押し、途中で戻すと1回だけ届く
+- fakeが応答しないと「結果不明」になり、送り直さない
+- 読み直しが失敗すると `dumpsys jobscheduler` の `WidgetRefresh` が回線を待ち、Wi-Fiが戻ると状態を読み直す
 電話とタブレット（Lenovo Y700相当の1600×2560・320dpi）のランチャーに置いて確かめます。
 ボタンの表示と短い結果の文言は `LabelsTest` と `ButtonFaceTest` で検証します。
 エアコンのウィジェットは、テストの中でAppWidgetHostに置いて画面に描き、fakeのAPIを相手に確かめます。
@@ -282,4 +318,5 @@ APKはCIでは作りません。署名鍵をリポジトリやCIへ置かない�
 - `SHA256SUMS`
 - `release-info.json`（ソースのcommit、APKのSHA-256、署名証明書のSHA-256）
 
-`android/app/build.gradle.kts` の `versionName` はCargoの版と揃え、`versionCode` はリリースごとに増やします。
+アプリの `versionName` と `versionCode` は、`android/app/build.gradle.kts` が `Cargo.toml` の版から作ります。
+`versionCode` は 主×1000000＋副×1000＋patch です。リリースで書き換えるのは `Cargo.toml` だけです。

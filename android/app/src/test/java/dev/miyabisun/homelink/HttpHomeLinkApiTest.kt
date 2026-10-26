@@ -207,9 +207,23 @@ class HttpHomeLinkApiTest {
         }
     }
 
+    /** A phone online all along whose clock moves only while it waits between attempts, so patience passes at once. */
+    private class Waiting : PhoneLink {
+        var clock = 0L
+        override fun state() = Link.USABLE
+        override fun await(ms: Long) {
+            clock += ms
+        }
+    }
+
+    private fun api(vararg urls: String): HttpHomeLinkApi {
+        val phone = Waiting()
+        return HttpHomeLinkApi({ urls.toList() }, phone) { phone.clock }
+    }
+
     @Test fun reportsAnUnreachableServer() {
         val port = ServerSocket(0).use { it.localPort }
-        val offline = HttpHomeLinkApi("http://127.0.0.1:$port")
+        val offline = api("http://127.0.0.1:$port")
         assertEquals(ApiResult.Failed(ApiError.UNREACHABLE), offline.devices())
         assertEquals(ApiResult.Failed(ApiError.UNREACHABLE), offline.switchLabel(1, LabelOp.ON))
         assertEquals(ApiResult.Failed(ApiError.UNREACHABLE), offline.commission(1))
@@ -226,7 +240,7 @@ class HttpHomeLinkApiTest {
                 Triple(503, "sesame_not_configured", ApiError.SESAME_NOT_CONFIGURED),
                 Triple(502, "sesame_rejected", ApiError.SESAME_REJECTED),
                 Triple(502, "sesame_unreachable", ApiError.SESAME_UNREACHABLE),
-                Triple(502, "", ApiError.SERVER),
+                Triple(502, "", ApiError.HTTP_GATEWAY),
             )
             for ((status, code, expected) in cases) {
                 respond(path, status, if (code.isEmpty()) "<html>bad gateway</html>" else """{"error":"$code"}""")
@@ -245,10 +259,107 @@ class HttpHomeLinkApiTest {
         }
     }
 
+    @Test fun aRefusedPrimarySendsTheSameRequestToTheFallbackOnce() {
+        respond("/api/labels/4/toggle", 200, """{"action":"on","on":true,"switched":2,"no_response":0,"failed":0,"missing_devices":[]}""")
+        val port = ServerSocket(0).use { it.localPort }
+        assertEquals(ApiResult.Ok(LabelResult("on", true, SwitchResult(2, 0, 0, emptyList()))),
+            api("http://127.0.0.1:$port", "http://127.0.0.1:${server.address.port}").switchLabel(4, LabelOp.TOGGLE))
+        assertEquals(listOf("POST /api/labels/4/toggle"), requests)
+        // An unknown name, as a tailnet name without the VPN, is refused before connecting too.
+        requests.clear()
+        assertEquals(ApiResult.Ok(LabelResult("on", true, SwitchResult(2, 0, 0, emptyList()))),
+            api("http://home-link.invalid", "http://127.0.0.1:${server.address.port}").switchLabel(4, LabelOp.TOGGLE))
+        assertEquals(listOf("POST /api/labels/4/toggle"), requests)
+    }
+
+    @Test fun aPrimaryThatTookTheRequestButNeverAnsweredSendsNothingToTheFallback() {
+        respond("/api/aircon", 200, """{"on":true}""")
+        // Accepts the connection (the backlog does) but never answers.
+        ServerSocket(0).use { silent ->
+            assertEquals(ApiResult.Failed(ApiError.TIMEOUT),
+                api("http://127.0.0.1:${silent.localPort}", "http://127.0.0.1:${server.address.port}").aircon())
+        }
+        assertEquals(emptyList<String>(), requests)
+    }
+
+    @Test fun aPrimaryThatCannotConnectWithinASecondRacesTheFallbackAndTheRequestGoesOnce() {
+        respond("/api/labels/4/on", 200, """{"action":"on","on":true,"switched":1,"no_response":0,"failed":0,"missing_devices":[]}""")
+        // A listener whose queue is full drops new connections unanswered, as a VPN not yet up does.
+        ServerSocket(0, 1).use { full ->
+            // Fills the queue until a connection goes unanswered.
+            val fillers = mutableListOf<java.net.Socket>()
+            while (true) {
+                val socket = java.net.Socket()
+                fillers += socket
+                try { socket.connect(full.localSocketAddress, 200) } catch (_: java.net.SocketTimeoutException) { break }
+            }
+            val began = System.nanoTime()
+            assertEquals(ApiResult.Ok(LabelResult("on", true, SwitchResult(1, 0, 0, emptyList()))),
+                api("http://127.0.0.1:${full.localPort}", "http://127.0.0.1:${server.address.port}").switchLabel(4, LabelOp.ON))
+            val took = (System.nanoTime() - began) / 1_000_000
+            assert(took in 900..4_000) { "took $took ms" }
+            fillers.forEach { it.close() }
+        }
+        assertEquals(listOf("POST /api/labels/4/on"), requests)
+    }
+
+    @Test fun aConnectionLeftOverFromAnEarlierRequestIsNotReused() {
+        // Answers one request per connection, then holds the connection open and silent, as one cut off by a
+        // network switch is: a request sent on it again would wait out its timeout unanswered.
+        val listener = ServerSocket(0)
+        val connections = java.util.concurrent.atomic.AtomicInteger()
+        Thread {
+            while (!listener.isClosed) {
+                val socket = try { listener.accept() } catch (_: java.io.IOException) { break }
+                connections.incrementAndGet()
+                Thread {
+                    val input = socket.getInputStream().bufferedReader()
+                    while (input.readLine()?.isNotEmpty() == true) { }
+                    val body = """{"on":true}"""
+                    socket.getOutputStream().write("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: ${body.length}\r\n\r\n$body".toByteArray())
+                    socket.getOutputStream().flush()
+                }.start()
+            }
+        }.start()
+        listener.use {
+            val reused = api("http://127.0.0.1:${listener.localPort}")
+            assertEquals(ApiResult.Ok(true), reused.aircon())
+            assertEquals(ApiResult.Ok(true), reused.aircon())
+            assertEquals(2, connections.get())
+        }
+    }
+
+    @Test fun anErrorThatIsNotHomeLinksNamesWhatAnsweredInstead() {
+        val cases = listOf(
+            401 to ApiError.HTTP_DENIED, 403 to ApiError.HTTP_DENIED, 404 to ApiError.HTTP_NOT_FOUND,
+            502 to ApiError.HTTP_GATEWAY, 503 to ApiError.HTTP_GATEWAY, 504 to ApiError.HTTP_GATEWAY, 500 to ApiError.SERVER,
+        )
+        for ((status, expected) in cases) {
+            respond("/api/aircon/toggle", status, "<html>$status</html>")
+            assertEquals("$status", ApiResult.Failed(expected), api.toggleAircon())
+        }
+        // home-link's own codes keep their meaning, whatever the status.
+        respond("/api/labels/9/on", 404, """{"error":"label_not_found"}""")
+        assertEquals(ApiResult.Failed(ApiError.LABEL_NOT_FOUND), api.switchLabel(9, LabelOp.ON))
+        // A success that is not home-link's JSON, such as a sign-in page.
+        respond("/api/aircon/toggle", 200, "<html>sign in</html>")
+        assertEquals(ApiResult.Failed(ApiError.BAD_ANSWER), api.toggleAircon())
+    }
+
+    @Test fun eachFailureIsLoggedWithWhatWasTriedAndThePhonesNetwork() {
+        val lines = mutableListOf<String>()
+        val port = ServerSocket(0).use { it.localPort }
+        val phone = Waiting()
+        HttpHomeLinkApi({ listOf("http://127.0.0.1:$port") }, phone, log = { lines += it }) { phone.clock }.switchLabel(4, LabelOp.ON)
+        assert(lines.isNotEmpty()) { "nothing logged" }
+        val line = lines.first()
+        assert("127.0.0.1:$port" in line && "ConnectException" in line && "REFUSED" in line && "USABLE" in line) { line }
+    }
+
     @Test fun readsTheBaseUrlForEveryRequestAndSendsNothingWithoutOne() {
         respond("/api/devices", 200, "[]")
         var base: String? = null
-        val configured = HttpHomeLinkApi { base }
+        val configured = HttpHomeLinkApi({ listOfNotNull(base) })
         assertEquals(ApiResult.Failed(ApiError.NOT_CONFIGURED), configured.devices())
         assertEquals(ApiResult.Failed(ApiError.NOT_CONFIGURED), configured.door(DoorCommand.UNLOCK))
         assertEquals(emptyList<String>(), requests)

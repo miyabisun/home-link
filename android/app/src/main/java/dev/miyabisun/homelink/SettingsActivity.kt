@@ -5,6 +5,7 @@ import android.app.Activity
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.text.InputFilter
 import android.text.InputType
 import android.view.Gravity
 import android.view.View
@@ -31,6 +32,7 @@ class SettingsActivity : Activity() {
         internal var wifiReaderFactory: ((Activity) -> WifiReader)? = null
         private const val MAX_URL = 2048
         private const val HOME_LINK_EXAMPLE = "http://home-link.example:5011"
+        private const val FALLBACK_EXAMPLE = "http://192.168.1.10:5011"
         private const val BLE_PROXY_EXAMPLE = "ws://192.0.2.10:5580/ble"
         private const val REQUEST_LOCATION = 1
         // Android shows the SSID of the connected network only to apps with fine location.
@@ -40,6 +42,8 @@ class SettingsActivity : Activity() {
 
     private lateinit var homeLinkField: EditText
     private lateinit var homeLinkMessage: TextView
+    private lateinit var fallbackField: EditText
+    private lateinit var fallbackMessage: TextView
     private lateinit var bleProxyField: EditText
     private lateinit var bleProxyMessage: TextView
     private lateinit var resultRow: ResultRow
@@ -88,8 +92,18 @@ class SettingsActivity : Activity() {
         // Both URLs are saved together, by the button in their panel.
         val urls = panel(content)
         label(urls, "home-link", 14, muted = true)
-        homeLinkField = urlField(urls, "home-linkのURL", HOME_LINK_EXAMPLE, EditorInfo.IME_ACTION_NEXT) { bleProxyField.requestFocus() }
+        homeLinkField = urlField(urls, "home-linkのURL", HOME_LINK_EXAMPLE, EditorInfo.IME_ACTION_NEXT) { fallbackField.requestFocus() }
         homeLinkMessage = message(urls)
+        label(urls, "予備のURL（任意・1行に1つ）", 14, muted = true).apply {
+            (layoutParams as LinearLayout.LayoutParams).topMargin = dp(8)
+        }
+        label(urls, "home-linkのURLに1秒で接続できないとき、こちらにも接続し、先につながった方へ1回だけ送ります。家のLANのアドレスなど", 14, muted = true)
+        // Enter starts the next URL, so the keyboard offers no action.
+        fallbackField = urlField(urls, "予備のURL", FALLBACK_EXAMPLE, EditorInfo.IME_ACTION_NONE) { }.apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+            filters = arrayOf(InputFilter.LengthFilter(MAX_URL * 4))
+        }
+        fallbackMessage = message(urls)
         label(urls, "matterjs-serverのBLE Proxy", 14, muted = true).apply {
             (layoutParams as LinearLayout.LayoutParams).topMargin = dp(8)
         }
@@ -101,6 +115,7 @@ class SettingsActivity : Activity() {
 
         val saved = Endpoints.load(this)
         homeLinkField.setText(savedInstanceState?.getString("homeLink") ?: saved.homeLink)
+        fallbackField.setText(savedInstanceState?.getString("fallbacks") ?: saved.fallbacks.joinToString("\n"))
         bleProxyField.setText(savedInstanceState?.getString("bleProxy") ?: saved.bleProxy)
         // A malformed value, as `adb push` may leave, is shown with what is wrong before any save.
         check()
@@ -112,6 +127,7 @@ class SettingsActivity : Activity() {
 
     override fun onSaveInstanceState(outState: Bundle) {
         outState.putString("homeLink", homeLinkField.text.toString())
+        outState.putString("fallbacks", fallbackField.text.toString())
         outState.putString("bleProxy", bleProxyField.text.toString())
         outState.putBoolean("addingWifi", addingWifi)
         outState.putBoolean("locationDenied", locationDenied)
@@ -213,10 +229,8 @@ class SettingsActivity : Activity() {
     }
 
     private fun failure(error: ApiError) = when (error) {
-        ApiError.NOT_CONFIGURED -> NOT_CONFIGURED
-        ApiError.UNREACHABLE, ApiError.TIMEOUT -> "home-link（${homeLinkHost(this)}）に接続できません。$CHECK_ENDPOINT"
         ApiError.INVALID_WIFI -> WIFI_LIMITS
-        else -> "home-linkでエラーが発生しました。時間をおいてお試しください"
+        else -> failure(error, homeLinkHost(this)).text
     }
 
     private fun chooseWifi(position: Int) {
@@ -348,9 +362,14 @@ class SettingsActivity : Activity() {
         maxLines = Int.MAX_VALUE
     }
 
-    /** Shows what is wrong with each entered URL; true when both may be saved. */
+    private fun fallbacks() = fallbackField.text.lines().map(String::trim).filter(String::isNotEmpty)
+
+    /** Shows what is wrong with each entered URL; true when all may be saved. */
     private fun check(): Boolean {
         val homeLink = homeLinkField.text.toString().trim()
+        show(fallbackMessage, fallbacks().firstOrNull { !isHomeLinkUrl(it) }?.let {
+            "「$it」はURLではありません。http://かhttps://で始まるURLを1行に1つ入れてください（例：$FALLBACK_EXAMPLE）"
+        })
         val bleProxy = bleProxyField.text.toString().trim()
         show(homeLinkMessage, when {
             homeLink.isEmpty() -> "home-linkのURLを入れてください（例：$HOME_LINK_EXAMPLE）"
@@ -359,13 +378,13 @@ class SettingsActivity : Activity() {
         })
         show(bleProxyMessage, if (bleProxy.isEmpty() || isBleProxyUrl(bleProxy)) null
             else "ws://かwss://で始まるURLを入れてください（例：$BLE_PROXY_EXAMPLE）")
-        return homeLinkMessage.text.isEmpty() && bleProxyMessage.text.isEmpty()
+        return homeLinkMessage.text.isEmpty() && fallbackMessage.text.isEmpty() && bleProxyMessage.text.isEmpty()
     }
 
     private fun save() {
         getSystemService(InputMethodManager::class.java).hideSoftInputFromWindow(bleProxyField.windowToken, 0)
         if (!check()) return resultRow.show("URLを直してから保存してください", failed = true)
-        val endpoints = Endpoints(homeLinkField.text.toString().trim(), bleProxyField.text.toString().trim())
+        val endpoints = Endpoints(homeLinkField.text.toString().trim(), bleProxyField.text.toString().trim(), fallbacks())
         if (!Endpoints.save(this, endpoints)) return resultRow.show("保存できませんでした。端末の保存領域を確かめてください", failed = true)
         resultRow.show("保存しました。次の要求からこの接続先へ送ります", failed = false)
         loadWifi()

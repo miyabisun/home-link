@@ -1,5 +1,9 @@
 plugins { id("com.android.application") }
 
+// The app's version is home-link's own, read from Cargo.toml so a release cannot leave the two apart.
+val homeLinkVersion = Regex("""(?m)^version\s*=\s*"(\d+)\.(\d+)\.(\d+)"""")
+    .find(rootDir.resolve("../Cargo.toml").readText()) ?: error("no version in Cargo.toml")
+
 android {
     namespace = "dev.miyabisun.homelink"
     compileSdk = 37
@@ -7,8 +11,10 @@ android {
         applicationId = "dev.miyabisun.homelink"
         minSdk = 36
         targetSdk = 37
-        versionCode = 41
-        versionName = "0.1.48"
+        val (major, minor, patch) = homeLinkVersion.destructured
+        // 0.1.48's code was 41; this grows with every version from there.
+        versionCode = major.toInt() * 1_000_000 + minor.toInt() * 1_000 + patch.toInt()
+        versionName = "$major.$minor.$patch"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
     compileOptions {

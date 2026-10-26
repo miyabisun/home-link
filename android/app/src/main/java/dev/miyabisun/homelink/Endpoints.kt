@@ -7,33 +7,55 @@ import java.net.URI
 import java.net.URISyntaxException
 
 /**
- * Where the app sends its requests: home-link's URL and matterjs-server's BLE proxy, as written in
- * [FILE]. A value is kept as written, so a malformed one can be shown and fixed; only a valid one is used.
+ * Where the app sends its requests: home-link's URL, other URLs of the same home-link to fall back on, and
+ * matterjs-server's BLE proxy, as written in [FILE]. A value is kept as written, so a malformed one can be
+ * shown and fixed; only a valid one is used.
  */
-data class Endpoints(val homeLink: String = "", val bleProxy: String = "") {
+data class Endpoints(val homeLink: String = "", val bleProxy: String = "", val fallbacks: List<String> = emptyList()) {
     val homeLinkUrl: String? get() = homeLink.takeIf(::isHomeLinkUrl)
     val bleProxyUrl: String? get() = bleProxy.takeIf(::isBleProxyUrl)
 
+    /** The URLs a request tries in turn: the primary, then valid fallbacks; none without the primary. */
+    val homeLinkUrls: List<String> get() = homeLinkUrl?.let { (listOf(it) + fallbacks.filter(::isHomeLinkUrl)).distinct() }.orEmpty()
+
     fun yaml(): String = "# home-link: where the app sends its requests\n" +
-        "$HOME_LINK: \"$homeLink\"\n$BLE_PROXY: \"$bleProxy\"\n"
+        "$HOME_LINK: \"$homeLink\"\n" +
+        "# Also connected to when home-link's URL does not connect within a second, such as its LAN address\n" +
+        "$FALLBACKS: ${fallbacks.joinToString(", ", "[", "]") { "\"$it\"" }}\n" +
+        "$BLE_PROXY: \"$bleProxy\"\n"
 
     companion object {
         /** In the app's external files directory, which `adb push` can write without root. */
         const val FILE = "home-link.yaml"
         private const val HOME_LINK = "home_link_url"
         private const val BLE_PROXY = "ble_proxy_url"
+        private const val FALLBACKS = "home_link_fallback_urls"
 
-        /** Reads flat `key: value` YAML: comments, quotes and unknown keys are allowed; nothing nested. */
+        /**
+         * Reads flat `key: value` YAML: comments, quotes and unknown keys are allowed. The one list, the
+         * fallbacks, may be a `[a, b]` flow, `- a` lines under its key, or a single value.
+         */
         fun parse(text: String): Endpoints {
-            val values = text.lines().mapNotNull { line ->
-                val trimmed = line.trim()
-                if (trimmed.isEmpty() || trimmed.startsWith("#") || ':' !in trimmed) return@mapNotNull null
-                val key = trimmed.substringBefore(':').trim()
+            val values = mutableMapOf<String, String>()
+            val fallbacks = mutableListOf<String>()
+            var key: String? = null
+            for (line in text.lines()) {
                 // A comment starts at a `#` after whitespace; one inside a URL is kept.
-                val value = Regex("\\s#.*$").replace(trimmed.substringAfter(':'), "").trim()
-                key to unquote(value)
-            }.toMap()
-            return Endpoints(values[HOME_LINK].orEmpty(), values[BLE_PROXY].orEmpty())
+                val trimmed = Regex("\\s#.*$").replace(line, "").trim()
+                if (trimmed.isEmpty() || trimmed.startsWith("#")) continue
+                if (trimmed.startsWith("- ")) {
+                    if (key == FALLBACKS) fallbacks += unquote(trimmed.removePrefix("- ").trim())
+                    continue
+                }
+                if (':' !in trimmed) continue
+                key = trimmed.substringBefore(':').trim()
+                val value = trimmed.substringAfter(':').trim()
+                if (key != FALLBACKS) values[key] = unquote(value)
+                else if (value.startsWith("[") && value.endsWith("]")) {
+                    fallbacks += value.substring(1, value.length - 1).split(',').map { unquote(it.trim()) }.filter { it.isNotEmpty() }
+                } else if (value.isNotEmpty()) fallbacks += unquote(value)
+            }
+            return Endpoints(values[HOME_LINK].orEmpty(), values[BLE_PROXY].orEmpty(), fallbacks)
         }
 
         private fun unquote(value: String) =
@@ -83,7 +105,8 @@ fun authority(url: String?): String = url?.let { runCatching { URI(it).rawAuthor
 
 /** home-link as configured when each request is sent; instrumentation may supply a fake. */
 fun homeLinkApi(context: Context): HomeLinkApi =
-    MainActivity.apiFactory?.invoke() ?: HttpHomeLinkApi { Endpoints.load(context).homeLinkUrl }
+    MainActivity.apiFactory?.invoke() ?: HttpHomeLinkApi({ Endpoints.load(context).homeLinkUrls }, PhoneNetwork.of(context),
+        log = { android.util.Log.w(LOG, it) })
 
 /** The configured home-link's host and port, for messages. */
 fun homeLinkHost(context: Context): String = authority(Endpoints.load(context).homeLinkUrl)

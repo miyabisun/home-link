@@ -17,22 +17,51 @@ class ButtonFaceTest {
 
     @Test fun theShortLabelNamesTheFailure() {
         assertEquals(LightsMessage("接続不可", failed = true), failureLabel(ApiError.UNREACHABLE))
-        assertEquals(LightsMessage("接続不可", failed = true), failureLabel(ApiError.MATTER_UNREACHABLE))
-        assertEquals(LightsMessage("未設定", failed = true), failureLabel(ApiError.MATTER_NOT_CONFIGURED))
-        assertEquals(LightsMessage("接続先未設定", failed = true), failureLabel(ApiError.NOT_CONFIGURED))
+        assertEquals(LightsMessage("SESAME不通", failed = true), failureLabel(ApiError.SESAME_UNREACHABLE))
+        assertEquals(LightsMessage("Matter不通", failed = true), failureLabel(ApiError.MATTER_UNREACHABLE))
+        assertEquals(LightsMessage("Matter未設定", failed = true), failureLabel(ApiError.MATTER_NOT_CONFIGURED))
+        assertEquals(LightsMessage("接続先なし", failed = true), failureLabel(ApiError.NOT_CONFIGURED))
         assertEquals(LightsMessage("エラー", failed = true), failureLabel(ApiError.SERVER))
     }
 
+    @Test fun eachStretchWhereAPressStoppedReadsDifferently() {
+        val host = "home-link.example:5011"
+        // The phone could not send; home-link could not be reached; it was sent but nothing came back;
+        // something other than home-link answered; home-link answered but the lights did not.
+        val cases = listOf(
+            ApiError.NO_NETWORK to ("回線なし" to "電話に使える回線が無く、送れませんでした"),
+            ApiError.BLOCKED to ("通信制限" to "電話の通信制限（データセーバーなど）で送れませんでした"),
+            ApiError.UNREACHABLE to ("接続不可" to "home-link（home-link.example:5011）に接続できません。接続先の設定と通信を確かめてください"),
+            ApiError.CONNECT_TIMEOUT to ("時間切れ" to "home-link（home-link.example:5011）に時間内に接続できませんでした。接続先の設定と通信（VPNなど）を確かめてください"),
+            ApiError.TIMEOUT to ("結果不明" to "home-link（home-link.example:5011）に送りましたが、時間内に応答がありませんでした。届いたかは分かりません"),
+            ApiError.HTTP_DENIED to ("要求拒否" to "home-link（home-link.example:5011）への要求が拒否されました。間にあるプロキシや認証の設定を確かめてください"),
+            ApiError.HTTP_NOT_FOUND to ("URL違い" to "home-link（home-link.example:5011）にこの操作の窓口がありません。接続先のURLとhome-linkの版を確かめてください"),
+            ApiError.HTTP_GATEWAY to ("中継エラー" to "home-link（home-link.example:5011）の手前の中継がエラーを返しました。home-linkが動いているか確かめてください"),
+            ApiError.BAD_ANSWER to ("応答不正" to "home-link（home-link.example:5011）から読めない応答が返りました。接続先がhome-linkか確かめてください"),
+        )
+        for ((error, words) in cases) {
+            assertEquals("$error", LightsMessage(words.first, failed = true), failureLabel(error))
+            assertEquals("$error", LightsMessage(words.second, failed = true), failure(error, host))
+        }
+        val silent = pressLabel(LabelOp.ON, ApiResult.Ok(LabelResult("on", true, SwitchResult(0, 3, 0, emptyList()))))
+        val labels = cases.map { it.second.first } + listOfNotNull(silent?.text) + failureLabel(ApiError.SERVER).text
+        assertEquals(labels.distinct(), labels)
+    }
+
     @Test fun aButtonInEffectReadsAsSo() {
-        assertEquals(ButtonFace("仕事中", R.drawable.ic_boosted, Tone.ACTIVE), buttonFace("仕事", R.drawable.ic_power, boosted = true, label = null))
-        assertEquals(ButtonFace("仕事", R.drawable.ic_power, Tone.PLAIN), buttonFace("仕事", R.drawable.ic_power, boosted = false, label = null))
-        assertEquals(ButtonFace("仕事", R.drawable.ic_power, Tone.PLAIN), buttonFace("仕事", R.drawable.ic_power, boosted = null, label = null))
+        assertEquals(ButtonFace("仕事中", R.drawable.ic_boosted, Tone.ACTIVE), buttonFace("仕事", R.drawable.ic_power, Toggle.ON, label = null))
+        assertEquals(ButtonFace("仕事", R.drawable.ic_power, Tone.PLAIN), buttonFace("仕事", R.drawable.ic_power, Toggle.OFF, label = null))
+        // A state that could not be read reads as unknown, never as off.
+        assertEquals(ButtonFace("仕事", R.drawable.ic_unknown, Tone.PLAIN, "仕事（状態不明）"),
+            buttonFace("仕事", R.drawable.ic_power, Toggle.UNKNOWN, label = null))
+        // A button without a state reads as its name.
+        assertEquals(ButtonFace("解錠", R.drawable.ic_unlock, Tone.PLAIN), buttonFace("解錠", R.drawable.ic_unlock, null, label = null))
     }
 
     @Test fun theAirconReadsOnWithItsOwnIcon() {
         assertEquals(ButtonFace("エアコン中", R.drawable.ic_aircon_on, Tone.ACTIVE), airconFace(on = true, press = null))
         assertEquals(ButtonFace("エアコン", R.drawable.ic_power, Tone.PLAIN), airconFace(on = false, press = null))
-        assertEquals(ButtonFace("エアコン", R.drawable.ic_power, Tone.PLAIN), airconFace(on = null, press = null))
+        assertEquals(ButtonFace("エアコン", R.drawable.ic_unknown, Tone.PLAIN, "エアコン（状態不明）"), airconFace(on = null, press = null))
         assertEquals(ButtonFace("送信中…", R.drawable.ic_power, Tone.PLAIN),
             airconFace(on = true, press = LightsMessage("送信中…", failed = false), sending = true))
         assertEquals(ButtonFace("接続不可", R.drawable.ic_error, Tone.FAILED),
@@ -42,10 +71,10 @@ class ButtonFaceTest {
     @Test fun aPressShowsItsProgressThenItsShortResult() {
         val sending = LightsMessage("送信中…", failed = false)
         assertEquals(ButtonFace("送信中…", R.drawable.ic_power, Tone.PLAIN),
-            buttonFace("仕事", R.drawable.ic_power, boosted = true, label = sending, sending = true))
+            buttonFace("仕事", R.drawable.ic_power, Toggle.ON, label = sending, sending = true))
         assertEquals(ButtonFace("機器なし", R.drawable.ic_error, Tone.FAILED),
-            buttonFace("仕事", R.drawable.ic_power, boosted = true, label = LightsMessage("機器なし", failed = true)))
+            buttonFace("仕事", R.drawable.ic_power, Toggle.ON, label = LightsMessage("機器なし", failed = true)))
         assertEquals(ButtonFace("受付済み", R.drawable.ic_success, Tone.PLAIN),
-            buttonFace("解錠", R.drawable.ic_unlock, boosted = null, label = LightsMessage("受付済み", failed = false)))
+            buttonFace("解錠", R.drawable.ic_unlock, null, label = LightsMessage("受付済み", failed = false)))
     }
 }

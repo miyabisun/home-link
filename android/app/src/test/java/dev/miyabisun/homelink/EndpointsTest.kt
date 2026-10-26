@@ -44,6 +44,49 @@ class EndpointsTest {
         assertEquals(Endpoints(), Endpoints.parse(Endpoints().yaml()))
     }
 
+    @Test fun aFileWithoutFallbacksReadsAsBefore() {
+        val endpoints = Endpoints.parse("home_link_url: http://homeserver:5011\nble_proxy_url: ws://10.0.0.5:5580/ble\n")
+        assertEquals(Endpoints("http://homeserver:5011", "ws://10.0.0.5:5580/ble"), endpoints)
+        assertEquals(emptyList<String>(), endpoints.fallbacks)
+        assertEquals(listOf("http://homeserver:5011"), endpoints.homeLinkUrls)
+        assertEquals(emptyList<String>(), Endpoints().homeLinkUrls)
+    }
+
+    @Test fun readsFallbacksAsAFlowOrBlockListOrOneUrl() {
+        val flow = Endpoints.parse("""
+            home_link_url: http://homeserver:5011
+            home_link_fallback_urls: ["http://192.168.1.100:5011", 'http://10.0.0.5:5011']  # LAN
+        """.trimIndent())
+        assertEquals(listOf("http://192.168.1.100:5011", "http://10.0.0.5:5011"), flow.fallbacks)
+        assertEquals(listOf("http://homeserver:5011", "http://192.168.1.100:5011", "http://10.0.0.5:5011"), flow.homeLinkUrls)
+        val block = Endpoints.parse("""
+            home_link_url: http://homeserver:5011
+            home_link_fallback_urls:
+              - "http://192.168.1.100:5011"
+              - http://10.0.0.5:5011  # LAN
+            ble_proxy_url: ws://10.0.0.5:5580/ble
+        """.trimIndent())
+        assertEquals(flow.fallbacks, block.fallbacks)
+        assertEquals("ws://10.0.0.5:5580/ble", block.bleProxy)
+        assertEquals(listOf("http://192.168.1.100:5011"),
+            Endpoints.parse("home_link_fallback_urls: http://192.168.1.100:5011").fallbacks)
+        assertEquals(emptyList<String>(), Endpoints.parse("home_link_fallback_urls: []").fallbacks)
+    }
+
+    @Test fun onlyValidDistinctFallbacksAreTriedAfterThePrimary() {
+        val endpoints = Endpoints("http://homeserver:5011", fallbacks = listOf("192.168.1.100:5011", "http://homeserver:5011", "http://192.168.1.100:5011"))
+        assertEquals(listOf("http://homeserver:5011", "http://192.168.1.100:5011"), endpoints.homeLinkUrls)
+        // Without the primary, nothing is configured: fallbacks back it up, they do not replace it.
+        assertEquals(emptyList<String>(), Endpoints(fallbacks = listOf("http://192.168.1.100:5011")).homeLinkUrls)
+    }
+
+    @Test fun writesFallbacksThatReadBack() {
+        val endpoints = Endpoints("http://homeserver:5011", "", listOf("http://192.168.1.100:5011", "http://10.0.0.5:5011"))
+        val yaml = endpoints.yaml()
+        assertTrue(yaml, yaml.contains("home_link_fallback_urls: [\"http://192.168.1.100:5011\", \"http://10.0.0.5:5011\"]\n"))
+        assertEquals(endpoints, Endpoints.parse(yaml))
+    }
+
     @Test fun homeLinkTakesHttpOrHttpsWithAHost() {
         for (url in listOf("http://home-link.example:5011", "https://home-link.example", "http://10.0.0.5:5011/",
             "HTTP://home-link.example/prefix", "http://[fd00::5]:5011")) {

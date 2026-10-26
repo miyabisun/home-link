@@ -6,7 +6,7 @@ import org.junit.Test
 class DoorMessageTest {
     private val failures = listOf(
         ApiError.UNREACHABLE, ApiError.TIMEOUT, ApiError.NOT_CONFIGURED, ApiError.SESAME_NOT_CONFIGURED,
-        ApiError.SESAME_REJECTED, ApiError.SESAME_UNREACHABLE, ApiError.SERVER,
+        ApiError.SESAME_REJECTED, ApiError.SESAME_UNREACHABLE, ApiError.SERVER, ApiError.NO_NETWORK, ApiError.BLOCKED,
     )
 
     @Test fun anAcceptedCommandIsASuccessWithoutClaimingTheDoorMoved() {
@@ -19,7 +19,7 @@ class DoorMessageTest {
 
     @Test fun eachFailureHasItsOwnShortLabel() {
         assertEquals(
-            listOf("接続不可", "時間切れ", "接続先未設定", "未設定", "拒否", "API不通", "エラー"),
+            listOf("接続不可", "結果不明", "接続先なし", "SESAME未設定", "SESAME拒否", "SESAME不通", "エラー", "回線なし", "通信制限"),
             failures.map { doorLabel(ApiResult.Failed(it)).text },
         )
         failures.forEach { assert(doorLabel(ApiResult.Failed(it)).failed) }
@@ -29,12 +29,14 @@ class DoorMessageTest {
         assertEquals(
             listOf(
                 "home-link（home-link.example:5011）に接続できません。接続先の設定と通信を確かめてください",
-                "home-link（home-link.example:5011）から時間内に応答がありませんでした。接続先の設定と通信を確かめてください",
+                "home-link（home-link.example:5011）に送りましたが、時間内に応答がありませんでした。届いたかは分かりません",
                 "接続先が未設定です。アプリの「接続先の設定」でhome-linkのURLを入れてください",
                 "home-linkにSESAMEが設定されていません",
                 "SESAMEのAPIが施錠を受け付けませんでした",
                 "SESAMEのAPIに接続できませんでした",
                 "home-linkでエラーが発生しました。時間をおいてお試しください",
+                "電話に使える回線が無く、送れませんでした",
+                "電話の通信制限（データセーバーなど）で送れませんでした",
             ),
             failures.map { doorMessage(DoorCommand.LOCK, ApiResult.Failed(it), "home-link.example:5011").text },
         )

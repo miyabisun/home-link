@@ -34,15 +34,18 @@ fun widgetName(typed: String, label: Label): String = typed.trim().ifEmpty { lab
 
 /**
  * How the widget button sending `op` to the label named `name` reads: "<name>オン", "<name>オフ",
- * or the name, as "<name>中" while the label is `on`, for a toggle. A press's short result shows instead.
+ * or the name for a toggle, as "<name>中" while the label is `on` and unknown while null. A press's short result shows instead.
  */
 fun labelFace(op: LabelOp, name: String, on: Boolean?, press: LightsMessage?, sending: Boolean = false): ButtonFace = when (op) {
     LabelOp.ON -> buttonFace("${name}オン", R.drawable.ic_light_on, null, press, sending)
     LabelOp.OFF -> buttonFace("${name}オフ", R.drawable.ic_light_off, null, press, sending)
-    LabelOp.TOGGLE -> buttonFace(name, R.drawable.ic_power, on, press, sending)
+    LabelOp.TOGGLE -> buttonFace(name, R.drawable.ic_power, Toggle.of(on), press, sending)
 }
 
-/** What a press shows on its button; none for a toggle that switched every device, as the button then shows the new state. */
+/**
+ * What a press shows on its button; none for a toggle that switched every device, as the button then shows the new state.
+ * Devices that did not answer read apart from ones that failed: home-link took the press, the lights did not.
+ */
 fun pressLabel(op: LabelOp, result: ApiResult<LabelResult>): LightsMessage? {
     val counts = when (result) {
         is ApiResult.Failed -> return failureLabel(result.error)
@@ -56,6 +59,7 @@ fun pressLabel(op: LabelOp, result: ApiResult<LabelResult>): LightsMessage? {
             LabelOp.OFF -> LightsMessage("オフ完了", failed = false)
             LabelOp.TOGGLE -> null
         }
+        left == counts.noResponse -> LightsMessage(if (counts.switched > 0) "一部無応答" else "照明無応答", failed = true)
         counts.switched > 0 -> LightsMessage("一部失敗", failed = true)
         else -> LightsMessage("失敗", failed = true)
     }
@@ -79,11 +83,30 @@ fun labelMessage(name: String, result: ApiResult<LabelResult>, host: String): Li
         missing,
     ).joinToString("・")
     if (left.isEmpty()) return null
+    val some = if (counts.switched > 0) "一部の" else ""
+    if (counts.failed == 0 && counts.missing.isEmpty()) return LightsMessage("${name}の${some}照明が応答しませんでした。$left", failed = true)
     val undone = when (done.action) {
         "on" -> "オンにできませんでした"
         "off" -> "オフにできませんでした"
         else -> "元に戻せませんでした"
     }
-    val some = if (counts.switched > 0) "一部の" else ""
     return LightsMessage("${name}の${some}機器を$undone。$left", failed = true)
+}
+
+/** Each label's state after a read: the answer's, where it has one; a failed read changes nothing known. */
+fun readStates(known: Map<Long, Boolean>, read: ApiResult<List<Label>>): Map<Long, Boolean> = when (read) {
+    is ApiResult.Ok -> read.value.mapNotNull { label -> label.on?.let { label.id to it } }.toMap()
+    is ApiResult.Failed -> known
+}
+
+/** A state after reading it: the answer, else what was known. */
+fun <T> readState(known: T?, read: ApiResult<T>): T? = if (read is ApiResult.Ok) read.value else known
+
+/**
+ * A state after a press: the answer's; unknown when the press was sent and nothing came back, as it may have
+ * switched; else, never sent or refused, what was known.
+ */
+fun <T> pressedState(known: T?, result: ApiResult<T?>): T? = when (result) {
+    is ApiResult.Ok -> result.value
+    is ApiResult.Failed -> if (result.error == ApiError.TIMEOUT) null else known
 }
