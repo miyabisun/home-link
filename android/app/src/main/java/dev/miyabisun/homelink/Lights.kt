@@ -21,6 +21,9 @@ internal val SENDING = LightsMessage("送信中…", failed = false)
  */
 internal fun failure(error: ApiError, host: String) = LightsMessage(when (error) {
     ApiError.NOT_CONFIGURED -> NOT_CONFIGURED
+    ApiError.SETTINGS_UNREADABLE -> "接続先の設定ファイルを読めませんでした。アプリの「接続先の設定」で保存し直してください"
+    ApiError.SETTINGS_MALFORMED -> "接続先の設定ファイルの書き方が正しくありません。アプリの「接続先の設定」で直してください"
+    ApiError.LOCAL_NETWORK_DENIED -> "LANへの接続が許可されていません。アプリを開いて「LANへの接続を許可」を押してください"
     ApiError.NO_NETWORK -> "電話に使える回線が無く、送れませんでした"
     ApiError.BLOCKED -> "電話の通信制限（データセーバーなど）で送れませんでした"
     ApiError.UNREACHABLE -> "home-link（$host）に接続できません。$CHECK_ENDPOINT"
@@ -43,6 +46,9 @@ internal fun failure(error: ApiError, host: String) = LightsMessage(when (error)
 /** The short label a widget shows for a failed press, one for each wording of [failure]. */
 internal fun failureLabel(error: ApiError) = LightsMessage(when (error) {
     ApiError.NOT_CONFIGURED -> NOT_CONFIGURED_LABEL
+    ApiError.SETTINGS_UNREADABLE -> "設定読めず"
+    ApiError.SETTINGS_MALFORMED -> "設定不正"
+    ApiError.LOCAL_NETWORK_DENIED -> "LAN未許可"
     ApiError.NO_NETWORK -> "回線なし"
     ApiError.BLOCKED -> "通信制限"
     ApiError.UNREACHABLE -> "接続不可"

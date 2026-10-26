@@ -128,6 +128,20 @@ internal object Widgets {
     private const val RESTORE = "dev.miyabisun.homelink.RESTORE"
     private const val REFRESH_JOB = 1
 
+    /**
+     * Whether every URL a press would try is on the LAN this app may not connect to: a press would only fail, so the
+     * buttons say so and open the app, which asks for the permission.
+     */
+    fun lanBlocked(context: Context): Boolean =
+        targets(Endpoints.read(context), context.lanAllowed()).let { it.urls.isEmpty() && it.none == ApiError.LOCAL_NETWORK_DENIED }
+
+    /** What a button opens while [lanBlocked]. */
+    fun askLan(context: Context): PendingIntent = PendingIntent.getActivity(context, 1,
+        Intent(context, MainActivity::class.java).putExtra(MainActivity.ASK_LAN, true), PendingIntent.FLAG_IMMUTABLE)
+
+    val LAN_FACE = ButtonFace(failureLabel(ApiError.LOCAL_NETWORK_DENIED).text, R.drawable.ic_error, Tone.FAILED,
+        "LANへの接続が許可されていません。押すとアプリを開いて許可を求めます")
+
     /** Draws every placed widget as last known. */
     fun showAll(context: Context) {
         LabelWidget.showAll(context)

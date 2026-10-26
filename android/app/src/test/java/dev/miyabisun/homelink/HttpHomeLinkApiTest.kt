@@ -230,7 +230,7 @@ class HttpHomeLinkApiTest {
 
     private fun api(vararg urls: String): HttpHomeLinkApi {
         val phone = Waiting()
-        return HttpHomeLinkApi({ urls.toList() }, phone) { phone.clock }
+        return HttpHomeLinkApi({ Targets(urls.toList()) }, phone) { phone.clock }
     }
 
     @Test fun reportsAnUnreachableServer() {
@@ -362,7 +362,7 @@ class HttpHomeLinkApiTest {
         val lines = mutableListOf<String>()
         val port = ServerSocket(0).use { it.localPort }
         val phone = Waiting()
-        HttpHomeLinkApi({ listOf("http://127.0.0.1:$port") }, phone, log = { lines += it }) { phone.clock }.switchLabel(4, LabelOp.ON)
+        HttpHomeLinkApi({ Targets(listOf("http://127.0.0.1:$port")) }, phone, log = { lines += it }) { phone.clock }.switchLabel(4, LabelOp.ON)
         assert(lines.isNotEmpty()) { "nothing logged" }
         val line = lines.first()
         assert("127.0.0.1:$port" in line && "ConnectException" in line && "REFUSED" in line && "USABLE" in line) { line }
@@ -371,12 +371,40 @@ class HttpHomeLinkApiTest {
     @Test fun readsTheBaseUrlForEveryRequestAndSendsNothingWithoutOne() {
         respond("/api/devices", 200, "[]")
         var base: String? = null
-        val configured = HttpHomeLinkApi({ listOfNotNull(base) })
+        val configured = HttpHomeLinkApi({ Targets(listOfNotNull(base)) })
         assertEquals(ApiResult.Failed(ApiError.NOT_CONFIGURED), configured.devices())
         assertEquals(ApiResult.Failed(ApiError.NOT_CONFIGURED), configured.door(DoorCommand.UNLOCK))
         assertEquals(emptyList<String>(), requests)
         base = "http://127.0.0.1:${server.address.port}"
         assertEquals(ApiResult.Ok(emptyList<Device>()), configured.devices())
         assertEquals(listOf("GET /api/devices"), requests)
+    }
+
+    @Test fun aRequestWithNowhereToGoSendsNothingAndSaysWhy() {
+        respond("/api/devices", 200, "[]")
+        for (why in listOf(ApiError.SETTINGS_UNREADABLE, ApiError.SETTINGS_MALFORMED, ApiError.LOCAL_NETWORK_DENIED)) {
+            assertEquals(ApiResult.Failed(why), HttpHomeLinkApi({ Targets(emptyList(), why) }).devices())
+        }
+        assertEquals(emptyList<String>(), requests)
+    }
+
+    @Test fun reachingNoUrlWithALanUrlLeftOutIsForWantOfThePermission() {
+        val port = ServerSocket(0).use { it.localPort }
+        val phone = Waiting()
+        val api = HttpHomeLinkApi({ Targets(listOf("http://127.0.0.1:$port"), lanSkipped = true) }, phone) { phone.clock }
+        assertEquals(ApiResult.Failed(ApiError.LOCAL_NETWORK_DENIED), api.labels())
+    }
+
+    @Test fun everyScreenReadWaitsTheSameAndOnlyAReceiversReadsWaitLess() {
+        val port = ServerSocket(0).use { it.localPort }
+        fun waited(limits: Limits, read: (HttpHomeLinkApi) -> Unit): Long {
+            val phone = Waiting()
+            read(HttpHomeLinkApi({ Targets(listOf("http://127.0.0.1:$port")) }, phone, limits = limits) { phone.clock })
+            return phone.clock
+        }
+        for (read in listOf<(HttpHomeLinkApi) -> Unit>({ it.labels() }, { it.aircon() }, { it.devices() })) {
+            assertEquals(15_000L, waited(Limits.SCREEN, read))
+            assertEquals(5_000L, waited(Limits.RECEIVER, read))
+        }
     }
 }

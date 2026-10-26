@@ -34,6 +34,12 @@ private fun showDoor(context: Context, command: DoorCommand, label: LightsMessag
     val ids = manager.getAppWidgetIds(ComponentName(context, command.widget))
     if (ids.isEmpty()) return
     val views = RemoteViews(context.packageName, command.layout)
+    if (Widgets.lanBlocked(context)) {
+        views.setOnClickPendingIntent(R.id.door_button, Widgets.askLan(context))
+        views.showFace(R.id.door_button, R.id.door_button_text, Widgets.LAN_FACE)
+        views.setContentDescription(R.id.door_button, "${command.verb}：${Widgets.LAN_FACE.description}")
+        return manager.updateAppWidget(ids, views)
+    }
     views.setOnClickPendingIntent(R.id.door_button, PressService.pending(context, "door:${command.name}",
         "玄関に${command.verb}を送っています", command.icon) { putExtra(COMMAND, command.name) })
     views.showFace(R.id.door_button, R.id.door_button_text, buttonFace(command.verb, command.icon, null, label, sending))

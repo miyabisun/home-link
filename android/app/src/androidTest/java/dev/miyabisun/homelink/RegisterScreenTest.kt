@@ -62,8 +62,12 @@ class RegisterScreenTest {
         MainActivity.linkFactory = null
         MainActivity.wifiStoreFactory = null
         SettingsActivity.wifiReaderFactory = null
-        // A connection a failed test left running would carry over to the next screen.
-        CommissionSession.cancel()
+        // A connection a failed test left running, or its outcome, would carry over to the next screen.
+        DeviceWork.of(context).run {
+            cancel()
+            take()
+            settle()
+        }
         endpointsFile.delete()
     }
 
@@ -312,6 +316,75 @@ class RegisterScreenTest {
             eventually(screen) { activity ->
                 listed(activity) == listOf("天井1") && views(activity).none { it is Button && it.text == "再接続" && it.isShown }
             }
+        }
+    }
+
+    @Test fun aNameOrLabelSentAsTheScreenIsRecreatedStillReachesHomeLink() {
+        api.labels += Label(1, "作業")
+        api.ledger += Device(1, "", emptySet(), DeviceState.UNCONNECTED, qr)
+        ActivityScenario.launch(MainActivity::class.java).use { screen ->
+            scanner.next = ScanResult.Read(qr)
+            screen.onActivity { button(it, "QRを読み取る").performClick() }
+            eventually(screen) { field(it, "機器名").isShown && checkBox(it, "作業").isShown }
+            // home-link takes a while to answer, and the screen turns meanwhile: leaving it sends the typed name.
+            api.updateGate = CountDownLatch(1)
+            screen.onActivity { field(it, "機器名").setText("押入れ1") }
+            screen.recreate()
+            eventually(screen) { field(it, "機器名").isShown }
+            screen.onActivity { checkBox(it, "作業").performClick() }
+            screen.recreate()
+            eventually(screen) { field(it, "機器名").isShown }
+            api.updateGate?.countDown()
+            eventually(screen) { api.ledger.single().let { it.name == "押入れ1" && it.labelIds == setOf(1L) } }
+            // Leaving the screen again, before home-link answered, sends the same name once more.
+            assertEquals(setOf(DeviceUpdate.Name("押入れ1"), DeviceUpdate.Labels(setOf(1))), api.updates.map { it.second }.toSet())
+            // The answers reach the screen open now.
+            eventually(screen) { checkBox(it, "作業").isChecked && field(it, "機器名").text.toString() == "押入れ1" }
+        }
+    }
+
+    @Test fun anEndpointsFileMissingUnreadableMalformedOrWithAByteOrderMarkReadsApart() {
+        val cases = listOf<Pair<() -> Unit, String>>(
+            { endpointsFile.delete(); Unit } to "接続先が未設定です。home-linkのURLを設定してください",
+            { endpointsFile.mkdir(); Unit } to "接続先の設定ファイル（${endpointsFile.path}）を読めませんでした。「接続先を設定」で保存し直してください",
+            { endpointsFile.writeText("home_link_url = http://home-link.example:5011\n") } to
+                "接続先の設定ファイルの1行目が「キー: 値」の形ではありません。「接続先を設定」で直してください",
+            { endpointsFile.writeText("home_link_url: home-link.example:5011\n") } to
+                "home-linkのURL「home-link.example:5011」はURLではありません。「接続先を設定」で直してください",
+        )
+        for ((write, text) in cases) {
+            endpointsFile.deleteRecursively()
+            write()
+            ActivityScenario.launch(MainActivity::class.java).use { screen ->
+                eventually(screen) { hasLabel(it, text) && button(it, "接続先を設定").isShown }
+            }
+        }
+        endpointsFile.deleteRecursively()
+        ActivityScenario.launch(MainActivity::class.java).use { screen ->
+            eventually(screen) { button(it, "接続先を設定").isShown }
+            capture(screen, "endpoints-unset")
+        }
+        // A byte order mark, as some editors write, is not part of the first key.
+        endpointsFile.writeBytes(byteArrayOf(0xEF.toByte(), 0xBB.toByte(), 0xBF.toByte()) +
+            "home_link_url: http://home-link.example:5011\n".toByteArray())
+        ActivityScenario.launch(MainActivity::class.java).use { screen ->
+            eventually(screen) { hasLabel(it, "機器を登録") }
+            screen.onActivity { activity -> assertFalse(views(activity).any { it is Button && it.isShown && it.text == "接続先を設定" }) }
+        }
+    }
+
+    @Test fun anUnreachableHomeLinkShowsAtTheFirstFailedRead() {
+        // The real client, to a port nothing listens on: each read keeps trying to connect for 15 s.
+        MainActivity.apiFactory = null
+        val port = ServerSocket(0).use { it.localPort }
+        assertTrue(Endpoints.save(context, Endpoints("http://127.0.0.1:$port", "ws://192.0.2.10:5580/ble")))
+        val started = System.currentTimeMillis()
+        ActivityScenario.launch(MainActivity::class.java).use { screen ->
+            eventually(screen, ms = 30_000) { activity -> views(activity).any { it is Button && it.isShown && it.text == "再接続" } }
+            // Read one after another, the three reads took 45 s.
+            val took = System.currentTimeMillis() - started
+            assertTrue("took $took ms", took < 25_000)
+            capture(screen, "unreachable")
         }
     }
 
@@ -1014,8 +1087,8 @@ class RegisterScreenTest {
         }
     }
 
-    private fun <T : Activity> eventually(screen: ActivityScenario<T>, condition: (T) -> Boolean) {
-        val deadline = System.currentTimeMillis() + 5_000
+    private fun <T : Activity> eventually(screen: ActivityScenario<T>, ms: Long = 5_000, condition: (T) -> Boolean) {
+        val deadline = System.currentTimeMillis() + ms
         while (true) {
             var met = false
             screen.onActivity { met = condition(it) }
@@ -1160,7 +1233,15 @@ private class FakeApi : HomeLinkApi {
         ApiResult.Ok(device.copy(code = null))
     }
 
-    override fun updateDevice(id: Long, update: DeviceUpdate): ApiResult<Device> = synchronized(ledger) {
+    /** Holds every change of a device until opened. */
+    @Volatile var updateGate: CountDownLatch? = null
+
+    override fun updateDevice(id: Long, update: DeviceUpdate): ApiResult<Device> = updateGate.let { gate ->
+        gate?.await()
+        changeDevice(id, update)
+    }
+
+    private fun changeDevice(id: Long, update: DeviceUpdate): ApiResult<Device> = synchronized(ledger) {
         updates += id to update
         val index = ledger.indexOfFirst { it.id == id }
         val device = ledger[index]

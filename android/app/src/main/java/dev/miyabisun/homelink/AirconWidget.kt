@@ -53,9 +53,9 @@ class AirconWidget : AppWidgetProvider() {
             edit.commit()
         }
 
-        /** Reads the state again, a failed read keeping what was known; whether it was read. */
-        fun read(context: Context): Boolean {
-            val read = homeLinkApi(context).aircon()
+        /** Reads the state again within `limits`, a failed read keeping what was known; whether it was read. */
+        fun read(context: Context, limits: Limits = Limits.SCREEN): Boolean {
+            val read = homeLinkApi(context, limits).aircon()
             save(context, readState(isOn(context), read))
             return read is ApiResult.Ok
         }
@@ -63,12 +63,16 @@ class AirconWidget : AppWidgetProvider() {
         /** Redraws the placed widgets: the state, or a press's short result `press` with `message` read aloud. */
         fun showAll(context: Context, press: LightsMessage? = null, sending: Boolean = false, message: String? = null) {
             val manager = AppWidgetManager.getInstance(context)
-            for (id in manager.getAppWidgetIds(ComponentName(context, AirconWidget::class.java))) {
+            val ids = manager.getAppWidgetIds(ComponentName(context, AirconWidget::class.java))
+            val blocked = ids.isNotEmpty() && Widgets.lanBlocked(context)
+            for (id in ids) {
                 val views = RemoteViews(context.packageName, R.layout.label_widget)
-                views.setOnClickPendingIntent(R.id.label_button, PressService.pending(context, "aircon", "エアコンに送っています", R.drawable.ic_power))
-                val face = airconFace(isOn(context), press, sending)
+                views.setOnClickPendingIntent(R.id.label_button,
+                    if (blocked) Widgets.askLan(context) else PressService.pending(context, "aircon", "エアコンに送っています", R.drawable.ic_power))
+                val face = if (blocked) Widgets.LAN_FACE else airconFace(isOn(context), press, sending)
                 views.showFace(R.id.label_button, R.id.label_button_text, face)
-                views.setContentDescription(R.id.label_button, message?.let { "${face.text}：$it" } ?: face.description)
+                views.setContentDescription(R.id.label_button,
+                    if (blocked) "$AIRCON：${face.description}" else message?.let { "${face.text}：$it" } ?: face.description)
                 manager.updateAppWidget(id, views)
             }
         }
@@ -92,7 +96,7 @@ class AirconWidget : AppWidgetProvider() {
     override fun onUpdate(context: Context, manager: AppWidgetManager, ids: IntArray) {
         showAll(context)
         async {
-            if (!read(context)) Widgets.refreshWhenOnline(context)
+            if (!read(context, Limits.RECEIVER)) Widgets.refreshWhenOnline(context)
             showAll(context)
         }
     }

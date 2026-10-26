@@ -286,4 +286,69 @@ class RegisterFormTest {
         assertEquals(plug, form.device)
         assertEquals(emptySet<Long>(), form.switching)
     }
+
+    @Test fun theFirstReadToFailSaysWhyUntilEveryReadSucceeds() {
+        val form = RegisterForm()
+        assertNull(form.readError)
+        // Read side by side, they end in any order: the first failure shows at once.
+        form.wifiRead(ApiResult.Failed(ApiError.CONNECT_TIMEOUT))
+        assertEquals(ApiError.CONNECT_TIMEOUT, form.readError)
+        form.devicesRead(ApiResult.Failed(ApiError.UNREACHABLE))
+        form.labelsRead(ApiResult.Failed(ApiError.UNREACHABLE))
+        assertEquals(ApiError.CONNECT_TIMEOUT, form.readError)
+        form.wifiRead(ApiResult.Ok(emptyList()))
+        assertEquals(ApiError.UNREACHABLE, form.readError)
+        form.devicesRead(ApiResult.Ok(emptyList()))
+        form.labelsRead(ApiResult.Ok(listOf(Label(1, "作業"))))
+        assertNull(form.readError)
+        assertEquals(listOf(Label(1, "作業")), form.labels)
+        // A failed read keeps what was read.
+        form.labelsRead(ApiResult.Failed(ApiError.TIMEOUT))
+        assertEquals(listOf(Label(1, "作業")), form.labels)
+    }
+
+    @Test fun aDeviceJobRunsAloneSoNeitherConnectNorMoveIsOfferedDuringTheOther() {
+        val form = RegisterForm()
+        form.wifiRead(ApiResult.Ok(listOf(SavedNetwork(1, "iot-2g", forDevices = true))))
+        form.opened(device(1))
+        form.moving = 2
+        assertFalse(form.canConnect())
+        form.moving = null
+        assertTrue(form.canConnect())
+        form.opened(Device(2, "", emptySet(), DeviceState.CONNECTED, null, "home-5g"))
+        assertTrue(form.canMoveWifi())
+        form.connect(1)
+        assertFalse(form.canMoveWifi())
+    }
+
+    private val started = 1_000_000L
+
+    @Test fun aRegistrationAnEndedProcessLeftIsReadFromHomeLink() {
+        val job = Unreported(DeviceJob.Commission(1), started)
+        val now = started + 10_000
+        val connected = device(1, DeviceState.CONNECTED, name = "押入れ1")
+        assertEquals(Recovery.Settled(Status.Commissioned("押入れ1"), connected), recover(job, ApiResult.Ok(connected), null, now))
+        assertEquals(Recovery.Settled(Status.Commissioned(""), device(1, DeviceState.NO_RESPONSE)),
+            recover(job, ApiResult.Ok(device(1, DeviceState.NO_RESPONSE)), null, now))
+        // Still unconnected: the proxy closed with the process, so the registration cannot have gone through.
+        assertEquals(Recovery.Settled(Status.Interrupted(job.job, null), device(1)), recover(job, ApiResult.Ok(device(1)), null, now))
+        // Gone from the ledger: home-link kept the row that already held the device.
+        assertEquals(Recovery.Settled(Status.Commissioned(""), null), recover(job, ApiResult.Failed(ApiError.DEVICE_NOT_FOUND), null, now))
+        // Not read: home-link, or matterjs-server behind it, is asked again later.
+        assertEquals(Recovery.Later(Status.Failed(ApiError.UNREACHABLE)), recover(job, ApiResult.Failed(ApiError.UNREACHABLE), null, now))
+        assertEquals(Recovery.Later(Status.Recovering(job.job)), recover(job, ApiResult.Ok(device(1, state = null)), null, now))
+    }
+
+    @Test fun aWifiMoveAnEndedProcessLeftWaitsForHomeLinkToFinishIt() {
+        val job = Unreported(DeviceJob.MoveWifi(2), started)
+        val moved = Device(2, "押入れ1", emptySet(), DeviceState.CONNECTED, null, "iot-2g")
+        val stayed = moved.copy(wifiSsid = "home-5g")
+        assertEquals(Recovery.Settled(Status.WifiMoved("iot-2g"), moved), recover(job, ApiResult.Ok(moved), "iot-2g", started + 10_000))
+        // home-link moves the device alone, for up to the six minutes the request may take.
+        assertEquals(Recovery.Later(Status.Recovering(job.job)), recover(job, ApiResult.Ok(stayed), "iot-2g", started + 10_000))
+        assertEquals(Recovery.Later(Status.Recovering(job.job)), recover(job, ApiResult.Ok(moved), null, started + 10_000))
+        assertEquals(Recovery.Settled(Status.Interrupted(job.job, "home-5g"), stayed),
+            recover(job, ApiResult.Ok(stayed), "iot-2g", started + DEVICE_JOB_MS))
+        assertEquals(Recovery.Later(Status.Failed(ApiError.TIMEOUT)), recover(job, ApiResult.Failed(ApiError.TIMEOUT), "iot-2g", started + 10_000))
+    }
 }

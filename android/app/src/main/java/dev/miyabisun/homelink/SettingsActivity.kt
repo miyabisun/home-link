@@ -3,7 +3,6 @@ package dev.miyabisun.homelink
 import android.Manifest
 import android.app.Activity
 import android.content.pm.PackageManager
-import android.os.Build
 import android.os.Bundle
 import android.text.InputFilter
 import android.text.InputType
@@ -19,8 +18,6 @@ import android.widget.LinearLayout
 import android.widget.Spinner
 import android.widget.TextView
 import android.graphics.drawable.LayerDrawable
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
 
 /**
  * Edits where the app sends its requests, in the same YAML file that `adb push` may write,
@@ -35,6 +32,8 @@ class SettingsActivity : Activity() {
         private const val FALLBACK_EXAMPLE = "http://192.168.1.10:5011"
         private const val BLE_PROXY_EXAMPLE = "ws://192.0.2.10:5580/ble"
         private const val REQUEST_LOCATION = 1
+        private const val REQUEST_LAN = 2
+        private val edits = Outbox.edits<SettingsActivity>()
         // Android shows the SSID of the connected network only to apps with fine location.
         private val LOCATION_PERMISSIONS = arrayOf(Manifest.permission.ACCESS_FINE_LOCATION,
             Manifest.permission.ACCESS_COARSE_LOCATION)
@@ -50,7 +49,7 @@ class SettingsActivity : Activity() {
 
     private lateinit var api: HomeLinkApi
     private lateinit var wifiReader: WifiReader
-    private lateinit var worker: ExecutorService
+    private lateinit var reads: Reads
     private var networks: List<SavedNetwork> = emptyList()
     /** null while reading home-link's networks, false when the read failed. */
     private var networksRead: Boolean? = null
@@ -84,7 +83,8 @@ class SettingsActivity : Activity() {
         super.onCreate(savedInstanceState)
         api = homeLinkApi(this)
         wifiReader = wifiReaderFactory?.invoke(this) ?: AndroidWifiReader(this)
-        worker = Executors.newSingleThreadExecutor()
+        reads = Reads(this)
+        edits.follow(this)
         addingWifi = savedInstanceState?.getBoolean("addingWifi") == true
         locationDenied = savedInstanceState?.getBoolean("locationDenied") == true
         val content = headedPage(home = ::finish, subtitle = "接続先の設定")
@@ -113,13 +113,18 @@ class SettingsActivity : Activity() {
         button(urls, "保存", primary = true) { save() }
         buildWifi(content)
 
-        val saved = Endpoints.load(this)
+        val file = Endpoints.read(this)
+        val saved = file.endpoints
         homeLinkField.setText(savedInstanceState?.getString("homeLink") ?: saved.homeLink)
         fallbackField.setText(savedInstanceState?.getString("fallbacks") ?: saved.fallbacks.joinToString("\n"))
         bleProxyField.setText(savedInstanceState?.getString("bleProxy") ?: saved.bleProxy)
         // A malformed value, as `adb push` may leave, is shown with what is wrong before any save.
         check()
-        resultRow.show(null, failed = false)
+        resultRow.show(when (file) {
+            is EndpointsFile.Unreadable -> "設定ファイルを読めませんでした。入れ直して保存すると書き直します"
+            is EndpointsFile.Malformed -> "設定ファイルの${file.line}行目が「キー: 値」の形ではありません。読めた値を入れました。保存すると書き直します"
+            else -> null
+        }, failed = true)
         wifiSsid.setText(savedInstanceState?.getString("wifiSsid").orEmpty())
         if (addingWifi) readCurrentWifi(ask = false)
         loadWifi()
@@ -137,16 +142,10 @@ class SettingsActivity : Activity() {
     }
 
     override fun onDestroy() {
-        worker.shutdownNow()
+        // A Wi-Fi change under way still reaches home-link; its result waits for the next screen.
+        edits.unfollow(this)
+        reads.close()
         super.onDestroy()
-    }
-
-    /** Runs a blocking API call off the main thread and drops results for a destroyed screen. */
-    private fun <T> background(call: () -> T, done: (T) -> Unit) {
-        worker.execute {
-            val result = call()
-            runOnUiThread { if (!isDestroyed) done(result) }
-        }
     }
 
     private fun buildWifi(content: LinearLayout) {
@@ -198,7 +197,7 @@ class SettingsActivity : Activity() {
     private fun loadWifi() {
         networksRead = null
         renderWifi()
-        background({ api.wifiNetworks() }) { result ->
+        reads.run({ api.wifiNetworks() }) { result ->
             networksRead = result is ApiResult.Ok
             if (result is ApiResult.Ok) networks = result.value
             wifiError = (result as? ApiResult.Failed)?.error
@@ -206,24 +205,26 @@ class SettingsActivity : Activity() {
         }
     }
 
-    /** Runs a change on home-link; on success runs [done] and reads the networks again. */
-    private fun <T> changeWifi(call: () -> ApiResult<T>, done: (T) -> Unit = {}) {
+    /** Runs a change on home-link; on success runs [done] on the screen open then and reads the networks again. */
+    private fun <T> changeWifi(call: () -> ApiResult<T>, done: SettingsActivity.(T) -> Unit = {}) {
         wifiBusy = true
         wifiNotice = null
         renderWifi()
-        background(call) { result ->
-            wifiBusy = false
-            when (result) {
-                is ApiResult.Ok -> {
-                    done(result.value)
-                    loadWifi()
-                }
-                is ApiResult.Failed -> {
-                    wifiNotice = LightsMessage(failure(result.error), failed = true)
-                    if (addingWifi) show(wifiMessage, failure(result.error))
-                    // The list is unchanged; this also puts the choice back.
-                    renderWifi()
-                }
+        edits.send(call) { result -> wifiChanged(result, done) }
+    }
+
+    private fun <T> wifiChanged(result: ApiResult<T>, done: SettingsActivity.(T) -> Unit) {
+        wifiBusy = false
+        when (result) {
+            is ApiResult.Ok -> {
+                done(result.value)
+                loadWifi()
+            }
+            is ApiResult.Failed -> {
+                wifiNotice = LightsMessage(failure(result.error), failed = true)
+                if (addingWifi) show(wifiMessage, failure(result.error))
+                // The list is unchanged; this also puts the choice back.
+                renderWifi()
             }
         }
     }
@@ -285,6 +286,11 @@ class SettingsActivity : Activity() {
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == REQUEST_LOCATION) readCurrentWifi(ask = false)
+        if (requestCode == REQUEST_LAN) {
+            if (lanMissing()) resultRow.show("保存しました。LANへの接続を許可しなかったため、LANの接続先へは送れません。" +
+                "許可は登録の画面の「LANへの接続を許可」でできます", failed = true)
+            else loadWifi()
+        }
     }
 
     private fun saveWifi() {
@@ -387,11 +393,11 @@ class SettingsActivity : Activity() {
         val endpoints = Endpoints(homeLinkField.text.toString().trim(), bleProxyField.text.toString().trim(), fallbacks())
         if (!Endpoints.save(this, endpoints)) return resultRow.show("保存できませんでした。端末の保存領域を確かめてください", failed = true)
         resultRow.show("保存しました。次の要求からこの接続先へ送ります", failed = false)
-        loadWifi()
+        // The widgets may now reach home-link, or no longer.
+        Widgets.showAll(this)
         // Android 17 blocks connections to LAN addresses, a likely place for home-link, without it.
-        if (Build.VERSION.SDK_INT >= 37 && checkSelfPermission(Manifest.permission.ACCESS_LOCAL_NETWORK) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(arrayOf(Manifest.permission.ACCESS_LOCAL_NETWORK), 0)
-        }
+        if (lanMissing()) requestPermissions(arrayOf(Manifest.permission.ACCESS_LOCAL_NETWORK), REQUEST_LAN)
+        else loadWifi()
     }
 }
 

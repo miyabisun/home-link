@@ -9,7 +9,54 @@ sealed interface Status {
     data class BleFailed(val problem: BleProblem) : Status
     /** Moved onto the Wi-Fi named [ssid]. */
     data class WifiMoved(val ssid: String) : Status
+    /** The app ended before `job` did; [ssid] is the Wi-Fi a moved device is on now, if read. */
+    data class Interrupted(val job: DeviceJob, val ssid: String?) : Status
+    /** Reading home-link for what came of `job`, which the app ended before. */
+    data class Recovering(val job: DeviceJob) : Status
 }
+
+/** The longest a device job waits for home-link: the six minutes its request may read for. */
+const val DEVICE_JOB_MS = 360_000L
+
+/** What a job an ended process left turned out as, by home-link's word: [Settled], or to read again [Later]. */
+sealed interface Recovery {
+    /** Over: `status` says how, on `device` as read now (none when home-link no longer lists it). */
+    data class Settled(val status: Status, val device: Device?) : Recovery
+    /** home-link may still be at it, or was not read: `status` says which. */
+    data class Later(val status: Status) : Recovery
+}
+
+/**
+ * What came of `unreported` by the device `read` from home-link at wall-clock `now`, and home-link's Wi-Fi for
+ * devices `deviceWifi`. A registration ends with the process, whose proxy it needs: still unconnected, it did not go
+ * through. home-link moves a device's Wi-Fi alone, so a move is over once the device is on that Wi-Fi, or once the
+ * request would have ended.
+ */
+fun recover(unreported: Unreported, read: ApiResult<Device>, deviceWifi: String?, now: Long): Recovery {
+    val job = unreported.job
+    val device = when (read) {
+        is ApiResult.Failed ->
+            // Gone after a registration: home-link kept the row that already held the device and dropped this one.
+            return if (job is DeviceJob.Commission && read.error == ApiError.DEVICE_NOT_FOUND) Recovery.Settled(Status.Commissioned(""), null)
+            else Recovery.Later(Status.Failed(read.error))
+        is ApiResult.Ok -> read.value
+    }
+    return when (job) {
+        is DeviceJob.Commission -> when (device.state) {
+            null -> Recovery.Later(Status.Recovering(job))
+            DeviceState.UNCONNECTED -> Recovery.Settled(Status.Interrupted(job, null), device)
+            else -> Recovery.Settled(Status.Commissioned(device.name), device)
+        }
+        is DeviceJob.MoveWifi -> when {
+            deviceWifi != null && device.wifiSsid == deviceWifi -> Recovery.Settled(Status.WifiMoved(deviceWifi), device)
+            now - unreported.startedAt < DEVICE_JOB_MS -> Recovery.Later(Status.Recovering(job))
+            else -> Recovery.Settled(Status.Interrupted(job, device.wifiSsid), device)
+        }
+    }
+}
+
+/** The screen reads that tell whether home-link can be read. */
+enum class Read { DEVICES, LABELS, WIFI }
 
 /** Why the phone could not lend its Bluetooth to matterjs-server. */
 enum class BleProblem { PERMISSION, BLUETOOTH_OFF, PROXY_NOT_CONFIGURED, PROXY_UNREACHABLE, PROXY_VERSION }
@@ -40,6 +87,10 @@ class RegisterForm {
     /** Why the ledger could not be read last; none once it was. */
     var devicesError: ApiError? = null
         private set
+    /** Each read failing now, in the order they failed. */
+    private val readErrors = LinkedHashMap<Read, ApiError>()
+    /** Why home-link cannot be read: the first of the reads failing now to fail; none once each read succeeded. */
+    val readError: ApiError? get() = readErrors.values.firstOrNull()
     /** The device whose pane is open. */
     var device: Device? = null
         private set
@@ -80,7 +131,8 @@ class RegisterForm {
         }
     }
 
-    fun canConnect() = device?.state == DeviceState.UNCONNECTED && !busy
+    /** One device job runs at a time: a move holds connecting back, as connecting holds a move. */
+    fun canConnect() = device?.state == DeviceState.UNCONNECTED && !busy && moving == null
 
     /** The device whose Wi-Fi is being moved. */
     var moving: Long? = null
@@ -89,7 +141,7 @@ class RegisterForm {
     fun canMoveWifi(): Boolean {
         val open = device ?: return false
         return open.state == DeviceState.CONNECTED && open.wifiSsid != null && deviceWifi != null &&
-            open.wifiSsid != deviceWifi && moving == null
+            open.wifiSsid != deviceWifi && moving == null && !busy
     }
 
     fun wifiMoved(result: ApiResult<Device>) {
@@ -104,6 +156,7 @@ class RegisterForm {
 
     /** Takes home-link's Wi-Fi networks; a failed read keeps what was read last. */
     fun wifiRead(result: ApiResult<List<SavedNetwork>>) {
+        readEnded(Read.WIFI, result)
         if (result !is ApiResult.Ok) return
         deviceWifi = result.value.firstOrNull { it.forDevices }?.ssid
         wifiMissing = deviceWifi == null
@@ -158,7 +211,18 @@ class RegisterForm {
         put(device)
     }
 
+    /** Takes home-link's labels; a failed read keeps what was read last. */
+    fun labelsRead(result: ApiResult<List<Label>>) {
+        readEnded(Read.LABELS, result)
+        if (result is ApiResult.Ok) labels = result.value
+    }
+
+    private fun readEnded(read: Read, result: ApiResult<*>) {
+        if (result is ApiResult.Failed) readErrors.putIfAbsent(read, result.error) else readErrors.remove(read)
+    }
+
     fun devicesRead(result: ApiResult<List<Device>>) {
+        readEnded(Read.DEVICES, result)
         devicesError = (result as? ApiResult.Failed)?.error
         if (result !is ApiResult.Ok) return
         // A successful read proves the server is reachable again.

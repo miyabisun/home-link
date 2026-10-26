@@ -69,9 +69,9 @@ abstract class LabelWidget(private val kind: Kind) : AppWidgetProvider() {
         /** Keeps what a read of the labels found; a failed read keeps what was known. */
         fun saveStates(context: Context, read: ApiResult<List<Label>>) = save(context, readStates(states(context), read))
 
-        /** Reads the labels' states again; whether they were read. */
-        fun read(context: Context): Boolean {
-            val read = homeLinkApi(context).labels()
+        /** Reads the labels' states again, within `limits`; whether they were read. */
+        fun read(context: Context, limits: Limits = Limits.SCREEN): Boolean {
+            val read = homeLinkApi(context, limits).labels()
             saveStates(context, read)
             return read is ApiResult.Ok
         }
@@ -87,6 +87,7 @@ abstract class LabelWidget(private val kind: Kind) : AppWidgetProvider() {
         private fun show(context: Context, kind: Kind, id: Int, press: Press? = null) {
             val views = RemoteViews(context.packageName, kind.layout)
             val config = config(context, id)
+            val blocked = config != null && Widgets.lanBlocked(context)
             for ((op, cell) in kind.ops.zip(CELLS)) {
                 val (button, words) = cell
                 if (config == null) {
@@ -96,6 +97,12 @@ abstract class LabelWidget(private val kind: Kind) : AppWidgetProvider() {
                         PendingIntent.FLAG_IMMUTABLE))
                     views.showFace(button, words, ButtonFace("", R.drawable.ic_settings, Tone.PLAIN))
                     views.setContentDescription(button, "設定")
+                    continue
+                }
+                if (blocked) {
+                    views.setOnClickPendingIntent(button, Widgets.askLan(context))
+                    views.showFace(button, words, Widgets.LAN_FACE)
+                    views.setContentDescription(button, "${config.name}：${Widgets.LAN_FACE.description}")
                     continue
                 }
                 views.setOnClickPendingIntent(button, PressService.pending(context, "label:$id:${op.name}",
@@ -139,7 +146,7 @@ abstract class LabelWidget(private val kind: Kind) : AppWidgetProvider() {
     override fun onUpdate(context: Context, manager: AppWidgetManager, ids: IntArray) {
         for (id in ids) show(context, kind, id)
         async {
-            if (!read(context)) Widgets.refreshWhenOnline(context)
+            if (!read(context, Limits.RECEIVER)) Widgets.refreshWhenOnline(context)
             showAll(context)
         }
     }

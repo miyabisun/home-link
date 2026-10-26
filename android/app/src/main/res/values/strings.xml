@@ -12,4 +12,5 @@
     <string name="door_lock_widget_name">玄関の施錠</string>
     <string name="door_lock_widget_description">玄関のSESAMEを施錠します</string>
     <string name="press_channel">ウィジェットの送信</string>
+    <string name="device_work_channel">機器の登録とWi-Fiの移動</string>
 </resources>

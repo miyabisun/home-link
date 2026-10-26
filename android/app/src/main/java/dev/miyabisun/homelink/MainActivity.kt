@@ -1,5 +1,7 @@
 package dev.miyabisun.homelink
 
+import android.Manifest
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
@@ -8,6 +10,7 @@ import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.text.Editable
 import android.text.InputType
 import android.text.TextWatcher
@@ -21,8 +24,6 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
 
 class MainActivity : Activity() {
     companion object {
@@ -35,21 +36,33 @@ class MainActivity : Activity() {
         private const val MAX_NAME = 100
         private const val REQUEST_BLUETOOTH = 1
         private const val REQUEST_ENABLE = 2
+        private const val REQUEST_LAN = 3
         private val BLUETOOTH_PERMISSIONS = bluetoothPermissions(Build.VERSION.SDK_INT)
+        /** Set by a widget that cannot send for want of the LAN permission: the screen asks for it on opening. */
+        const val ASK_LAN = "ask_lan"
+        /** How often a job an ended process left is read again while home-link may still be at it. */
+        private const val RECOVER_MS = 15_000L
+        private val edits = Outbox.edits<MainActivity>()
+        private val switches = Outbox.switches<MainActivity>()
     }
 
     private val form = RegisterForm()
     private lateinit var api: HomeLinkApi
     private lateinit var scanner: QrScanner
     private lateinit var wifiStore: WifiStore
-    private lateinit var worker: ExecutorService
-    private lateinit var switchWorker: ExecutorService
+    private lateinit var reads: Reads
+    private lateinit var work: DeviceWork
+    /** Reading home-link for what came of a job an ended process left. */
+    private var recovering = false
+    /** Android no longer shows its prompt for the LAN permission: only the app's settings can grant it. */
+    private var lanAskedOut = false
     private var enteringCode = false
     private var formattingCode = false
     /** The device to connect once Bluetooth is allowed and on. */
     private var pendingConnect: Long? = null
 
-    private var endpoints = Endpoints()
+    private var endpointsFile: EndpointsFile = EndpointsFile.Missing
+    private val endpoints get() = endpointsFile.endpoints
 
     private lateinit var content: LinearLayout
     private lateinit var noticePanel: LinearLayout
@@ -81,33 +94,40 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         api = homeLinkApi(this)
-        endpoints = Endpoints.load(this)
+        endpointsFile = Endpoints.read(this)
         scanner = scannerFactory?.invoke(this) ?: GmsQrScanner(this)
         wifiStore = wifiStoreFactory?.invoke(this) ?: KeystoreWifiStore(this)
-        worker = Executors.newSingleThreadExecutor()
+        reads = Reads(this)
+        work = DeviceWork.of(this)
+        lanAskedOut = savedInstanceState?.getBoolean("lanAskedOut") == true
+        edits.follow(this)
+        switches.follow(this)
         // Networks earlier versions kept on this phone move to home-link before anything reads them.
-        background({ moveToServer(wifiStore, api::saveWifi) }) { }
-        // Switching a label can wait seconds for every device; registration does not queue behind it.
-        switchWorker = Executors.newSingleThreadExecutor()
+        val store = wifiStore
+        edits.send({ moveToServer(store, api::saveWifi) }) { }
         enteringCode = savedInstanceState?.getBoolean("enteringCode") == true
         build()
         manualField.setText(savedInstanceState?.getString("manualCode").orEmpty())
         manualField.setSelection(manualField.length())
-        // A registration started before the screen was recreated carries on.
-        if (CommissionSession.running) {
-            form.connect(savedInstanceState?.getLong("connecting") ?: -1)
-            form.stage = CommissionSession.stage
+        // A registration started before the screen was recreated, or left, carries on.
+        (work.job as? DeviceJob.Commission)?.let {
+            form.connect(it.device)
+            form.stage = work.stage
         }
-        CommissionSession.follow { sessionChanged() }
-        sessionChanged()
-        WifiMove.follow { moveChanged() }
-        moveChanged()
+        work.follow { workChanged() }
+        workChanged()
         savedInstanceState?.getLong("device", -1)?.takeIf { it >= 0 }?.let { id ->
-            background({ api.device(id) }) { result ->
+            reads.run({ api.device(id) }) { result ->
                 if (result is ApiResult.Ok && form.device == null) open(result.value, savedInstanceState.getString("name"))
                 render()
             }
         }
+        if (savedInstanceState == null) askLanIfSent(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        askLanIfSent(intent)
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -115,8 +135,8 @@ class MainActivity : Activity() {
             outState.putLong("device", it.id)
             outState.putString("name", nameField.text.toString())
         }
-        form.connecting?.let { outState.putLong("connecting", it) }
         outState.putBoolean("enteringCode", enteringCode)
+        outState.putBoolean("lanAskedOut", lanAskedOut)
         outState.putString("manualCode", manualField.text.toString())
         super.onSaveInstanceState(outState)
     }
@@ -124,13 +144,14 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         // The settings screen or `adb push` may have changed the endpoints meanwhile.
-        endpoints = Endpoints.load(this)
+        endpointsFile = Endpoints.read(this)
         // The admin screen may have changed the labels meanwhile.
         loadLabels()
         // The settings screen may have saved the Wi-Fi for devices meanwhile.
         loadWifi()
         // Opening the app lists the devices still to connect.
         loadDevices()
+        recoverJob()
         render()
     }
 
@@ -140,36 +161,27 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
-        CommissionSession.follow(null)
-        WifiMove.follow(null)
-        worker.shutdownNow()
-        switchWorker.shutdownNow()
+        work.follow(null)
+        // Changes under way still reach home-link; their results wait for the next screen.
+        edits.unfollow(this)
+        switches.unfollow(this)
+        reads.close()
         super.onDestroy()
     }
 
-    /** Runs a blocking API call off the main thread and drops results for a destroyed screen. */
-    private fun <T> background(call: () -> T, done: (T) -> Unit) = background(worker, call, done)
-
-    private fun <T> background(executor: ExecutorService, call: () -> T, done: (T) -> Unit) {
-        executor.execute {
-            val result = call()
-            runOnUiThread { if (!isDestroyed) done(result) }
-        }
-    }
-
     private fun loadLabels() {
-        background({ api.labels() }) { result ->
-            if (result is ApiResult.Ok) form.labels = result.value
+        reads.run({ api.labels() }) { result ->
+            form.labelsRead(result)
             render()
         }
     }
 
     /** Reads the ledger, then the codes of the devices still to connect, to tell them apart. */
     private fun loadDevices() {
-        background({ api.devices() }) { result ->
+        reads.run({ api.devices() }) { result ->
             form.devicesRead(result)
             if (result is ApiResult.Ok) for (device in form.unconnected.filter { it.code == null }) {
-                background({ api.device(device.id) }) { detail ->
+                reads.run({ api.device(device.id) }) { detail ->
                     form.detailRead(detail)
                     render()
                 }
@@ -179,7 +191,7 @@ class MainActivity : Activity() {
     }
 
     private fun loadWifi() {
-        background({ api.wifiNetworks() }) { result ->
+        reads.run({ api.wifiNetworks() }) { result ->
             form.wifiRead(result)
             render()
         }
@@ -203,12 +215,14 @@ class MainActivity : Activity() {
     /** Sends a read code to home-link at once and opens the device it answers with. */
     private fun add(code: String) {
         saveName()
-        background({ api.addDevice(code) }) { result ->
-            val before = form.device
-            form.added(code, result)
-            form.device?.takeIf { it != before }?.let { open(it) }
-            render()
-        }
+        edits.send({ api.addDevice(code) }) { result -> added(code, result) }
+    }
+
+    private fun added(code: String, result: ApiResult<Device>) {
+        val before = form.device
+        form.added(code, result)
+        form.device?.takeIf { it != before }?.let { open(it) }
+        render()
     }
 
     /** Opens the device's pane; [name] is a name typed before the screen was recreated. */
@@ -225,12 +239,15 @@ class MainActivity : Activity() {
         update(device.id, DeviceUpdate.Name(name))
     }
 
+    /** Sends a change of device `id`; it reaches home-link even if this screen goes meanwhile. */
     private fun update(id: Long, change: DeviceUpdate) {
-        background({ api.updateDevice(id, change) }) { result ->
-            form.updated(result)
-            if (result == ApiResult.Failed(ApiError.LABEL_NOT_FOUND)) loadLabels()
-            render()
-        }
+        edits.send({ api.updateDevice(id, change) }) { result -> updated(result) }
+    }
+
+    private fun updated(result: ApiResult<Device>) {
+        form.updated(result)
+        if (result == ApiResult.Failed(ApiError.LABEL_NOT_FOUND)) loadLabels()
+        render()
     }
 
     private fun openManual() {
@@ -294,16 +311,16 @@ class MainActivity : Activity() {
                 return
             }
         }
-        endpoints = Endpoints.load(this)
+        endpointsFile = Endpoints.read(this)
         val proxy = endpoints.bleProxyUrl ?: run {
             form.bleFailed(BleProblem.PROXY_NOT_CONFIGURED)
             return render()
         }
         saveName()
         val link = linkFactory?.invoke(this) ?: ProxyLink(applicationContext, proxy)
+        if (!work.start(DeviceJob.Commission(id), link) { api.commission(id) }) return render()
         form.connect(id)
-        CommissionSession.start(link) { api.commission(id) }
-        form.stage = CommissionSession.stage
+        form.stage = work.stage
         render()
     }
 
@@ -321,20 +338,22 @@ class MainActivity : Activity() {
         val on = form.nextOn(device)
         form.switchStarted(device.id)
         render()
-        background(switchWorker, { api.switchDevice(device.id, on) }) { result ->
-            form.switched(device.id, result)
+        val id = device.id
+        switches.send({ api.switchDevice(id, on) }) { result ->
+            form.switched(id, result)
             render()
         }
     }
 
     private fun cancel() {
-        CommissionSession.cancel()
+        work.cancel()
         form.cancelled()
         render()
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_LAN) return lanAnswered(grantResults)
         if (requestCode != REQUEST_BLUETOOTH) return
         val id = pendingConnect
         if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED } && id != null) commission(id)
@@ -357,15 +376,32 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun sessionChanged() {
-        form.stage = CommissionSession.stage
-        when (val outcome = CommissionSession.take()) {
-            is Outcome.Done -> {
-                form.commissioned(outcome.result)
-                loadDevices()
+    /** Shows how the device job goes, and takes its outcome: on the device's pane, opened for it if none is. */
+    private fun workChanged() {
+        form.stage = work.stage
+        form.moving = (work.job as? DeviceJob.MoveWifi)?.device
+        work.take()?.let { (job, outcome) ->
+            val result = (outcome as? Outcome.Done)?.result
+            if (form.device == null && result is ApiResult.Ok) open(result.value)
+            when (job) {
+                is DeviceJob.Commission -> {
+                    // A screen opened after the registration ended did not see it start.
+                    if (form.connecting == null) form.connect(job.device)
+                    when (outcome) {
+                        is Outcome.Done -> {
+                            form.commissioned(outcome.result)
+                            loadDevices()
+                        }
+                        is Outcome.Failed -> form.bleFailed(outcome.problem)
+                    }
+                }
+                is DeviceJob.MoveWifi -> if (result != null) {
+                    if (form.device == null || form.device?.id == job.device) form.wifiMoved(result)
+                    // A failed device may answer from the old Wi-Fi or not at all: its state shows which.
+                    // A moved one is as home-link answered; matterjs-server may not have read its new network yet.
+                    if (result is ApiResult.Failed) loadDevices()
+                }
             }
-            is Outcome.Failed -> form.bleFailed(outcome.problem)
-            null -> Unit
         }
         render()
     }
@@ -373,17 +409,58 @@ class MainActivity : Activity() {
     private fun moveWifi(id: Long) {
         saveName()
         form.status = null
-        WifiMove.start(id) { api.moveWifi(id) }
-        moveChanged()
+        work.start(DeviceJob.MoveWifi(id), null) { api.moveWifi(id) }
+        workChanged()
     }
 
-    private fun moveChanged() {
-        form.moving = WifiMove.device
-        WifiMove.take()?.let { (id, result) ->
-            if (form.device?.id == id) form.wifiMoved(result)
-            // A failed device may answer from the old Wi-Fi or not at all: its state shows which.
-            // A moved one is as home-link answered; matterjs-server may not have read its new network yet.
-            if (result is ApiResult.Failed) loadDevices()
+    /**
+     * Reads home-link for what came of a job the app ended before, and shows it on the device's pane. While home-link
+     * may still be at it, or cannot be read, it reads again a while later.
+     */
+    private fun recoverJob() {
+        if (recovering || isDestroyed) return
+        val left = work.unreported() ?: return
+        recovering = true
+        if (form.status == null) form.status = Status.Recovering(left.job)
+        reads.run({ api.device(left.job.device) to if (left.job is DeviceJob.MoveWifi) api.wifiNetworks() else null }) { (read, wifi) ->
+            recovering = false
+            wifi?.let(form::wifiRead)
+            when (val recovery = recover(left, read, form.deviceWifi, System.currentTimeMillis())) {
+                is Recovery.Settled -> {
+                    work.settle()
+                    recovery.device?.let { device -> if (form.device == null || form.device?.id == device.id) open(device) }
+                    form.status = recovery.status
+                    loadDevices()
+                }
+                is Recovery.Later -> {
+                    form.status = recovery.status
+                    content.postDelayed(::recoverJob, RECOVER_MS)
+                }
+            }
+            render()
+        }
+    }
+
+    /** Asks for the LAN permission when a widget opened the screen for it. */
+    private fun askLanIfSent(intent: Intent?) {
+        if (intent?.getBooleanExtra(ASK_LAN, false) == true && lanMissing()) askLan()
+    }
+
+    /** Asks Android for the LAN permission; once it stops asking, the app's settings page is where to grant it. */
+    @SuppressLint("InlinedApi") // Only asked for while lanMissing(), which Android 16 never is.
+    private fun askLan() {
+        if (lanAskedOut) startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, android.net.Uri.fromParts("package", packageName, null)))
+        else requestPermissions(arrayOf(Manifest.permission.ACCESS_LOCAL_NETWORK), REQUEST_LAN)
+    }
+
+    @SuppressLint("InlinedApi") // An answer to askLan().
+    private fun lanAnswered(grantResults: IntArray) {
+        if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
+            reload()
+            // Widgets that offered to ask for it send again.
+            Widgets.showAll(this)
+        } else {
+            lanAskedOut = !shouldShowRequestPermissionRationale(Manifest.permission.ACCESS_LOCAL_NETWORK)
         }
         render()
     }
@@ -394,7 +471,7 @@ class MainActivity : Activity() {
         // Until home-link's URL is set or its ledger read, nothing below works: the way out comes first.
         noticePanel = panel(content)
         noticeRow = ResultRow(this, noticePanel, dp(4))
-        noticeButton = button(noticePanel, "") { if (endpoints.homeLinkUrl == null) openSettings() else reload() }
+        noticeButton = button(noticePanel, "") { notice()?.action?.invoke() }
 
         wifiPanel = panel(content)
         label(wifiPanel, "機器に渡すWi-Fi", 18, bold = true)
@@ -480,22 +557,37 @@ class MainActivity : Activity() {
 
     private fun openSettings() = startActivity(Intent(this, SettingsActivity::class.java))
 
+    /** What stops the screen working, its words and the way out; the endpoints first, as nothing works without them. */
+    private class Notice(val text: String, val button: String, val icon: Int, val action: () -> Unit)
+
+    private fun notice(): Notice? {
+        val file = endpointsFile
+        val settings = { text: String -> Notice(text, "接続先を設定", R.drawable.ic_settings, ::openSettings) }
+        val homeLink = file.endpoints.homeLink
+        return when {
+            file is EndpointsFile.Unreadable -> settings("接続先の設定ファイル（${Endpoints.path(this)}）を読めませんでした。" +
+                "「接続先を設定」で保存し直してください")
+            file is EndpointsFile.Malformed && file.endpoints.homeLinkUrl == null ->
+                settings("接続先の設定ファイルの${file.line}行目が「キー: 値」の形ではありません。「接続先を設定」で直してください")
+            homeLink.isEmpty() -> settings("接続先が未設定です。home-linkのURLを設定してください")
+            file.endpoints.homeLinkUrl == null -> settings("home-linkのURL「$homeLink」はURLではありません。「接続先を設定」で直してください")
+            lanMissing() -> Notice("LANへの接続が許可されていないため、LANの接続先へ送れません。許可してください",
+                if (lanAskedOut) "設定アプリで許可" else "LANへの接続を許可", R.drawable.ic_settings, ::askLan)
+            else -> form.readError?.let { Notice(resultText(Status.Failed(it)).orEmpty(), "再接続", 0, ::reload) }
+        }
+    }
+
     private fun render() {
-        val unset = endpoints.homeLinkUrl == null
-        val ledgerError = form.devicesError
-        noticePanel.visibility = if (unset || ledgerError != null) View.VISIBLE else View.GONE
-        noticeRow.show(when {
-            unset -> "接続先が未設定です。home-linkのURLを設定してください"
-            ledgerError != null -> resultText(Status.Failed(ledgerError))
-            else -> null
-        }, failed = true)
-        noticeButton.text = if (unset) "接続先を設定" else "再接続"
-        noticeButton.setCompoundDrawablesRelativeWithIntrinsicBounds(if (unset) R.drawable.ic_settings else 0, 0, 0, 0)
+        val notice = notice()
+        noticePanel.visibility = if (notice != null) View.VISIBLE else View.GONE
+        noticeRow.show(notice?.text, failed = true)
+        noticeButton.text = notice?.button.orEmpty()
+        noticeButton.setCompoundDrawablesRelativeWithIntrinsicBounds(notice?.icon ?: 0, 0, 0, 0)
 
         val device = form.device
         val status = form.status
         val result = resultText(status)
-        val failed = status is Status.Failed || status is Status.BleFailed
+        val failed = status is Status.Failed || status is Status.BleFailed || status is Status.Interrupted
 
         // Reading another code while one connects would leave that connection without its pane.
         qrPanel.visibility = if (form.busy) View.GONE else View.VISIBLE
@@ -562,6 +654,13 @@ class MainActivity : Activity() {
         return when (status) {
             is Status.Commissioned -> if (status.name.isEmpty()) "接続しました" else "「${status.name}」を接続しました"
             is Status.WifiMoved -> "「${status.ssid}」へ移しました"
+            is Status.Recovering -> "アプリが途中で終了しました。" +
+                (if (status.job is DeviceJob.Commission) "接続" else "Wi-Fiの移動") + "の結果をhome-linkに確かめています…"
+            is Status.Interrupted -> when (status.job) {
+                is DeviceJob.Commission -> "アプリが途中で終了したため、接続は終わりませんでした。「接続」を押し直してください"
+                is DeviceJob.MoveWifi -> "アプリが途中で終了し、Wi-Fiを移せませんでした。機器は今" +
+                    (status.ssid?.let { "「$it」につながっています" } ?: "どのWi-Fiにいるか分かりません")
+            }
             is Status.BleFailed -> when (status.problem) {
                 BleProblem.PERMISSION -> "Bluetoothで機器を探すには「付近のデバイス」の許可が必要です。" +
                     "許可してから「接続」を押し直してください"

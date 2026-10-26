@@ -21,7 +21,8 @@ enum class ApiError { NOT_CONFIGURED, UNREACHABLE, TIMEOUT, INVALID_QR, INVALID_
     THREAD_FAILED, WIFI_NOT_SET, WIFI_NOT_FOUND, LABEL_NOT_FOUND, LABEL_HAS_NO_DEVICES, DUPLICATE_LABEL, INVALID_LABEL,
     WIFI_REVERTED, WIFI_REVERTING, NOT_ON_WIFI,
     SESAME_NOT_CONFIGURED, SESAME_REJECTED, SESAME_UNREACHABLE, SWITCH_FAILED, NO_NETWORK, BLOCKED,
-    CONNECT_TIMEOUT, HTTP_DENIED, HTTP_NOT_FOUND, HTTP_GATEWAY, BAD_ANSWER }
+    CONNECT_TIMEOUT, HTTP_DENIED, HTTP_NOT_FOUND, HTTP_GATEWAY, BAD_ANSWER,
+    SETTINGS_UNREADABLE, SETTINGS_MALFORMED, LOCAL_NETWORK_DENIED }
 
 /** A Wi-Fi network to save on home-link for new devices. */
 data class WifiNetwork(val ssid: String, val password: String)
@@ -119,13 +120,27 @@ object SteadyLink : PhoneLink {
 private class Yielded : IOException("another URL connected first")
 
 /**
- * Calls home-link at the URLs `baseUrls` gives for each request: the primary, racing the fallbacks while it cannot
- * connect. None sends nothing. `link` is the phone's network, `log` takes a line for each failed attempt, and `now`
- * is a monotonic clock in ms.
+ * How long a request may take: `patience` ms to connect, as [Reach] keeps trying, then `readMs` for each read of the
+ * answer. One for every screen and press; only a broadcast receiver, which has 10 s in all, reads with less.
  */
-class HttpHomeLinkApi(private val baseUrls: () -> List<String>, private val link: PhoneLink = SteadyLink,
-                      private val log: (String) -> Unit = {}, now: () -> Long = { System.nanoTime() / 1_000_000 }) : HomeLinkApi {
-    constructor(baseUrl: String) : this({ listOf(baseUrl) })
+enum class Limits(val patience: Long, val readMs: Int) {
+    /**
+     * Over mobile data or a network switching, a path to home-link may take a while to come up. Switching a label
+     * waits up to 10 s for every device's answer.
+     */
+    SCREEN(15_000, 20_000),
+    RECEIVER(5_000, 3_000),
+}
+
+/**
+ * Calls home-link at the URLs `targets` gives for each request: the primary, racing the fallbacks while it cannot
+ * connect. None sends nothing. `link` is the phone's network, `log` takes a line for each failed attempt, and `now`
+ * is a monotonic clock in ms. Every request keeps to `limits`, but for the minutes registering takes.
+ */
+class HttpHomeLinkApi(private val targets: () -> Targets, private val link: PhoneLink = SteadyLink,
+                      private val log: (String) -> Unit = {}, private val limits: Limits = Limits.SCREEN,
+                      now: () -> Long = { System.nanoTime() / 1_000_000 }) : HomeLinkApi {
+    constructor(baseUrl: String) : this({ Targets(listOf(baseUrl)) })
 
     private val reach = Reach(link, now = now)
 
@@ -138,13 +153,6 @@ class HttpHomeLinkApi(private val baseUrls: () -> List<String>, private val link
             .connectionPool(ConnectionPool(0, 1, TimeUnit.SECONDS)).build()
         val JSON = "application/json".toMediaType()
         val EMPTY = ByteArray(0).toRequestBody()
-        /**
-         * How long a request keeps trying to connect: over mobile data or a network switching, a path to home-link
-         * may take a while to come up.
-         */
-        const val PATIENCE_MS = 15_000L
-        /** For a widget's read in a broadcast receiver, which has 10 s in all. */
-        const val RECEIVER_MS = 5_000L
     }
 
     override fun devices(): ApiResult<List<Device>> = call("GET", "/api/devices", null) { body ->
@@ -167,8 +175,7 @@ class HttpHomeLinkApi(private val baseUrls: () -> List<String>, private val link
         return call("PATCH", "/api/devices/$id", body) { device(JSONObject(it)) }
     }
 
-    // A widget reads this within the time a broadcast receiver may run.
-    override fun labels(): ApiResult<List<Label>> = call("GET", "/api/labels", null, readTimeout = 3_000, patience = RECEIVER_MS) { body ->
+    override fun labels(): ApiResult<List<Label>> = call("GET", "/api/labels", null) { body ->
         val array = JSONArray(body)
         (0 until array.length()).map { label(array.getJSONObject(it)) }
     }
@@ -180,7 +187,7 @@ class HttpHomeLinkApi(private val baseUrls: () -> List<String>, private val link
         }
 
     override fun aircon(): ApiResult<Boolean> =
-        call("GET", "/api/aircon", null, readTimeout = 3_000, patience = RECEIVER_MS) { JSONObject(it).getBoolean("on") }
+        call("GET", "/api/aircon", null) { JSONObject(it).getBoolean("on") }
 
     // home-link answers once the air conditioner took the switch, or did not, in about 12 s at most.
     override fun toggleAircon(): ApiResult<AirconToggle> =
@@ -208,11 +215,11 @@ class HttpHomeLinkApi(private val baseUrls: () -> List<String>, private val link
 
     // matterjs-server may take minutes: Bluetooth discovery, PASE, the network join and CASE.
     override fun commission(id: Long): ApiResult<Device> =
-        call("POST", "/api/devices/$id/commission", null, readTimeout = 360_000) { device(JSONObject(it).getJSONObject("device")) }
+        call("POST", "/api/devices/$id/commission", null, readMs = 360_000) { device(JSONObject(it).getJSONObject("device")) }
 
     // Under a two-minute fail-safe, then a minute for the device to come back.
     override fun moveWifi(id: Long): ApiResult<Device> =
-        call("POST", "/api/devices/$id/wifi", null, readTimeout = 360_000) { device(JSONObject(it).getJSONObject("device")) }
+        call("POST", "/api/devices/$id/wifi", null, readMs = 360_000) { device(JSONObject(it).getJSONObject("device")) }
 
     override fun switchDevice(id: Long, on: Boolean): ApiResult<Boolean?> =
         call("POST", "/api/devices/$id/${if (on) "on" else "off"}", null) { body ->
@@ -269,12 +276,19 @@ class HttpHomeLinkApi(private val baseUrls: () -> List<String>, private val link
     }
 
     /**
-     * Sends one request, connecting for up to `patience` ms as [Reach] does; once connected, it waits `readTimeout`
+     * Sends one request, connecting for up to [Limits.patience] ms as [Reach] does; once connected, it waits `readMs`
      * for each read of the answer. Every failed attempt is logged with the phone's network.
      */
-    private fun <T> call(method: String, path: String, body: JSONObject?, readTimeout: Int = 20_000,
-                         patience: Long = PATIENCE_MS, parse: (String) -> T): ApiResult<T> =
-        reach.send(baseUrls().map { it.trimEnd('/') }, patience) { base, connectMs, race ->
+    private fun <T> call(method: String, path: String, body: JSONObject?, readMs: Int = limits.readMs,
+                         parse: (String) -> T): ApiResult<T> {
+        val to = targets()
+        if (to.urls.isEmpty()) return ApiResult.Failed(to.none)
+        return to.explain(send(to.urls, method, path, body, readMs, parse))
+    }
+
+    private fun <T> send(urls: List<String>, method: String, path: String, body: JSONObject?, readMs: Int,
+                         parse: (String) -> T): ApiResult<T> =
+        reach.send(urls.map { it.trimEnd('/') }, limits.patience) { base, connectMs, race ->
             // OkHttp, unlike the JDK's HttpURLConnection, sends PATCH.
             val request = try {
                 Request.Builder().url(base + path).header("accept", "application/json")
@@ -284,10 +298,9 @@ class HttpHomeLinkApi(private val baseUrls: () -> List<String>, private val link
             }
             val connected = AtomicBoolean()
             val client = CLIENT.newBuilder().connectTimeout(connectMs, TimeUnit.MILLISECONDS)
-                // Switching a label waits up to 10 s for every device's answer.
-                .readTimeout(readTimeout.toLong(), TimeUnit.MILLISECONDS)
+                .readTimeout(readMs.toLong(), TimeUnit.MILLISECONDS)
                 // Name lookups have no timeout of their own; this bounds one that hangs while the network changes.
-                .callTimeout(connectMs + readTimeout, TimeUnit.MILLISECONDS)
+                .callTimeout(connectMs + readMs, TimeUnit.MILLISECONDS)
                 .eventListener(object : EventListener() {
                     // Before anything is written: only the first URL to connect may send.
                     override fun connectionAcquired(call: Call, connection: Connection) {

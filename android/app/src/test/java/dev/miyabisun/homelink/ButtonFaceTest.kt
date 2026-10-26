@@ -98,4 +98,19 @@ class ButtonFaceTest {
         assertEquals(ButtonFace("受付済み", R.drawable.ic_success, Tone.PLAIN),
             buttonFace("解錠", R.drawable.ic_unlock, null, label = LightsMessage("受付済み", failed = false)))
     }
+
+    @Test fun anUnreadableOrMalformedSettingsFileAndTheMissingLanPermissionReadApart() {
+        val host = "home-link.example:5011"
+        val words = listOf(ApiError.NOT_CONFIGURED, ApiError.SETTINGS_UNREADABLE, ApiError.SETTINGS_MALFORMED, ApiError.LOCAL_NETWORK_DENIED)
+        assertEquals(words.size, words.map { failure(it, host).text }.toSet().size)
+        assertEquals(words.size, words.map { failureLabel(it).text }.toSet().size)
+        assertEquals("LAN未許可", failureLabel(ApiError.LOCAL_NETWORK_DENIED).text)
+        assert("許可" in failure(ApiError.LOCAL_NETWORK_DENIED, host).text)
+        // The narrowest button holds five full-width characters; a half-width one takes half.
+        for (error in words) {
+            val text = failureLabel(error).text
+            val width = text.sumOf { if (it.code < 0x80) 1 else 2 }
+            assert(width <= 10) { "$error: $text" }
+        }
+    }
 }

@@ -10,8 +10,6 @@ import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
 import android.widget.Spinner
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
 
 /**
  * Picks the label a placed label widget sends to and the name it shows; the launcher opens it on placing
@@ -20,7 +18,7 @@ import java.util.concurrent.Executors
 class WidgetConfigActivity : Activity() {
     private var widget = AppWidgetManager.INVALID_APPWIDGET_ID
     private lateinit var api: HomeLinkApi
-    private lateinit var worker: ExecutorService
+    private lateinit var reads: Reads
     private var labels: List<Label>? = null
     private var error: ApiError? = null
     /** The label last drawn as picked; the select box reports it back without the user choosing. */
@@ -41,7 +39,7 @@ class WidgetConfigActivity : Activity() {
         // Only this app's own widgets are set up here.
         if (AppWidgetManager.getInstance(this).getAppWidgetInfo(widget)?.provider?.packageName != packageName) return finish()
         api = homeLinkApi(this)
-        worker = Executors.newSingleThreadExecutor()
+        reads = Reads(this)
 
         val content = page()
         label(content, "ウィジェット", 28, bold = true)
@@ -69,7 +67,7 @@ class WidgetConfigActivity : Activity() {
     }
 
     override fun onDestroy() {
-        if (::worker.isInitialized) worker.shutdownNow()
+        if (::reads.isInitialized) reads.close()
         super.onDestroy()
     }
 
@@ -77,20 +75,16 @@ class WidgetConfigActivity : Activity() {
         labels = null
         error = null
         render()
-        worker.execute {
-            val result = api.labels()
-            runOnUiThread {
-                if (isDestroyed) return@runOnUiThread
-                when (result) {
-                    is ApiResult.Ok -> {
-                        labels = result.value
-                        val index = result.value.indexOfFirst { it.id == pickId }.coerceAtLeast(0)
-                        result.value.getOrNull(index)?.let { show(it) }
-                    }
-                    is ApiResult.Failed -> error = result.error
+        reads.run({ api.labels() }) { result ->
+            when (result) {
+                is ApiResult.Ok -> {
+                    labels = result.value
+                    val index = result.value.indexOfFirst { it.id == pickId }.coerceAtLeast(0)
+                    result.value.getOrNull(index)?.let { show(it) }
                 }
-                render()
+                is ApiResult.Failed -> error = result.error
             }
+            render()
         }
     }
 
