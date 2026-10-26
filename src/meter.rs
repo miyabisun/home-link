@@ -281,10 +281,11 @@ async fn tend(bus: &Connection, busy: bool, quiet: i64) -> zbus::Result<bool> {
         }
         Step::Start => {}
     }
-    let filter: HashMap<&str, Value> =
-        HashMap::from([("Transport", "le".into()), ("DuplicateData", true.into())]);
     adapter
-        .call_method("SetDiscoveryFilter", &(filter,))
+        .call_method(
+            "SetDiscoveryFilter",
+            &(crate::ble_proxy::discovery_filter(),),
+        )
         .await?;
     adapter.call_method("StartDiscovery", &()).await?;
     tracing::info!(adapter = path.as_str(), "meter: discovery started");

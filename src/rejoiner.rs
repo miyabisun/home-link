@@ -9,7 +9,7 @@ use futures_util::StreamExt;
 
 use crate::{
     AppState, UNPOISONED,
-    ble_proxy::{self, Radio, Signals},
+    ble_proxy::{self, Concern, Radio, Signals},
     rejoin::{self, ATTEMPT_TIMEOUT, COMMISSION_WAIT, MATTER_SERVICE, Reason, Sought},
     watcher,
 };
@@ -30,7 +30,7 @@ struct Ear {
 impl Ear {
     async fn open(adapter: Option<&str>) -> zbus::Result<Self> {
         let radio = Radio::open(adapter).await?;
-        radio.scan(&[MATTER_SERVICE.to_owned()]).await?;
+        radio.scan().await?;
         let signals = radio.signals().await?;
         tracing::info!(
             adapter = radio.name(),
@@ -74,11 +74,18 @@ impl Ear {
                 Ok(None) => return Err(zbus::Error::Failure("the bus closed".into())),
                 Ok(Some(signal)) => signal?,
             };
-            let Some(path) = self.radio.device_of(&signal) else {
-                continue;
+            let path = match self.radio.concern(&signal) {
+                Concern::Device(path) => path,
+                Concern::Adapter => return Err(zbus::Error::Failure("the adapter went".into())),
+                Concern::Gone(_) | Concern::Other => continue,
             };
-            if let Some(seen) = self.radio.heard(&path).await? {
-                take(&seen);
+            match self.radio.heard(&path).await {
+                Ok(Some(seen)) => take(&seen),
+                Ok(None) => {}
+                // BlueZ forgot the device between its signal and this question.
+                Err(zbus::Error::MethodError(name, _, _))
+                    if name.as_str() == "org.freedesktop.DBus.Error.UnknownObject" => {}
+                Err(error) => return Err(error),
             }
         }
     }

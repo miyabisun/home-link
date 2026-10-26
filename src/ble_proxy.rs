@@ -46,7 +46,10 @@ type Socket =
 /// The signals of the devices under one adapter.
 pub(crate) type Signals = futures_util::stream::BoxStream<'static, zbus::Result<zbus::Message>>;
 
-type Objects = HashMap<OwnedObjectPath, HashMap<String, HashMap<String, OwnedValue>>>;
+/// An object's interfaces with their properties, as `BlueZ` reports them.
+type Interfaces = HashMap<String, HashMap<String, OwnedValue>>;
+
+type Objects = HashMap<OwnedObjectPath, Interfaces>;
 
 /// A 16-, 32- or 128-bit UUID in the dashed, lower-case 128-bit form `BlueZ` uses.
 #[must_use]
@@ -72,6 +75,69 @@ pub(crate) fn canonical(uuid: &str) -> String {
         &full[16..20],
         &full[20..]
     )
+}
+
+/// The discovery filter every client of home-link's gives `BlueZ`: LE, every advertisement.
+/// It names no UUIDs: `BlueZ` 5.87 crashes once an advertisement meets a UUID filter
+/// (bluez#2282), so the UUIDs looked for are picked out of what is heard ([`Heard::wanted`]).
+#[must_use]
+pub(crate) fn discovery_filter() -> HashMap<&'static str, Variant<'static>> {
+    HashMap::from([("Transport", "le".into()), ("DuplicateData", true.into())])
+}
+
+/// What a `BlueZ` signal says about one adapter and the devices under it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Concern {
+    /// The adapter itself came or went: `BlueZ` started again, or the adapter was unplugged or
+    /// reset. Its discovery and the devices under it are gone.
+    Adapter,
+    /// The device at this path came or changed.
+    Device(String),
+    /// `BlueZ` forgot the device at this path, as it does with devices not heard a while.
+    Gone(String),
+    /// Anything else.
+    Other,
+}
+
+/// What `signal` says about the adapter at `adapter` and the devices under it.
+pub(crate) fn concern(adapter: &str, signal: &zbus::Message) -> Concern {
+    let header = signal.header();
+    let body = signal.body();
+    let (path, gone) = match header.member().map(zbus::names::MemberName::as_str) {
+        Some("InterfacesAdded") => (
+            body.deserialize::<(OwnedObjectPath, Interfaces)>()
+                .map(|(path, _)| path),
+            false,
+        ),
+        Some("InterfacesRemoved") => (
+            body.deserialize::<(OwnedObjectPath, Vec<String>)>()
+                .map(|(path, _)| path),
+            true,
+        ),
+        _ => {
+            return header
+                .path()
+                .map_or(Concern::Other, |path| under(adapter, path.as_str(), false));
+        }
+    };
+    match path {
+        Ok(path) if path.as_str() == adapter => Concern::Adapter,
+        Ok(path) => under(adapter, path.as_str(), gone),
+        Err(_) => Concern::Other,
+    }
+}
+
+/// The device at `path` when it is one directly under `adapter`.
+fn under(adapter: &str, path: &str, gone: bool) -> Concern {
+    match path
+        .strip_prefix(adapter)
+        .and_then(|rest| rest.strip_prefix("/dev_"))
+    {
+        Some(rest) if rest.contains('/') => Concern::Other,
+        Some(_) if gone => Concern::Gone(path.to_owned()),
+        Some(_) => Concern::Device(path.to_owned()),
+        None => Concern::Other,
+    }
 }
 
 /// The object path `BlueZ` gives the device at `address` under `adapter`.
@@ -398,21 +464,15 @@ impl Radio {
         Proxy::new(&self.bus, BLUEZ, self.adapter.as_str(), ADAPTER).await
     }
 
-    /// Keeps discovery on for devices advertising `uuids` (all devices when empty), with every
-    /// advertisement reported; `BlueZ` merges this filter with the meter's.
+    /// Keeps discovery on for every device, with every advertisement reported; the callers pick
+    /// out what they look for ([`discovery_filter`]).
     ///
     /// # Errors
     /// When `BlueZ` refuses the filter or discovery.
-    pub async fn scan(&self, uuids: &[String]) -> zbus::Result<()> {
-        let uuids: Vec<String> = uuids.iter().map(|uuid| canonical(uuid)).collect();
-        let filter: HashMap<&str, Variant> = HashMap::from([
-            ("Transport", "le".into()),
-            ("DuplicateData", true.into()),
-            ("UUIDs", uuids.into()),
-        ]);
+    pub async fn scan(&self) -> zbus::Result<()> {
         let adapter = self.adapter().await?;
         adapter
-            .call_method("SetDiscoveryFilter", &(filter,))
+            .call_method("SetDiscoveryFilter", &(discovery_filter(),))
             .await?;
         match adapter.call_method("StartDiscovery", &()).await {
             Err(zbus::Error::MethodError(name, _, _))
@@ -452,32 +512,10 @@ impl Radio {
         Ok(futures_util::stream::select(changed, objects).boxed())
     }
 
-    /// The device a signal is about, if it is one under the adapter.
+    /// What a signal says about the adapter and the devices under it.
     #[must_use]
-    pub fn device_of(&self, signal: &zbus::Message) -> Option<String> {
-        let body = signal.body();
-        let path = match signal
-            .header()
-            .member()
-            .map(zbus::names::MemberName::as_str)
-        {
-            Some("InterfacesAdded") => body
-                .deserialize::<(
-                    OwnedObjectPath,
-                    HashMap<String, HashMap<String, OwnedValue>>,
-                )>()
-                .ok()?
-                .0
-                .to_string(),
-            Some("InterfacesRemoved") => body
-                .deserialize::<(OwnedObjectPath, Vec<String>)>()
-                .ok()?
-                .0
-                .to_string(),
-            _ => signal.header().path()?.to_string(),
-        };
-        let rest = path.strip_prefix(&format!("{}/dev_", self.adapter))?;
-        (!rest.contains('/')).then_some(path)
+    pub fn concern(&self, signal: &zbus::Message) -> Concern {
+        concern(&self.adapter, signal)
     }
 
     /// What `BlueZ` last heard of the device at `path`.
@@ -837,7 +875,7 @@ async fn execute(
                 })
                 .unwrap_or_default();
             radio
-                .scan(&uuids)
+                .scan()
                 .await
                 .map_err(refused("bluetooth_unavailable"))?;
             let known = radio.known().await.unwrap_or_default();
@@ -1100,13 +1138,14 @@ async fn forward(
                 continue;
             }
         }
-        let Some(path) = radio.device_of(&signal) else {
-            continue;
+        let path = match radio.concern(&signal) {
+            Concern::Device(path) => path,
+            Concern::Gone(path) => {
+                dropped(held, out, &path);
+                continue;
+            }
+            Concern::Adapter | Concern::Other => continue,
         };
-        if header.member().is_some_and(|m| m == "InterfacesRemoved") {
-            dropped(held, out, &path);
-            continue;
-        }
         if held.lock().expect(crate::UNPOISONED).scanning.is_none() {
             continue;
         }
@@ -1159,6 +1198,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn discovery_never_narrows_by_uuid() {
+        let filter = discovery_filter();
+        assert!(!filter.contains_key("UUIDs"), "BlueZ 5.87 crashes on it");
+        assert_eq!(filter.get("Transport"), Some(&Variant::from("le")));
+        assert_eq!(filter.get("DuplicateData"), Some(&Variant::from(true)));
+    }
+
+    #[test]
     fn uuids_take_bluez_form() {
         let fff6 = "0000fff6-0000-1000-8000-00805f9b34fb";
         for form in [
@@ -1185,6 +1232,76 @@ mod tests {
             device_path("/org/bluez/hci1", "aa:bb:cc:dd:ee:01"),
             "/org/bluez/hci1/dev_AA_BB_CC_DD_EE_01",
             "BlueZ's path"
+        );
+    }
+
+    fn object_signal(member: &str, object: &str) -> zbus::Message {
+        let builder = zbus::Message::signal("/", "org.freedesktop.DBus.ObjectManager", member)
+            .expect("a signal");
+        let object = OwnedObjectPath::try_from(object).expect("a path");
+        if member == "InterfacesAdded" {
+            let interfaces: HashMap<String, HashMap<String, OwnedValue>> = HashMap::new();
+            builder.build(&(object, interfaces))
+        } else {
+            builder.build(&(object, vec![DEVICE.to_owned()]))
+        }
+        .expect("a body")
+    }
+
+    fn changed_signal(path: &str) -> zbus::Message {
+        let changed: HashMap<String, OwnedValue> = HashMap::new();
+        zbus::Message::signal(path, "org.freedesktop.DBus.Properties", "PropertiesChanged")
+            .expect("a signal")
+            .build(&(DEVICE.to_owned(), changed, Vec::<String>::new()))
+            .expect("a body")
+    }
+
+    #[test]
+    fn signals_tell_devices_from_the_adapter_coming_or_going() {
+        let adapter = "/org/bluez/hci0";
+        let device = "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_01";
+        assert_eq!(
+            concern(adapter, &changed_signal(device)),
+            Concern::Device(device.into())
+        );
+        assert_eq!(
+            concern(adapter, &object_signal("InterfacesAdded", device)),
+            Concern::Device(device.into())
+        );
+        assert_eq!(
+            concern(adapter, &object_signal("InterfacesRemoved", device)),
+            Concern::Gone(device.into()),
+            "BlueZ forgets devices not heard a while"
+        );
+        assert_eq!(
+            concern(adapter, &object_signal("InterfacesAdded", adapter)),
+            Concern::Adapter,
+            "BlueZ came back"
+        );
+        assert_eq!(
+            concern(adapter, &object_signal("InterfacesRemoved", adapter)),
+            Concern::Adapter,
+            "the adapter was unplugged or reset"
+        );
+        assert_eq!(
+            concern(adapter, &changed_signal(adapter)),
+            Concern::Other,
+            "the adapter's own properties change as discovery starts and stops"
+        );
+        assert_eq!(
+            concern(
+                adapter,
+                &changed_signal("/org/bluez/hci0/dev_AA_BB_CC_DD_EE_01/service000a")
+            ),
+            Concern::Other
+        );
+        assert_eq!(
+            concern(
+                adapter,
+                &object_signal("InterfacesAdded", "/org/bluez/hci1")
+            ),
+            Concern::Other,
+            "another adapter"
         );
     }
 
