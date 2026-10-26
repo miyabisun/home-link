@@ -35,8 +35,13 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// The ATT MTU of a link whose `BlueZ` does not say.
 const DEFAULT_MTU: u16 = 23;
 const PROTOCOL_VERSION: u64 = 1;
+/// How long the proxy stays open after its last peripheral went, for matterjs-server to connect again.
+const LINK_GRACE: Duration = Duration::from_secs(10);
 const WRITE_DATA: u8 = 0x01;
 const NOTIFICATION: u8 = 0x02;
+
+type Socket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// The signals of the devices under one adapter.
 pub(crate) type Signals = futures_util::stream::BoxStream<'static, zbus::Result<zbus::Message>>;
@@ -426,7 +431,8 @@ impl Radio {
         }
     }
 
-    /// The signals of devices under the adapter: their properties changing and their arrival.
+    /// The signals of devices under the adapter: their properties changing, their arrival and
+    /// their going.
     ///
     /// # Errors
     /// When the bus refuses the match.
@@ -437,32 +443,38 @@ impl Radio {
             .member("PropertiesChanged")?
             .path_namespace(self.adapter.as_str())?
             .build();
-        let added = MatchRule::builder()
+        let objects = MatchRule::builder()
             .msg_type(Type::Signal)
             .interface("org.freedesktop.DBus.ObjectManager")?
-            .member("InterfacesAdded")?
             .build();
         let changed = MessageStream::for_match_rule(changed, &self.bus, None).await?;
-        let added = MessageStream::for_match_rule(added, &self.bus, None).await?;
-        Ok(futures_util::stream::select(changed, added).boxed())
+        let objects = MessageStream::for_match_rule(objects, &self.bus, None).await?;
+        Ok(futures_util::stream::select(changed, objects).boxed())
     }
 
     /// The device a signal is about, if it is one under the adapter.
     #[must_use]
     pub fn device_of(&self, signal: &zbus::Message) -> Option<String> {
-        let path = if signal
+        let body = signal.body();
+        let path = match signal
             .header()
             .member()
-            .is_some_and(|m| m == "InterfacesAdded")
+            .map(zbus::names::MemberName::as_str)
         {
-            signal
-                .body()
-                .deserialize::<(OwnedObjectPath, Objects)>()
+            Some("InterfacesAdded") => body
+                .deserialize::<(
+                    OwnedObjectPath,
+                    HashMap<String, HashMap<String, OwnedValue>>,
+                )>()
                 .ok()?
                 .0
-                .to_string()
-        } else {
-            signal.header().path()?.to_string()
+                .to_string(),
+            Some("InterfacesRemoved") => body
+                .deserialize::<(OwnedObjectPath, Vec<String>)>()
+                .ok()?
+                .0
+                .to_string(),
+            _ => signal.header().path()?.to_string(),
         };
         let rest = path.strip_prefix(&format!("{}/dev_", self.adapter))?;
         (!rest.contains('/')).then_some(path)
@@ -521,32 +533,52 @@ struct Held {
     reported: Option<Vec<String>>,
     links: HashMap<u16, Link>,
     next: u16,
+    /// Since when no peripheral is connected, once one was.
+    unlinked_since: Option<Instant>,
+}
+
+impl Held {
+    /// Whether the proxy has served its turn at `now`: it connected a peripheral and has held
+    /// none for [`LINK_GRACE`]. matterjs-server keeps looking while a proxy is open, even after
+    /// the device refused the code; closing it has matterjs-server answer at once.
+    fn done(&self, now: Instant) -> bool {
+        self.links.is_empty()
+            && self
+                .unlinked_since
+                .is_some_and(|since| now.duration_since(since) >= LINK_GRACE)
+    }
+
+    fn link(&mut self, link: Link) -> u16 {
+        self.next = self.next.wrapping_add(1).max(1);
+        self.links.insert(self.next, link);
+        self.unlinked_since = None;
+        self.next
+    }
+
+    fn unlink(&mut self, handle: u16, now: Instant) -> Option<Link> {
+        let link = self.links.remove(&handle)?;
+        if self.links.is_empty() {
+            self.unlinked_since = Some(now);
+        }
+        Some(link)
+    }
 }
 
 /// The proxy's state, shared by the commands, the signals and the end.
 type Shared = Arc<Mutex<Held>>;
 
-/// Serves matterjs-server's BLE proxy at `url` on `radio` until `until` ends, then disconnects
-/// every peripheral and ends this client's discovery.
-///
-/// # Errors
-/// When the proxy cannot be opened or greeted, or `BlueZ` cannot be listened to.
-pub(crate) async fn serve(
-    url: &str,
-    radio: &Radio,
-    until: impl Future<Output = ()>,
-) -> Result<(), String> {
-    let (ws, _) = tokio::time::timeout(HELLO_TIMEOUT, connect_async(url))
+/// Opens matterjs-server's BLE proxy at `url` and completes the protocol v1 handshake.
+async fn greet(url: &str) -> Result<Socket, String> {
+    let (mut ws, _) = tokio::time::timeout(HELLO_TIMEOUT, connect_async(url))
         .await
         .map_err(|_| "the BLE proxy did not answer in time".to_owned())?
         .map_err(|error| format!("the BLE proxy refused: {error}"))?;
-    let (mut sink, mut stream) = ws.split();
     let hello = json!({ "type": "hello", "version": PROTOCOL_VERSION });
-    sink.send(Message::text(hello.to_string()))
+    ws.send(Message::text(hello.to_string()))
         .await
         .map_err(|error| error.to_string())?;
     let greeted = tokio::time::timeout(HELLO_TIMEOUT, async {
-        while let Some(Ok(message)) = stream.next().await {
+        while let Some(Ok(message)) = ws.next().await {
             if let Message::Text(text) = message
                 && let Ok(reply) = serde_json::from_str::<Value>(&text)
                 && reply["type"] == "hello_response"
@@ -561,6 +593,20 @@ pub(crate) async fn serve(
     if !greeted {
         return Err("the BLE proxy did not accept protocol v1".into());
     }
+    Ok(ws)
+}
+
+/// Serves matterjs-server's BLE proxy at `url` on `radio` until `until` ends, then disconnects
+/// every peripheral and ends this client's discovery.
+///
+/// # Errors
+/// When the proxy cannot be opened or greeted, or `BlueZ` cannot be listened to.
+pub(crate) async fn serve(
+    url: &str,
+    radio: &Radio,
+    until: impl Future<Output = ()>,
+) -> Result<(), String> {
+    let (mut sink, mut stream) = greet(url).await?.split();
     let signals = radio.signals().await.map_err(|error| error.to_string())?;
     let held = Shared::default();
     let (out, mut outgoing) = mpsc::unbounded_channel::<Message>();
@@ -619,8 +665,17 @@ pub(crate) async fn serve(
         }
     };
     let listen = forward(radio, &held, &out, signals);
+    let served = async {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if held.lock().expect(crate::UNPOISONED).done(Instant::now()) {
+                break;
+            }
+        }
+    };
     tokio::select! {
         () = until => {},
+        () = served => {},
         () = write => {},
         () = read => {},
         () = run => {},
@@ -826,22 +881,18 @@ async fn execute(
                 .map_err(refused("connection_failed"))?;
             resolved(&device, deadline).await?;
             let mtu = mtu(radio, &path).await;
-            let mut held = held.lock().expect(crate::UNPOISONED);
-            held.next = held.next.wrapping_add(1).max(1);
-            let handle = held.next;
-            held.links.insert(
-                handle,
-                Link {
-                    path,
-                    ..Link::default()
-                },
-            );
+            let handle = held.lock().expect(crate::UNPOISONED).link(Link {
+                path,
+                ..Link::default()
+            });
             Ok(json!({ "connection_handle": handle, "mtu": mtu }))
         }
         "disconnect" => {
             let handle = handle_of(args)?;
             let path = link_path(held, handle)?;
-            held.lock().expect(crate::UNPOISONED).links.remove(&handle);
+            held.lock()
+                .expect(crate::UNPOISONED)
+                .unlink(handle, Instant::now());
             if let Ok(device) = device(radio, &path).await {
                 let _ = device.call_method("Disconnect", &()).await;
             }
@@ -1052,6 +1103,10 @@ async fn forward(
         let Some(path) = radio.device_of(&signal) else {
             continue;
         };
+        if header.member().is_some_and(|m| m == "InterfacesRemoved") {
+            dropped(held, out, &path);
+            continue;
+        }
         if held.lock().expect(crate::UNPOISONED).scanning.is_none() {
             continue;
         }
@@ -1091,7 +1146,7 @@ fn dropped(held: &Shared, out: &mpsc::UnboundedSender<Message>, path: &str) {
         .map(|(handle, _)| *handle)
         .collect();
     for handle in handles {
-        held.links.remove(&handle);
+        held.unlink(handle, Instant::now());
         let event = json!({ "event": "disconnected", "data": {
             "connection_handle": handle, "reason": "peripheral disconnected",
         }});
@@ -1224,6 +1279,28 @@ mod tests {
             json!({ "id": 8, "success": false, "error": "not_connected", "message": "no connection 3" }),
             "failure"
         );
+    }
+
+    #[test]
+    fn the_proxy_closes_once_its_peripherals_are_gone_a_while() {
+        let start = Instant::now();
+        let mut held = Held::default();
+        assert!(
+            !held.done(start + LINK_GRACE * 10),
+            "nothing connected yet: still scanning"
+        );
+        let first = held.link(Link::default());
+        assert!(!held.done(start + LINK_GRACE * 10), "connected");
+        held.unlink(first, start);
+        assert!(
+            !held.done(start + LINK_GRACE - Duration::from_millis(1)),
+            "within the grace"
+        );
+        assert!(held.done(start + LINK_GRACE), "gone a while");
+        let second = held.link(Link::default());
+        assert_ne!(first, second, "a new handle");
+        assert!(!held.done(start + LINK_GRACE * 2), "connected again");
+        assert!(held.unlink(first, start).is_none(), "already gone");
     }
 
     #[test]

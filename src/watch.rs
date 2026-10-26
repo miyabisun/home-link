@@ -942,12 +942,20 @@ impl Notice {
                 text
             }),
             Self::Rejoined(lights) => sentences(lights, |light| {
-                let back = light.until.unwrap_or(light.since);
-                format!(
+                // Back when home-link registered it again, else when the check found it.
+                let back = light
+                    .rejoin
+                    .attempted_at
+                    .filter(|_| light.rejoin.rejoined)
+                    .or(light.until)
+                    .unwrap_or(light.since);
+                let mut text = format!(
                     "{}を登録し直しました（外れてから{}）。",
                     light.name,
                     span(back - light.left_at.unwrap_or(light.since))
-                )
+                );
+                text.extend(leaves_text(light.leaves));
+                text
             }),
             Self::NotRejoined(lights) => sentences(lights, |light| {
                 light
@@ -1778,8 +1786,8 @@ mod tests {
         );
         let text = notice.text();
         assert_eq!(
-            text, "物置き1を登録し直しました（外れてから4分）。",
-            "name and time out"
+            text, "物置き1を登録し直しました（外れてから3分）。",
+            "out until home-link registered it again, not until the check after"
         );
         assert_eq!(
             watch.pursued(),
@@ -1892,6 +1900,28 @@ mod tests {
         let text = Notice::Left(left_notices(&steps)[0].1.clone()).text();
         assert!(
             text.contains("14日で3回目です（前回 10-25 00:00）"),
+            "{text}"
+        );
+        // Back soon, before it was told it left: the return tells how often it left.
+        let mut watch = Watch::default();
+        let mut steps = run_left(&mut watch, 0, 0, |_| {
+            Some((
+                vec![other()],
+                vec![Left {
+                    leaves: vec![before(1)],
+                    ..storage_left(None)
+                }],
+            ))
+        });
+        watch.look(STORAGE, minute(0) + 30, true, true, true);
+        watch.attempted(STORAGE, minute(1), Ok(()));
+        steps.extend(run_left(&mut watch, 2, 2, |_| {
+            Some((vec![ledger_light(99, "物置き1", true), other()], vec![]))
+        }));
+        let text = notices(&steps)[0].1.text();
+        assert_eq!(
+            text,
+            "物置き1を登録し直しました（外れてから1分）。14日で2回目です（前回 10-25 00:00）。",
             "{text}"
         );
     }

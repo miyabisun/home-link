@@ -10,7 +10,7 @@ use futures_util::StreamExt;
 use crate::{
     AppState, UNPOISONED,
     ble_proxy::{self, Radio, Signals},
-    rejoin::{self, ATTEMPT_TIMEOUT, MATTER_SERVICE, Reason, Sought},
+    rejoin::{self, ATTEMPT_TIMEOUT, COMMISSION_WAIT, MATTER_SERVICE, Reason, Sought},
     watcher,
 };
 
@@ -191,37 +191,45 @@ async fn attempt(state: &AppState, radio: &Radio, proxy: &str, device: i64) -> R
         adapter = radio.name(),
         "rejoin: commissioning again"
     );
-    let shared = radio.is_first().await;
-    let hold = shared.then(|| state.meter.hold());
-    let timeout = Duration::from_secs(ATTEMPT_TIMEOUT.unsigned_abs());
+    // The meter's discovery stops only while the proxy is open, at most ATTEMPT_TIMEOUT.
+    let hold = radio.is_first().await.then(|| state.meter.hold());
+    let wait = Duration::from_secs(COMMISSION_WAIT.unsigned_abs());
     let (done, finished) = tokio::sync::oneshot::channel::<()>();
-    let serve = ble_proxy::serve(proxy, radio, async {
-        let _ = finished.await;
-    });
+    let serve = async {
+        let open = Duration::from_secs(ATTEMPT_TIMEOUT.unsigned_abs());
+        let served = ble_proxy::serve(proxy, radio, async {
+            let _ = tokio::time::timeout(open, finished).await;
+        })
+        .await;
+        drop(hold);
+        served
+    };
     let work = async {
-        let result = crate::recommission(state, device, timeout).await;
+        let result = crate::recommission(state, device, wait).await;
         let _ = done.send(());
         result
+            .map(|_| ())
+            .map_err(|error| Reason::of_failure(error.1))
     };
     tokio::pin!(serve, work);
-    let result = tokio::time::timeout(timeout + Duration::from_secs(5), async {
+    let result = tokio::time::timeout(wait + Duration::from_secs(5), async {
         tokio::select! {
             result = &mut work => {
                 let _ = (&mut serve).await;
-                result.map(|_| ()).map_err(|error| Reason::of_failure(error.1))
+                result
             }
             served = &mut serve => match served {
                 Err(error) => {
                     tracing::warn!(%error, "rejoin: no BLE proxy");
                     Err(Reason::NoBluetooth)
                 }
-                Ok(()) => (&mut work).await.map(|_| ()).map_err(|error| Reason::of_failure(error.1)),
+                // matterjs-server answers once its own discovery ends, after the proxy closed.
+                Ok(()) => (&mut work).await,
             },
         }
     })
     .await
     .unwrap_or(Err(Reason::ConnectFailed));
-    drop(hold);
     match &result {
         Ok(()) => tracing::info!(device_id = device, "rejoin: light commissioned again"),
         Err(reason) => tracing::warn!(

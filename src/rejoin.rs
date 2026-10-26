@@ -10,9 +10,12 @@ use crate::onboarding::{self, Discriminator};
 
 /// The service UUID a Matter device waiting for commissioning advertises under.
 pub const MATTER_SERVICE: &str = "0000fff6-0000-1000-8000-00805f9b34fb";
-/// The longest one commissioning may hold the meter's adapter, in seconds: under the five
+/// The longest home-link's BLE proxy stays open, holding the meter's adapter, in seconds: under the five
 /// minutes [`crate::meter::FRESH_FOR`] a reading stands, so the room's reading never lapses.
 pub const ATTEMPT_TIMEOUT: i64 = 180;
+/// How long to wait for matterjs-server to answer a commissioning, in seconds: after a light
+/// refuses the code, it answers only once its own discovery of about three minutes ends.
+pub const COMMISSION_WAIT: i64 = 240;
 /// How long the meter has its adapter back between two commissionings, in seconds.
 pub const METER_GAP: i64 = 60;
 /// How long an advertisement stands for a light waiting to be commissioned, in seconds.
@@ -142,18 +145,6 @@ impl Reason {
         }
     }
 
-    /// The reason in a few words, for the admin screen.
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::NoAdvert => "登録を待っていない",
-            Self::ConnectFailed => "つながらない",
-            Self::WrongCode => "コードが合わない",
-            Self::NoCode => "コードがない",
-            Self::NoBluetooth => "Bluetoothが使えない",
-        }
-    }
-
     /// The reason for the light `name` in a message: what holds it, and what the user can do.
     #[must_use]
     pub fn sentence(self, name: &str) -> String {
@@ -244,7 +235,19 @@ impl Pursuit {
             // A failure stands while the light keeps advertising; the next try may clear it.
             self.reason
                 .filter(|reason| matches!(reason, Reason::ConnectFailed | Reason::WrongCode))
-        } else if at - self.advert_at.unwrap_or(since).max(since) >= ADVERT_FRESH {
+        } else if self.reason == Some(Reason::WrongCode) {
+            // Switching the light off and on does not help a wrong code; it stands until tried again.
+            self.reason
+        } else if at
+            - [self.advert_at, Some(since), self.attempted_at]
+                .into_iter()
+                .flatten()
+                .max()
+                .unwrap_or(since)
+            >= ADVERT_FRESH
+        {
+            // Unheard for a minute since it was heard, it left, or it was last tried (nothing
+            // listens while trying).
             Some(Reason::NoAdvert)
         } else {
             self.reason
@@ -477,11 +480,45 @@ mod tests {
         assert!(!pursuit.due(T0 + 699), "a refused code waits ten minutes");
         pursuit.look(T0 + 700, T0, true, true, true);
         assert!(pursuit.due(T0 + 700), "then is tried again");
-        pursuit.look(T0 + 760, T0, true, true, false);
+        pursuit.attempted(T0 + 730, Err(Reason::ConnectFailed));
+        pursuit.look(T0 + 790, T0, true, true, false);
         assert_eq!(
             pursuit.reason,
             Some(Reason::NoAdvert),
             "the light stopped advertising: that is what holds it now"
+        );
+    }
+
+    #[test]
+    fn a_refused_code_stands_when_the_light_stops_advertising() {
+        let mut pursuit = heard(T0);
+        // Three minutes trying, unheard meanwhile: the advertisement is old when the try ends.
+        pursuit.attempted(T0 + 180, Err(Reason::WrongCode));
+        pursuit.look(T0 + 185, T0, true, true, false);
+        assert_eq!(pursuit.reason, Some(Reason::WrongCode), "just tried");
+        pursuit.look(T0 + 600, T0, true, true, false);
+        assert_eq!(
+            pursuit.reason,
+            Some(Reason::WrongCode),
+            "switching it off and on would not help a wrong code"
+        );
+    }
+
+    #[test]
+    fn a_light_unheard_while_it_was_tried_gets_a_minute_after_the_try() {
+        let mut pursuit = heard(T0);
+        pursuit.attempted(T0 + 180, Err(Reason::ConnectFailed));
+        pursuit.look(T0 + 239, T0, true, true, false);
+        assert_eq!(
+            pursuit.reason,
+            Some(Reason::ConnectFailed),
+            "under a minute since the try"
+        );
+        pursuit.look(T0 + 240, T0, true, true, false);
+        assert_eq!(
+            pursuit.reason,
+            Some(Reason::NoAdvert),
+            "a minute unheard after it"
         );
     }
 

@@ -41,7 +41,7 @@ export function stateText(
   state: string | null,
   leftFabric: boolean | null = false,
 ): string | null {
-  if (leftFabric) return "網から外れた";
+  if (leftFabric) return "登録が外れた";
   if (state === "unconnected") return "未接続";
   if (state === "no_response") return "応答なし";
   return null;
@@ -165,7 +165,7 @@ export function switchProblem(result: {
     ["応答なし", result.no_response, names("no_response")],
     ["失敗", result.failed, names("failed")],
     [
-      "網から外れた",
+      "登録が外れた",
       result.missing,
       result.missing_devices?.length
         ? `（${result.missing_devices.map((device) => device.name).join("・")}）`
@@ -313,7 +313,21 @@ export interface Outage {
   /** When the light left the fabric, and whether that is matterjs-server's time, a check's, or when it was found. */
   left_at?: number | null;
   left_by?: "event" | "check" | "unknown" | null;
+  /** For a light that left: home-link registering it again, and how often it left in two weeks. */
+  rejoin?: { attempts: number; reason: RejoinReason | null; rejoined: boolean };
+  leaves?: { count: number; previous_at: number | null };
 }
+
+export type RejoinReason =
+  "no_advert" | "connect_failed" | "wrong_code" | "no_code" | "no_bluetooth";
+
+const REJOIN_REASONS: Record<RejoinReason, string> = {
+  no_advert: "登録を待っていない",
+  connect_failed: "つながらない",
+  wrong_code: "コードが合わない",
+  no_code: "コードがない",
+  no_bluetooth: "Bluetoothが使えない",
+};
 
 export interface WatchLight {
   /** `null` for a light that left the fabric: matterjs-server serves no node for it. */
@@ -358,7 +372,7 @@ function span(seconds: number): string {
 
 /** The badge of a light that needs attention: left the fabric, or down. */
 export function watchBadge(light: WatchLight): string | null {
-  if (light.state === "left_fabric") return "網から外れた";
+  if (light.state === "left_fabric") return "登録が外れた";
   return light.connected ? null : "切断";
 }
 
@@ -367,7 +381,15 @@ export function watchNote(light: WatchLight, now: number): string {
   const outage = light.outage;
   if (light.state === "left_fabric" && outage?.left_at != null) {
     const at = moment(outage.left_at, now);
-    return `${outage.left_by === "unknown" ? `${at}に発見` : `${at}から`}・アプリで登録し直す`;
+    const parts = [
+      outage.left_by === "unknown" ? `${at}に発見` : `${at}から`,
+      "自動で登録し直し中",
+    ];
+    const { rejoin, leaves } = outage;
+    if (rejoin?.reason) parts.push(REJOIN_REASONS[rejoin.reason]);
+    if (rejoin?.attempts) parts.push(`${rejoin.attempts}回試した`);
+    if (leaves && leaves.count > 1) parts.push(`14日で${leaves.count}回目`);
+    return parts.join("・");
   }
   const parts = light.since === null ? [] : [`${moment(light.since, now)}から`];
   if (light.connected || outage === null) {
@@ -384,7 +406,7 @@ export function watchNote(light: WatchLight, now: number): string {
 /** When a stretch out of reach began and ended, and how long it lasted. */
 export function outageText(outage: Outage, now: number): string {
   const start = moment(outage.started_at, now);
-  const left = outage.left_at != null ? "・網から外れた" : "";
+  const left = outage.left_at != null ? "・登録が外れた" : "";
   if (outage.ended_at === null)
     return `${start}〜（${span(now - outage.started_at)}、続いている）${left}`;
   return `${start}〜${moment(outage.ended_at, now)}（${span(outage.ended_at - outage.started_at)}）${left}`;

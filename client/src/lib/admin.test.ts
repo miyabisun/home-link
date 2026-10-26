@@ -78,7 +78,7 @@ describe("device states", () => {
   });
 
   it("tells a device that left the fabric from one never connected", () => {
-    expect(stateText("unconnected", true)).toBe("網から外れた");
+    expect(stateText("unconnected", true)).toBe("登録が外れた");
     expect(stateText("unconnected", false)).toBe("未接続");
     expect(stateText(null, null)).toBeNull();
   });
@@ -203,7 +203,7 @@ describe("switch results", () => {
   it("names the devices that did not switch, or nothing when all did", () => {
     expect(switchProblem({ no_response: 0, failed: 0, missing: 0 })).toBeNull();
     expect(switchProblem({ no_response: 2, failed: 0, missing: 1 })).toBe(
-      "応答なし 2・網から外れた 1",
+      "応答なし 2・登録が外れた 1",
     );
     expect(switchProblem({ no_response: 0, failed: 1, missing: 0 })).toBe(
       "失敗 1",
@@ -240,7 +240,7 @@ describe("switch results", () => {
         missing: 1,
         missing_devices: [{ name: "物置き1" }],
       }),
-    ).toBe("網から外れた 1（物置き1）");
+    ).toBe("登録が外れた 1（物置き1）");
   });
 
   it("points to the Thread base when only Thread devices did not answer", () => {
@@ -483,7 +483,7 @@ describe("the light watch", () => {
         left_by: "event" as const,
       },
     };
-    expect(watchNote(left, now)).toBe("10/21 09:17から・アプリで登録し直す");
+    expect(watchNote(left, now)).toBe("10/21 09:17から・自動で登録し直し中");
     expect(
       watchNote(
         {
@@ -492,14 +492,49 @@ describe("the light watch", () => {
         },
         now,
       ),
-    ).toBe("00:14に発見・アプリで登録し直す");
-    expect(watchBadge(left)).toBe("網から外れた");
+    ).toBe("00:14に発見・自動で登録し直し中");
+    expect(
+      watchNote(
+        {
+          ...left,
+          outage: {
+            ...left.outage,
+            rejoin: {
+              attempts: 3,
+              reason: "wrong_code" as const,
+              rejoined: false,
+            },
+            leaves: { count: 2, previous_at: T0 - 86_400 },
+          },
+        },
+        now,
+      ),
+    ).toBe(
+      "10/21 09:17から・自動で登録し直し中・コードが合わない・3回試した・14日で2回目",
+    );
+    expect(
+      watchNote(
+        {
+          ...left,
+          outage: {
+            ...left.outage,
+            rejoin: {
+              attempts: 0,
+              reason: "no_advert" as const,
+              rejoined: false,
+            },
+          },
+        },
+        now,
+      ),
+    ).toBe("10/21 09:17から・自動で登録し直し中・登録を待っていない");
+    expect(watchBadge(left)).toBe("登録が外れた");
     expect(watchBadge({ ...light, connected: false, state: "down" })).toBe(
       "切断",
     );
     expect(watchBadge(light)).toBeNull();
     expect(outageText(left.outage, now)).toBe(
-      "10/21 09:17〜（4日15時間13分、続いている）・網から外れた",
+      "10/21 09:17〜（4日15時間13分、続いている）・登録が外れた",
     );
   });
 });

@@ -72,6 +72,15 @@ const left = {
     device_id: 19,
     left_at: minutes(5 * 1440),
     left_by: "event",
+    rejoin: {
+      attempts: 4,
+      attempted_at: minutes(3),
+      reason: "no_advert",
+      reason_since: minutes(2),
+      advert_at: minutes(10),
+      rejoined: false,
+    },
+    leaves: { count: 2, previous_at: minutes(9 * 1440) },
   },
 };
 const server = {
@@ -152,8 +161,10 @@ for (const size of widths) {
       await expect(cards.nth(0).locator(".badge")).toHaveCount(0);
       await expect(cards.nth(1).locator(".badge")).toHaveText("切断");
       await expect(cards.nth(1)).toContainText("つなぎ直し3回・網で届かない");
-      await expect(cards.nth(3).locator(".badge")).toHaveText("網から外れた");
-      await expect(cards.nth(3)).toContainText("から・アプリで登録し直す");
+      await expect(cards.nth(3).locator(".badge")).toHaveText("登録が外れた");
+      await expect(cards.nth(3)).toContainText(
+        "から・自動で登録し直し中・登録を待っていない・4回試した・14日で2回目",
+      );
       await expect(page.getByRole("alert")).toContainText(
         "matterjs-serverに届きません",
       );
@@ -168,7 +179,7 @@ for (const size of widths) {
       await history.locator("summary").click();
       // Newest first; the one still going says so.
       await expect(history.locator("li").nth(0)).toContainText("続いている");
-      await expect(history.locator("li").nth(1)).toContainText("網から外れた");
+      await expect(history.locator("li").nth(1)).toContainText("登録が外れた");
       await expect(history.locator("li").nth(2)).toContainText("（7分）");
       await noSideScroll(page);
       await page.screenshot({

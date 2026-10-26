@@ -309,9 +309,12 @@ fn save(db: &Connection, outage: &Outage) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Logs `change` on one line, and keeps it in the history.
+/// Keeps `change` in the history; its own module logs it.
 pub(crate) fn keep(state: &AppState, change: &Change) {
-    record(state, change);
+    let (Change::Down(outage) | Change::Updated(outage) | Change::Up(outage)) = change;
+    if let Err(error) = save(&state.db.lock().expect(UNPOISONED), outage) {
+        tracing::warn!(%error, "light history not saved");
+    }
 }
 
 /// Logs `change` on one line, and keeps it in the history.

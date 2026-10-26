@@ -85,7 +85,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .ok()
             .filter(|value: &String| !value.is_empty())
     };
-    let adapter = env("BLUETOOTH_ADAPTER");
+    let adapter = env("REJOIN_BLUETOOTH_ADAPTER");
     info!(
         adapter = adapter.as_deref().unwrap_or("first"),
         "lights that leave are looked for over Bluetooth"

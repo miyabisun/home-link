@@ -71,6 +71,8 @@ curl http://127.0.0.1:5011/healthz
 | `SESAME_UUID` | なし | 解錠するSESAMEのUUID（SESAMEアプリの機器の画面にあります）。 |
 | `SESAME_SECRET_KEY` | なし | SESAMEの秘密鍵（32桁の16進数）。SESAMEアプリで共有する鍵のQRコードを上のページで読み取ると得られます。 |
 | `SWITCHBOT_METER_ADDRESS` | なし | 受信するSwitchBot CO2センサー（W4900010）のBluetoothアドレス（例: `AA:BB:CC:DD:EE:01`）。未設定なら受信しません。 |
+| `REJOIN_BLUETOOTH_ADAPTER` | 最初のアダプタ | 登録が外れた照明をBluetoothで探し、登録し直すアダプタの名前（例: `hci1`）。温度計と分けるときや、照明の届く位置に2台目を置くときに設定します。 |
+| `MATTER_BLE_PROXY_URL` | `MATTER_SERVER_URL` の `/ws` を `/ble` にしたもの | 登録し直しで使う、matterjs-serverのBLE Proxy。matterjs-serverは `--ble-proxy` で起動しておきます。 |
 | `DISCORD_WEBHOOK_URL` | なし | 照明の見張りの知らせを送るDiscordのWebhook。WebhookのURL（`https://discord.com/api/webhooks/<id>/<token>`）か、Watchtowerと同じ `discord://<token>@<id>` の形で書きます。未設定なら知らせだけを送りません。 |
 | `GSI_URL` | `https://msearch.gsi.go.jp/address-search/AddressSearch` | 住所から座標を引く国土地理院の住所検索API。試験で差し替えるときだけ設定します。 |
 | `OPEN_METEO_URL` | `https://api.open-meteo.com/v1/forecast` | 外気温を取るOpen-MeteoのAPI。試験で差し替えるときだけ設定します。 |
@@ -92,6 +94,7 @@ docker run -d --name home-link -p 5011:3000 -v home-link-data:/data \
 - アダプタが外れたり、BlueZやD-Busに届かなかったりしても、ほかの機能はそのまま動き、1分ごとに受信をやり直します。
   D-Busへの接続とBlueZへの各呼び出しは5秒で打ち切るので、BlueZが応答しなくなっても受信が黙って止まりません。
 - 機器の登録（`POST /api/commission` など）の間は受信を止め、BluetoothをBLE Proxyに譲ります。終わると受信に戻ります。
+  登録が外れた照明をhome-linkが登録し直す間も、同じアダプタなら受信を止めます。1回は最長3分で、次の登録し直しまで1分以上は受信に戻すので、温度計の値（5分有効）が途切れません。
 - 起動時のログは温度計が設定されたことだけを示し、アドレスの値は出しません。
 
 ### ログ
@@ -144,28 +147,35 @@ matterjs-serverに届かなくなったときは `warn` の `matterjs-server out
 - 知らせの送り先が未設定でも、見張り・つなぎ直し・履歴は同じように動きます。送り先が受け付けなかった知らせは、次の確かめで送り直します（20通まで）。
 - home-linkを起動し直しても、続いている区間と知らせた事実を引き継ぎます。同じ照明を重ねて知らせず、戻ったら知らせます。
 
-#### 網（fabric）から外れた照明
+#### 登録が外れた照明
 
-台帳の照明のうち、一度つながった（製造番号で見つかった）のにmatterjs-serverが持たなくなったものは、網から外れています。
-電球が自分からLeaveを送ったときなど、matterjs-serverはそのnodeを消すため、つなぎ直しでは戻りません。home-linkはこの照明も見張りに残し、「応答しない」とは分けて扱います。
+台帳の照明のうち、一度つながった（製造番号で見つかった）のにmatterjs-serverが持たなくなったものは、登録が外れています（Matterのfabricからの離脱）。
+電球が自分からLeaveを送ると、電球はfabricの鍵を消し、matterjs-serverはそのnodeを消します。つなぎ直しでは戻らないため、home-linkは保存したコードで登録し直します。
 
 - 外れた時刻は、matterjs-serverが送るnodeの削除（`start_listening` の `node_removed`）を受けた時刻です。受けていなければ、毎分の確かめで見つけた時刻を使います。
-  home-linkが見張る前から外れていた照明は、見つけた時刻を示し、いつ外れたかは分からないとします。
-- 外れて5分で、Discordへ1通知らせます（照明名・label・製造番号・いつから・戻し方）。つなぎ直しは送りません。
-- home-linkアプリで登録し直すと、製造番号で台帳の同じ行へ戻ります。戻ったら1通知らせ、区間を閉じます。
+- 外れた照明がある間、home-linkはホストのBluetooth（BlueZ）で、登録を待つMatterの広告（サービス `0xFFF6`）を探し続けます。
+  台帳のコードの識別子（discriminator。QRコードなら12ビットと製品、手動のコードなら上位4ビット）が合う広告を聞いたら、すぐにそのコードで登録し直します。
+  home-link自身がmatterjs-serverのBLE Proxy（`MATTER_BLE_PROXY_URL`）のclientになり、電話のアプリと同じ役を務めます。電話のアプリでの登録もそのまま使えます。
+- 登録し直した照明は台帳の同じ行（名前・label）へ戻ります。戻ったら、外れてから戻るまでの時間を1通知らせます。
+- 失敗したら30秒から倍々に最長3分おきに試し直します。コードを受け付けなかったときは10分おきです。広告が出ない間も探し続け、壁のスイッチで電源を入れ直して広告が出れば、その時点で戻します。
+- 戻らない理由は、`no_advert`（登録を待っていない）・`connect_failed`（つながらない）・`wrong_code`（コードが合わない）・`no_code`（コードがない）・`no_bluetooth`（Bluetoothが使えない）に分けます。
+  外れて5分の知らせにその時の理由と取る操作を添え、別の理由が5分続いたらまた1通知らせます。管理画面にも理由と試した回数を示します。
+- 14日の履歴で同じ照明が何度外れたかを数え、2回目からは回数と前回の時刻を知らせと管理画面に示します（交換の判断の材料）。
 - 外れた時の手がかりとして、最後のSoftware Version（`0/40/10`）、Threadなら最後の親（RLOC16）を履歴に残し、警告のログを1行書きます（時刻はUTC）。
 - 最後に照明以外の種類（プラグなど）だった機器は見張りません。無視の機器も見張りません。無視はuserが台帳で付けるもので、home-linkは付けません。
 
 | API | 内容 |
 | --- | --- |
-| `GET /api/lights/watch` | 今の状態。`server_reachable`（最後の確かめでmatterjs-serverに届いたか）、`server_since`、`server_outage`、`wifi_all_down`（見張るWi-Fiの照明が1台以上あり、全て切れている。網から外れた照明は数えません）、`notify`（送り先があるか）、照明ごとの `connected`・`state`（`connected`・`down`・`left_fabric`）・`device_id`（台帳の行）・`since`（つながった、または切れた時刻）・`last_answer`（最後に読み取りに答えた時刻）・`outage`。網から外れた照明は `node_id`・`endpoint`・`network` がnullで、最後の網は `outage` にあります |
+| `GET /api/lights/watch` | 今の状態。`server_reachable`（最後の確かめでmatterjs-serverに届いたか）、`server_since`、`server_outage`、`wifi_all_down`（見張るWi-Fiの照明が1台以上あり、全て切れている。登録が外れた照明は数えません）、`notify`（送り先があるか）、照明ごとの `connected`・`state`（`connected`・`down`・`left_fabric`）・`device_id`（台帳の行）・`since`（つながった、または切れた時刻）・`last_answer`（最後に読み取りに答えた時刻）・`outage`。登録が外れた照明は `node_id`・`endpoint`・`network` がnullで、最後の網は `outage` にあります |
 | `GET /api/lights/outages` | 14日分の、照明とmatterjs-serverがつながらなかった区間。古い順。`since`（その時刻より後に続いていた区間）、`node_id` と `endpoint`（1台の照明）で絞れます |
 | `GET /api/lights/connected?at=<Unix秒>` | その時刻の分の確かめで、照明ごとにつながっていたか（`connected`・`state`・`device_id`）。確かめた記録が無い時刻は404 `not_checked` |
 | `POST /api/lights/watch/test` | 試しの知らせを1通送ります。送り先が未設定なら503 `notify_not_configured`、送れなければ502 `notify_failed` |
 
 区間は `started_at`・`ended_at`（続いていればnull）・`network`・`found_by`（`unavailable`・`no_answer`・`left_fabric`・matterjs-serverの `unreachable`）・`reconnects`・`reconnect_result`（`accepted` か失敗の理由）・`reachable`（pingが届いたか）を持ちます。
-網から外れた照明の区間は、`device_id`・`left_at`・`left_by`（`event`・`check`・`unknown`）・`labels`・`serial_number`・`software_version`・`thread_parent` も持ちます。
-応答が無いまま網から外れた照明は、切れた時からの区間に `left_at` が付きます。
+登録が外れた照明の区間は、`device_id`・`left_at`・`left_by`（`event`・`check`・`unknown`）・`labels`・`serial_number`・`software_version`・`thread_parent` と、
+登録し直しの `rejoin_attempts`・`rejoin_reason`・`rejoined` と、14日の `leaves`（この回を含む回数）・`previous_left_at` も持ちます。
+`GET /api/lights/watch` の `outage` では、`rejoin`（`attempts`・`attempted_at`・`reason`・`reason_since`・`advert_at`・`rejoined`）と `leaves`（`count`・`previous_at`）の形です。
+応答が無いまま登録が外れた照明は、切れた時からの区間に `left_at` が付きます。
 時刻はUnix秒です。
 
 ```sh
@@ -183,12 +193,12 @@ curl http://home-link.example:5011/api/lights/watch
 
 | 画面 | できること |
 | --- | --- |
-| 機器（最初の画面） | 台帳の機器の一覧。名前、付いているlabel、入っているプラグと、未接続・網から外れた・応答なし・無視の機器はその状態を示します。選ぶと機器の画面を開きます |
+| 機器（最初の画面） | 台帳の機器の一覧。名前、付いているlabel、入っているプラグと、未接続・登録が外れた・応答なし・無視の機器はその状態を示します。選ぶと機器の画面を開きます |
 | 機器の画面 | 名前の変更、labelの割り当て（チェックで付け外し）、無視の設定、プラグの入り切り、台帳からの削除（確認してから） |
 | ラベル（右上のメニュー） | labelの一覧と作成。一覧は固定・自動調光の別、機器の台数、入っているかを示します。名前を入れて「追加」で作り、そのlabelの画面を開きます |
 | labelの画面 | 名前の変更、入り切り、調光（なし・自動調光・固定）、固定の明るさ（%）と色温度（K）、毎日の時刻での入・切、機器の割り当て、削除（確認してから） |
 | 温度計（右上のメニュー） | 温度計の今の温度・湿度・CO2・電池と受けた時刻。受信が途絶えたときは、最後に受けた時刻だけを示します |
-| 照明の接続（右上のメニュー） | 照明ごとに、いつからつながっているかと最後に答えた時刻、切れている照明はいつからか・つなぎ直した回数・網の層で届くか。網から外れた照明は「網から外れた」といつから、アプリで登録し直すことを示します。matterjs-serverに届かないときは画面の上部に示します。「14日の履歴」を開くとつながらなかった区間を新しい順に並べます。「試しに知らせる」で送り先へ試しの知らせを1通送ります |
+| 照明の接続（右上のメニュー） | 照明ごとに、いつからつながっているかと最後に答えた時刻、切れている照明はいつからか・つなぎ直した回数・網の層で届くか。登録が外れた照明は「登録が外れた」といつから、自動で登録し直していること、戻らない理由・試した回数・14日で何回目かを示します。matterjs-serverに届かないときは画面の上部に示します。「14日の履歴」を開くとつながらなかった区間を新しい順に並べます。「試しに知らせる」で送り先へ試しの知らせを1通送ります |
 | エアコン（右上のメニュー） | 目標の温度（18〜30℃）の変更、自動調整の入・切、室温・湿度・外気温とその時刻、エアコンの今の運転（「冷房 25℃」「切」など）、直近の判断の理由。「設定」に家の住所の登録と夜の時間帯 |
 
 変えた値はその場でAPIへ送り、保存ボタンはありません。値の誤りはその入力の下に、サーバーが受け付けなかった理由は画面の上部に示します。
@@ -417,7 +427,7 @@ Thread網の資格情報（dataset）は、matterjs-serverに `set_thread_datase
 | `POST /api/labels` | labelの作成。本文は `{"name": "work", "override_level": 254, "override_kelvin": 5000}`、`{"name": "ambient", "auto": true}`、`{"name": "razor", "schedule": [{"time": "00:00", "on": true}, {"time": "05:00", "on": false}]}` など（下の「label」） | 400 `invalid_label_name`・`invalid_label`、409 `duplicate_label_name` |
 | `PATCH /api/labels/{id}` | labelの名前・性質・`schedule` のうち、送った項目だけを変更します。`override_level`・`override_kelvin` を `null` にすると上書きの値を外し、`schedule` は送ったもので置き換えます（`[]` で消す） | 400 `invalid_label_name`・`invalid_label`、404 `label_not_found`、409 `duplicate_label_name` |
 | `DELETE /api/labels/{id}` | labelの削除。割り当てた機器は、ほかのlabelだけになります | 404 `label_not_found` |
-| `POST /api/labels/{id}/on`・`/off`・`/toggle` | labelの機器（照明とプラグ、無視の機器を除く）をON・OFF・切り替えにします（下の「label」）。応答は、行った操作 `action`（`on`・`off`・`release`）、操作後の `on`・`boosted`、件数（`switched`・`no_response`・`failed`・`missing`）、機器ごとの結果 `devices` と、網から外れた機器 `missing_devices` です | 404 `label_not_found`、422 `label_has_no_devices`、503 `matter_server_not_configured`、502 `matter_server_unreachable` |
+| `POST /api/labels/{id}/on`・`/off`・`/toggle` | labelの機器（照明とプラグ、無視の機器を除く）をON・OFF・切り替えにします（下の「label」）。応答は、行った操作 `action`（`on`・`off`・`release`）、操作後の `on`・`boosted`、件数（`switched`・`no_response`・`failed`・`missing`）、機器ごとの結果 `devices` と、登録が外れた機器 `missing_devices` です | 404 `label_not_found`、422 `label_has_no_devices`、503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `GET /api/wifi` | 保存したWi-Fiの一覧（`id`・`ssid`・機器に渡すものか `for_devices`）。パスワードは返しません | |
 | `POST /api/wifi` | Wi-Fiの保存。本文は `{"ssid": "home-2g", "password": "…"}`。同じSSIDならパスワードを置き換えます。最初の1つ、または `"for_devices": true` で送ったものを機器に渡します | 400 `invalid_wifi` |
 | `PUT /api/wifi/devices` | 機器に渡すWi-Fiの指定。本文は `{"id": 2}` | 404 `wifi_not_found` |
@@ -536,7 +546,7 @@ matterjs-serverとの通信は、接続（3秒）・全nodeの読み取り（5�
 接続は受けるが応答しないmatterjs-serverでも、要求と10分ごと・1分ごとの処理は止まりません。
 照明・label・プラグの1回の要求がmatterjs-serverに使う時間は、全部で約15秒までです。
 アプリが接続の後に応答を待つ20秒より短くしています。
-照明の `name` は台帳の機器名で、台帳に無い照明は製品名です。台帳の機器のうち、一度つながったのにmatterjs-serverに見えないもの（網から外れた機器）は `missing_devices` に並び、
+照明の `name` は台帳の機器名で、台帳に無い照明は製品名です。台帳の機器のうち、一度つながったのにmatterjs-serverに見えないもの（登録が外れた機器）は `missing_devices` に並び、
 `missing` に数えます。`missing_devices` の各機器は `id`・`name`・`state`（`left_fabric`）・`left_at`（見張りが知る外れた時刻、知らなければnull）を持ちます。状態の `GET /api/lights` は、matterjs-serverが最後に読んだOn/Offの値を返します。
 
 #### 二度と応答しない照明を無視する
