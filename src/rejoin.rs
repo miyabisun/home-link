@@ -157,28 +157,14 @@ impl Reason {
         }
     }
 
-    /// The reason for the light `name` in a message: what holds it, and what the user can do.
+    /// What the user can do to bring the light back, as a message tells it: nothing when
+    /// home-link only has to keep trying.
     #[must_use]
-    pub fn sentence(self, name: &str) -> String {
+    pub const fn action(self) -> Option<&'static str> {
         match self {
-            Self::NoAdvert => {
-                format!(
-                    "{name}がまだ登録を待っていません。壁のスイッチで電源を入れ直してください。"
-                )
-            }
-            Self::ConnectFailed => format!("{name}につながらず、登録し直せていません。"),
-            Self::WrongCode => {
-                format!("{name}が保存したコードを受け付けません。アプリで登録し直してください。")
-            }
-            Self::NoCode => {
-                format!("{name}のコードが保存されていません。アプリで登録し直してください。")
-            }
-            Self::NoBluetooth => {
-                format!("homeserverのBluetoothが使えず、{name}を登録し直せていません。")
-            }
-            Self::AdapterLost => {
-                format!("{name}を登録し直す途中で、homeserverのBluetoothが途切れました。")
-            }
+            Self::NoAdvert => Some("壁のスイッチで電源を入れ直してください。"),
+            Self::WrongCode | Self::NoCode => Some("アプリで登録し直してください。"),
+            Self::ConnectFailed | Self::NoBluetooth | Self::AdapterLost => None,
         }
     }
 
@@ -193,9 +179,6 @@ impl Reason {
         }
     }
 }
-
-/// The bit of [`Pursuit::told`] for the tries slowing down after losing the adapter.
-const SLOWED: u8 = 64;
 
 /// How long to wait after the `attempts`-th failed try before the next, in seconds: doubling
 /// from 30 s up to [`MAX_RETRY`], so a light that advertises for a few minutes after it is
@@ -366,10 +349,6 @@ impl Pursuit {
         }
         self.slowed_until =
             (self.adapter_losses >= ADAPTER_LOSSES_TO_SLOW).then_some(at + ADAPTER_LOST_RETRY);
-        if self.slowed_until.is_none() {
-            // A later slowing down is told anew.
-            self.told &= !SLOWED;
-        }
         match result {
             Ok(()) => {
                 self.rejoined = true;
@@ -389,14 +368,11 @@ impl Pursuit {
         again
     }
 
-    /// The reason to tell at `at`: one that has stood for [`TELL_AFTER`] and was not told in this
-    /// stretch, or any once the tries slowed down; it is marked told.
+    /// The reason to tell at `at`: one the user can do something about, that has stood for
+    /// [`TELL_AFTER`] and was not told in this stretch; it is marked told. Slowed tries are not
+    /// told: they ask nothing of the user.
     pub fn tell(&mut self, at: i64) -> Option<Reason> {
-        let reason = self.reason?;
-        if self.slowed_until.is_some() && self.told & SLOWED == 0 {
-            self.told |= SLOWED | reason.bit();
-            return Some(reason);
-        }
+        let reason = self.reason.filter(|reason| reason.action().is_some())?;
         let stood = at - self.reason_since? >= TELL_AFTER;
         (stood && self.told & reason.bit() == 0).then(|| {
             self.told |= reason.bit();
@@ -408,9 +384,6 @@ impl Pursuit {
     pub fn told_now(&mut self) {
         if let Some(reason) = self.reason {
             self.told |= reason.bit();
-            if self.slowed_until.is_some() {
-                self.told |= SLOWED;
-            }
         }
     }
 }
@@ -677,8 +650,8 @@ mod tests {
         assert_eq!(pursuit.tell(T0 + 839), None, "a failure under five minutes");
         assert_eq!(
             pursuit.tell(T0 + 840),
-            Some(Reason::ConnectFailed),
-            "another reason, told too"
+            None,
+            "nothing for the user to do: home-link keeps trying"
         );
         pursuit.look(T0 + 900, T0, true, true, false);
         pursuit.look(T0 + 2000, T0, true, true, false);
@@ -920,9 +893,9 @@ mod tests {
         );
         left.look(T0 + 120, T0, true, true, true);
         assert_eq!(
-            left.tell(T0 + 121),
-            Some(Reason::AdapterLost),
-            "the slowing down not yet told is told with its reason"
+            left.tell(T0 + 421),
+            None,
+            "a lost adapter asks nothing of the user: not told"
         );
     }
 
@@ -940,26 +913,13 @@ mod tests {
     }
 
     #[test]
-    fn slowing_down_is_told_at_once_and_once() {
+    fn slowing_down_is_not_told() {
         let mut pursuit = heard(T0);
         pursuit.attempted(T0 + 20, Err(Reason::AdapterLost));
-        assert_eq!(pursuit.tell(T0 + 30), None, "a loss under five minutes");
         pursuit.attempted(T0 + 60, Err(Reason::AdapterLost));
-        assert_eq!(
-            pursuit.tell(T0 + 61),
-            Some(Reason::AdapterLost),
-            "slowed: told now"
-        );
-        assert_eq!(pursuit.tell(T0 + 400), None, "told once");
-        pursuit.attempted(T0 + 1900, Err(Reason::ConnectFailed));
-        pursuit.attempted(T0 + 1990, Err(Reason::AdapterLost));
-        pursuit.attempted(T0 + 2050, Err(Reason::AdapterLost));
-        assert!(pursuit.tell(T0 + 2051).is_some(), "slowed anew: told again");
-        let mut left = heard(T0);
-        left.attempted(T0 + 20, Err(Reason::AdapterLost));
-        left.attempted(T0 + 60, Err(Reason::AdapterLost));
-        left.told_now();
-        assert_eq!(left.tell(T0 + 61), None, "went out with the left message");
+        assert!(pursuit.slowed_until.is_some(), "slowed");
+        assert_eq!(pursuit.tell(T0 + 61), None, "nothing for the user to do");
+        assert_eq!(pursuit.tell(T0 + 400), None, "nor after five minutes");
     }
 
     #[test]

@@ -294,7 +294,7 @@ async fn a_wifi_bulb_drops_out_and_comes_back(rig: &Rig) {
         let messages = messages.lock().unwrap();
         assert_eq!(messages.len(), 1, "{messages:?}");
         assert!(
-            messages[0].contains("玄関（Wi-Fi）: 00:01から"),
+            messages[0].contains("玄関が00:01からつながっていません。"),
             "{}",
             messages[0]
         );
@@ -316,7 +316,7 @@ async fn a_wifi_bulb_drops_out_and_comes_back(rig: &Rig) {
     matter.lock().unwrap().unavailable.retain(|node| *node != 5);
     home.check_lights(minute(8)).await;
     assert!(
-        messages.lock().unwrap()[1].contains("玄関（Wi-Fi）: 7分つながっていませんでした"),
+        messages.lock().unwrap()[1].contains("玄関が7分ぶりにつながりました。"),
         "{:?}",
         messages.lock().unwrap()
     );
@@ -343,12 +343,12 @@ async fn matterjs_server_drops_out_and_comes_back(rig: &Rig) {
         let messages = messages.lock().unwrap();
         assert_eq!(messages.len(), 4, "{messages:?}");
         assert!(
-            messages[2].contains("matterjs-serverに5分以上届きません（00:10から）"),
+            messages[2].contains("matterjs-serverに00:10からつながりません。"),
             "{}",
             messages[2]
         );
         assert!(
-            messages[3].contains("matterjs-serverに再び届きました"),
+            messages[3].contains("matterjs-serverに6分ぶりにつながりました。"),
             "{}",
             messages[3]
         );
@@ -435,7 +435,7 @@ async fn a_silent_thread_bulb_is_reconnected_and_a_test_is_sent(rig: &Rig) {
             .unwrap()
             .last()
             .unwrap()
-            .contains("試しの知らせ")
+            .contains("試しに送りました")
     );
     assert_eq!(
         asked(matter, "device_command"),
@@ -501,7 +501,7 @@ async fn a_notice_the_destination_refused_is_sent_at_the_next_check() {
     let messages = messages.lock().unwrap();
     assert_eq!(messages.len(), 1, "{messages:?}");
     assert!(
-        messages[0].contains("玄関（Wi-Fi）: 00:00から"),
+        messages[0].contains("玄関が00:00からつながっていません。"),
         "{}",
         messages[0]
     );
@@ -537,7 +537,7 @@ async fn after_a_restart_a_light_told_down_is_not_told_again_and_is_told_back() 
     let messages = messages.lock().unwrap();
     assert_eq!(messages.len(), 2, "{messages:?}");
     assert!(
-        messages[1].contains("27分つながっていませんでした"),
+        messages[1].contains("27分ぶりにつながりました"),
         "{}",
         messages[1]
     );
@@ -588,7 +588,7 @@ async fn a_thread_bulb_leaves_the_fabric(rig: &Rig) {
         let messages = messages.lock().unwrap();
         assert_eq!(messages.len(), 1, "{messages:?}");
         assert!(
-            messages[0].starts_with("寝室の登録が外れました（00:00）"),
+            messages[0].starts_with("寝室の登録が00:00に外れました。"),
             "{}",
             messages[0]
         );
@@ -736,7 +736,7 @@ async fn the_bulb_registered_again_is_back(rig: &Rig) {
         let messages = messages.lock().unwrap();
         assert_eq!(messages.len(), 2, "{messages:?}");
         assert!(
-            messages[1].contains("寝室を登録し直しました（外れてから9分）"),
+            messages[1].contains("寝室の登録が9分ぶりに戻りました。"),
             "{}",
             messages[1]
         );
