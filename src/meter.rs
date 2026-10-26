@@ -30,6 +30,9 @@ const ADAPTER: &str = "org.bluez.Adapter1";
 const TICK: Duration = Duration::from_secs(10);
 /// How long to wait before reaching the system bus again.
 const RETRY: Duration = Duration::from_mins(1);
+/// How long connecting to the system bus, and each call to `BlueZ`, may take: zbus waits forever
+/// by default, and a stuck `BlueZ` would hold the meter's reading still without a word.
+const DBUS_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long discovery may stay quiet before it is started again (another HCI user may have stopped it).
 pub const QUIET_FOR: i64 = 120;
 
@@ -195,7 +198,14 @@ enum Event {
 }
 
 async fn listen(meter: &Meter, device: &str, clock: fn() -> i64) -> zbus::Result<()> {
-    let bus = Connection::system().await?;
+    let bus = tokio::time::timeout(
+        DBUS_TIMEOUT,
+        zbus::connection::Builder::system()?
+            .method_timeout(DBUS_TIMEOUT)
+            .build(),
+    )
+    .await
+    .map_err(|_| zbus::Error::Failure("the system bus did not answer in time".into()))??;
     let rule = MatchRule::builder()
         .msg_type(Type::Signal)
         .interface("org.freedesktop.DBus.Properties")?

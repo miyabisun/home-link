@@ -95,6 +95,60 @@ async fn health_endpoints_respond() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+/// `GET /healthz`: its status and text.
+async fn healthz(app: &Router) -> (StatusCode, String) {
+    let request = Request::builder()
+        .uri("/healthz")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, String::from_utf8(bytes.to_vec()).unwrap())
+}
+
+#[tokio::test]
+async fn a_periodic_task_that_panics_is_started_again_and_healthz_tells() {
+    let home = home_link::Home::new(home_link::open_db(":memory:").unwrap(), None);
+    let app = home.router();
+    assert_eq!(healthz(&app).await, (StatusCode::OK, "ok\n".into()));
+
+    let runs = Arc::new(AtomicUsize::new(0));
+    let counted = runs.clone();
+    home.supervise("flaky", move |_| {
+        let runs = counted.clone();
+        async move {
+            assert!(
+                runs.fetch_add(1, Ordering::SeqCst) > 0,
+                "the first run panics"
+            );
+            std::future::pending::<()>().await;
+        }
+    });
+    within("the second run", Duration::from_secs(5), async {
+        while runs.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    let (status, text) = healthz(&app).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert!(text.starts_with("ok\n"), "{text}");
+    assert!(text.contains("flaky running restarts=1"), "{text}");
+
+    // A loop that ends is not started again, and the server is no longer healthy.
+    home.supervise("ending", |_| async {});
+    within("the end", Duration::from_secs(5), async {
+        while healthz(&app).await.0 == StatusCode::OK {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    let (status, text) = healthz(&app).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{text}");
+    assert!(text.contains("ending stopped restarts=0"), "{text}");
+}
+
 const TAPO: &str = "AABBCCDDEEFF";
 
 #[tokio::test]
@@ -241,6 +295,45 @@ async fn status_locates_ledger_devices_on_the_matter_server() {
 }
 
 #[tokio::test]
+async fn a_serial_number_in_another_case_is_the_same_device() {
+    // The bridge reports the serial in lower case, the ledger holds it as printed on the box.
+    let nodes = json!([
+        { "node_id": 1, "attributes": { "0/40/1": "Aqara", "0/40/15": "hub", "3/57/1": "Aqara", "3/57/15": "54ef441001372c4c" }},
+        { "node_id": 5, "attributes": { "0/40/1": "Tapo", "0/40/15": TAPO }},
+    ]);
+    let addr = fake_matter_server(nodes).await;
+    let (db, sql) = ledger();
+    let app = home_link::app(db, Some(format!("ws://{addr}/ws")));
+    for body in [
+        json!({ "vendor": "Aqara", "serial_number": "54EF441001372C4C", "name": "B" }),
+        json!({ "vendor": "Tapo", "serial_number": TAPO.to_lowercase(), "name": "A" }),
+    ] {
+        add_device(&app, &sql, body).await;
+    }
+    let (status, body) = call(&app, "GET", "/api/status", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let seen: Vec<_> = body["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            (
+                d["name"].clone(),
+                d["node_id"].clone(),
+                d["endpoint"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (json!("B"), json!(1), json!(3)),
+            (json!("A"), json!(5), json!(0)),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn status_reports_an_unset_or_unreachable_matter_server() {
     let (status, error) = call(&app(), "GET", "/api/status", None).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -257,6 +350,9 @@ async fn status_reports_an_unset_or_unreachable_matter_server() {
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert_eq!(error["error"], "matter_server_unreachable");
 }
+
+/// `(node_id, path, value)` to set on the served attributes.
+type Edits = Arc<Mutex<Vec<(u64, &'static str, Value)>>>;
 
 /// How the fake matterjs-server answers `device_command`.
 #[derive(Clone, Default)]
@@ -276,6 +372,8 @@ struct Fake {
     late_on: Vec<(u64, u64)>,
     /// `(node_id, endpoint)` that leaves its first command unanswered.
     silent_first: Vec<(u64, u64)>,
+    /// `(node_id, endpoint)` that leaves its first so many commands unanswered.
+    silent_for: Vec<((u64, u64), usize)>,
     /// `(node_id, endpoint)` answering its commands only after the milliseconds given.
     delayed: Vec<((u64, u64), u64)>,
     /// `(node_id, endpoint)` whose On/Off reads are never answered.
@@ -286,11 +384,17 @@ struct Fake {
     server_errors: Vec<((u64, u64), &'static str)>,
     /// Milliseconds every reply, `get_nodes` included, waits; changeable while serving.
     slow_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// `(node_id, path, value)` set on the served attributes before the next `get_nodes`, as by
+    /// a light switched off and on at the wall; changeable while serving.
+    edits: Edits,
 }
 
 /// Serves `get_nodes` and On/Off `device_command` the way matterjs-server does,
 /// applying each command to the served On/Off attribute and recording it.
-#[allow(clippy::too_many_lines)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one stand-in answering every command as matterjs-server does"
+)]
 async fn fake_light_server(
     nodes: Value,
     fake: Fake,
@@ -340,7 +444,15 @@ async fn fake_light_server(
                     "get_nodes" if fake.nodes_once && nodes_read => continue,
                     "get_nodes" => {
                         nodes_read = true;
-                        json!({ "message_id": id, "result": *nodes.lock().unwrap() })
+                        let mut nodes = nodes.lock().unwrap();
+                        for (node_id, path, value) in fake.edits.lock().unwrap().drain(..) {
+                            for node in nodes.as_array_mut().unwrap() {
+                                if node["node_id"] == node_id {
+                                    node["attributes"][path] = value.clone();
+                                }
+                            }
+                        }
+                        json!({ "message_id": id, "result": *nodes })
                     }
                     "read_attribute" => {
                         seen.lock().unwrap().push(command.clone());
@@ -378,6 +490,14 @@ async fn fake_light_server(
                         if fake.silent.contains(&target) {
                             continue;
                         }
+                        if let Some((_, times)) = fake.silent_for.iter().find(|(t, _)| *t == target)
+                        {
+                            let mut answered = answered.lock().unwrap();
+                            if answered.iter().filter(|t| **t == target).count() < *times {
+                                answered.push(target);
+                                continue;
+                            }
+                        }
                         if fake.silent_first.contains(&target) {
                             let mut answered = answered.lock().unwrap();
                             if !answered.contains(&target) {
@@ -393,6 +513,20 @@ async fn fake_light_server(
                             // The device answered with an Interaction Model status: FAILURE.
                             json!({ "message_id": id, "error_code": 0, "details": "failed", "status": 1 })
                         } else {
+                            // The light takes the level and colour temperature sent.
+                            let payload = &args["payload"];
+                            for (field, path) in
+                                [("level", "8/0"), ("colorTemperatureMireds", "768/7")]
+                            {
+                                if let Some(value) = payload.get(field) {
+                                    for node in nodes.lock().unwrap().as_array_mut().unwrap() {
+                                        if node["node_id"] == target.0 {
+                                            node["attributes"][format!("{}/{path}", target.1)] =
+                                                value.clone();
+                                        }
+                                    }
+                                }
+                            }
                             let lights = args["command_name"] == "MoveToLevelWithOnOff";
                             if (args["cluster_id"] == 6 || lights)
                                 && !(fake.ignore_off && args["command_name"] == "Off")
@@ -1083,6 +1217,72 @@ async fn scheduled_adjustment_writes_only_to_lights_read_as_on() {
     assert_eq!(body["runs"][0]["commands"], 0);
 }
 
+/// `(cluster, value)` of each level and colour temperature sent `(node, endpoint)`.
+fn values_sent(commands: &Arc<Mutex<Vec<Value>>>, node: u64, endpoint: u64) -> Vec<(Value, Value)> {
+    tunings_of(commands, node, endpoint)
+        .into_iter()
+        .map(|(cluster, _, payload)| {
+            let value = if cluster == 8 {
+                payload["level"].clone()
+            } else {
+                payload["colorTemperatureMireds"].clone()
+            };
+            (cluster, value)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_light_no_longer_at_the_values_sent_is_sent_them_again_unless_manual() {
+    let fake = Fake::default();
+    let edits = fake.edits.clone();
+    let (addr, commands, _) = fake_light_server(tuning_nodes(), fake).await;
+    let (home, app, _) = auto_home(addr, None).await;
+    enable(&app).await;
+    home.adjust(NIGHT, "scheduled").await;
+    for light in [(1, 3), (5, 1)] {
+        assert_eq!(
+            values_sent(&commands, light.0, light.1),
+            [(json!(8), json!(102)), (json!(768), json!(333))]
+        );
+    }
+    commands.lock().unwrap().clear();
+    home.adjust(NIGHT, "scheduled").await;
+    assert_eq!(tunings(&commands), []);
+
+    // The Tapo is taken off the auto label: left to the user from now on.
+    let (_, devices) = call(&app, "GET", "/api/devices", None).await;
+    let tapo = devices
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["serial_number"] == TAPO)
+        .unwrap()
+        .clone();
+    assert_eq!(assign(&app, &tapo, &[]).await.0, StatusCode::OK);
+    // Both are switched off and on at the wall: back at full and cool.
+    for (node, endpoint) in [(1, 3), (5, 1)] {
+        let mut edits = edits.lock().unwrap();
+        edits.push((
+            node,
+            if endpoint == 3 { "3/8/0" } else { "1/8/0" },
+            json!(254),
+        ));
+        edits.push((
+            node,
+            if endpoint == 3 { "3/768/7" } else { "1/768/7" },
+            json!(153),
+        ));
+    }
+    commands.lock().unwrap().clear();
+    home.adjust(NIGHT, "scheduled").await;
+    assert_eq!(
+        values_sent(&commands, 1, 3),
+        [(json!(8), json!(102)), (json!(768), json!(333))]
+    );
+    assert_eq!(values_sent(&commands, 5, 1), []);
+}
+
 #[tokio::test]
 async fn an_adjustment_is_not_held_up_by_lights_that_never_answer() {
     // The desk Tapo is on too; the T2 and the other Tapo that are on never answer a read.
@@ -1447,7 +1647,7 @@ async fn adjustment_is_off_until_the_user_enables_it() {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, reason = "one scenario, step after step")]
 async fn an_auto_labels_off_stops_its_adjustment_until_it_is_on_across_restarts() {
     let fake = Fake {
         ignore_off: true,
@@ -1725,6 +1925,8 @@ enum Commission {
     Node(Value),
     /// An error with these details, as matterjs-server words a failed commissioning.
     Error(&'static str),
+    /// An error with these details and matterjs-server's `reason` (1.5.0 and later).
+    Failed(&'static str, &'static str),
     /// No answer at all.
     Silent,
 }
@@ -1784,6 +1986,9 @@ async fn fake_matter(
                     }
                     ("commission_with_code", Commission::Error(details)) => {
                         json!({ "message_id": id, "error_code": 1, "details": details })
+                    }
+                    ("commission_with_code", Commission::Failed(details, reason)) => {
+                        json!({ "message_id": id, "error_code": 1, "details": details, "reason": reason })
                     }
                     ("commission_with_code", Commission::Silent) => continue,
                     ("read_attribute", _) => json!({ "message_id": id, "result": read }),
@@ -2095,6 +2300,49 @@ async fn commissioning_failures_are_told_apart_and_register_nothing() {
             ),
             StatusCode::UNPROCESSABLE_ENTITY,
             "commission_failed",
+        ),
+        // 2026-10-20: the bulb stopped answering after PASE and Bluetooth dropped.
+        (
+            Commission::Error(
+                "Commission failed: commissioning discovery failed: No device could be commissioned (1 of 1 started attempt(s) failed, 1 discovered): Operation aborted",
+            ),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "commission_failed",
+        ),
+        // matterjs-server 1.5.0 names the cause in `reason`, which outweighs the words.
+        (
+            Commission::Failed(
+                "Commission failed: commissioning discovery failed: No device could be commissioned (1 of 1 started attempt(s) failed, 1 discovered): Operation aborted",
+                "other",
+            ),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "commission_failed",
+        ),
+        (
+            Commission::Failed(
+                "The pairing code does not match the device. Check the code and commission again.",
+                "passcode-mismatch",
+            ),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "wrong_code",
+        ),
+        (
+            Commission::Failed("Commission failed: Discovery failed", "not-discovered"),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "device_not_found",
+        ),
+        (
+            Commission::Failed("Commission failed: Operation timed out", "timeout"),
+            StatusCode::GATEWAY_TIMEOUT,
+            "commission_timeout",
+        ),
+        (
+            Commission::Failed(
+                "Commission failed: Commissionee failed to connect to WiFi network \"home-2g\": AuthFail",
+                "other",
+            ),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "wifi_failed",
         ),
     ];
     for (commission, status, code) in cases {
@@ -3415,6 +3663,15 @@ async fn door_from(
     (status, String::from_utf8(bytes.to_vec()).unwrap())
 }
 
+/// Lets a test's scoped subscriber see callsites other tests' threads hit first.
+fn log_everywhere() {
+    // While one scoped dispatcher is alive, tracing-core asks only the registering
+    // thread's, so a callsite first hit on another test's thread would never log;
+    // a second one kept alive makes it ask every live dispatcher.
+    static SECOND: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    SECOND.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+}
+
 /// Collects every log line, at every level, written while the guard lives.
 fn capture_logs() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard) {
     #[derive(Clone)]
@@ -3428,11 +3685,7 @@ fn capture_logs() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard) {
             Ok(())
         }
     }
-    // While one scoped dispatcher is alive, tracing-core asks only the registering
-    // thread's, so a callsite first hit on another test's thread would never log;
-    // a second one kept alive makes it ask every live dispatcher.
-    static SECOND: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
-    SECOND.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+    log_everywhere();
     let logs = Arc::new(Mutex::new(Vec::new()));
     let writer = Logs(logs.clone());
     let subscriber = tracing_subscriber::fmt()
@@ -3490,6 +3743,63 @@ async fn door_commands_are_signed_and_sent_to_candy_house() {
         assert!(logs.contains(accepted), "logs were not captured: {logs}");
     }
     assert_no_keys(&logs);
+}
+
+#[tokio::test]
+async fn door_commands_go_out_as_chrome_and_give_up_on_a_silent_candy_house() {
+    let (logs, _guard) = capture_logs();
+    // Answers with the agent it was sent, refusing with a body that must stay out of the logs.
+    let agents = Arc::new(Mutex::new(Vec::new()));
+    let seen = agents.clone();
+    let app = Router::new().route(
+        "/api/sesame2/{uuid}/cmd",
+        axum::routing::post(move |headers: axum::http::HeaderMap| async move {
+            let agent = headers
+                .get("user-agent")
+                .map(|a| a.to_str().unwrap().to_owned());
+            seen.lock().unwrap().push(agent);
+            (StatusCode::FORBIDDEN, "refused-body-6d3a")
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let refusing = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (status, _) = door_from(
+        &door_app(sesame_config(&format!("http://{refusing}"))),
+        "unlock",
+        PEER,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        *agents.lock().unwrap(),
+        [Some(home_link::outside::USER_AGENT.to_owned())]
+    );
+    assert!(home_link::outside::USER_AGENT.contains("Chrome/"));
+
+    // Accepts the connection and never answers.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let silent = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            held.push(listener.accept().await.unwrap());
+        }
+    });
+    let app = door_app(sesame_config(&format!("http://{silent}")));
+    let (status, body) = within(
+        "a door command to a silent CANDY HOUSE",
+        Duration::from_secs(12),
+        door_from(&app, "lock", PEER),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["error"],
+        "sesame_unreachable"
+    );
+    let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert!(!logs.contains("refused-body-6d3a"), "{logs}");
 }
 
 #[tokio::test]
@@ -3986,7 +4296,7 @@ fn plug_nodes() -> Value {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, reason = "one scenario, step after step")]
 async fn plugs_get_their_kind_and_are_switched_one_at_a_time() {
     let fake = Fake {
         silent: vec![(22, 1)],
@@ -4147,7 +4457,7 @@ fn device_results(body: &Value) -> Vec<(Value, Value, Value)> {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, reason = "one scenario, step after step")]
 async fn a_labels_on_off_and_toggle_reach_its_lights_and_plugs() {
     let (addr, commands, _) = fake_light_server(plug_nodes(), Fake::default()).await;
     let (db, sql) = ledger();
@@ -4530,6 +4840,216 @@ async fn an_override_that_reaches_no_light_is_not_kept() {
     );
 }
 
+/// Takes every TCP connection and passes it on to `behind` while fewer than `allowed` have
+/// been taken; the rest are held unanswered. Returns the address, how many were taken, and `allowed`.
+async fn gated(behind: SocketAddr) -> (SocketAddr, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (taken, allowed) = (
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(usize::MAX)),
+    );
+    let (count, limit) = (taken.clone(), allowed.clone());
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            if count.fetch_add(1, Ordering::SeqCst) < limit.load(Ordering::SeqCst) {
+                tokio::spawn(async move {
+                    let mut upstream = tokio::net::TcpStream::connect(behind).await.unwrap();
+                    let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
+                });
+            } else {
+                held.push(stream);
+            }
+        }
+    });
+    (addr, taken, allowed)
+}
+
+/// Each label's name and whether it is on, as `GET /api/labels` shows them.
+async fn label_states(app: &Router) -> Vec<(Value, Value)> {
+    let (_, labels) = call(app, "GET", "/api/labels", None).await;
+    labels
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| (l["name"].clone(), l["on"].clone()))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_label_switched_on_stays_on_when_its_values_cannot_be_sent() {
+    let (behind, commands, _) = fake_light_server(tuning_nodes(), Fake::default()).await;
+    let (addr, taken, allowed) = gated(behind).await;
+    let (_, app, [_, _, work]) = override_home(addr, || NIGHT).await;
+    // The switch's connection goes through; the next, to send the label's values, hangs.
+    allowed.store(taken.load(Ordering::SeqCst) + 1, Ordering::SeqCst);
+
+    let (status, body) = within("label on", HUNG_WITHIN, label_op(&app, &work, "on")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(switches(&commands), [(json!(6), json!(1), json!("On"))]);
+    assert_eq!(
+        (&body["on"], &body["boosted"]),
+        (&json!(true), &json!(true))
+    );
+    let desk: Vec<_> = body["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            (
+                d["node_id"].clone(),
+                d["result"].clone(),
+                d["reason"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(desk, [(json!(6), json!("failed"), json!("server_error"))]);
+    assert!(
+        body["devices"][0]["details"]
+            .as_str()
+            .is_some_and(|d| d.contains("matterjs-server")),
+        "{body}"
+    );
+    assert_eq!(label_states(&app).await[2], (json!("work"), json!(true)));
+}
+
+#[tokio::test]
+async fn labels_keep_their_state_when_their_lights_miss_the_switch() {
+    // The T2, alone under ambient and also under game, never answers.
+    let fake = Fake {
+        silent: vec![(1, 3)],
+        ..Fake::default()
+    };
+    let (addr, commands, _) = fake_light_server(tuning_nodes(), fake).await;
+    let (_, app, _) = override_home(addr, || NIGHT).await;
+    let (status, _) = call(&app, "POST", "/api/lights/on", None).await;
+    assert_eq!(status, StatusCode::OK);
+    // ambient's only light missed On: it stays as it was.
+    assert_eq!(
+        label_states(&app).await,
+        [
+            (json!("ambient"), Value::Null),
+            (json!("game"), Value::Null),
+            (json!("work"), Value::Null)
+        ]
+    );
+    for label in ["game", "work"] {
+        let (_, labels) = call(&app, "GET", "/api/labels", None).await;
+        let id = labels
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["name"] == label)
+            .unwrap()["id"]
+            .clone();
+        let (status, body) = label_op(&app, &json!({ "id": id }), "on").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    commands.lock().unwrap().clear();
+
+    let (status, body) = call(&app, "POST", "/api/lights/off", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(switches(&commands).contains(&(json!(1), json!(3), json!("Off"))));
+    // game's Tapo and work's desk light went off; nothing reached game's or ambient's T2,
+    // but game has a light that did.
+    assert_eq!(
+        label_states(&app).await,
+        [
+            (json!("ambient"), Value::Null),
+            (json!("game"), json!(false)),
+            (json!("work"), json!(false))
+        ]
+    );
+}
+
+#[tokio::test]
+async fn labels_keep_their_state_when_matterjs_server_cannot_be_reached() {
+    let (behind, _, _) = fake_light_server(tuning_nodes(), Fake::default()).await;
+    let (addr, taken, allowed) = gated(behind).await;
+    let (_, app, [ambient, game, _]) = override_home(addr, || NIGHT).await;
+    assert_eq!(label_op(&app, &ambient, "on").await.0, StatusCode::OK);
+    assert_eq!(label_op(&app, &game, "on").await.0, StatusCode::OK);
+    let before = label_states(&app).await;
+    assert_eq!(before[0], (json!("ambient"), json!(true)));
+    allowed.store(taken.load(Ordering::SeqCst), Ordering::SeqCst);
+
+    for (method, uri) in [
+        ("POST", "/api/lights/off".to_owned()),
+        ("POST", "/api/lights/on".to_owned()),
+        ("POST", format!("/api/labels/{}/off", ambient["id"])),
+        ("POST", format!("/api/labels/{}/toggle", game["id"])),
+    ] {
+        let (status, body) = within(&uri, HUNG_WITHIN, call(&app, method, &uri, None)).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{uri} {body}");
+        assert_eq!(label_states(&app).await, before, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn an_auto_labels_on_waits_on_a_silent_light_once_only() {
+    // The T2 is available but answers neither commands nor reads.
+    let fake = Fake {
+        silent: vec![(1, 3)],
+        silent_reads: vec![(1, 3)],
+        ..Fake::default()
+    };
+    let (addr, commands, _) = fake_light_server(tuning_nodes(), fake).await;
+    let (_, app, _) = auto_home(addr, Some(|| NIGHT)).await;
+    enable(&app).await;
+    let (_, labels) = call(&app, "GET", "/api/labels", None).await;
+    let started = std::time::Instant::now();
+    let (status, body) = label_op(&app, &labels[0], "on").await;
+    let took = started.elapsed();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // The switch's window, without another wait to read the light that missed it.
+    assert!(took < Duration::from_secs(4), "{took:?}");
+    assert!(
+        !reads(&commands).iter().any(|(node, _)| *node == 1),
+        "{:?}",
+        reads(&commands)
+    );
+    // The lights that went on got the night's values at once.
+    assert_eq!(
+        values_sent(&commands, 5, 1),
+        [(json!(8), json!(102)), (json!(768), json!(333))]
+    );
+}
+
+#[tokio::test]
+async fn a_release_does_not_count_a_light_another_override_holds_as_switched() {
+    let (addr, commands, _) = fake_light_server(tuning_nodes(), Fake::default()).await;
+    let (_, app, [_, game, work]) = override_home(addr, || NIGHT).await;
+    // The Tapo is under game and work alike.
+    let (_, devices) = call(&app, "GET", "/api/devices", None).await;
+    let tapo = devices
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["serial_number"] == TAPO)
+        .unwrap()
+        .clone();
+    assert_eq!(assign(&app, &tapo, &[&game, &work]).await.0, StatusCode::OK);
+    label_op(&app, &game, "on").await;
+    label_op(&app, &work, "on").await;
+    commands.lock().unwrap().clear();
+
+    let (status, body) = label_op(&app, &game, "toggle").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["action"], "release");
+    let tapo_result = body["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["node_id"] == 5)
+        .unwrap()["result"]
+        .clone();
+    assert_eq!(tapo_result, "override", "{body}");
+    assert_eq!(tunings_of(&commands, 5, 1), []);
+    assert!(!switches(&commands).iter().any(|s| s.0 == 5));
+}
+
 /// 2026-10-06 00:00 in Tokyo.
 const MIDNIGHT: i64 = NIGHT + 3600;
 
@@ -4578,6 +5098,59 @@ async fn schedules_switch_a_label_at_their_times_across_midnight() {
     }
     let (_, labels) = call(&app, "GET", "/api/labels", None).await;
     assert_eq!(labels[0]["on"], false);
+}
+
+#[tokio::test]
+async fn schedules_of_missed_minutes_run_and_devices_that_missed_are_sent_again() {
+    // The Tapo leaves both sends of the first switch unanswered.
+    let fake = Fake {
+        silent_for: vec![((5, 1), 2)],
+        ..Fake::default()
+    };
+    let (addr, commands, _) = fake_light_server(plug_nodes(), fake).await;
+    let (db, sql) = ledger();
+    let home = home_link::Home::new(db, Some(format!("ws://{addr}/ws")))
+        .with_schedule_retry(Duration::from_millis(200));
+    let app = home.router();
+    let both = create_label(
+        &app,
+        json!({ "name": "both", "schedule": [{ "time": "23:30", "on": true }] }),
+    )
+    .await;
+    let plug = create_label(
+        &app,
+        json!({ "name": "plug", "schedule": [{ "time": "23:31", "on": true }] }),
+    )
+    .await;
+    for (vendor, serial, label) in [
+        ("Tapo", TAPO, &both),
+        ("Plugco", "plug-a", &both),
+        ("Plugco", "plug-c", &plug),
+    ] {
+        let device = add_device(
+            &app,
+            &sql,
+            json!({ "vendor": vendor, "serial_number": serial }),
+        )
+        .await;
+        assert_eq!(assign(&app, &device, &[label]).await.0, StatusCode::OK);
+    }
+    let minute = |h: i64, m: i64| MIDNIGHT - 86_400 + h * 3600 + m * 60;
+    home.run_schedules(minute(23, 29)).await;
+    // The minutes of 23:30 and 23:31 went by while another run held on: both run at 23:32.
+    home.run_schedules(minute(23, 32)).await;
+    let ons = |node: u64| {
+        switches(&commands)
+            .iter()
+            .filter(|s| **s == (json!(node), json!(1), json!("On")))
+            .count()
+    };
+    // The Tapo answered the send again; the plug that answered was not sent it twice.
+    assert_eq!((ons(5), ons(20), ons(22)), (3, 1, 1));
+    assert_eq!(
+        label_states(&app).await,
+        [(json!("both"), json!(true)), (json!("plug"), json!(true))]
+    );
 }
 
 #[test]
@@ -4683,7 +5256,7 @@ fn v0_1_36_ledger(path: &std::path::Path) {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, reason = "one scenario, step after step")]
 async fn after_the_update_the_v0_1_36_widgets_and_lights_behave_as_before() {
     let path = std::env::temp_dir().join(format!("home-link-v8-app-{}.db", std::process::id()));
     let _ = std::fs::remove_file(&path);
@@ -4861,7 +5434,7 @@ fn tool_result(reply: &Value) -> (Value, bool) {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, reason = "one scenario, step after step")]
 async fn mcp_tools_manage_and_switch_labels_over_http() {
     let (addr, commands, _) = fake_light_server(plug_nodes(), Fake::default()).await;
     let (db, sql) = ledger();
@@ -5350,17 +5923,6 @@ fn aircon_writes(commands: &Arc<Mutex<Vec<Value>>>) -> Vec<String> {
         .collect()
 }
 
-/// `aircon_writes` once `count` have arrived, within a second.
-async fn aircon_writes_soon(commands: &Arc<Mutex<Vec<Value>>>, count: usize) -> Vec<String> {
-    for _ in 0..100 {
-        if aircon_writes(commands).len() >= count {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    aircon_writes(commands)
-}
-
 fn cool(celsius: i64, from_cooling: i64) -> Vec<String> {
     let (cooling, heating) = (
         format!("1/513/17={}", celsius * 100),
@@ -5399,7 +5961,7 @@ fn aircon_home(addr: SocketAddr, path: &std::path::Path) -> (home_link::Home, Ro
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, reason = "one scenario, step after step")]
 async fn the_aircon_follows_the_meter_unless_switched_off() {
     let (addr, commands, _) = fake_light_server(aircon_nodes(), Fake::default()).await;
     let path = std::env::temp_dir().join(format!("home-link-aircon-{}.db", std::process::id()));
@@ -5509,11 +6071,15 @@ async fn the_aircon_follows_the_meter_unless_switched_off() {
         (&json!(false), &json!(false))
     );
 
-    // The widget's toggle answers at once; it turns the air conditioner on for the room after,
-    // and the adjustment goes on.
+    // The widget's toggle turns the air conditioner on for the room and answers what became of
+    // it; the adjustment goes on.
     let (status, body) = call(&app, "POST", "/api/aircon/toggle", None).await;
-    assert_eq!((status, body), (StatusCode::OK, json!({ "on": true })));
-    assert_eq!(aircon_writes_soon(&commands, 5).await, cool(23, 2300));
+    assert_eq!(
+        (status, &body["on"], &body["result"], &body["delivered"]),
+        (StatusCode::OK, &json!(true), &json!("sent"), &json!(true)),
+        "{body}"
+    );
+    assert_eq!(aircon_writes(&commands), cool(23, 2300));
     commands.lock().unwrap().clear();
     home.record_meter(HOT, NIGHT + 600);
     home.adjust_aircon(NIGHT + 600).await;
@@ -5540,8 +6106,11 @@ async fn the_aircon_follows_the_meter_unless_switched_off() {
     );
     commands.lock().unwrap().clear();
     let (_, body) = call(&app, "POST", "/api/aircon/toggle", None).await;
-    assert_eq!(body["on"], false);
-    assert_eq!(aircon_writes_soon(&commands, 1).await, ["Off"]);
+    assert_eq!(
+        (&body["on"], &body["delivered"]),
+        (&json!(false), &json!(true))
+    );
+    assert_eq!(aircon_writes(&commands), ["Off"]);
     let (_, view) = call(&app, "GET", "/api/aircon", None).await;
     let results: Vec<_> = view["runs"]
         .as_array()
@@ -5588,9 +6157,41 @@ impl Captured {
 }
 
 #[tokio::test]
+async fn the_aircon_toggle_says_when_the_air_conditioner_was_not_reached() {
+    let fake = Fake {
+        silent: vec![(40, 1)],
+        ..Fake::default()
+    };
+    let (addr, _, _) = fake_light_server(aircon_nodes(), fake).await;
+    let path = std::env::temp_dir().join(format!("home-link-ac-silent-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let (home, app) = aircon_home(addr, &path);
+    let sql = home_link::open_db(path.to_str().unwrap()).unwrap();
+    insert_device(&sql, "Airco", "ac-1", "エアコン");
+    home.record_meter(HOT, aircon_clock());
+
+    let (status, body) = call(&app, "POST", "/api/aircon/toggle", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        (&body["result"], &body["delivered"], &body["reason"]),
+        (
+            &json!("no_response"),
+            &json!(false),
+            &json!("エアコンが応答しませんでした")
+        ),
+        "{body}"
+    );
+    // The switch is kept: the loop sends it again.
+    let (_, view) = call(&app, "GET", "/api/aircon", None).await;
+    assert_eq!(view["on"], body["on"]);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
 async fn each_aircon_run_is_logged_on_one_line_without_the_address() {
     let captured = Captured::default();
     let writer = captured.clone();
+    log_everywhere();
     let _logging = tracing::subscriber::set_default(
         tracing_subscriber::fmt()
             .with_ansi(false)
@@ -5827,7 +6428,7 @@ async fn fake_outside() -> (home_link::Outside, Asked) {
                     let at = outside_clock() - OUTSIDE_AGE.load(Ordering::Relaxed);
                     let at = at - at.rem_euclid(900);
                     let local = home_link::schedule::timestamp(at - 9 * 3600);
-                    #[allow(clippy::cast_precision_loss)]
+                    #[allow(clippy::cast_precision_loss, reason = "tenths of a degree, far below 2^52")]
                     let celsius = tenths as f64 / 10.0;
                     (
                         StatusCode::OK,
@@ -5875,7 +6476,7 @@ fn percent_decode(text: &str) -> String {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, reason = "one scenario, step after step")]
 async fn the_aircon_follows_the_outside_of_the_registered_address() {
     let (addr, commands, _) = fake_light_server(aircon_nodes(), Fake::default()).await;
     let (outside, asked) = fake_outside().await;
@@ -6244,7 +6845,8 @@ async fn a_matter_server_that_never_answers_the_upgrade_holds_up_no_request_or_l
         home_link::open_db(path.to_str().unwrap()).unwrap(),
         Some(format!("ws://{hung}/ws")),
     )
-    .with_clock(night);
+    .with_clock(night)
+    .with_schedule_retry(Duration::from_millis(10));
     let app = home.router();
     let light = insert_device(&sql, "Tapo", TAPO, "読書灯");
     let plug = insert_device(&sql, "Plugco", "plug-a", "プラグ");
@@ -6299,8 +6901,14 @@ async fn a_matter_server_that_never_answers_the_upgrade_holds_up_no_request_or_l
             assert_eq!(error["error"], "matter_server_unreachable", "{uri} {error}");
         }
     }
-    // Each minute's label schedules and each ten minutes' adjustments end, so the next comes.
-    within("label schedules", HUNG_WITHIN, home.run_schedules(NIGHT)).await;
+    // Each minute's label schedules and each ten minutes' adjustments end, so the next comes;
+    // a schedule tries three times in all.
+    within(
+        "label schedules",
+        HUNG_WITHIN * 3,
+        home.run_schedules(NIGHT),
+    )
+    .await;
     within(
         "light adjustment",
         HUNG_WITHIN,

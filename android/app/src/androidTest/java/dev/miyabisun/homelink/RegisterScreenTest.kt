@@ -611,6 +611,20 @@ class RegisterScreenTest {
                 Thread.sleep(5_000)
                 eventually(screen) { words() == "エアコン" }
                 assertEquals(3, api.airconToggles.get())
+
+                // Kept but not taken by the air conditioner: the short failure, then the new state.
+                api.airconFailure = null
+                api.airconUndelivered = "子機が応答しませんでした"
+                press()
+                eventually(screen) { words() == "届かず" }
+                assertTrue(api.airconOn)
+                assertEquals("届かず：子機が応答しませんでした。入・切は保存済みで、10分ごとにエアコンへ送り直します",
+                    shown.findViewById<View>(R.id.label_button).contentDescription.toString())
+                captureWidget(shown, "aircon-undelivered")
+                Thread.sleep(5_000)
+                eventually(screen) { words() == "エアコン中" }
+                captureWidget(shown, "aircon-undelivered-after")
+                assertEquals(4, api.airconToggles.get())
             }
         } finally {
             host.stopListening()
@@ -1165,18 +1179,24 @@ private class FakeApi : HomeLinkApi {
     /** What a label switch reports; null switches every device. */
     @Volatile var labelCounts: SwitchResult? = null
 
-    /** home-link's air conditioner switch, and what a toggle fails with instead of switching it. */
+    /**
+     * home-link's air conditioner switch, what a toggle fails with instead of switching it, and why a switch it keeps
+     * does not reach the air conditioner (null: it does).
+     */
     @Volatile var airconOn = false
     @Volatile var airconFailure: ApiError? = null
+    @Volatile var airconUndelivered: String? = null
     val airconToggles = java.util.concurrent.atomic.AtomicInteger()
 
     override fun aircon(): ApiResult<Boolean> = ApiResult.Ok(airconOn)
 
-    override fun toggleAircon(): ApiResult<Boolean> {
+    override fun toggleAircon(): ApiResult<AirconToggle> {
         airconToggles.incrementAndGet()
         airconFailure?.let { return ApiResult.Failed(it) }
         airconOn = !airconOn
-        return ApiResult.Ok(airconOn)
+        val reason = airconUndelivered
+        return ApiResult.Ok(if (reason == null) AirconToggle(airconOn, delivered = true, result = "sent")
+            else AirconToggle(airconOn, delivered = false, result = "no_response", reason = reason))
     }
 
     override fun switchLabel(id: Long, op: LabelOp): ApiResult<LabelResult> {

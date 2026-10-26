@@ -69,6 +69,13 @@ sealed interface ApiResult<out T> {
     data class Failed(val error: ApiError) : ApiResult<Nothing>
 }
 
+/**
+ * What switching the air conditioner's control did: its new state [on], kept by home-link either way, and whether the
+ * air conditioner took it. Not [delivered], home-link sends it again every 10 minutes. [result] is home-link's word
+ * for the send and [reason] its sentence, both null from a home-link that answered before sending.
+ */
+data class AirconToggle(val on: Boolean, val delivered: Boolean, val result: String? = null, val reason: String? = null)
+
 /** The home-link ledger API. Calls block; run them off the main thread. */
 interface HomeLinkApi {
     fun devices(): ApiResult<List<Device>>
@@ -81,8 +88,8 @@ interface HomeLinkApi {
     fun switchLabel(id: Long, op: LabelOp): ApiResult<LabelResult>
     /** Whether the air conditioner's control is on: off holds it off until switched on again. */
     fun aircon(): ApiResult<Boolean>
-    /** Switches the air conditioner's control the other way; its new state. */
-    fun toggleAircon(): ApiResult<Boolean>
+    /** Switches the air conditioner's control the other way: its new state, and whether the air conditioner took it. */
+    fun toggleAircon(): ApiResult<AirconToggle>
     /**
      * Has matterjs-server commission ledger device `id` by its code over the BLE proxy this phone holds open;
      * home-link hands over its Wi-Fi for devices, and matterjs-server picks Wi-Fi or Thread. Takes up to minutes.
@@ -175,9 +182,14 @@ class HttpHomeLinkApi(private val baseUrls: () -> List<String>, private val link
     override fun aircon(): ApiResult<Boolean> =
         call("GET", "/api/aircon", null, readTimeout = 3_000, patience = RECEIVER_MS) { JSONObject(it).getBoolean("on") }
 
-    // home-link answers once the switch is kept.
-    override fun toggleAircon(): ApiResult<Boolean> =
-        call("POST", "/api/aircon/toggle", null, readTimeout = 8_000) { JSONObject(it).getBoolean("on") }
+    // home-link answers once the air conditioner took the switch, or did not, in about 12 s at most.
+    override fun toggleAircon(): ApiResult<AirconToggle> =
+        call("POST", "/api/aircon/toggle", null) { body ->
+            val json = JSONObject(body)
+            AirconToggle(json.getBoolean("on"), json.isNull("delivered") || json.getBoolean("delivered"),
+                json.optString("result").takeUnless { json.isNull("result") },
+                json.optString("reason").takeUnless { json.isNull("reason") })
+        }
 
     private fun label(json: JSONObject): Label {
         val schedule = json.optJSONArray("schedule") ?: JSONArray()

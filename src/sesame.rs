@@ -1,7 +1,7 @@
 //! Unlocking and locking the front door's SESAME through the CANDY HOUSE Web API and its Wi-Fi module.
 //! The request follows <https://github.com/CANDY-HOUSE/API_document> (`SesameOS3/webapi.md`).
 
-use std::{fmt, time::Duration};
+use std::fmt;
 
 use aes::Aes128;
 use cmac::{Cmac, Mac};
@@ -10,7 +10,6 @@ use reqwest::header::HeaderValue;
 pub const API_URL: &str = "https://app.candyhouse.co";
 /// `home-link` in base64, the name the SESAME app shows in its history (21 bytes at most).
 const HISTORY: &str = "aG9tZS1saW5r";
-const TIMEOUT: Duration = Duration::from_secs(10);
 
 const NOT_CONFIGURED: &str =
     "SESAMEの設定（SESAME_API_KEY・SESAME_UUID・SESAME_SECRET_KEY）がありません";
@@ -120,7 +119,7 @@ pub async fn send(config: &Config, command: Command, unix: i64) -> Result<(), Fa
         "history": HISTORY,
         "sign": sign(&config.secret, unix),
     });
-    let response = reqwest::Client::new()
+    let response = crate::outside::client()
         .post(format!(
             "{}/api/sesame2/{}/cmd",
             config.api_url, config.uuid
@@ -128,7 +127,6 @@ pub async fn send(config: &Config, command: Command, unix: i64) -> Result<(), Fa
         .header("x-api-key", config.api_key.clone())
         .header("content-type", "application/json")
         .body(body.to_string())
-        .timeout(TIMEOUT)
         .send()
         .await
         .map_err(|error| Failure::Unreachable(error.without_url().to_string()))?;
@@ -149,8 +147,9 @@ fn sign(secret: &[u8; 16], unix: i64) -> String {
 /// Bytes 2–4 of `unix` as a 4-byte little-endian number.
 fn signed_bytes(unix: i64) -> [u8; 3] {
     // The low 32 bits, as Python's `to_bytes(4, 'little')` would hold them until 2106.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let le = (unix as u32).to_le_bytes();
+    let le = u32::try_from(unix.rem_euclid(1 << 32))
+        .unwrap_or_default()
+        .to_le_bytes();
     [le[1], le[2], le[3]]
 }
 

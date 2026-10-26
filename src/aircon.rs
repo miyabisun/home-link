@@ -298,8 +298,11 @@ pub fn decide(
     let changes = resend || Some(command) != last;
     let hold = if !changes || user {
         None
+    } else if suspect {
+        Some(Hold::Suspect)
     } else {
-        hold(memory, now, running, command, why, night, suspect, resend)
+        // A resend is due at night as by day.
+        hold(memory, now, running, command, why, night && !resend)
     };
     let send = (changes && hold.is_none()).then_some(command);
 
@@ -381,8 +384,8 @@ impl Memory {
     }
 }
 
-/// Why an automatic `command` that changes what runs is not sent yet, if it is not.
-#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
+/// Why an automatic `command` that changes what runs is not sent yet, if it is not; at
+/// `night`, only a room out of its band is acted on.
 fn hold(
     memory: &Memory,
     now: i64,
@@ -390,13 +393,9 @@ fn hold(
     command: Command,
     why: Why,
     night: bool,
-    suspect: bool,
-    resend: bool,
 ) -> Option<Hold> {
     let switches = (command != Command::Off) != running.is_some();
-    if suspect {
-        Some(Hold::Suspect)
-    } else if switches && memory.switched_at.is_some_and(|at| now - at < HALF_HOUR) {
+    if switches && memory.switched_at.is_some_and(|at| now - at < HALF_HOUR) {
         Some(if running.is_some() {
             Hold::MinRun
         } else {
@@ -404,7 +403,7 @@ fn hold(
         })
     } else if memory.sent_at.is_some_and(|at| now - at < HALF_HOUR) {
         Some(Hold::Recent)
-    } else if night && !resend && !matches!(why, Why::High { .. } | Why::Low { .. }) {
+    } else if night && !matches!(why, Why::High { .. } | Why::Low { .. }) {
         Some(Hold::Night)
     } else {
         None
@@ -517,7 +516,7 @@ fn correction(target: u8, command: Command, memory: &Memory, now: i64) -> Option
     if memory.watch_from.is_none_or(|from| now - from < HALF_HOUR) || memory.samples.is_empty() {
         return None;
     }
-    #[allow(clippy::cast_precision_loss)] // a handful of samples
+    #[allow(clippy::cast_precision_loss, reason = "a handful of samples")]
     let average = memory.samples.iter().map(|(_, t)| t).sum::<f64>() / memory.samples.len() as f64;
     let off = average - f64::from(target);
     // A room still on its way to the target, its latest reading near it, is left to arrive.
@@ -733,7 +732,10 @@ mod tests {
         Command::On { mode, celsius }
     }
 
-    #[allow(clippy::unnecessary_wraps)] // compared with what `decide` returns
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "compared with what `decide` returns"
+    )]
     fn run(mode: Mode) -> Option<Command> {
         Some(on(mode, 25))
     }

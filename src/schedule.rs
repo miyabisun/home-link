@@ -192,8 +192,11 @@ pub(crate) fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 
 /// Sunrise and sunset as minutes of the day in Asia/Tokyo (NOAA's approximation,
 /// within a few minutes). Polar day and night clamp to the whole or no day.
-// The values are rounded and clamped into range before the casts.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the values are rounded and clamped into range before the casts"
+)]
 #[must_use]
 pub fn sun_times(day_of_year: u32, latitude: f64, longitude: f64) -> (u32, u32) {
     let g = 2.0 * std::f64::consts::PI / 365.0 * f64::from(day_of_year.saturating_sub(1));
@@ -219,8 +222,11 @@ pub fn sun_times(day_of_year: u32, latitude: f64, longitude: f64) -> (u32, u32) 
 /// the morning's start to the day's by the morning end, and fall back from
 /// sunset to 22:00. From midnight until the morning starts, the night's level
 /// is scaled by `late_night_percent`, never below 1.
-// The values are rounded and clamped into range before the casts.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the values are rounded and clamped into range before the casts"
+)]
 #[must_use]
 pub fn target(minute: u32, sun: (u32, u32), settings: &Settings) -> (u8, u16) {
     let start = sun.0.max(MORNING_FROM);
@@ -259,8 +265,11 @@ pub struct Target {
 }
 
 /// Fits `level` and `kelvin` into the ranges `light` reports.
-// The values are rounded and clamped into range before the casts.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the values are rounded and clamped into range before the casts"
+)]
 #[must_use]
 pub fn fit(level: u8, kelvin: u16, light: &Light) -> Target {
     Target {
@@ -295,8 +304,26 @@ pub enum Skip {
     Ignored,
 }
 
+/// How many minutes back a run takes up the label schedules it missed, as when a run before
+/// it took over a minute; beyond that, as after home-link was stopped, they are left.
+pub const CATCH_UP: i64 = 10;
+
+/// The minutes, in Unix minutes, whose label schedules a run at `minute` takes after the run
+/// at `last`.
+#[must_use]
+pub fn minutes_due(last: Option<i64>, minute: i64) -> std::ops::RangeInclusive<i64> {
+    let first = last.map_or(minute, |last| (last + 1).max(minute - CATCH_UP + 1));
+    first..=minute
+}
+
+/// How far a light's reported level and colour temperature may sit from what was sent before
+/// it counts as moved: a bulb may round what it is sent.
+const LEVEL_SLACK: u8 = 2;
+const MIREDS_SLACK: u16 = 5;
+
 /// What to send `light` for the `goal` level and kelvin, before its On/Off is
-/// read again: only the values that differ from `last` sent, or why to send nothing.
+/// read again: only the values that differ from `last` sent, or from what the light reports
+/// now, as after it was switched off and on at the wall; or why to send nothing.
 ///
 /// # Errors
 /// The reason the light is left alone.
@@ -311,6 +338,19 @@ pub fn plan(
         level: None,
         mireds: None,
     });
+    // A value the light no longer reports was not kept; send it again.
+    let last = Target {
+        level: last.level.filter(|sent| {
+            light
+                .level_now
+                .is_none_or(|now| now.abs_diff(*sent) <= LEVEL_SLACK)
+        }),
+        mireds: last.mireds.filter(|sent| {
+            light
+                .mireds_now
+                .is_none_or(|now| now.abs_diff(*sent) <= MIREDS_SLACK)
+        }),
+    };
     let changed = Target {
         level: target.level.filter(|v| last.level != Some(*v)),
         mireds: target.mireds.filter(|v| last.mireds != Some(*v)),
@@ -465,6 +505,8 @@ mod tests {
             product: None,
             levels,
             mireds,
+            level_now: None,
+            mireds_now: None,
         }
     }
 
@@ -553,6 +595,56 @@ mod tests {
             Ok(Target {
                 level: None,
                 mireds: Some(323)
+            })
+        );
+    }
+
+    #[test]
+    fn the_minutes_due_are_those_since_the_last_run_up_to_ten() {
+        // The first run, at start-up, takes its own minute alone.
+        assert_eq!(minutes_due(None, 100), 100..=100);
+        assert_eq!(minutes_due(Some(99), 100), 100..=100);
+        // Minutes a long run held up come after it.
+        assert_eq!(minutes_due(Some(97), 100), 98..=100);
+        assert_eq!(minutes_due(Some(50), 100), 91..=100);
+        // A minute already run, or one before it, is not run again.
+        assert!(minutes_due(Some(100), 100).is_empty());
+        assert!(minutes_due(Some(101), 100).is_empty());
+    }
+
+    #[test]
+    fn a_light_no_longer_at_the_values_last_sent_is_sent_them_again() {
+        let sent = Target {
+            level: Some(102),
+            mireds: Some(333),
+        };
+        let at = |level_now, mireds_now| Light {
+            level_now,
+            mireds_now,
+            ..bulb(Some((1, 254)), Some((153, 370)))
+        };
+        // Where it was left, a step off it, or not reported: nothing to send.
+        for light in [
+            at(Some(102), Some(333)),
+            at(Some(104), Some(328)),
+            at(None, None),
+        ] {
+            assert_eq!(
+                plan(&light, &on(), (102, 3000), Some(sent)),
+                Err(Skip::Unchanged)
+            );
+        }
+        // Switched off and on at the wall: full and cool again.
+        assert_eq!(
+            plan(&at(Some(254), Some(153)), &on(), (102, 3000), Some(sent)),
+            Ok(sent)
+        );
+        // Only the value that moved.
+        assert_eq!(
+            plan(&at(Some(254), Some(333)), &on(), (102, 3000), Some(sent)),
+            Ok(Target {
+                level: Some(102),
+                mireds: None
             })
         );
     }

@@ -80,12 +80,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             home_link::discord::ENV
         ),
     }
-    tokio::spawn(home.clone().receive_meter());
-    if matter_url.is_some() {
-        tokio::spawn(home.clone().watch_lights());
-        tokio::spawn(home.clone().every_ten_minutes());
-        tokio::spawn(home.clone().every_minute());
-    }
+    home.start();
 
     axum::serve(
         listener,

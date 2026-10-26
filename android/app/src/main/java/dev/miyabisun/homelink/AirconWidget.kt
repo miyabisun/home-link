@@ -15,6 +15,25 @@ private const val AIRCON = "エアコン"
 fun airconFace(on: Boolean?, press: LightsMessage?, sending: Boolean = false): ButtonFace =
     buttonFace(AIRCON, R.drawable.ic_power, Toggle.of(on), press, sending, activeIcon = R.drawable.ic_aircon_on)
 
+/** What home-link does with a switch the air conditioner did not take. */
+private const val RESENT = "入・切は保存済みで、10分ごとにエアコンへ送り直します"
+
+/**
+ * What a press shows on the button: none when the air conditioner took the switch, as the button then shows the
+ * new state; "届かず" when home-link kept it but the air conditioner did not take it; else the request's failure.
+ */
+fun airconPress(result: ApiResult<AirconToggle>): LightsMessage? = when (result) {
+    is ApiResult.Failed -> failureLabel(result.error)
+    is ApiResult.Ok -> if (result.value.delivered) null else LightsMessage("届かず", failed = true)
+}
+
+/** What is read aloud for a press's result: home-link's reason a switch it kept did not reach the air conditioner. */
+fun airconMessage(result: ApiResult<AirconToggle>, host: String): String? = when (result) {
+    is ApiResult.Failed -> failure(result.error, host).text
+    is ApiResult.Ok -> if (result.value.delivered) null
+        else "${result.value.reason?.trimEnd('。') ?: "エアコンへ届いていません"}。$RESENT"
+}
+
 /**
  * The home-screen toggle for the air conditioner's control: off holds it off, on lets it follow the room again.
  * The state is home-link's, read when placed, after a press and every update period.
@@ -54,13 +73,19 @@ class AirconWidget : AppWidgetProvider() {
             }
         }
 
-        /** Switches the control the other way, showing the press's progress and, for a while, a failure on the button. */
+        /**
+         * Switches the control the other way, showing the press's progress and, for a while, a failure on the button:
+         * the request's, or the air conditioner not taking it. The button then shows the new state.
+         */
         fun press(context: Context) = flow.run(context, sending = { showAll(context, SENDING, sending = true) }, send = {
             val result = homeLinkApi(context).toggleAircon()
-            save(context, pressedState(isOn(context), result))
-            val failed = (result as? ApiResult.Failed)?.error
-            if (failed == null) showAll(context) else showAll(context, failureLabel(failed), message = failure(failed, homeLinkHost(context)).text)
-            failed != null
+            save(context, pressedState(isOn(context), when (result) {
+                is ApiResult.Ok -> ApiResult.Ok(result.value.on)
+                is ApiResult.Failed -> result
+            }))
+            val short = airconPress(result)
+            showAll(context, short, message = airconMessage(result, homeLinkHost(context)))
+            short != null
         }, reread = { if (!read(context)) Widgets.refreshWhenOnline(context) }, restore = { showAll(context) })
     }
 

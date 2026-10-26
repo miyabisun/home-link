@@ -7,6 +7,19 @@ pub const GSI_URL: &str = "https://msearch.gsi.go.jp/address-search/AddressSearc
 pub const OPEN_METEO_URL: &str = "https://api.open-meteo.com/v1/forecast";
 /// The latest stable Chrome on Windows, as the requests go out to public services.
 pub const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36";
+/// How long one request to a public service may take, connection to the last byte.
+pub const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The client for every request to a public service: Chrome's agent and [`TIMEOUT`].
+#[must_use]
+pub fn client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .timeout(TIMEOUT)
+        .build()
+        .unwrap_or_default()
+}
+
 /// How long an outside temperature is used after the time it is for.
 pub const FRESH_FOR: i64 = 2 * 3600;
 

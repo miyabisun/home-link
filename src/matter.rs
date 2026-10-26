@@ -16,7 +16,8 @@ const VENDOR_NAME: &str = "1";
 const SERIAL_NUMBER: &str = "15";
 
 /// Finds the node and endpoint whose identity cluster carries `vendor` and
-/// `serial` in a matterjs-server `get_nodes` result.
+/// `serial` in a matterjs-server `get_nodes` result. The serial matches in any case: a bridge
+/// may report in lower case what the box prints in upper.
 #[must_use]
 pub fn locate(nodes: &[Value], vendor: &str, serial: &str) -> Option<(u64, u16)> {
     nodes.iter().find_map(|node| {
@@ -26,7 +27,9 @@ pub fn locate(nodes: &[Value], vendor: &str, serial: &str) -> Option<(u64, u16)>
             let (endpoint, cluster) = (parts.next()?, parts.next()?);
             let identity = IDENTITY_CLUSTERS.contains(&cluster)
                 && parts.next() == Some(SERIAL_NUMBER)
-                && value == serial
+                && value
+                    .as_str()
+                    .is_some_and(|v| v.eq_ignore_ascii_case(serial))
                 && attributes.get(&format!("{endpoint}/{cluster}/{VENDOR_NAME}"))? == vendor;
             identity.then(|| endpoint.parse().ok()).flatten()
         })?;
@@ -161,6 +164,8 @@ pub fn outlet(nodes: &[Value], node_id: u64, endpoint: u16) -> Option<Light> {
         product,
         levels: None,
         mireds: None,
+        level_now: None,
+        mireds_now: None,
     })
 }
 
@@ -181,6 +186,10 @@ pub struct Light {
     /// Physical min and max colour temperature in mireds when the light
     /// supports it (Color Control with the `ColorTemperature` feature).
     pub mireds: Option<(u16, u16)>,
+    /// `CurrentLevel` as matterjs-server last read it.
+    pub level_now: Option<u8>,
+    /// `ColorTemperatureMireds` as matterjs-server last read it.
+    pub mireds_now: Option<u16>,
 }
 
 /// Lists every endpoint, including those behind bridges, whose Descriptor
@@ -244,6 +253,9 @@ pub fn lights(nodes: &[Value]) -> Vec<Light> {
                     .map(str::to_owned),
                 levels,
                 mireds,
+                level_now: attribute(format!("{endpoint}/8/0")).and_then(|v| u8::try_from(v).ok()),
+                mireds_now: attribute(format!("{endpoint}/768/7"))
+                    .and_then(|v| u16::try_from(v).ok()),
             });
         }
     }
@@ -877,6 +889,8 @@ mod tests {
             product: Some("Bulb".into()),
             levels: None,
             mireds: None,
+            level_now: None,
+            mireds_now: None,
         }
     }
 

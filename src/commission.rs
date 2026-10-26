@@ -330,7 +330,7 @@ async fn session(
     });
     let mut reply = call(link, &request, deadline).await?;
     if let Some(details) = link::error(&reply) {
-        return Err(Error::Failed(classify(&details)));
+        return Err(Error::Failed(classify(&details, reply["reason"].as_str())));
     }
     let node = reply["result"].take();
     let node_id = node["node_id"].as_u64().ok_or_else(|| {
@@ -411,15 +411,27 @@ pub enum Failure {
     Other(String),
 }
 
-/// Classifies matterjs-server's error details, which carry matter.js's message
-/// behind "Commission failed:" with error code 1 whatever went wrong.
+/// Classifies a failed commissioning by matterjs-server's `reason` (1.5.0 and later) and its
+/// details, which carry matter.js's message behind "Commission failed:".
+///
+/// Only the `passcode-mismatch` reason, or from an older server without one, a failed passcode
+/// exchange in the words, is a wrong code: anything else, such as Bluetooth dropping after PASE
+/// (`Operation aborted`), shows matter.js's details.
 #[must_use]
-pub fn classify(details: &str) -> Failure {
+pub fn classify(details: &str, reason: Option<&str>) -> Failure {
     let has = |word: &str| details.contains(word);
+    match reason {
+        Some("passcode-mismatch") => return Failure::WrongCode,
+        Some("not-discovered") => return Failure::NotFound,
+        Some("timeout") => return Failure::Timeout,
+        _ => {}
+    }
     if has("WiFi network") || has("Wi-Fi network") {
         Failure::Wifi
     } else if has("Thread network") {
         Failure::Thread
+    } else if reason.is_some() {
+        Failure::Other(details.to_owned())
     } else if has("timed out") || has("maximum timeframe") || has("Timeout") {
         Failure::Timeout
     } else if has("No commissionable device") || has("Node not found") || has("No device found") {
@@ -430,6 +442,7 @@ pub fn classify(details: &str) -> Failure {
         "Unknown command",
         "peripheral disconnected",
         "[peer-communication] Could not connect to device",
+        "Operation aborted",
     ]
     .iter()
     .any(|word| has(word))
@@ -606,7 +619,7 @@ mod tests {
             ),
         ];
         for (details, failure) in cases {
-            assert_eq!(classify(details), failure, "{details}");
+            assert_eq!(classify(details, None), failure, "{details}");
         }
     }
 
@@ -655,7 +668,7 @@ mod tests {
         ];
         for (details, failure) in cases {
             let failure = failure.unwrap_or_else(|| Failure::Other(details.clone()));
-            assert_eq!(classify(&details), failure, "{details}");
+            assert_eq!(classify(&details, None), failure, "{details}");
         }
     }
 

@@ -68,11 +68,23 @@ class HttpHomeLinkApiTest {
         respond("/api/aircon", 200, """{"on":false,"target":25,"device":null,"reading":null,"sent":null,"runs":[]}""")
         assertEquals(ApiResult.Ok(false), api.aircon())
         assertEquals("GET /api/aircon", requests.last())
-        respond("/api/aircon/toggle", 200, """{"on":true}""")
-        assertEquals(ApiResult.Ok(true), api.toggleAircon())
+        respond("/api/aircon/toggle", 200, """{"on":true,"result":"sent","delivered":true,"reason":null}""")
+        assertEquals(ApiResult.Ok(AirconToggle(on = true, delivered = true, result = "sent")), api.toggleAircon())
         assertEquals("POST /api/aircon/toggle", requests.last())
         respond("/api/aircon/toggle", 500, """{"error":"internal"}""")
         assertEquals(ApiResult.Failed(ApiError.SERVER), api.toggleAircon())
+    }
+
+    @Test fun readsWhetherTheToggleReachedTheAircon() {
+        // Kept, but the air conditioner did not take it: home-link sends it again every 10 minutes.
+        respond("/api/aircon/toggle", 200, """{"on":false,"result":"no_response","delivered":false,"reason":"子機が応答しませんでした"}""")
+        assertEquals(ApiResult.Ok(AirconToggle(on = false, delivered = false, result = "no_response", reason = "子機が応答しませんでした")),
+            api.toggleAircon())
+        respond("/api/aircon/toggle", 200, """{"on":true,"result":"pending","delivered":false,"reason":null}""")
+        assertEquals(ApiResult.Ok(AirconToggle(on = true, delivered = false, result = "pending")), api.toggleAircon())
+        // A home-link that answered before sending says nothing of it: taken as reached, as it always was.
+        respond("/api/aircon/toggle", 200, """{"on":true}""")
+        assertEquals(ApiResult.Ok(AirconToggle(on = true, delivered = true)), api.toggleAircon())
     }
 
     @Test fun changesANameAndTheLabels() {

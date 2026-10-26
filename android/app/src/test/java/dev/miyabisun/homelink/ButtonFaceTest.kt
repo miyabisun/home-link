@@ -1,6 +1,7 @@
 package dev.miyabisun.homelink
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Test
 
 class ButtonFaceTest {
@@ -66,6 +67,26 @@ class ButtonFaceTest {
             airconFace(on = true, press = LightsMessage("送信中…", failed = false), sending = true))
         assertEquals(ButtonFace("接続不可", R.drawable.ic_error, Tone.FAILED),
             airconFace(on = true, press = failureLabel(ApiError.UNREACHABLE)))
+    }
+
+    @Test fun anAirconPressThatDidNotReachItReadsAsAFailure() {
+        val host = "home-link.example:5011"
+        val reached = ApiResult.Ok(AirconToggle(on = true, delivered = true, result = "sent"))
+        val unreached = ApiResult.Ok(AirconToggle(on = true, delivered = false, result = "no_response", reason = "子機が応答しませんでした"))
+        // Reached: the button shows the new state at once, as before.
+        assertEquals(null, airconPress(reached))
+        assertEquals(null, airconMessage(reached, host))
+        // Kept but not reached: a failure for a while, said apart from every failure of the request itself.
+        assertEquals(LightsMessage("届かず", failed = true), airconPress(unreached))
+        assertEquals(ButtonFace("届かず", R.drawable.ic_error, Tone.FAILED), airconFace(on = true, press = airconPress(unreached)))
+        assertFalse(ApiError.entries.any { failureLabel(it).text == "届かず" })
+        assertEquals("子機が応答しませんでした。入・切は保存済みで、10分ごとにエアコンへ送り直します", airconMessage(unreached, host))
+        assertEquals("エアコンへ届いていません。入・切は保存済みで、10分ごとにエアコンへ送り直します",
+            airconMessage(ApiResult.Ok(AirconToggle(on = false, delivered = false, result = "pending")), host))
+        // The request itself failed: the one wording for every widget.
+        val failed = ApiResult.Failed(ApiError.UNREACHABLE)
+        assertEquals(failureLabel(ApiError.UNREACHABLE), airconPress(failed))
+        assertEquals(failure(ApiError.UNREACHABLE, host).text, airconMessage(failed, host))
     }
 
     @Test fun aPressShowsItsProgressThenItsShortResult() {

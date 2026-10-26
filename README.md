@@ -55,6 +55,9 @@ curl http://127.0.0.1:5011/healthz
 ```
 
 `ok` が返れば起動しています。
+2行目からは、ずっと動かす処理（照明の見張り・10分ごとの調整・1分ごとのlabelの予定、温度計の受信）が1行ずつ、
+`every_minute running restarts=0` の形で続きます。処理が異常終了（panic）したときは、1秒後に起こし直してログに `task panicked` を残し、
+`restarts` と最後の時刻 `last_panic` で示します。処理が終わってしまったときは、1行目が `stopped` になり503を返します。
 イメージは uid 10001 で動きます。ボリュームの代わりにホストのディレクトリを割り当てる場合は、
 `--user` で実行ユーザーを指定し、そのユーザーが書き込めるディレクトリを使ってください。
 
@@ -74,6 +77,7 @@ curl http://127.0.0.1:5011/healthz
 
 `SESAME_` の3つは、解錠と施錠のAPIだけが使います。どれかが無いか形式が違うと、この2つは503 `sesame_not_configured` を返し、ほかの機能はそのまま動きます。
 SESAMEはWi-Fiモジュールでインターネットにつながっている必要があります。
+CANDY HOUSE・国土地理院・Open-Meteoへの要求は、どれも最新の安定版ChromeのUser-Agentで送り、10秒で打ち切ります。
 
 温度計は、センサーが流し続けるBluetoothの広告を、接続せずにホストのBlueZ（システムのD-Bus）から受けます。
 コンテナにはホストのD-Busのsocketを渡します。BluetoothのアダプタはBlueZが扱い、コンテナへ渡す必要はありません。
@@ -86,6 +90,7 @@ docker run -d --name home-link -p 5011:3000 -v home-link-data:/data \
 
 - 受けた値は5分間だけ今の値として扱い、それより古い値は返しません（受けた時刻は残します）。
 - アダプタが外れたり、BlueZやD-Busに届かなかったりしても、ほかの機能はそのまま動き、1分ごとに受信をやり直します。
+  D-Busへの接続とBlueZへの各呼び出しは5秒で打ち切るので、BlueZが応答しなくなっても受信が黙って止まりません。
 - 機器の登録（`POST /api/commission` など）の間は受信を止め、BluetoothをBLE Proxyに譲ります。終わると受信に戻ります。
 - 起動時のログは温度計が設定されたことだけを示し、アドレスの値は出しません。
 
@@ -273,7 +278,9 @@ adb -s DEVICE_SERIAL push home-link.yaml /sdcard/Android/data/dev.miyabisun.home
 
 入・切はhome-linkが保存し、サーバーを再起動しても保ちます。状態は、置いたとき、押した後、30分ごとにhome-linkから読み直します。
 状態が分からないときは「?」のアイコンで示します。
+押すと、home-linkがエアコンへ送り終えるまで（最長十数秒）「送信中…」を示します。
 押してうまくいかなかったときは、数秒だけ[ボタンの表示](#ボタンの表示)の結果を示してから元の表示に戻ります。
+入・切は保存できたのにエアコンへ届かなかったときは、数秒だけ「届かず」を示してから新しい入・切を示します。home-linkが10分ごとに送り直します。
 
 ### 玄関を解錠・施錠する
 
@@ -304,6 +311,7 @@ SESAMEアプリの履歴には `home-link` の名前で記録されます。
 | 照明無応答 | 照明 | home-linkは受けましたが、照明がどれも応答しませんでした |
 | 一部無応答 | 照明 | 一部の照明が応答しませんでした |
 | 一部失敗・失敗 | 照明 | 照明が切り替えを受け付けませんでした |
+| 届かず | エアコン | 入・切はhome-linkに保存しましたが、エアコン（子機）へ届いていません。home-linkが10分ごとに送り直します |
 | Matter不通・Matter未設定 | home-linkの奥 | home-linkから照明のサーバー（matterjs-server）に届かないか、設定がありません |
 | SESAME不通・SESAME未設定・SESAME拒否 | home-linkの奥 | home-linkからCANDY HOUSEに届かない、`SESAME_` の環境変数が無い、またはCANDY HOUSEが受け付けませんでした |
 | ラベルなし・機器なし | home-link | labelが無いか、labelに機器がありません |
@@ -390,7 +398,7 @@ Thread網の資格情報（dataset）は、matterjs-serverに `set_thread_datase
 | `GET /api/aircon/runs` | 14日分の実行の記録（古い順）。`?since=`（Unix秒）でそれ以降に絞れます。各回は時刻 `at`、きっかけ `trigger`、室温 `temperature`・湿度 `humidity`・外気温 `outdoor`、決めた命令 `command`、結果 `result`、理由 `reason` を持ちます | |
 | `GET /api/location` | 家の位置。登録した住所 `address`、見つかった場所の名前 `name`、`latitude`・`longitude`、登録済みか `registered`。未登録なら東京（新宿）の座標です | |
 | `PUT /api/location` | 本文 `{"address": "東京都新宿区西新宿2-8-1"}` の住所を国土地理院の住所検索で引き、最初の候補を家の位置にします。見つからないときと届かないときは前の位置のままです。応答は `GET /api/location` と同じです | 400 `invalid_location`、404 `address_not_found`、502 `address_search_unreachable` |
-| `POST /api/aircon/toggle` | 入・切を切り替えます（ウィジェットのボタン）。保存してすぐ `{"on": true}` を返し、エアコンへはその後に送ります | |
+| `POST /api/aircon/toggle` | 入・切を切り替えます（ウィジェットのボタン）。保存してからエアコンへ送り、その結果を返します（最長12秒）。`{"on": true, "result": "sent", "delivered": true, "reason": "…"}`。`delivered` が `false`（`result` が `no_aircon`・`no_response`・`refused`・`failed`、12秒で分からなければ `pending`）のときも入・切は保存済みで、10分ごとの処理が送り直します。`reason` はそのときの理由です | |
 | `GET /api/thread` | Threadの機器を登録できるか（matterjs-serverがThread網のdatasetを持つか）を `{"ready": true}` で返します | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `GET /api/status` | 台帳の機器ごとに、matterjs-serverで見えるか（`visible`）と今の `node_id`・`endpoint` | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `GET /api/lights` | 照明ごとの今の状態（`on`・`off`・`no_response`・`ignored`）と、無視の照明を除いた件数 | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
@@ -403,7 +411,7 @@ Thread網の資格情報（dataset）は、matterjs-serverに `set_thread_datase
 | `POST /api/door/lock` | 玄関のSESAMEの施錠をCANDY HOUSEのWeb APIへ送り、受け付けられたら `{"status":"accepted"}` を返します | 503 `sesame_not_configured`、502 `sesame_rejected`（CANDY HOUSEのHTTPステータスを `message` に含みます）・`sesame_unreachable` |
 | `POST /mcp` | MCP（Streamable HTTP、JSONの応答だけ）。下の「MCP」 | |
 | `GET /api/health` | 稼働確認と版（`{"status":"ok","version":"0.1.4"}`） | |
-| `GET /healthz` | 稼働確認（`ok`） | |
+| `GET /healthz` | 稼働確認。1行目は `ok`、2行目からずっと動かす処理ごとの状態と起こし直した回数（上の「サーバーの起動」）。処理が終わってしまったら1行目が `stopped` | 503（処理が終わったとき） |
 
 機器名は0〜100文字です。
 
@@ -448,6 +456,7 @@ QRコードと手動ペアリングコードは、setup passcodeとdiscriminator
 
 識別子は、matterjs-serverが機器から読んだBasic Information（ブリッジ配下の機器はBridged Device Basic Information）の
 VendorNameとSerialNumberです。Aqara Hub M3配下のT2ではZigbeeのIEEEアドレス、TapoではWi-FiのMACがSerialNumberになります。
+SerialNumberは大文字・小文字を区別せずに照らし合わせます（ブリッジが小文字で報告し、箱には大文字で書かれていることがあるため）。
 
 `POST /api/commission` は、本文の `qr_payload` か `manual_code` のどちらか一方、`name`（任意）、
 `network`（`wifi` か `thread`、既定は `wifi`）を受け取ります。`wifi` では、保存したWi-Fiのうち機器に渡すもの（`for_devices`）を
@@ -462,6 +471,8 @@ MACアドレスを読み、コードとともに台帳へ登録して201を返�
 1回の登録は5分で打ち切ります。Wi-Fiのパスワードは応答とログには含めません。
 `device_not_found` はペアリング待ちの機器がBluetoothで見つからない、`wrong_code` は見つかったがコードを受け付けない、
 `wifi_failed` は機器がWi-Fiにつながらない、`thread_failed` は機器がThread網に参加できない、`commission_failed` はそれ以外（matterjs-serverの説明を `message` に含みます）です。
+matterjs-server 1.5.0からは、失敗の理由 `reason`（`passcode-mismatch`・`not-discovered`・`timeout` など）で分けます。
+`wrong_code` は `passcode-mismatch` のときだけで、Bluetoothが途中で切れた `Operation aborted` などは `commission_failed` です。
 
 `GET /api/status` は、そのたびにmatterjs-serverの全nodeを読み、識別子から機器の今の `node_id` と `endpoint` を引きます。
 node IDとendpointはmatterjs-serverが振る番号なので台帳には保存しません。
@@ -520,18 +531,35 @@ labelには、次の性質を持たせられます。
 | --- | --- |
 | `auto` | 自動調光連動。`true` のlabelの照明は、下の「明るさと色温度の自動調整」に従います |
 | `override_level`・`override_kelvin` | 上書きの値（明るさ1〜254、色温度1000〜10000K）。2つは両方を指定するか、両方を `null` にします。ONの間、labelの照明をこの値に固定し、自動調整しません。`auto` とは同じlabelに持てません |
-| `schedule` | 毎日の切り替え。`[{"time": "00:00", "on": true}, {"time": "05:00", "on": false}]` の形で、時刻（Asia/Tokyo、`00:00`〜`23:59`）ごとにONかOFFを1回送ります。間に手で切り替えた状態は、次の時刻まで保ちます |
+| `schedule` | 毎日の切り替え。`[{"time": "00:00", "on": true}, {"time": "05:00", "on": false}]` の形で、時刻（Asia/Tokyo、`00:00`〜`23:59`）ごとにONかOFFを送ります。間に手で切り替えた状態は、次の時刻まで保ちます。下の「予定の実行」 |
 
 labelの操作（`POST /api/labels/{id}/on`・`/off`・`/toggle`）は、labelの機器のうち無視の機器を除く照明とプラグに送ります。
 
 - **ON**: 機器をオンにします。上書きの値を持つlabelなら、その照明を上書きの値ですぐに点けます（`MoveToLevelWithOnOff` と `ExecuteIfOff` 付きの `MoveToColorTemperature`、`transitionTime` 0）。
   自動調整の対象になった照明があり、自動調整が有効なら、続けて自動調整を行います（`runs` の `trigger` は `label_on`）。
-  1台もオンにできなかったときは、labelの `on` を変えません。
-- **OFF**: 機器をオフにします。その機器に付いた上書きのlabelも、上書きをやめます。
+  上書きの値や自動調整を送れなかった照明は、その照明の結果（`failed`・`no_response` と `reason`）に出し、要求全体は失敗にしません。
+- **OFF**: 機器をオフにします。オフにできた機器に付いた上書きのlabelも、上書きをやめます。
 - **切り替え（toggle）**: labelの `on` が `true` でなければONにします。`true` なら、上書きの値を持たないlabelはOFFにし、
   上書きの値を持つlabelは上書きをやめます。上書きをやめた照明は、ほかのlabelで決まる状態に戻ります。
   ほかの上書き中のlabelがあればその値のまま、ONの（OFFでない）自動調光連動のlabelがあればその時刻の目標値へすぐ戻り（`ExecuteIfOff` なし、`transitionTime` 0）、
   どちらでもなければ消えます。プラグも同じく、自動調光連動のlabelに入っていなければ切ります。
+  ほかの上書き中のlabelが持つ照明へは何も送らず、結果は `override` です（`switched` に数えません）。
+
+labelの `on` は、切り替えが届いた後、上書きの値を送る前に保存します。照明の全部オン・オフ（`POST /api/lights/on`・`/off`）も同じです。
+
+- labelの機器のどれか1台でも切り替えを受け付けたlabelだけが、新しい `on` になります。1台も受け付けなかったlabelは、照明の実際と合わせて元の `on` のままです。
+- 全部オフでは、照明を1台も消せなかったlabel（プラグだけのlabelを含みます）は元の `on` のままです。
+- matterjs-serverに届かず502を返したときは、どのlabelの `on` も変えません。
+
+#### 予定の実行
+
+毎分0秒に、その分の予定を実行します。1分の実行は次の分を待たせず、labelごとに別々に進みます。同じlabelの予定は、時刻の順に1つずつ実行します。
+
+- 前の実行が長引いて、ある分の実行が遅れたり抜けたりしても、次の実行がそれまでの分（10分前まで）の予定もまとめて実行します。
+  home-linkを止めていた間の予定は実行しません。
+- 応答しなかった機器（`no_response`）とmatterjs-serverが届けられなかった機器（`server_error`）へは、30秒あけて2回まで送り直します。
+  matterjs-serverに届かなかったときは、labelの全部の機器へ送り直します。間にlabelが手で切り替えられたら、送り直しをやめます。
+- 予定ごとにログへ `label switched on schedule`（`attempt` は送り直しの回数）を残し、送り直しても応答しない機器が残ったら `warn` を残します。
 
 1台の照明に性質の違うlabelが付いているときは、次の順に決めます。labelの順はidの小さい順です。
 
@@ -634,6 +662,9 @@ curl -s -X PUT localhost:5011/api/aircon -H 'content-type: application/json' -d 
 - 色温度と明るさは、照明ごとに報告された範囲へ収めます。色温度に対応しない照明へは色温度を、調光しない照明へは明るさを送りません。
 - 定時の1回の変化は30秒（`transitionTime` 300）かけて移します。
 - 前回送った値と同じ値は送りません。送った値はメモリだけに持ち、再起動後は改めて送ります。
+- ただし、照明が今報告している明るさ（`8/0`）か色温度（`768/7`）が前回送った値から離れていれば（明るさ2・色温度5mired超）、送り直します。
+  壁のスイッチで電源を入れ直して明るく・青白く戻った照明を、次の調整で直すためです。自動調光連動のlabelが無い照明（`manual`）には送りません。
+- labelのONや照明オンの後の調整は、そのとき点けた照明だけを対象にします。ほかの照明は次の10分ごとの調整に任せ、応答しない照明で要求を待たせません。
 
 | 設定 | 既定値 | 内容 |
 | --- | --- | --- |

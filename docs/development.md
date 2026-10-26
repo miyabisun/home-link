@@ -62,13 +62,26 @@ WebSocketサーバーを立て、全部オン・全部オフ、エラーや無�
 - `status` 付きのエラーを返すmock（機器の拒否）
 - 3秒遅れて答えるmock
 
+部分の失敗で状態を壊さないことは、次のmockで確かめます。
+
+- 最初の接続だけを通し、次の接続を止めるmock（`gated`）: labelのONで切り替えは届き、上書きの値を送れなくても、labelは `on` で保存され、照明ごとの結果が返る。
+  matterjs-serverに届かないときは、全部オン・全部オフ・labelのOFF・解除のどれもlabelの `on` を変えない。
+- 1台が答えないmock（`silent`）: その照明しか持たないlabelは、全部オフの後も元の `on` のまま。
+- 照明の明るさ・色温度を外から変えるmock（`edits`、壁のスイッチでの入れ直しに当たる）: 次の調整で送り直し、自動調光連動でない照明には送らない。
+  mockは送られた明るさと色温度を `8/0`・`768/7` に反映します。
+- 最初の何回かの命令に答えないmock（`silent_for`）と `Home::with_schedule_retry`: 抜けた分の予定をまとめて実行し、答えなかった機器だけへ送り直す。
+  抜けた分の求め方（`schedule::minutes_due`）は単体テストで確かめます。
+- `Home::supervise` にpanicする処理を渡し、起こし直されて `/healthz` に出ること、終わった処理で503になることを確かめます。
+- エアコンが答えないmockで、`POST /api/aircon/toggle` が `delivered: false` を返すことを確かめます。
+- CANDY HOUSEの代わりのHTTPサーバーで、ChromeのUser-Agentと、答えないときに10秒で打ち切ることを確かめます。
+
 要求のログは `capture_logs` で、起動時に温度計のアドレスを出さないことは `tests/port.rs` で実行ファイルを起動して確かめます。
 機器の種類とプラグの入り切りは、同じmockに照明・プラグ（0x010A・0x010B）・ブリッジ配下のプラグ・センサーを並べ、
 種類と入・切の値、そのnodeとendpointへのOn/Off、応答しない・使えないプラグ、照明と入り切りの無い機器の拒否、
 全部オン・全部オフと自動調整がプラグへ命令を送らないことを検証します。
 `src/commission.rs` はmatterjs-serverへ保存した機器用のWi-Fi情報を渡して（Threadでは渡さず、Thread網の有無を確かめて）
 `commission_with_code` で機器を登録する処理と、
-失敗の文言（matter.jsの例外の文）を見つからない・コード違い・Wi-Fi・Thread・時間切れに分ける処理、
+失敗をmatterjs-server（1.5.0から）の `reason` と、それが無い古い版では文言（matter.jsの例外の文）で、見つからない・コード違い・Wi-Fi・Thread・時間切れに分ける処理、
 登録した機器のBasic InformationとWi-FiのMACアドレスの取り出し、接続済みの機器のWi-Fiの差し替え（fail-safeの下での付け替えと確定・戻り）と、それらの単体テストを持ちます。
 機器登録APIのテストは、`tests/api.rs` の中で `set_wifi_credentials`・`commission_with_code`・`read_attribute` に応答するmockを立て、
 成功・各失敗・時間切れ・台帳の重複・入力の検証を検証します。
@@ -257,6 +270,7 @@ adb shell settings put global low_power 1
 ボタンの表示と短い結果の文言は `LabelsTest` と `ButtonFaceTest` で検証します。
 エアコンのウィジェットは、テストの中でAppWidgetHostに置いて画面に描き、fakeのAPIを相手に確かめます。
 読んだ状態の表示と、押して入と切が切り替わることを扱います。届かないときに短い結果を示し、元の表示へ戻ることも扱います。
+入・切は保存されたがエアコンへ届かなかった応答（`delivered` が false）では「届かず」と理由の読み上げを示し、その後に新しい状態へ戻ることも扱います。
 エミュレータでは、ホストのfakeのhome-linkやAPIサーバーを接続先にします（エミュレータからホストは `10.0.2.2`）。
 
 ```sh
