@@ -51,21 +51,40 @@ struct Matter {
     silent: Vec<u64>,
     /// Every command but `get_nodes`, by name and node.
     asked: Vec<(String, u64)>,
+    /// Node ids no longer served: their bulbs left the fabric.
+    gone: Vec<u64>,
+    /// Node ids served under another, as a bulb registered again is.
+    renumbered: Vec<(u64, u64)>,
+    /// Whether a connection listens for events, and the events still to send it.
+    listening: bool,
+    events: Vec<Value>,
 }
 
-/// A Wi-Fi bulb, a Thread bulb and a Wi-Fi bulb the ledger ignores.
+/// A Wi-Fi bulb, a Thread bulb (a child of the router 0x4c00) and a Wi-Fi bulb the ledger ignores.
 fn nodes(matter: &Matter) -> Value {
     let node = |id: u64, serial: &str, network: u64| {
-        json!({ "node_id": id, "available": !matter.unavailable.contains(&id), "attributes": {
+        let served = matter
+            .renumbered
+            .iter()
+            .find(|(from, _)| *from == id)
+            .map_or(id, |(_, to)| *to);
+        let mut node = json!({ "node_id": served, "available": !matter.unavailable.contains(&id), "attributes": {
             "0/40/1": "Repro", "0/40/15": serial, "0/40/3": "Bulb", "0/49/65532": network,
-            "1/29/0": [{ "0": 269, "1": 1 }], "1/6/0": true,
-        }})
+            "0/40/10": "1.0.0.6", "1/29/0": [{ "0": 269, "1": 1 }], "1/6/0": true,
+        }});
+        if network == 2 {
+            node["attributes"]["0/53/64"] = json!(0x4c01);
+        }
+        (!matter.gone.contains(&id)).then_some(node)
     };
-    json!([
+    [
         node(5, "wifi-bulb", 1),
         node(7, "thread-bulb", 2),
-        node(16, "dead-bulb", 1)
-    ])
+        node(16, "dead-bulb", 1),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 async fn fake_matter(matter: Arc<Mutex<Matter>>) -> SocketAddr {
@@ -98,6 +117,10 @@ async fn fake_matter(matter: Arc<Mutex<Matter>>) -> SocketAddr {
                         }
                         match name.as_str() {
                             "get_nodes" => json!({ "message_id": id, "result": nodes(&matter) }),
+                            "start_listening" => {
+                                matter.listening = true;
+                                json!({ "message_id": id, "result": nodes(&matter) })
+                            }
                             "read_attribute" if matter.silent.contains(&node) => continue,
                             "read_attribute" => {
                                 json!({ "message_id": id, "result": { "1/6/0": true } })
@@ -112,6 +135,17 @@ async fn fake_matter(matter: Arc<Mutex<Matter>>) -> SocketAddr {
                     };
                     if ws.send(Message::text(reply.to_string())).await.is_err() {
                         return;
+                    }
+                    if name == "start_listening" {
+                        loop {
+                            let events = std::mem::take(&mut matter.lock().unwrap().events);
+                            for event in events {
+                                if ws.send(Message::text(event.to_string())).await.is_err() {
+                                    return;
+                                }
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        }
                     }
                 }
             });
@@ -508,4 +542,243 @@ async fn after_a_restart_a_light_told_down_is_not_told_again_and_is_told_back() 
         messages[1]
     );
     drop(before);
+}
+
+/// Waits until `done` holds, for up to two seconds.
+async fn until(done: impl Fn() -> bool) {
+    for _ in 0..200 {
+        if done() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("not done in time");
+}
+
+/// The Thread bulb leaves the fabric at 00:00:40, as matterjs-server sends: told once, not reconnected.
+async fn a_thread_bulb_leaves_the_fabric(rig: &Rig) {
+    let Rig {
+        matter,
+        messages,
+        home,
+        ..
+    } = rig;
+    home.check_lights(minute(0)).await;
+    tokio::spawn(home.clone().watch_removals());
+    until(|| matter.lock().unwrap().listening).await;
+    {
+        let mut matter = matter.lock().unwrap();
+        matter.gone.push(7);
+        matter
+            .events
+            .push(json!({ "event": "node_removed", "data": 7 }));
+    }
+    until(|| matter.lock().unwrap().events.is_empty()).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    for n in 1..=6 {
+        home.check_lights(minute(n)).await;
+    }
+
+    assert_eq!(
+        asked(matter, "interview_node"),
+        Vec::<u64>::new(),
+        "no node to reconnect"
+    );
+    {
+        let messages = messages.lock().unwrap();
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        for part in [
+            "網（fabric）から外れました",
+            "寝室（Thread）",
+            "製造番号 thread-bulb",
+            "10-26 00:00から（matterjs-serverが外した時刻）",
+            "home-linkアプリで登録し直す",
+        ] {
+            assert!(messages[0].contains(part), "{part}: {}", messages[0]);
+        }
+    }
+}
+
+/// The watch and its history show the bulb that left, with what was last known of it.
+async fn the_bulb_that_left_is_shown_everywhere(rig: &Rig) {
+    let Rig { app, .. } = rig;
+    let (_, watch) = call(app, "GET", "/api/lights/watch").await;
+    assert_eq!(watch["wifi_all_down"], false);
+    let lights = watch["lights"].as_array().unwrap();
+    let left = lights
+        .iter()
+        .find(|l| l["name"] == "寝室")
+        .expect("still watched");
+    assert_eq!(
+        (
+            &left["state"],
+            &left["connected"],
+            &left["node_id"],
+            &left["network"],
+            &left["device_id"]
+        ),
+        (
+            &json!("left_fabric"),
+            &json!(false),
+            &Value::Null,
+            &Value::Null,
+            &json!(2)
+        ),
+        "{left}"
+    );
+    assert_eq!(
+        lights.iter().find(|l| l["name"] == "玄関").unwrap()["state"],
+        "connected"
+    );
+    let outage = &left["outage"];
+    assert_eq!(
+        (
+            &outage["found_by"],
+            &outage["left_by"],
+            &outage["left_at"],
+            &outage["started_at"]
+        ),
+        (
+            &json!("left_fabric"),
+            &json!("event"),
+            &json!(T0 + 40),
+            &json!(T0 + 40)
+        )
+    );
+
+    let (_, outages) = call(app, "GET", "/api/lights/outages").await;
+    let row = &outages["outages"][0];
+    assert_eq!(
+        (
+            &row["node_id"],
+            &row["device_id"],
+            &row["serial_number"],
+            &row["network"]
+        ),
+        (
+            &json!(7),
+            &json!(2),
+            &json!("thread-bulb"),
+            &json!("thread")
+        ),
+        "{outages}"
+    );
+    assert_eq!(
+        (
+            &row["left_at"],
+            &row["left_by"],
+            &row["software_version"],
+            &row["thread_parent"]
+        ),
+        (
+            &json!(T0 + 40),
+            &json!("event"),
+            &json!("1.0.0.6"),
+            &json!("0x4c00")
+        )
+    );
+}
+
+/// The minute's check, the lights and the devices show the bulb that left, with when it left.
+async fn the_lights_and_devices_show_the_bulb_that_left(rig: &Rig) {
+    let Rig { app, .. } = rig;
+    let (_, at) = call(
+        app,
+        "GET",
+        &format!("/api/lights/connected?at={}", minute(3)),
+    )
+    .await;
+    let gone = at["lights"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["name"] == "寝室")
+        .cloned();
+    assert_eq!(
+        gone,
+        Some(
+            json!({ "node_id": null, "endpoint": null, "name": "寝室", "connected": false,
+            "device_id": 2, "state": "left_fabric" })
+        )
+    );
+
+    let (_, all) = call(app, "GET", "/api/lights").await;
+    assert_eq!(
+        all["missing_devices"],
+        json!([{ "id": 2, "name": "寝室", "state": "left_fabric", "left_at": T0 + 40 }])
+    );
+    let (_, devices) = call(app, "GET", "/api/devices").await;
+    let device = devices
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["id"] == 2)
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        (&device["state"], &device["left_fabric"], &device["left_at"]),
+        (&json!("unconnected"), &json!(true), &json!(T0 + 40))
+    );
+}
+
+/// Registered again, it is served under a new node and found on its ledger row: told back once.
+async fn the_bulb_registered_again_is_back(rig: &Rig) {
+    let Rig {
+        matter,
+        messages,
+        home,
+        app,
+    } = rig;
+    // Registered again: matterjs-server serves it under a new node, found by its serial number.
+    {
+        let mut matter = matter.lock().unwrap();
+        matter.gone.clear();
+        matter.renumbered.push((7, 70));
+    }
+    home.check_lights(minute(10)).await;
+    {
+        let messages = messages.lock().unwrap();
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert!(
+            messages[1].contains("寝室（Thread）: 9分つながっていませんでした"),
+            "{}",
+            messages[1]
+        );
+    }
+    let (_, watch) = call(app, "GET", "/api/lights/watch").await;
+    let back: Vec<_> = watch["lights"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|l| l["name"] == "寝室")
+        .collect();
+    assert_eq!(back.len(), 1, "{watch}");
+    assert_eq!(
+        (&back[0]["node_id"], &back[0]["state"]),
+        (&json!(70), &json!("connected"))
+    );
+    let (_, outages) = call(app, "GET", "/api/lights/outages").await;
+    assert_eq!(outages["outages"][0]["ended_at"], minute(10));
+}
+
+#[tokio::test]
+async fn a_ledger_bulb_that_leaves_the_fabric_is_told_and_comes_back_when_registered_again() {
+    let matter = Arc::new(Mutex::new(Matter {
+        unavailable: vec![16],
+        ..Matter::default()
+    }));
+    let (discord, messages) = fake_discord().await;
+    // matterjs-server removes the Thread bulb's node at 00:00:40.
+    let home = home(fake_matter(matter.clone()).await, Some(discord)).with_clock(|| T0 + 40);
+    let app = home.router();
+    let rig = Rig {
+        matter,
+        messages,
+        home,
+        app,
+    };
+    a_thread_bulb_leaves_the_fabric(&rig).await;
+    the_bulb_that_left_is_shown_everywhere(&rig).await;
+    the_lights_and_devices_show_the_bulb_that_left(&rig).await;
+    the_bulb_registered_again_is_back(&rig).await;
 }

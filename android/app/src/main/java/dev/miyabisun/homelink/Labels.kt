@@ -60,6 +60,7 @@ fun pressLabel(op: LabelOp, result: ApiResult<LabelResult>): LightsMessage? {
             LabelOp.TOGGLE -> null
         }
         left == counts.noResponse -> LightsMessage(if (counts.switched > 0) "一部無応答" else "照明無応答", failed = true)
+        left == counts.missing.size -> LightsMessage(if (counts.switched > 0) "一部網外れ" else "網外れ", failed = true)
         counts.switched > 0 -> LightsMessage("一部失敗", failed = true)
         else -> LightsMessage("失敗", failed = true)
     }
@@ -76,7 +77,7 @@ fun labelMessage(name: String, result: ApiResult<LabelResult>, host: String): Li
         is ApiResult.Ok -> result.value
     }
     val counts = done.devices
-    val missing = counts.missing.size.takeIf { it > 0 }?.let { count -> "見つからない${count}台" + counts.missing.joinToString("、", "（", "）") }
+    val missing = counts.missing.size.takeIf { it > 0 }?.let { count -> "網から外れた${count}台" + counts.missing.joinToString("、", "（", "）") }
     val left = listOfNotNull(
         counts.noResponse.takeIf { it > 0 }?.let { "応答なし${it}台" },
         counts.failed.takeIf { it > 0 }?.let { "失敗${it}台" },
@@ -85,6 +86,9 @@ fun labelMessage(name: String, result: ApiResult<LabelResult>, host: String): Li
     if (left.isEmpty()) return null
     val some = if (counts.switched > 0) "一部の" else ""
     if (counts.failed == 0 && counts.missing.isEmpty()) return LightsMessage("${name}の${some}照明が応答しませんでした。$left", failed = true)
+    if (counts.failed == 0 && counts.noResponse == 0) {
+        return LightsMessage("${name}の${some}照明が網から外れています。$left。アプリで登録し直してください", failed = true)
+    }
     val undone = when (done.action) {
         "on" -> "オンにできませんでした"
         "off" -> "オフにできませんでした"

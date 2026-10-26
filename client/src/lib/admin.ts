@@ -36,7 +36,12 @@ export function labelNameError(name: string): string | null {
   return n < 1 || n > MAX_NAME ? `1〜${MAX_NAME}文字` : null;
 }
 
-export function stateText(state: string | null): string | null {
+/** A device once connected that matterjs-server serves no more (`leftFabric`) left the fabric. */
+export function stateText(
+  state: string | null,
+  leftFabric: boolean | null = false,
+): string | null {
+  if (leftFabric) return "網から外れた";
   if (state === "unconnected") return "未接続";
   if (state === "no_response") return "応答なし";
   return null;
@@ -148,6 +153,7 @@ export function switchProblem(result: {
   failed: number;
   missing: number;
   devices?: SwitchEntry[];
+  missing_devices?: { name: string }[];
 }): string | null {
   const names = (outcome: string) => {
     const named = (result.devices ?? [])
@@ -158,7 +164,13 @@ export function switchProblem(result: {
   const parts = [
     ["応答なし", result.no_response, names("no_response")],
     ["失敗", result.failed, names("failed")],
-    ["見つからない", result.missing, ""],
+    [
+      "網から外れた",
+      result.missing,
+      result.missing_devices?.length
+        ? `（${result.missing_devices.map((device) => device.name).join("・")}）`
+        : "",
+    ],
   ]
     .filter(([, count]) => Number(count) > 0)
     .map(([name, count, which]) => `${name} ${count}${which}`);
@@ -298,14 +310,20 @@ export interface Outage {
   reconnects: number;
   reconnect_result: string | null;
   reachable: boolean | null;
+  /** When the light left the fabric, and whether that is matterjs-server's time, a check's, or when it was found. */
+  left_at?: number | null;
+  left_by?: "event" | "check" | "unknown" | null;
 }
 
 export interface WatchLight {
-  node_id: number;
-  endpoint: number;
+  /** `null` for a light that left the fabric: matterjs-server serves no node for it. */
+  node_id: number | null;
+  endpoint: number | null;
+  device_id?: number | null;
   name: string;
   network: "wifi" | "thread" | "ethernet" | null;
   connected: boolean;
+  state?: "connected" | "down" | "left_fabric";
   since: number | null;
   last_answer: number | null;
   outage: Outage | null;
@@ -333,15 +351,25 @@ function moment(unix: number, now: number): string {
 
 function span(seconds: number): string {
   const minutes = Math.max(0, Math.floor(seconds / 60));
-  return minutes < 60
-    ? `${minutes}分`
-    : `${Math.floor(minutes / 60)}時間${minutes % 60}分`;
+  if (minutes < 60) return `${minutes}分`;
+  const hours = `${Math.floor(minutes / 60) % 24}時間${minutes % 60}分`;
+  return minutes < 1440 ? hours : `${Math.floor(minutes / 1440)}日${hours}`;
+}
+
+/** The badge of a light that needs attention: left the fabric, or down. */
+export function watchBadge(light: WatchLight): string | null {
+  if (light.state === "left_fabric") return "網から外れた";
+  return light.connected ? null : "切断";
 }
 
 /** Since when a light has been connected and when it last answered, or since when it is down and what was done. */
 export function watchNote(light: WatchLight, now: number): string {
-  const parts = light.since === null ? [] : [`${moment(light.since, now)}から`];
   const outage = light.outage;
+  if (light.state === "left_fabric" && outage?.left_at != null) {
+    const at = moment(outage.left_at, now);
+    return `${outage.left_by === "unknown" ? `${at}に発見` : `${at}から`}・アプリで登録し直す`;
+  }
+  const parts = light.since === null ? [] : [`${moment(light.since, now)}から`];
   if (light.connected || outage === null) {
     if (light.last_answer !== null)
       parts.push(`応答 ${moment(light.last_answer, now)}`);
@@ -356,7 +384,8 @@ export function watchNote(light: WatchLight, now: number): string {
 /** When a stretch out of reach began and ended, and how long it lasted. */
 export function outageText(outage: Outage, now: number): string {
   const start = moment(outage.started_at, now);
+  const left = outage.left_at != null ? "・網から外れた" : "";
   if (outage.ended_at === null)
-    return `${start}〜（${span(now - outage.started_at)}、続いている）`;
-  return `${start}〜${moment(outage.ended_at, now)}（${span(outage.ended_at - outage.started_at)}）`;
+    return `${start}〜（${span(now - outage.started_at)}、続いている）${left}`;
+  return `${start}〜${moment(outage.ended_at, now)}（${span(outage.ended_at - outage.started_at)}）${left}`;
 }

@@ -48,6 +48,32 @@ const thread = {
   network: "thread",
   since: minutes(600),
 };
+// A light that left the fabric five days ago, as matterjs-server sent.
+const left = {
+  node_id: null,
+  endpoint: null,
+  device_id: 19,
+  name: "物置き1",
+  network: null,
+  connected: false,
+  state: "left_fabric",
+  since: minutes(5 * 1440),
+  last_answer: null,
+  outage: {
+    ...down.outage,
+    node_id: 52,
+    name: "物置き1",
+    network: "thread",
+    started_at: minutes(5 * 1440),
+    found_by: "left_fabric",
+    reconnects: 0,
+    reconnect_result: null,
+    reachable: null,
+    device_id: 19,
+    left_at: minutes(5 * 1440),
+    left_by: "event",
+  },
+};
 const server = {
   ...down.outage,
   node_id: null,
@@ -74,7 +100,7 @@ async function watching(
         server_outage: serverDown ? server : null,
         wifi_all_down: false,
         notify,
-        lights: [light, down, thread],
+        lights: [light, down, thread, left],
       },
     }),
   );
@@ -91,6 +117,7 @@ async function watching(
             reconnects: 1,
             reconnect_result: "accepted",
           },
+          left.outage,
           down.outage,
         ],
       },
@@ -119,12 +146,14 @@ for (const size of widths) {
       await page.goto("/lights");
 
       const cards = page.locator(".card");
-      await expect(cards).toHaveCount(3);
+      await expect(cards).toHaveCount(4);
       await expect(cards.nth(0)).toContainText("玄関");
       await expect(cards.nth(0)).toContainText("から・応答");
       await expect(cards.nth(0).locator(".badge")).toHaveCount(0);
       await expect(cards.nth(1).locator(".badge")).toHaveText("切断");
       await expect(cards.nth(1)).toContainText("つなぎ直し3回・網で届かない");
+      await expect(cards.nth(3).locator(".badge")).toHaveText("網から外れた");
+      await expect(cards.nth(3)).toContainText("から・アプリで登録し直す");
       await expect(page.getByRole("alert")).toContainText(
         "matterjs-serverに届きません",
       );
@@ -135,11 +164,12 @@ for (const size of widths) {
       });
 
       const history = page.locator("details.history");
-      await expect(history.locator("summary")).toHaveText("14日の履歴（2件）");
+      await expect(history.locator("summary")).toHaveText("14日の履歴（3件）");
       await history.locator("summary").click();
       // Newest first; the one still going says so.
       await expect(history.locator("li").nth(0)).toContainText("続いている");
-      await expect(history.locator("li").nth(1)).toContainText("（7分）");
+      await expect(history.locator("li").nth(1)).toContainText("網から外れた");
+      await expect(history.locator("li").nth(2)).toContainText("（7分）");
       await noSideScroll(page);
       await page.screenshot({
         path: `test-results/screens/lights-history-${size.width}-${scheme}.png`,

@@ -54,10 +54,21 @@ enum class DeviceKind {
  */
 data class Device(val id: Long, val name: String, val labelIds: Set<Long>, val state: DeviceState?,
                   val code: String?, val wifiSsid: String? = null, val kind: DeviceKind? = null, val on: Boolean? = null,
-                  val productName: String? = null)
+                  val productName: String? = null, val leftFabric: Boolean = false)
 
 /** How a device reads in lists: its name, else its product, else its printed code. */
 val Device.title: String get() = name.ifEmpty { productName ?: code?.let { ManualCode.label(it) ?: it } ?: "機器" }
+
+/** A device once connected that matterjs-server serves no more left the fabric: registering it again brings it back. */
+fun stateText(device: Device): String = when (device.state) {
+    DeviceState.UNCONNECTED -> if (device.leftFabric) "網から外れた" else "未接続"
+    DeviceState.CONNECTED -> "接続済み"
+    DeviceState.NO_RESPONSE -> "応答なし"
+    null -> ""
+}
+
+/** How a device still to connect reads in the list: one that left the fabric says so. */
+fun listTitle(device: Device): String = if (device.leftFabric) "${device.title}（網から外れた）" else device.title
 
 /** One field of a device to change. */
 sealed interface DeviceUpdate {
@@ -241,6 +252,7 @@ class HttpHomeLinkApi(private val targets: () -> Targets, private val link: Phon
             DeviceKind.of(json.optString("kind").takeUnless { json.isNull("kind") }),
             if (json.isNull("on")) null else json.optBoolean("on"),
             json.optString("product_name").takeUnless { json.isNull("product_name") },
+            json.optBoolean("left_fabric", false),
         )
     }
 

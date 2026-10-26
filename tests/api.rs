@@ -676,7 +676,7 @@ async fn all_lights_switch_on_and_off_and_report_each_result() {
     );
     assert_eq!(
         body["missing_devices"],
-        json!([{ "id": 3, "name": "消えた灯" }])
+        json!([{ "id": 3, "name": "消えた灯", "state": "left_fabric", "left_at": null }])
     );
     let sent: Vec<_> = commands
         .lock()
@@ -2823,8 +2823,24 @@ async fn three_codes_scanned_first_then_connecting_one_connects_only_that_row() 
         (&device["state"], &device["product_name"]),
         (&json!("unconnected"), &Value::Null)
     );
+    assert_eq!(
+        (&device["left_fabric"], &device["left_at"]),
+        (&json!(true), &Value::Null),
+        "once connected, no longer served: {device}"
+    );
     let (_, lights) = call(&app, "GET", "/api/lights", None).await;
     assert_eq!(lights["missing"], 1);
+    assert_eq!(lights["missing_devices"][0]["state"], "left_fabric");
+    let (_, list) = call(&app, "GET", "/api/devices", None).await;
+    assert_eq!(
+        list.as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["left_fabric"].clone())
+            .collect::<Vec<_>>(),
+        [json!(false), json!(true), json!(false)],
+        "never connected is not left"
+    );
 
     let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
     assert!(logs.contains("device commissioned"), "{logs}");
@@ -3281,7 +3297,7 @@ async fn ignored_lights_get_no_switch_and_are_not_counted() {
         );
         assert_eq!(
             body["missing_devices"],
-            json!([{ "id": 3, "name": "消えた灯" }])
+            json!([{ "id": 3, "name": "消えた灯", "state": "left_fabric", "left_at": null }])
         );
         let sent: Vec<_> = commands
             .lock()
@@ -5907,7 +5923,7 @@ fn opening_a_v0_1_39_ledger_drops_rooms_and_keeps_everything_else() {
         let version: i64 = db
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
         let broken: i64 = db
             .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
                 r.get(0)
@@ -6895,7 +6911,7 @@ fn moves_changed_schedule_coordinates_to_the_home_location() {
         let version: i64 = db
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
         drop(db);
         let _ = std::fs::remove_file(&path);
     }

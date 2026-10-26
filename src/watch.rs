@@ -6,6 +6,9 @@
 //! [`READ_EVERY`], reads each light's On/Off for real, since a light can stay `available`
 //! after it stopped answering. A light is down while it is not `available` or after
 //! [`MISSES_TO_RECONNECT`] reads in a row went unanswered.
+//!
+//! A ledger light matterjs-server no longer serves has left the fabric: no reconnection brings
+//! it back, so it is watched by its ledger row until it is registered again.
 
 use std::collections::BTreeMap;
 
@@ -37,12 +40,58 @@ pub struct Seen {
     pub name: String,
     /// `wifi`, `thread` or `ethernet`, when known.
     pub network: Option<&'static str>,
+    /// The ledger row it is, if any.
+    pub device: Option<i64>,
     /// The ledger ignores it: it is neither watched nor told.
     pub ignored: bool,
     /// matterjs-server serves it as available and, behind a bridge, the bridge reaches it.
     pub available: bool,
     /// Whether it answered a read of its On/Off, when one was sent in this check.
     pub answered: Option<bool>,
+}
+
+/// A ledger light matterjs-server does not serve: it left the fabric, and only registering it
+/// again brings it back. What is known of it is from when it was last served.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Left {
+    /// Its ledger row.
+    pub device: i64,
+    pub name: String,
+    pub labels: Vec<String>,
+    pub serial: Option<String>,
+    /// The ledger ignores it: it is neither watched nor told.
+    pub ignored: bool,
+    /// The network it was last on, when known.
+    pub network: Option<&'static str>,
+    /// Its last Software Version (`0/40/10`, or `57/10` behind a bridge).
+    pub software_version: Option<String>,
+    /// Its last Thread parent, as an RLOC16, when it was a child.
+    pub thread_parent: Option<String>,
+    /// When matterjs-server sent that it removed the node, if it did.
+    pub removed_at: Option<i64>,
+}
+
+/// How the time a light left the fabric is known.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeftBy {
+    /// matterjs-server sent that it removed the node: the time it did.
+    Event,
+    /// A check found it gone that the one before saw: the time of that check.
+    Check,
+    /// It was gone before the watch first saw it: the time the watch found it.
+    Unknown,
+}
+
+impl LeftBy {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Event => "event",
+            Self::Check => "check",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 /// How a light was found down.
@@ -55,6 +104,9 @@ pub enum Cause {
     NoAnswer,
     /// matterjs-server itself was out of reach.
     Unreachable,
+    /// matterjs-server no longer serves it: it left the fabric.
+    #[serde(rename = "left_fabric")]
+    Left,
 }
 
 impl Cause {
@@ -64,6 +116,7 @@ impl Cause {
             Self::Unavailable => "unavailable",
             Self::NoAnswer => "no_answer",
             Self::Unreachable => "unreachable",
+            Self::Left => "left_fabric",
         }
     }
 }
@@ -85,10 +138,22 @@ pub struct Outage {
     pub reconnect_result: Option<String>,
     /// Whether the light's addresses answered a ping, when checked.
     pub reachable: Option<bool>,
+    /// The ledger row of the light, when known.
+    pub device_id: Option<i64>,
+    /// When it left the fabric, and how that time is known.
+    pub left_at: Option<i64>,
+    pub left_by: Option<LeftBy>,
+    /// Its labels, serial number, last Software Version and Thread parent, kept when it left.
+    pub labels: Vec<String>,
+    pub serial_number: Option<String>,
+    pub software_version: Option<String>,
+    pub thread_parent: Option<String>,
     #[serde(skip)]
     notified: bool,
     #[serde(skip)]
     advised: bool,
+    #[serde(skip)]
+    left_told: bool,
 }
 
 impl Outage {
@@ -111,8 +176,16 @@ impl Outage {
             reconnects: 0,
             reconnect_result: None,
             reachable: None,
+            device_id: None,
+            left_at: None,
+            left_by: None,
+            labels: Vec::new(),
+            serial_number: None,
+            software_version: None,
+            thread_parent: None,
             notified: false,
             advised: false,
+            left_told: false,
         }
     }
 
@@ -136,6 +209,19 @@ impl Outage {
         self.advised
     }
 
+    /// The stretch as kept, with whether the user was told the light left the fabric.
+    #[must_use]
+    pub const fn told_left(mut self, told: bool) -> Self {
+        self.left_told = told;
+        self
+    }
+
+    /// Whether the user was told the light left the fabric.
+    #[must_use]
+    pub const fn left_told(&self) -> bool {
+        self.left_told
+    }
+
     /// The light, or `None` for matterjs-server.
     #[must_use]
     pub fn key(&self) -> Option<Key> {
@@ -147,6 +233,8 @@ impl Outage {
 #[derive(Clone, Debug, Default)]
 struct Light {
     name: String,
+    /// Its ledger row, if any: a light that leaves the fabric is watched by it.
+    device: Option<i64>,
     network: Option<&'static str>,
     /// Since when it has been connected, as far as the watch saw.
     up_since: Option<i64>,
@@ -179,6 +267,11 @@ pub struct Told {
     /// Until when, for a light that came back.
     pub until: Option<i64>,
     pub reachable: Option<bool>,
+    /// For a light that left the fabric: its labels, serial number, and when and how it left.
+    pub labels: Vec<String>,
+    pub serial_number: Option<String>,
+    pub left_at: Option<i64>,
+    pub left_by: Option<LeftBy>,
 }
 
 /// A message to the user.
@@ -190,6 +283,8 @@ pub enum Notice {
     StillDown(Vec<Told>),
     /// Lights told down that came back.
     Up(Vec<Told>),
+    /// Ledger lights matterjs-server no longer serves for [`NOTIFY_AFTER`]: register them again.
+    Left(Vec<Told>),
     /// matterjs-server out of reach for [`NOTIFY_AFTER`].
     ServerDown { since: i64 },
     /// matterjs-server, told out of reach, back.
@@ -213,19 +308,30 @@ pub struct Step {
 #[derive(Clone, Debug, Default)]
 pub struct Watch {
     lights: BTreeMap<Key, Light>,
+    /// The stretches of ledger lights that left the fabric, by ledger row.
+    left: BTreeMap<i64, Outage>,
     server: Option<Outage>,
     server_up_since: Option<i64>,
     checked_at: Option<i64>,
 }
 
+/// A watched light's node, else its ledger row, name, and state: `connected`, `down` or `left_fabric`.
+pub type Connected = (Option<Key>, Option<i64>, String, &'static str);
+
 /// One light's state for the API.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct LightStatus {
-    pub node_id: u64,
-    pub endpoint: u16,
+    /// `None` for a light that left the fabric: matterjs-server serves no node for it.
+    pub node_id: Option<u64>,
+    pub endpoint: Option<u16>,
+    /// The ledger row, when it has one.
+    pub device_id: Option<i64>,
     pub name: String,
+    /// `None` for a light that left the fabric; the network it was on is in its `outage`.
     pub network: Option<&'static str>,
     pub connected: bool,
+    /// `connected`, `down`, or `left_fabric`.
+    pub state: &'static str,
     /// Since when it has been connected, or down.
     pub since: Option<i64>,
     pub last_answer: Option<i64>,
@@ -258,14 +364,14 @@ impl Watch {
     /// Takes in one check at `at`, on the minute: the lights it saw, or `None` when
     /// matterjs-server was out of reach. Without a destination (`notify` false) no notice
     /// comes out, and every other decision is the same.
-    pub fn step(&mut self, at: i64, seen: Option<&[Seen]>, notify: bool) -> Step {
+    pub fn step(&mut self, at: i64, seen: Option<&[Seen]>, left: &[Left], notify: bool) -> Step {
         self.checked_at = Some(at);
         let mut step = Step::default();
         match seen {
             None => self.server_down(at, &mut step),
             Some(seen) => {
                 self.server_up(at, &mut step);
-                self.lights_seen(at, seen, &mut step);
+                self.lights_seen(at, seen, left, &mut step);
             }
         }
         if !notify {
@@ -304,15 +410,20 @@ impl Watch {
         }
     }
 
-    fn lights_seen(&mut self, at: i64, seen: &[Seen], step: &mut Step) {
+    fn lights_seen(&mut self, at: i64, seen: &[Seen], left: &[Left], step: &mut Step) {
         let watched: Vec<&Seen> = seen.iter().filter(|light| !light.ignored).collect();
+        let gone: Vec<&Left> = left.iter().filter(|light| !light.ignored).collect();
+        let mut up = Vec::new();
+        self.leave(at, &gone, step);
+        self.come_back(at, &watched, &gone, &mut up, step);
         self.forget(at, seen, &watched, step);
         let mut due = Vec::new();
-        let (mut down, mut still_down, mut up) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut down, mut still_down) = (Vec::new(), Vec::new());
         for seen in watched {
             let light = self.lights.entry(seen.key).or_default();
             light.name.clone_from(&seen.name);
             light.network = seen.network;
+            light.device = seen.device;
             match seen.answered {
                 Some(true) => {
                     light.last_read = Some(at);
@@ -375,9 +486,19 @@ impl Watch {
             }
         }
         self.reconnect(at, due, step);
+        let mut left = Vec::new();
+        for outage in self.left.values_mut() {
+            let since = outage.left_at.unwrap_or(outage.started_at);
+            if !outage.left_told && at - since >= NOTIFY_AFTER {
+                outage.left_told = true;
+                left.push(told(outage));
+                step.changes.push(Change::Updated(outage.clone()));
+            }
+        }
         for (lights, notice) in [
             (down, Notice::Down as fn(Vec<Told>) -> Notice),
             (still_down, Notice::StillDown),
+            (left, Notice::Left),
             (up, Notice::Up),
         ] {
             if !lights.is_empty() {
@@ -386,8 +507,85 @@ impl Watch {
         }
     }
 
+    /// Ledger lights matterjs-server no longer serves have left the fabric: a light watched
+    /// keeps its stretch, or starts one, from when matterjs-server removed it, else from this
+    /// check; one never seen starts one now. It is watched by its ledger row from then on.
+    fn leave(&mut self, at: i64, gone: &[&Left], step: &mut Step) {
+        for left in gone {
+            if let Some(outage) = self.left.get_mut(&left.device) {
+                outage.name.clone_from(&left.name);
+                outage.labels.clone_from(&left.labels);
+                continue;
+            }
+            let watched = self
+                .lights
+                .iter()
+                .find(|(_, light)| light.device == Some(left.device))
+                .map(|(key, _)| *key);
+            let (left_at, left_by) = match (left.removed_at, watched) {
+                (Some(removed), _) => (removed, LeftBy::Event),
+                (None, Some(_)) => (at, LeftBy::Check),
+                (None, None) => (at, LeftBy::Unknown),
+            };
+            let light = watched.and_then(|key| self.lights.remove(&key));
+            let network = light
+                .as_ref()
+                .and_then(|light| light.network)
+                .or(left.network);
+            let (mut outage, change): (Outage, fn(Outage) -> Change) =
+                match light.and_then(|light| light.outage) {
+                    Some(outage) => (outage, Change::Updated),
+                    None => (
+                        Outage::new(watched, &left.name, network, left_at, Cause::Left),
+                        Change::Down,
+                    ),
+                };
+            outage.device_id = Some(left.device);
+            outage.left_at = Some(left_at);
+            outage.left_by = Some(left_by);
+            outage.network = network;
+            outage.labels.clone_from(&left.labels);
+            outage.serial_number.clone_from(&left.serial);
+            outage.software_version.clone_from(&left.software_version);
+            outage.thread_parent.clone_from(&left.thread_parent);
+            step.changes.push(change(outage.clone()));
+            self.left.insert(left.device, outage);
+        }
+    }
+
+    /// A light that left and is served again, registered again, ends its stretch, told back if
+    /// it was told gone; one no longer in the ledger as a light to watch ends it untold.
+    fn come_back(
+        &mut self,
+        at: i64,
+        watched: &[&Seen],
+        gone: &[&Left],
+        up: &mut Vec<Told>,
+        step: &mut Step,
+    ) {
+        let ended: Vec<(i64, bool)> = self
+            .left
+            .keys()
+            .filter(|device| !gone.iter().any(|left| left.device == **device))
+            .map(|device| {
+                let back = watched.iter().any(|seen| seen.device == Some(*device));
+                (*device, back)
+            })
+            .collect();
+        for (device, back) in ended {
+            let Some(mut outage) = self.left.remove(&device) else {
+                continue;
+            };
+            outage.ended_at = Some(at);
+            if back && (outage.left_told || outage.notified) {
+                up.push(told(&outage));
+            }
+            step.changes.push(Change::Up(outage));
+        }
+    }
+
     /// A light ignored since ends its stretch untold. One matterjs-server no longer serves
-    /// stays as it was while down, and is no longer watched while up.
+    /// and the ledger does not hold stays as it was while down, and is no longer watched while up.
     fn forget(&mut self, at: i64, seen: &[Seen], watched: &[&Seen], step: &mut Step) {
         let gone: Vec<Key> = self
             .lights
@@ -428,9 +626,19 @@ impl Watch {
         self.lights.get_mut(&key)?.outage.as_mut()
     }
 
+    /// When the ledger light `device` left the fabric, while it is out of it.
+    #[must_use]
+    pub fn left_at(&self, device: i64) -> Option<i64> {
+        self.left.get(&device).and_then(|outage| outage.left_at)
+    }
+
     /// Takes back the stretches still open when home-link last stopped: what was told stays told.
     pub fn resume(&mut self, outages: Vec<Outage>) {
         for outage in outages {
+            if let Some(device) = outage.device_id.filter(|_| outage.left_at.is_some()) {
+                self.left.insert(device, outage);
+                continue;
+            }
             match outage.key() {
                 None => self.server = Some(outage),
                 Some(key) => {
@@ -438,6 +646,7 @@ impl Watch {
                         key,
                         Light {
                             name: outage.name.clone(),
+                            device: outage.device_id,
                             network: outage.network,
                             outage: Some(outage),
                             ..Light::default()
@@ -462,12 +671,24 @@ impl Watch {
         Some(Change::Updated(outage.clone()))
     }
 
-    /// Each watched light and whether it is connected now.
+    /// Each watched light, by its node or else its ledger row, and its state now.
     #[must_use]
-    pub fn connected(&self) -> Vec<(Key, String, bool)> {
+    pub fn connected(&self) -> Vec<Connected> {
         self.lights
             .iter()
-            .map(|(key, light)| (*key, light.name.clone(), light.outage.is_none()))
+            .map(|(key, light)| {
+                let state = if light.outage.is_none() {
+                    "connected"
+                } else {
+                    "down"
+                };
+                (Some(*key), light.device, light.name.clone(), state)
+            })
+            .chain(
+                self.left.iter().map(|(device, outage)| {
+                    (None, Some(*device), outage.name.clone(), "left_fabric")
+                }),
+            )
             .collect()
     }
 
@@ -492,11 +713,17 @@ impl Watch {
                 .lights
                 .iter()
                 .map(|(&(node_id, endpoint), light)| LightStatus {
-                    node_id,
-                    endpoint,
+                    node_id: Some(node_id),
+                    endpoint: Some(endpoint),
+                    device_id: light.device,
                     name: light.name.clone(),
                     network: light.network,
                     connected: light.outage.is_none(),
+                    state: if light.outage.is_none() {
+                        "connected"
+                    } else {
+                        "down"
+                    },
                     since: light
                         .outage
                         .as_ref()
@@ -505,6 +732,18 @@ impl Watch {
                     last_answer: light.last_answer,
                     outage: light.outage.clone(),
                 })
+                .chain(self.left.iter().map(|(device, outage)| LightStatus {
+                    node_id: None,
+                    endpoint: None,
+                    device_id: Some(*device),
+                    name: outage.name.clone(),
+                    network: None,
+                    connected: false,
+                    state: "left_fabric",
+                    since: Some(outage.started_at),
+                    last_answer: None,
+                    outage: Some(outage.clone()),
+                }))
                 .collect(),
         }
     }
@@ -517,6 +756,10 @@ fn told(outage: &Outage) -> Told {
         since: outage.started_at,
         until: outage.ended_at,
         reachable: outage.reachable,
+        labels: outage.labels.clone(),
+        serial_number: outage.serial_number.clone(),
+        left_at: outage.left_at,
+        left_by: outage.left_by,
     }
 }
 
@@ -531,6 +774,12 @@ fn network_name(network: Option<&str>) -> &'static str {
 
 fn hhmm(unix: i64) -> String {
     schedule::clock(schedule::local(unix).1)
+}
+
+/// `unix` as month, day and time in Tokyo: `10-21 09:17`.
+fn date_time(unix: i64) -> String {
+    let stamp = schedule::timestamp(unix);
+    stamp.get(5..16).unwrap_or_default().replace('T', " ")
 }
 
 /// `seconds` in minutes, or hours and minutes.
@@ -595,6 +844,36 @@ impl Notice {
                 "matterjs-serverに再び届きました（{}届きませんでした）。",
                 span(until - since)
             ),
+            Self::Left(lights) => format!(
+                "照明が網（fabric）から外れました。matterjs-serverはこの照明をもう持っていないため、つなぎ直しでは戻りません。home-linkアプリで登録し直すと、製造番号で台帳の同じ行へ戻ります。\n{}",
+                lines(lights, &|light| {
+                    let mut known = Vec::new();
+                    if !light.labels.is_empty() {
+                        known.push(format!("label {}", light.labels.join("・")));
+                    }
+                    if let Some(serial) = &light.serial_number {
+                        known.push(format!("製造番号 {serial}"));
+                    }
+                    let at = light.left_at.unwrap_or(light.since);
+                    let when = match light.left_by {
+                        Some(LeftBy::Event) => {
+                            format!("{}から（matterjs-serverが外した時刻）", date_time(at))
+                        }
+                        Some(LeftBy::Check) => {
+                            format!("{}から（毎分の確かめで見つけた時刻）", date_time(at))
+                        }
+                        _ => format!(
+                            "{}に見つけました（いつ外れたかは分かりません）",
+                            date_time(at)
+                        ),
+                    };
+                    if known.is_empty() {
+                        when
+                    } else {
+                        format!("{}、{when}", known.join("、"))
+                    }
+                })
+            ),
             Self::Test => {
                 "home-linkからの試しの知らせです。照明の見張りの知らせはここへ届きます。".into()
             }
@@ -618,6 +897,7 @@ mod tests {
             key: (node, 1),
             name: name.into(),
             network: Some("wifi"),
+            device: None,
             ignored: false,
             available,
             answered,
@@ -636,7 +916,7 @@ mod tests {
         (from..=to)
             .map(|n| {
                 let lights = seen(n);
-                (n, watch.step(minute(n), lights.as_deref(), notify))
+                (n, watch.step(minute(n), lights.as_deref(), &[], notify))
             })
             .collect()
     }
@@ -715,7 +995,12 @@ mod tests {
             let answered = watch.read_due(minute(n), key).then_some(n < 5);
             steps.push((
                 n,
-                watch.step(minute(n), Some(&[light(1, "廊下", true, answered)]), true),
+                watch.step(
+                    minute(n),
+                    Some(&[light(1, "廊下", true, answered)]),
+                    &[],
+                    true,
+                ),
             ));
         }
         // Read at 0 (answered) and 5 (missed); a miss is read again at once, at 6.
@@ -739,7 +1024,12 @@ mod tests {
             let answered = watch.read_due(minute(n), key).then_some(n != 5);
             steps.push((
                 n,
-                watch.step(minute(n), Some(&[light(1, "廊下", true, answered)]), true),
+                watch.step(
+                    minute(n),
+                    Some(&[light(1, "廊下", true, answered)]),
+                    &[],
+                    true,
+                ),
             ));
         }
         assert_eq!(reconnects(&steps, key), Vec::<i64>::new());
@@ -795,8 +1085,8 @@ mod tests {
     fn a_light_matterjs_server_stops_serving_stays_as_it_was() {
         let mut watch = Watch::default();
         let both = |first: bool| vec![light(1, "玄関", first, None), light(2, "廊下", true, None)];
-        watch.step(minute(0), Some(&both(true)), true);
-        watch.step(minute(1), Some(&both(false)), true);
+        watch.step(minute(0), Some(&both(true)), &[], true);
+        watch.step(minute(1), Some(&both(false)), &[], true);
         // The first light goes missing from the nodes while down: still down, untold back.
         let steps = run(&mut watch, 2, 30, true, |_| {
             Some(vec![light(2, "廊下", true, None)])
@@ -817,13 +1107,16 @@ mod tests {
         assert_eq!(
             watch.connected(),
             vec![
-                ((1, 1), "玄関".into(), false),
-                ((2, 1), "廊下".into(), true)
+                (Some((1, 1)), None, "玄関".into(), "down"),
+                (Some((2, 1)), None, "廊下".into(), "connected")
             ]
         );
         // A light up when it goes missing is no longer watched.
-        watch.step(minute(31), Some(&[light(1, "玄関", true, None)]), true);
-        assert_eq!(watch.connected(), vec![((1, 1), "玄関".into(), true)]);
+        watch.step(minute(31), Some(&[light(1, "玄関", true, None)]), &[], true);
+        assert_eq!(
+            watch.connected(),
+            vec![(Some((1, 1)), None, "玄関".into(), "connected")]
+        );
     }
 
     #[test]
@@ -831,7 +1124,7 @@ mod tests {
         let mut before = Watch::default();
         let mut open = Vec::new();
         for n in 0..=10 {
-            let step = before.step(minute(n), Some(&[light(1, "玄関", n < 1, None)]), true);
+            let step = before.step(minute(n), Some(&[light(1, "玄関", n < 1, None)]), &[], true);
             open.extend(step.changes.into_iter().filter_map(|c| match c {
                 Change::Down(o) | Change::Updated(o) => Some(o),
                 Change::Up(_) => None,
@@ -883,7 +1176,7 @@ mod tests {
         let mut told = Vec::new();
         let mut pings = Vec::new();
         for n in 0..=40 {
-            let step = watch.step(minute(n), Some(&[light(1, "玄関", n < 1, None)]), true);
+            let step = watch.step(minute(n), Some(&[light(1, "玄関", n < 1, None)]), &[], true);
             for &k in &step.ping {
                 pings.push(n);
                 // The bulb is on the Wi-Fi: Matter alone is cut.
@@ -995,6 +1288,7 @@ mod tests {
         watch.step(
             minute(0),
             Some(&[light(1, "玄関", true, None), thread(true)]),
+            &[],
             true,
         );
         let status = watch.status();
@@ -1005,6 +1299,7 @@ mod tests {
         watch.step(
             minute(1),
             Some(&[light(1, "玄関", false, None), thread(true)]),
+            &[],
             true,
         );
         let status = watch.status();
@@ -1015,12 +1310,12 @@ mod tests {
         assert_eq!(
             watch.connected(),
             vec![
-                ((1, 1), "玄関".into(), false),
-                ((3, 1), "寝室".into(), true)
+                (Some((1, 1)), None, "玄関".into(), "down"),
+                (Some((3, 1)), None, "寝室".into(), "connected")
             ]
         );
 
-        watch.step(minute(2), None, true);
+        watch.step(minute(2), None, &[], true);
         let status = watch.status();
         assert_eq!(status.server_reachable, Some(false));
         assert_eq!(status.server_since, Some(minute(2)));
@@ -1034,9 +1329,447 @@ mod tests {
             watch.read_due(minute(0), (1, 1)),
             "a light never read is read"
         );
-        watch.step(minute(0), Some(&[light(1, "玄関", true, Some(true))]), true);
+        watch.step(
+            minute(0),
+            Some(&[light(1, "玄関", true, Some(true))]),
+            &[],
+            true,
+        );
         assert!(!watch.read_due(minute(4), (1, 1)));
         assert!(watch.read_due(minute(5), (1, 1)));
         assert_eq!(watch.status().lights[0].last_answer, Some(minute(0)));
+    }
+
+    const STORAGE: i64 = 19;
+
+    fn ledger_light(node: u64, name: &str, available: bool) -> Seen {
+        Seen {
+            device: Some(STORAGE),
+            network: Some("thread"),
+            ..light(node, name, available, None)
+        }
+    }
+
+    fn storage_left(removed_at: Option<i64>) -> Left {
+        Left {
+            device: STORAGE,
+            name: "物置き1".into(),
+            labels: vec!["room".into(), "storage".into()],
+            serial: Some("54EF441001301194".into()),
+            ignored: false,
+            network: Some("thread"),
+            software_version: Some("1.0.0.6".into()),
+            thread_parent: Some("0x4c00".into()),
+            removed_at,
+        }
+    }
+
+    fn other() -> Seen {
+        Seen {
+            network: Some("thread"),
+            ..light(52, "物置き2", true, None)
+        }
+    }
+
+    /// Runs one check a minute from `from` to `to` minutes, `seen` giving the lights served and
+    /// the ledger lights not served at each, and gathers every step.
+    fn run_left(
+        watch: &mut Watch,
+        from: i64,
+        to: i64,
+        seen: impl Fn(i64) -> Option<(Vec<Seen>, Vec<Left>)>,
+    ) -> Vec<(i64, Step)> {
+        (from..=to)
+            .map(|n| {
+                let step = match seen(n) {
+                    Some((lights, left)) => watch.step(minute(n), Some(&lights), &left, true),
+                    None => watch.step(minute(n), None, &[], true),
+                };
+                (n, step)
+            })
+            .collect()
+    }
+
+    fn changes(steps: &[(i64, Step)]) -> Vec<(i64, Change)> {
+        steps
+            .iter()
+            .flat_map(|(n, step)| step.changes.iter().map(move |c| (*n, c.clone())))
+            .collect()
+    }
+
+    fn left_notices(steps: &[(i64, Step)]) -> Vec<(i64, Vec<Told>)> {
+        notices(steps)
+            .into_iter()
+            .filter_map(|(n, notice)| match notice {
+                Notice::Left(lights) => Some((n, lights)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_ledger_light_never_served_has_left_the_fabric_and_is_told_once_after_five_minutes() {
+        let mut watch = Watch::default();
+        let steps = run_left(&mut watch, 0, 30, |_| {
+            Some((vec![other()], vec![storage_left(None)]))
+        });
+        let downs: Vec<_> = changes(&steps)
+            .into_iter()
+            .filter_map(|(n, c)| match c {
+                Change::Down(o) => Some((n, o)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(downs.len(), 1, "{downs:?}");
+        let (0, outage) = &downs[0] else {
+            panic!("down at the first check: {downs:?}");
+        };
+        assert_eq!(outage.found_by, Cause::Left);
+        assert_eq!(outage.device_id, Some(STORAGE));
+        assert_eq!(outage.started_at, minute(0));
+        assert_eq!(outage.left_at, Some(minute(0)));
+        assert_eq!(outage.left_by, Some(LeftBy::Unknown));
+        assert_eq!(outage.serial_number.as_deref(), Some("54EF441001301194"));
+        assert_eq!(outage.software_version.as_deref(), Some("1.0.0.6"));
+        assert_eq!(outage.thread_parent.as_deref(), Some("0x4c00"));
+        assert_eq!(outage.network, Some("thread"));
+
+        let told = left_notices(&steps);
+        assert_eq!(told.len(), 1, "{told:?}");
+        assert_eq!(told[0].0, 5, "told five minutes after it was found");
+        assert_eq!(told[0].1[0].name, "物置き1");
+        assert_eq!(notices(&steps).len(), 1, "nothing else is told");
+        assert!(
+            steps
+                .iter()
+                .all(|(_, s)| s.reconnect.is_empty() && s.ping.is_empty()),
+            "a light with no node is not reconnected"
+        );
+
+        let status = watch.status();
+        let left = status
+            .lights
+            .iter()
+            .find(|l| l.device_id == Some(STORAGE))
+            .expect("the light that left is watched");
+        assert_eq!(left.state, "left_fabric");
+        assert!(!left.connected);
+        assert_eq!(
+            (left.node_id, left.endpoint, left.network),
+            (None, None, None)
+        );
+        assert_eq!(left.name, "物置き1");
+        assert_eq!(left.since, Some(minute(0)));
+        assert!(!status.wifi_all_down);
+    }
+
+    #[test]
+    fn the_left_notice_names_the_light_its_labels_serial_since_and_how_to_bring_it_back() {
+        let mut watch = Watch::default();
+        // matterjs-server removed the node on 10-21 at 09:17 Tokyo time.
+        let removed = minute(-5 * 24 * 60 + 9 * 60 + 17);
+        let steps = run_left(&mut watch, 0, 1, |_| {
+            Some((vec![other()], vec![storage_left(Some(removed))]))
+        });
+        let told = notices(&steps);
+        let (0, notice @ Notice::Left(_)) = &told[0] else {
+            panic!("told at once, being gone over five minutes: {told:?}");
+        };
+        let text = notice.text();
+        for part in [
+            "網（fabric）から外れました",
+            "物置き1（Thread）",
+            "room・storage",
+            "54EF441001301194",
+            "10-21 09:17から",
+            "つなぎ直しでは戻りません",
+            "home-linkアプリで登録し直す",
+            "同じ行",
+        ] {
+            assert!(text.contains(part), "{part}: {text}");
+        }
+        let mut watch = Watch::default();
+        let steps = run_left(&mut watch, 0, 5, |_| {
+            Some((vec![other()], vec![storage_left(None)]))
+        });
+        let text = notices(&steps)[0].1.text();
+        assert!(text.contains("いつ外れたかは分かりません"), "{text}");
+    }
+
+    #[test]
+    fn a_light_whose_node_goes_while_up_has_left_from_when_matterjs_server_removed_it() {
+        let mut watch = Watch::default();
+        let removed = minute(3) - 20;
+        let steps = run_left(&mut watch, 0, 20, |n| {
+            Some(if n < 3 {
+                (vec![ledger_light(7, "物置き1", true), other()], vec![])
+            } else {
+                (vec![other()], vec![storage_left(Some(removed))])
+            })
+        });
+        let downs: Vec<_> = changes(&steps)
+            .into_iter()
+            .filter_map(|(n, c)| match c {
+                Change::Down(o) => Some((n, o)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(downs.len(), 1, "{downs:?}");
+        let (3, outage) = &downs[0] else {
+            panic!("{downs:?}");
+        };
+        assert_eq!(outage.found_by, Cause::Left);
+        assert_eq!((outage.node_id, outage.endpoint), (Some(7), Some(1)));
+        assert_eq!(outage.started_at, removed);
+        assert_eq!(outage.left_by, Some(LeftBy::Event));
+        let told = left_notices(&steps);
+        assert_eq!(told.len(), 1, "{told:?}");
+        assert_eq!(told[0].0, 8, "five minutes from the removal");
+        assert!(steps.iter().all(|(_, s)| s.reconnect.is_empty()));
+        let status = watch.status();
+        assert_eq!(
+            status.lights.len(),
+            2,
+            "not watched twice: {:?}",
+            status.lights
+        );
+        assert_eq!(
+            watch.connected(),
+            vec![
+                (Some((52, 1)), None, "物置き2".into(), "connected"),
+                (None, Some(STORAGE), "物置き1".into(), "left_fabric"),
+            ]
+        );
+
+        // Without the removal sent, from the check that found it gone.
+        let mut watch = Watch::default();
+        let steps = run_left(&mut watch, 0, 20, |n| {
+            Some(if n < 3 {
+                (vec![ledger_light(7, "物置き1", true)], vec![])
+            } else {
+                (vec![], vec![storage_left(None)])
+            })
+        });
+        let Some((3, Change::Down(outage))) = changes(&steps).into_iter().next() else {
+            panic!("{steps:?}");
+        };
+        assert_eq!(
+            (outage.started_at, outage.left_by),
+            (minute(3), Some(LeftBy::Check))
+        );
+        assert_eq!(left_notices(&steps)[0].0, 8);
+    }
+
+    #[test]
+    fn a_light_down_whose_node_goes_keeps_its_stretch_and_is_told_it_left() {
+        let mut watch = Watch::default();
+        let steps = run_left(&mut watch, 0, 30, |n| {
+            Some(if n < 10 {
+                (vec![ledger_light(7, "物置き1", n < 1), other()], vec![])
+            } else {
+                (vec![other()], vec![storage_left(None)])
+            })
+        });
+        let all = changes(&steps);
+        let downs = all
+            .iter()
+            .filter(|(_, c)| matches!(c, Change::Down(_)))
+            .count();
+        assert_eq!(downs, 1, "one stretch: {all:?}");
+        assert!(
+            !all.iter().any(|(_, c)| matches!(c, Change::Up(_))),
+            "{all:?}"
+        );
+        let told = notices(&steps);
+        assert!(matches!(told[0], (6, Notice::Down(_))), "{told:?}");
+        let left = left_notices(&steps);
+        assert_eq!(left.len(), 1, "{told:?}");
+        assert_eq!(left[0].0, 15);
+        assert_eq!(left[0].1[0].since, minute(1), "down since the first minute");
+        assert_eq!(left[0].1[0].left_at, Some(minute(10)));
+        let last_reconnect = steps
+            .iter()
+            .filter(|(_, s)| !s.reconnect.is_empty())
+            .map(|(n, _)| *n)
+            .max();
+        assert!(last_reconnect < Some(10), "{last_reconnect:?}");
+        let status = watch.status();
+        let light = status
+            .lights
+            .iter()
+            .find(|l| l.device_id == Some(STORAGE))
+            .expect("watched");
+        let outage = light.outage.clone().expect("left");
+        assert_eq!(outage.found_by, Cause::Unavailable);
+        assert_eq!(outage.started_at, minute(1));
+        assert_eq!(outage.left_at, Some(minute(10)));
+        assert_eq!(outage.device_id, Some(STORAGE));
+        assert_eq!(light.state, "left_fabric");
+    }
+
+    #[test]
+    fn a_light_registered_again_is_back_on_its_ledger_row_and_told_once() {
+        let mut watch = Watch::default();
+        let steps = run_left(&mut watch, 0, 30, |n| {
+            Some(if n < 20 {
+                (vec![other()], vec![storage_left(None)])
+            } else {
+                // Registered again: a new node, the same ledger row.
+                (vec![ledger_light(99, "物置き1", true), other()], vec![])
+            })
+        });
+        let told = notices(&steps);
+        assert_eq!(told.len(), 2, "{told:?}");
+        let (20, Notice::Up(lights)) = &told[1] else {
+            panic!("{told:?}");
+        };
+        assert_eq!(
+            (lights[0].name.as_str(), lights[0].since, lights[0].until),
+            ("物置き1", minute(0), Some(minute(20)))
+        );
+        let ups: Vec<_> = changes(&steps)
+            .into_iter()
+            .filter_map(|(n, c)| match c {
+                Change::Up(o) => Some((n, o)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ups.len(), 1, "{ups:?}");
+        assert_eq!(ups[0].1.found_by, Cause::Left);
+        assert_eq!(ups[0].1.ended_at, Some(minute(20)));
+        let status = watch.status();
+        assert_eq!(status.lights.len(), 2);
+        assert_eq!(status.lights[0].node_id, Some(52));
+        assert_eq!(
+            (status.lights[1].node_id, status.lights[1].state),
+            (Some(99), "connected")
+        );
+
+        // Back before it was told: the history keeps it, nothing is told.
+        let mut watch = Watch::default();
+        let steps = run_left(&mut watch, 0, 10, |n| {
+            Some(if n < 2 {
+                (vec![], vec![storage_left(None)])
+            } else {
+                (vec![ledger_light(99, "物置き1", true)], vec![])
+            })
+        });
+        assert_eq!(notices(&steps), vec![]);
+        assert!(
+            changes(&steps)
+                .iter()
+                .any(|(n, c)| *n == 2 && matches!(c, Change::Up(_)))
+        );
+    }
+
+    #[test]
+    fn an_ignored_ledger_light_that_left_is_neither_watched_nor_told() {
+        let ignored = || Left {
+            ignored: true,
+            ..storage_left(None)
+        };
+        let mut watch = Watch::default();
+        let steps = run_left(&mut watch, 0, 30, |_| {
+            Some((vec![other()], vec![ignored()]))
+        });
+        assert_eq!(notices(&steps), vec![]);
+        assert_eq!(changes(&steps), vec![]);
+        assert_eq!(watch.status().lights.len(), 1);
+
+        // Ignored after it left: its stretch ends, untold.
+        let mut watch = Watch::default();
+        let steps = run_left(&mut watch, 0, 30, |n| {
+            Some((
+                vec![other()],
+                vec![if n < 10 {
+                    storage_left(None)
+                } else {
+                    ignored()
+                }],
+            ))
+        });
+        assert_eq!(left_notices(&steps).len(), 1);
+        assert!(
+            !notices(&steps)
+                .iter()
+                .any(|(_, n)| matches!(n, Notice::Up(_))),
+            "not told back"
+        );
+        assert!(
+            changes(&steps)
+                .iter()
+                .any(|(n, c)| *n == 10 && matches!(c, Change::Up(_)))
+        );
+        assert_eq!(watch.status().lights.len(), 1);
+    }
+
+    #[test]
+    fn nothing_is_judged_of_the_lights_that_left_while_matterjs_server_is_out_of_reach() {
+        let mut watch = Watch::default();
+        let steps = run_left(&mut watch, 0, 20, |n| {
+            (n >= 2).then(|| (vec![other()], vec![storage_left(None)]))
+        });
+        let downs: Vec<_> = changes(&steps)
+            .into_iter()
+            .filter(|(_, c)| matches!(c, Change::Down(o) if o.found_by == Cause::Left))
+            .collect();
+        assert_eq!(downs.len(), 1);
+        assert_eq!(downs[0].0, 2, "found once matterjs-server answered");
+
+        // A light that left stays left while matterjs-server is out of reach, and is not told back.
+        let mut watch = Watch::default();
+        let steps = run_left(&mut watch, 0, 30, |n| {
+            (!(10..25).contains(&n)).then(|| (vec![other()], vec![storage_left(None)]))
+        });
+        assert_eq!(left_notices(&steps).len(), 1);
+        assert!(
+            !changes(&steps)
+                .iter()
+                .any(|(_, c)| matches!(c, Change::Up(o) if o.found_by == Cause::Left))
+        );
+        assert!(
+            !notices(&steps)
+                .iter()
+                .any(|(_, n)| matches!(n, Notice::Up(_)))
+        );
+    }
+
+    #[test]
+    fn a_light_that_left_carries_on_after_home_link_starts_again() {
+        let mut before = Watch::default();
+        let mut open = Vec::new();
+        for (_, step) in run_left(&mut before, 0, 10, |_| {
+            Some((vec![other()], vec![storage_left(None)]))
+        }) {
+            open.extend(step.changes.into_iter().filter_map(|c| match c {
+                Change::Down(o) | Change::Updated(o) => Some(o),
+                Change::Up(_) => None,
+            }));
+        }
+        let last = open.last().cloned().expect("kept");
+        assert!(last.left_told(), "told before the restart");
+
+        let mut after = Watch::default();
+        after.resume(vec![last]);
+        assert_eq!(after.status().lights[0].state, "left_fabric");
+        let steps = run_left(&mut after, 20, 40, |n| {
+            Some(if n < 30 {
+                (vec![other()], vec![storage_left(None)])
+            } else {
+                (vec![ledger_light(99, "物置き1", true), other()], vec![])
+            })
+        });
+        let told = notices(&steps);
+        assert_eq!(told.len(), 1, "not told again that it left: {told:?}");
+        let (30, Notice::Up(lights)) = &told[0] else {
+            panic!("{told:?}");
+        };
+        assert_eq!(lights[0].since, minute(0));
+        assert!(
+            !changes(&steps)
+                .iter()
+                .any(|(_, c)| matches!(c, Change::Down(_))),
+            "the same stretch"
+        );
     }
 }

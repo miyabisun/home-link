@@ -51,7 +51,7 @@
     {/if}
     <ul class="cards">
       {#each devices as device (device.id)}
-        {@const state = stateText(device.state)}
+        {@const state = stateText(device.state, device.left_fabric)}
         <li>
           <a class="card" href={`/devices/${device.id}`}>
             <span class="name">{deviceName(device)}</span>
@@ -63,8 +63,10 @@
             {#if device.on}<span class="badge">入</span>{/if}
             {#if device.ignored}<span class="badge">無視</span>{/if}
             {#if state}
-              <span class="badge" class:danger={device.state === "no_response"}
-                >{state}</span
+              <span
+                class="badge"
+                class:danger={device.state === "no_response" ||
+                  device.left_fabric}>{state}</span
               >
             {/if}
           </a>

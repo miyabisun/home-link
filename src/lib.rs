@@ -57,6 +57,9 @@ pub fn open_db(path: &str) -> rusqlite::Result<Connection> {
     if version < 12 {
         watcher::migrate(&db)?;
     }
+    if version < 13 {
+        watcher::migrate_left(&db)?;
+    }
     Ok(db)
 }
 
@@ -459,6 +462,8 @@ struct AppState {
     discord: Option<discord::Discord>,
     /// The watch's messages not delivered yet, to send again.
     unsent: Mutex<Vec<watch::Notice>>,
+    /// The nodes matterjs-server sent it removed, and when.
+    removed: Mutex<Vec<(u64, i64)>>,
 }
 
 /// How a task run forever under [`Home::supervise`] is doing.
@@ -536,6 +541,7 @@ impl Home {
             watch: Mutex::new(watch::Watch::default()),
             discord: None,
             unsent: Mutex::new(Vec::new()),
+            removed: Mutex::new(Vec::new()),
         }))
     }
 
@@ -728,14 +734,15 @@ impl Home {
     }
 
     /// Starts the tasks home-link runs forever, each under [`Self::supervise`]: the meter's
-    /// receiver when a meter is set, and with matterjs-server the light watch, the adjustments
-    /// every ten minutes and the label schedules every minute.
+    /// receiver when a meter is set, and with matterjs-server the light watch and its listening
+    /// for removed nodes, the adjustments every ten minutes and the label schedules every minute.
     pub fn start(&self) {
         if self.0.meter.address().is_some() {
             self.supervise("meter", Self::receive_meter);
         }
         if self.0.matter_url.is_some() {
             self.supervise("watch_lights", Self::watch_lights);
+            self.supervise("watch_removals", Self::watch_removals);
             self.supervise("every_ten_minutes", Self::every_ten_minutes);
             self.supervise("every_minute", Self::every_minute);
         }
@@ -775,6 +782,12 @@ impl Home {
             let at = now();
             self.check_lights(at - at.rem_euclid(60)).await;
         }
+    }
+
+    /// Listens to matterjs-server for the nodes it removes, forever: a light that leaves the
+    /// fabric is then known to have left when it did.
+    pub async fn watch_removals(self) {
+        watcher::listen(&self.0).await;
     }
 
     /// Adjusts the lights and the air conditioner every ten minutes on the clock, forever.
@@ -1053,6 +1066,11 @@ struct Device {
     labels: Vec<LabelRef>,
     /// Left out of switching, adjusting and the counts.
     ignored: bool,
+    /// Once served by matterjs-server, by its serial number, and served no more: it left the
+    /// fabric and is registered again to come back. `null` when matterjs-server cannot be read.
+    left_fabric: Option<bool>,
+    /// When it left, as the light watch knows it.
+    left_at: Option<i64>,
     created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     qr_payload: Option<String>,
@@ -1097,6 +1115,8 @@ fn device_row(row: &rusqlite::Row, with_payload: bool) -> rusqlite::Result<Devic
         on: None,
         wifi_ssid: None,
         network: None,
+        left_fabric: None,
+        left_at: None,
         created_at: row.get(2)?,
         qr_payload,
         manual_code,
@@ -1144,7 +1164,7 @@ async fn observe(state: &AppState, devices: &mut [Device]) {
             return;
         }
     };
-    for device in devices {
+    for device in devices.iter_mut() {
         let (state, product) = match place(device, &nodes) {
             None => ("unconnected", None),
             Some((node, endpoint)) => match matter::describe(&nodes, node, endpoint) {
@@ -1157,12 +1177,7 @@ async fn observe(state: &AppState, devices: &mut [Device]) {
         if let Some((kind, on_off)) =
             place(device, &nodes).and_then(|(node, endpoint)| matter::kind(&nodes, node, endpoint))
         {
-            device.kind = Some(match kind {
-                matter::Kind::Light => "light",
-                matter::Kind::Plug => "plug",
-                matter::Kind::Aircon => "aircon",
-                matter::Kind::Other => "other",
-            });
+            device.kind = Some(kind.as_str());
             // The air conditioner is switched on its own page, not as a plug.
             if kind != matter::Kind::Aircon {
                 device.on = on_off.and_then(|(_, on)| on);
@@ -1170,6 +1185,11 @@ async fn observe(state: &AppState, devices: &mut [Device]) {
         }
         device.wifi_ssid = wifi_of(device, &nodes).map(|(_, wifi)| wifi.ssid);
         device.network = place(device, &nodes).and_then(|(node, _)| matter::network(&nodes, node));
+        device.left_fabric = Some(is_missing(device, &nodes));
+    }
+    let watch = state.watch.lock().expect(UNPOISONED);
+    for device in devices {
+        device.left_at = watch.left_at(device.id);
     }
 }
 
@@ -2252,11 +2272,34 @@ async fn status(State(state): State<Db>) -> ApiResult<Json<serde_json::Value>> {
     })))
 }
 
-/// A ledger device matterjs-server does not serve.
+/// A ledger device matterjs-server does not serve: once served, it left the fabric.
 #[derive(Serialize)]
 struct MissingDevice {
     id: i64,
     name: String,
+    /// Always `left_fabric`: registering it again brings it back.
+    state: &'static str,
+    /// When it left, as the light watch knows it.
+    left_at: Option<i64>,
+}
+
+impl MissingDevice {
+    fn of(device: &Device) -> Self {
+        Self {
+            id: device.id,
+            name: device.name.clone(),
+            state: "left_fabric",
+            left_at: None,
+        }
+    }
+}
+
+/// Sets when each of `missing` left the fabric, as the light watch knows it.
+fn left_at(state: &AppState, missing: &mut [MissingDevice]) {
+    let watch = state.watch.lock().expect(UNPOISONED);
+    for device in missing {
+        device.left_at = watch.left_at(device.id);
+    }
 }
 
 /// A light's ledger name (else its product name) and whether it is ignored.
@@ -2315,10 +2358,7 @@ fn match_ledger(
     let missing = devices
         .iter()
         .filter(|device| !device.ignored && is_missing(device, nodes))
-        .map(|device| MissingDevice {
-            id: device.id,
-            name: device.name.clone(),
-        })
+        .map(MissingDevice::of)
         .collect();
     (names, missing)
 }
@@ -2369,11 +2409,12 @@ async fn light_states(State(state): State<Db>) -> ApiResult<Json<serde_json::Val
         .await
         .map_err(matter_unreachable)?;
     let lights = matter::lights(&nodes);
-    let (names, missing) = match_ledger(
+    let (names, mut missing) = match_ledger(
         &ledger(&state.db.lock().expect(UNPOISONED))?,
         &nodes,
         &lights,
     );
+    left_at(&state, &mut missing);
     let states: Vec<&str> = lights
         .iter()
         .zip(&names)
@@ -3052,15 +3093,13 @@ impl<'a> LabelSwitch<'a> {
         let (lights, done): (Vec<_>, Vec<Done>) = run.results.into_iter().unzip();
         let outcomes: Vec<&str> = done.iter().map(|d| d.result).collect();
         let (names, _) = match_ledger(&self.devices, &nodes, &lights);
-        let missing: Vec<_> = self
+        let mut missing: Vec<_> = self
             .devices
             .iter()
             .filter(|d| self.members.contains(&d.id) && is_missing(d, &nodes))
-            .map(|d| MissingDevice {
-                id: d.id,
-                name: d.name.clone(),
-            })
+            .map(MissingDevice::of)
             .collect();
+        left_at(state, &mut missing);
         tracing::info!(
             label = label.name,
             action,
@@ -3265,7 +3304,8 @@ async fn switch_lights(
         })
         .collect();
     let outcomes: Vec<&str> = done.iter().map(|d| d.result).collect();
-    let (names, missing) = match_ledger(&devices, &nodes, &lights);
+    let (names, mut missing) = match_ledger(&devices, &nodes, &lights);
+    left_at(state, &mut missing);
     tracing::info!(
         on,
         switched = count(&outcomes, "switched"),

@@ -100,7 +100,7 @@
       >
     </div>
   {:else if device}
-    {@const state = stateText(device.state)}
+    {@const state = stateText(device.state, device.left_fabric)}
     {#if error}<p class="error-banner" role="alert">{error}</p>{/if}
     {@const details = [device.product_name, device.wifi_ssid].filter(
       (text) => text && text !== deviceName(device!),
@@ -108,7 +108,9 @@
     {#if state || details.length}
       <p class="meta">
         {#if state}
-          <span class="badge" class:danger={device.state === "no_response"}
+          <span
+            class="badge"
+            class:danger={device.state === "no_response" || device.left_fabric}
             >{state}</span
           >
         {/if}

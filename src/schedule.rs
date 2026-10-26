@@ -146,11 +146,21 @@ pub fn local(unix: i64) -> (u32, u32) {
 /// `unix` seconds as an Asia/Tokyo timestamp, `2026-10-05T23:00:00+09:00`.
 #[must_use]
 pub fn timestamp(unix: i64) -> String {
-    let local = unix + JST;
-    let (year, month, day) = civil(local.div_euclid(86_400));
-    let seconds = local.rem_euclid(86_400);
+    stamp(unix + JST, "+09:00")
+}
+
+/// `unix` seconds in UTC, `2026-10-21T00:17:00Z`, as the log lines carry their time.
+#[must_use]
+pub fn utc(unix: i64) -> String {
+    stamp(unix, "Z")
+}
+
+/// `seconds` from the epoch of a zone as an RFC 3339 timestamp with its `offset`.
+fn stamp(seconds: i64, offset: &str) -> String {
+    let (year, month, day) = civil(seconds.div_euclid(86_400));
+    let seconds = seconds.rem_euclid(86_400);
     format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}+09:00",
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}{offset}",
         seconds / 3600,
         seconds / 60 % 60,
         seconds % 60
@@ -759,5 +769,12 @@ mod tests {
         ] {
             assert!(bad.invalid().is_some(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn utc_is_the_time_the_log_lines_carry() {
+        // 2026-10-21 09:17:05 in Tokyo.
+        assert_eq!(utc(1_792_541_825), "2026-10-21T00:17:05Z");
+        assert_eq!(utc(0), "1970-01-01T00:00:00Z");
     }
 }

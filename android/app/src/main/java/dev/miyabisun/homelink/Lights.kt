@@ -1,6 +1,6 @@
 package dev.miyabisun.homelink
 
-/** What switching a label's devices did: `missing` names ledger devices matterjs-server does not serve. */
+/** What switching a label's devices did: `missing` names ledger devices matterjs-server does not serve, which left the fabric. */
 data class SwitchResult(val switched: Int, val noResponse: Int, val failed: Int, val missing: List<String>)
 
 /** A result line; `failed` when any device was left behind or the request failed. */

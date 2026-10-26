@@ -613,21 +613,17 @@ class MainActivity : Activity() {
         codeView.text = device?.code?.let { ManualCode.label(it) ?: it }.orEmpty()
         codeView.visibility = if (codeView.text.isEmpty()) View.GONE else View.VISIBLE
         val state = device?.state
-        deviceState.text = when (state) {
-            DeviceState.UNCONNECTED -> "未接続"
-            DeviceState.CONNECTED -> "接続済み"
-            DeviceState.NO_RESPONSE -> "応答なし"
-            null -> ""
-        }
+        val left = device?.leftFabric == true
+        deviceState.text = device?.let(::stateText).orEmpty()
         deviceState.visibility = if (state == null) View.GONE else View.VISIBLE
-        deviceState.setTextColor(getColor(when (state) {
-            DeviceState.NO_RESPONSE -> R.color.danger
-            DeviceState.UNCONNECTED -> R.color.muted
+        deviceState.setTextColor(getColor(when {
+            left || state == DeviceState.NO_RESPONSE -> R.color.danger
+            state == DeviceState.UNCONNECTED -> R.color.muted
             else -> R.color.text
         }))
-        deviceState.setCompoundDrawablesRelativeWithIntrinsicBounds(when (state) {
-            DeviceState.CONNECTED -> R.drawable.ic_success
-            DeviceState.NO_RESPONSE -> R.drawable.ic_error
+        deviceState.setCompoundDrawablesRelativeWithIntrinsicBounds(when {
+            state == DeviceState.CONNECTED -> R.drawable.ic_success
+            left || state == DeviceState.NO_RESPONSE -> R.drawable.ic_error
             else -> 0
         }, 0, 0, 0)
         val plug = device?.takeIf { it.kind == DeviceKind.PLUG && it.state != DeviceState.UNCONNECTED }
@@ -720,7 +716,7 @@ class MainActivity : Activity() {
     private fun renderUnconnected() {
         val listed = form.pickable
         unconnectedPanel.visibility = if (listed.isEmpty()) View.GONE else View.VISIBLE
-        val titles = listed.map { it.title }
+        val titles = listed.map(::listTitle)
         if (unconnectedList.childCount != listed.size ||
             titles.withIndex().any { (i, title) -> (unconnectedList.getChildAt(i) as Button).text != title }) {
             unconnectedList.removeAllViews()

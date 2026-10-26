@@ -70,6 +70,29 @@ pub fn network(nodes: &[Value], node_id: u64) -> Option<&'static str> {
         .find_map(|(bit, network)| (features & bit != 0).then_some(network))
 }
 
+/// The Software Version String of the device `locate` found: Basic Information on the root
+/// endpoint, Bridged Device Basic Information behind a bridge.
+#[must_use]
+pub fn software_version(nodes: &[Value], node_id: u64, endpoint: u16) -> Option<String> {
+    let node = nodes.iter().find(|n| n["node_id"] == node_id)?;
+    let path = if endpoint == 0 {
+        "0/40/10".to_owned()
+    } else {
+        format!("{endpoint}/57/10")
+    };
+    node["attributes"][path].as_str().map(str::to_owned)
+}
+
+/// The Thread parent of a node that is a child, as an RLOC16, by its own RLOC16 (Thread Network
+/// Diagnostics 0x0035): a router, or a node off Thread, has none.
+#[must_use]
+pub fn thread_parent(nodes: &[Value], node_id: u64) -> Option<String> {
+    let node = nodes.iter().find(|n| n["node_id"] == node_id)?;
+    let rloc16 = node["attributes"]["0/53/64"].as_u64()?;
+    // The low 9 bits are the child id; a router's are 0.
+    (rloc16 & 0x01FF != 0).then(|| format!("{:#06x}", rloc16 & 0xFC00))
+}
+
 /// On/Off, Dimmable, Color Temperature and Extended Color Light device types.
 const LIGHT_TYPES: [u64; 4] = [0x0100, 0x0101, 0x010C, 0x010D];
 /// On/Off and Dimmable Plug-in Unit device types.
@@ -86,6 +109,19 @@ pub enum Kind {
     /// Driven by the air conditioner's own control, not switched as a plug or with labels.
     Aircon,
     Other,
+}
+
+impl Kind {
+    /// `light`, `plug`, `aircon` or `other`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Light => "light",
+            Self::Plug => "plug",
+            Self::Aircon => "aircon",
+            Self::Other => "other",
+        }
+    }
 }
 
 /// The endpoint carrying a device's On/Off, and the On/Off last read.
@@ -831,7 +867,7 @@ pub(crate) fn read_on_off(light: &Light) -> Value {
 mod tests {
     use serde_json::json;
 
-    use super::{Light, lights, locate, network};
+    use super::{Light, lights, locate, network, software_version, thread_parent};
 
     // Trimmed from a matterjs-server `get_nodes` result (2026-10-05).
     fn nodes() -> Vec<serde_json::Value> {
@@ -983,5 +1019,38 @@ mod tests {
         assert_eq!(network(&nodes, 3), Some("ethernet"));
         assert_eq!(network(&nodes, 4), None);
         assert_eq!(network(&nodes, 9), None);
+    }
+
+    #[test]
+    fn the_software_version_is_the_nodes_or_behind_a_bridge_the_devices() {
+        let nodes = vec![
+            json!({ "node_id": 52, "attributes": { "0/40/10": "1.0.0.6" }}),
+            json!({ "node_id": 1, "attributes": { "0/40/10": "4.3.1", "2/57/10": "1.0.2" }}),
+        ];
+        assert_eq!(software_version(&nodes, 52, 0).as_deref(), Some("1.0.0.6"));
+        assert_eq!(software_version(&nodes, 1, 2).as_deref(), Some("1.0.2"));
+        assert_eq!(software_version(&nodes, 1, 3), None);
+        assert_eq!(software_version(&nodes, 9, 0), None);
+    }
+
+    #[test]
+    fn a_thread_childs_parent_is_its_rloc16_without_the_child_bits() {
+        let node = |rloc16: Option<u64>| {
+            let mut node = json!({ "node_id": 52, "attributes": {} });
+            if let Some(rloc16) = rloc16 {
+                node["attributes"]["0/53/64"] = json!(rloc16);
+            }
+            vec![node]
+        };
+        assert_eq!(
+            thread_parent(&node(Some(0x4c01)), 52).as_deref(),
+            Some("0x4c00")
+        );
+        assert_eq!(
+            thread_parent(&node(Some(0x4c00)), 52),
+            None,
+            "a router has no parent"
+        );
+        assert_eq!(thread_parent(&node(None), 52), None);
     }
 }

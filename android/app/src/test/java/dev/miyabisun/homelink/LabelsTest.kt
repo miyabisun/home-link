@@ -47,7 +47,9 @@ class LabelsTest {
         assertEquals(LightsMessage("一部無応答", failed = true), pressLabel(LabelOp.TOGGLE, result("on", true, SwitchResult(2, 1, 0, emptyList()))))
         assertEquals(LightsMessage("回線なし", failed = true), pressLabel(LabelOp.ON, ApiResult.Failed(ApiError.NO_NETWORK)))
         assertEquals(LightsMessage("結果不明", failed = true), pressLabel(LabelOp.ON, ApiResult.Failed(ApiError.TIMEOUT)))
-        assertEquals(LightsMessage("失敗", failed = true), pressLabel(LabelOp.OFF, result("off", false, SwitchResult(0, 0, 0, listOf("台所")))))
+        // Lights that left the fabric, apart from failures: all of them, or some.
+        assertEquals(LightsMessage("網外れ", failed = true), pressLabel(LabelOp.OFF, result("off", false, SwitchResult(0, 0, 0, listOf("台所")))))
+        assertEquals(LightsMessage("一部網外れ", failed = true), pressLabel(LabelOp.TOGGLE, result("on", true, SwitchResult(14, 0, 0, listOf("物置き1")))))
         assertEquals(LightsMessage("ラベルなし", failed = true), pressLabel(LabelOp.ON, ApiResult.Failed(ApiError.LABEL_NOT_FOUND)))
         assertEquals(LightsMessage("機器なし", failed = true), pressLabel(LabelOp.TOGGLE, ApiResult.Failed(ApiError.LABEL_HAS_NO_DEVICES)))
         assertEquals(LightsMessage("接続不可", failed = true), pressLabel(LabelOp.ON, ApiResult.Failed(ApiError.UNREACHABLE)))
@@ -57,8 +59,10 @@ class LabelsTest {
     @Test fun theAppSaysNothingOnSuccessAndCountsWhatWasLeftBehind() {
         val host = "home-link.example:5011"
         assertEquals(null, labelMessage("ambient", result("on", true), host))
-        assertEquals(LightsMessage("ambientの一部の機器をオフにできませんでした。応答なし2台・失敗1台・見つからない2台（台所、通路）", failed = true),
+        assertEquals(LightsMessage("ambientの一部の機器をオフにできませんでした。応答なし2台・失敗1台・網から外れた2台（台所、通路）", failed = true),
             labelMessage("ambient", result("off", false, SwitchResult(3, 2, 1, listOf("台所", "通路"))), host))
+        assertEquals(LightsMessage("roomの一部の照明が網から外れています。網から外れた1台（物置き1）。アプリで登録し直してください", failed = true),
+            labelMessage("room", result("on", true, SwitchResult(14, 0, 0, listOf("物置き1"))), host))
         assertEquals(LightsMessage("gameの照明が応答しませんでした。応答なし3台", failed = true),
             labelMessage("game", result("release", true, SwitchResult(0, 3, 0, emptyList())), host))
         assertEquals(LightsMessage("roomの一部の照明が応答しませんでした。応答なし1台", failed = true),

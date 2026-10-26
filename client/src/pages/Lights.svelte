@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { outageText, type Outage, watchNote } from "../lib/admin";
+  import { outageText, type Outage, watchBadge, watchNote } from "../lib/admin";
   import { aborted, api, type Watch } from "../lib/api";
 
   // The server checks every light once a minute; the page follows while it is shown.
@@ -87,12 +87,13 @@
       <p class="state">照明がありません</p>
     {:else}
       <ul class="cards">
-        {#each watch.lights as light (`${light.node_id}/${light.endpoint}`)}
+        {#each watch.lights as light (light.node_id === null ? `device/${light.device_id}` : `${light.node_id}/${light.endpoint}`)}
+          {@const badge = watchBadge(light)}
           <li class="card">
             <span class="name">{light.name}</span>
             <span class="note">{watchNote(light, now)}</span>
-            {#if !light.connected}
-              <span class="badge danger">切断</span>
+            {#if badge}
+              <span class="badge danger">{badge}</span>
             {/if}
           </li>
         {/each}
@@ -105,7 +106,7 @@
         <p class="note">途切れた記録はありません</p>
       {:else}
         <ul>
-          {#each outages as outage (`${outage.node_id}/${outage.endpoint}/${outage.started_at}`)}
+          {#each outages as outage (`${outage.node_id}/${outage.endpoint}/${outage.name}/${outage.started_at}`)}
             <li>
               <span class="name">{outage.name}</span>
               <span class="note">{outageText(outage, now)}</span>

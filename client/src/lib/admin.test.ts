@@ -22,6 +22,7 @@ import {
   scheduleInput,
   stateText,
   outageText,
+  watchBadge,
   watchNote,
   switchProblem,
   withLabel,
@@ -74,6 +75,12 @@ describe("device states", () => {
     expect(stateText(null)).toBeNull();
     expect(stateText("unconnected")).toBe("未接続");
     expect(stateText("no_response")).toBe("応答なし");
+  });
+
+  it("tells a device that left the fabric from one never connected", () => {
+    expect(stateText("unconnected", true)).toBe("網から外れた");
+    expect(stateText("unconnected", false)).toBe("未接続");
+    expect(stateText(null, null)).toBeNull();
   });
 });
 
@@ -196,7 +203,7 @@ describe("switch results", () => {
   it("names the devices that did not switch, or nothing when all did", () => {
     expect(switchProblem({ no_response: 0, failed: 0, missing: 0 })).toBeNull();
     expect(switchProblem({ no_response: 2, failed: 0, missing: 1 })).toBe(
-      "応答なし 2・見つからない 1",
+      "応答なし 2・網から外れた 1",
     );
     expect(switchProblem({ no_response: 0, failed: 1, missing: 0 })).toBe(
       "失敗 1",
@@ -223,6 +230,17 @@ describe("switch results", () => {
         ],
       }),
     ).toBe("応答なし 2（台所・寝室）・失敗 1（玄関）");
+  });
+
+  it("names each device that left the fabric", () => {
+    expect(
+      switchProblem({
+        no_response: 0,
+        failed: 0,
+        missing: 1,
+        missing_devices: [{ name: "物置き1" }],
+      }),
+    ).toBe("網から外れた 1（物置き1）");
   });
 
   it("points to the Thread base when only Thread devices did not answer", () => {
@@ -375,11 +393,13 @@ describe("the light watch", () => {
   // 2026-10-26 00:00 in Tokyo.
   const T0 = 1_792_940_400;
   const light = {
-    node_id: 5,
-    endpoint: 1,
+    node_id: 5 as number | null,
+    endpoint: 1 as number | null,
+    device_id: 1,
     name: "玄関",
-    network: "wifi" as const,
+    network: "wifi" as "wifi" | null,
     connected: true,
+    state: "connected" as const,
     since: T0 + 8 * 60,
     last_answer: T0 + 20 * 60,
     outage: null,
@@ -395,6 +415,8 @@ describe("the light watch", () => {
     reconnects: 1,
     reconnect_result: "accepted",
     reachable: false,
+    left_at: null as number | null,
+    left_by: null as "event" | "check" | "unknown" | null,
   };
 
   it("tells a connected light since when and its last answer", () => {
@@ -438,5 +460,46 @@ describe("the light watch", () => {
         now,
       ),
     ).toBe("10/25 21:00〜00:05（3時間5分）");
+  });
+
+  it("tells a light that left the fabric since when and to register it again", () => {
+    const now = T0 + 30 * 60;
+    const left = {
+      ...light,
+      node_id: null,
+      endpoint: null,
+      network: null,
+      connected: false,
+      state: "left_fabric" as const,
+      since: T0 - 5 * 86_400 + (9 * 60 + 17) * 60,
+      outage: {
+        ...outage,
+        found_by: "left_fabric",
+        started_at: T0 - 5 * 86_400 + (9 * 60 + 17) * 60,
+        ended_at: null,
+        reconnects: 0,
+        reachable: null,
+        left_at: T0 - 5 * 86_400 + (9 * 60 + 17) * 60,
+        left_by: "event" as const,
+      },
+    };
+    expect(watchNote(left, now)).toBe("10/21 09:17から・アプリで登録し直す");
+    expect(
+      watchNote(
+        {
+          ...left,
+          outage: { ...left.outage, left_at: T0 + 14 * 60, left_by: "unknown" },
+        },
+        now,
+      ),
+    ).toBe("00:14に発見・アプリで登録し直す");
+    expect(watchBadge(left)).toBe("網から外れた");
+    expect(watchBadge({ ...light, connected: false, state: "down" })).toBe(
+      "切断",
+    );
+    expect(watchBadge(light)).toBeNull();
+    expect(outageText(left.outage, now)).toBe(
+      "10/21 09:17〜（4日15時間13分、続いている）・網から外れた",
+    );
   });
 });

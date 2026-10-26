@@ -38,6 +38,9 @@ export interface Device {
   network: "wifi" | "thread" | "ethernet" | null;
   labels: LabelRef[];
   ignored: boolean;
+  /** Once connected and served no more: it left the fabric. `null` when unknown. */
+  left_fabric?: boolean | null;
+  left_at?: number | null;
 }
 
 export interface Label extends LabelTraits {
@@ -157,6 +160,7 @@ export const api = {
       failed: number;
       missing: number;
       devices: SwitchEntry[];
+      missing_devices: { id: number; name: string }[];
     }>("POST", `/api/labels/${id}/toggle`),
   watch: (signal?: AbortSignal) =>
     request<Watch>("GET", "/api/lights/watch", undefined, signal),

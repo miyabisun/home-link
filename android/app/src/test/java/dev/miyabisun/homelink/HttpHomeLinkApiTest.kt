@@ -54,6 +54,9 @@ class HttpHomeLinkApiTest {
         assertEquals(ApiResult.Ok(listOf(ledgerDevice, ledgerDevice.copy(state = DeviceState.CONNECTED),
             ledgerDevice.copy(labelIds = emptySet(), state = null))), api.devices())
         assertEquals("GET /api/devices", requests.last())
+        // A device that left the fabric says so; one never connected does not.
+        respond("/api/devices", 200, "[${ledgerRow.replace("\"ignored\"", "\"left_fabric\":true,\"ignored\"")}]")
+        assertEquals(ApiResult.Ok(listOf(ledgerDevice.copy(leftFabric = true))), api.devices())
 
         // One device carries its code.
         respond("/api/devices/9", 200, ledgerRow.replace("\"ignored\"", "\"qr_payload\":\"MT:Y.K9042C00KA0648G00\",\"ignored\""))

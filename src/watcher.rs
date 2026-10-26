@@ -2,7 +2,7 @@
 //! pings and messages it calls for, and two weeks of history. [`crate::watch`] decides; this
 //! module only carries the decisions out.
 
-use std::time::Duration;
+use std::{collections::BTreeMap, fmt::Write as _, time::Duration};
 
 use axum::{
     Json,
@@ -15,10 +15,10 @@ use serde_json::{Value, json};
 use tokio::time::Instant;
 
 use crate::{
-    ApiError, ApiResult, AppState, Db, UNPOISONED, ledger,
-    link::{Link, Outcome},
-    match_ledger, matter,
-    watch::{Cause, Change, Key, Notice, Outage, Seen},
+    ApiError, ApiResult, AppState, Db, Device, UNPOISONED, devices_of, ledger,
+    link::{Link, OPEN_TIMEOUT, Outcome, next_id},
+    match_ledger, matter, place,
+    watch::{Cause, Change, Key, Left, LeftBy, Notice, Outage, Seen},
 };
 
 /// One check's reading of every node and of the lights due a read.
@@ -35,6 +35,12 @@ const KEPT: i64 = 14 * 86_400;
 const MAX_UNSENT: usize = 20;
 /// A check this close before a moment answers for it, in seconds: a minute and its slack.
 const CHECK_COVERS: i64 = 90;
+/// The connection listening for removed nodes is opened again after this long without a message.
+const LISTEN_IDLE: Duration = Duration::from_mins(10);
+/// The connection listening for removed nodes is opened again this long after it fails.
+const LISTEN_AGAIN: Duration = Duration::from_secs(10);
+/// Removed nodes kept to tell when a light left.
+const MAX_REMOVED: usize = 100;
 
 /// Version 12 keeps two weeks of the light watch: every stretch a light or matterjs-server was
 /// out of reach, and which lights each check found connected.
@@ -68,6 +74,51 @@ pub(crate) fn migrate(db: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+/// Version 13 keeps what is known of a light that leaves the fabric: its ledger row, when and
+/// how it left, its labels, serial number, last Software Version and Thread parent, and whether
+/// the user was told; and what each ledger device last was while matterjs-server served it.
+pub(crate) fn migrate_left(db: &Connection) -> rusqlite::Result<()> {
+    let columns: Vec<String> = db
+        .prepare("SELECT name FROM pragma_table_info('light_outages')")?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let added = [
+        ("device_id", "INTEGER"),
+        ("left_at", "INTEGER"),
+        ("left_by", "TEXT"),
+        ("labels", "TEXT NOT NULL DEFAULT '[]'"),
+        ("serial_number", "TEXT"),
+        ("software_version", "TEXT"),
+        ("thread_parent", "TEXT"),
+        ("left_told", "INTEGER NOT NULL DEFAULT 0"),
+    ]
+    .into_iter()
+    .filter(|(column, _)| !columns.iter().any(|c| c == column))
+    .fold(String::new(), |mut added, (column, kind)| {
+        let _ = writeln!(
+            added,
+            "ALTER TABLE light_outages ADD COLUMN {column} {kind};"
+        );
+        added
+    });
+    db.execute_batch(&format!(
+        "BEGIN;
+        {added}
+        CREATE TABLE IF NOT EXISTS device_traces (
+            device_id INTEGER PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+            kind TEXT,
+            node_id INTEGER NOT NULL,
+            endpoint INTEGER NOT NULL,
+            network TEXT,
+            software_version TEXT,
+            thread_parent TEXT,
+            seen_at INTEGER NOT NULL
+        );
+        PRAGMA user_version = 13;
+        COMMIT;"
+    ))
+}
+
 fn network_of(text: Option<&str>) -> Option<&'static str> {
     ["wifi", "thread", "ethernet"]
         .into_iter()
@@ -77,7 +128,8 @@ fn network_of(text: Option<&str>) -> Option<&'static str> {
 fn open_outages(db: &Connection) -> rusqlite::Result<Vec<Outage>> {
     db.prepare(
         "SELECT node_id, endpoint, name, network, started_at, found_by, reconnects,
-            reconnect_result, reachable, notified, advised
+            reconnect_result, reachable, notified, advised, device_id, left_at, left_by, labels,
+            serial_number, software_version, thread_parent, left_told
          FROM light_outages WHERE ended_at IS NULL",
     )?
     .query_map([], |row| {
@@ -88,6 +140,7 @@ fn open_outages(db: &Connection) -> rusqlite::Result<Vec<Outage>> {
         let found_by = match row.get::<_, String>(5)?.as_str() {
             "no_answer" => Cause::NoAnswer,
             "unreachable" => Cause::Unreachable,
+            "left_fabric" => Cause::Left,
             _ => Cause::Unavailable,
         };
         let mut outage = Outage::new(
@@ -97,10 +150,23 @@ fn open_outages(db: &Connection) -> rusqlite::Result<Vec<Outage>> {
             row.get(4)?,
             found_by,
         )
-        .told(row.get(9)?, row.get(10)?);
+        .told(row.get(9)?, row.get(10)?)
+        .told_left(row.get(18)?);
         outage.reconnects = row.get(6)?;
         outage.reconnect_result = row.get(7)?;
         outage.reachable = row.get(8)?;
+        outage.device_id = row.get(11)?;
+        outage.left_at = row.get(12)?;
+        outage.left_by = match row.get::<_, Option<String>>(13)?.as_deref() {
+            Some("event") => Some(LeftBy::Event),
+            Some("check") => Some(LeftBy::Check),
+            Some(_) => Some(LeftBy::Unknown),
+            None => None,
+        };
+        outage.labels = serde_json::from_str(&row.get::<_, String>(14)?).unwrap_or_default();
+        outage.serial_number = row.get(15)?;
+        outage.software_version = row.get(16)?;
+        outage.thread_parent = row.get(17)?;
         Ok(outage)
     })?
     .collect()
@@ -122,17 +188,32 @@ fn key_text(key: Option<Key>) -> String {
     )
 }
 
+/// The stretch's key in the history: its light's node and endpoint, else its ledger row for a
+/// light that left before the watch saw it, else matterjs-server.
+fn outage_key(outage: &Outage) -> String {
+    match (outage.key(), outage.device_id) {
+        (None, Some(device)) => format!("device/{device}"),
+        (key, _) => key_text(key),
+    }
+}
+
 fn save(db: &Connection, outage: &Outage) -> rusqlite::Result<()> {
     db.execute(
         "INSERT INTO light_outages (key, node_id, endpoint, name, network, started_at, ended_at,
-            found_by, reconnects, reconnect_result, reachable, notified, advised)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            found_by, reconnects, reconnect_result, reachable, notified, advised, device_id,
+            left_at, left_by, labels, serial_number, software_version, thread_parent, left_told)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
+            ?19, ?20, ?21)
          ON CONFLICT (key, started_at) DO UPDATE SET name = excluded.name,
-            ended_at = excluded.ended_at, reconnects = excluded.reconnects,
-            reconnect_result = excluded.reconnect_result, reachable = excluded.reachable,
-            notified = excluded.notified, advised = excluded.advised",
+            network = excluded.network, ended_at = excluded.ended_at,
+            reconnects = excluded.reconnects, reconnect_result = excluded.reconnect_result,
+            reachable = excluded.reachable, notified = excluded.notified,
+            advised = excluded.advised, device_id = excluded.device_id,
+            left_at = excluded.left_at, left_by = excluded.left_by, labels = excluded.labels,
+            serial_number = excluded.serial_number, software_version = excluded.software_version,
+            thread_parent = excluded.thread_parent, left_told = excluded.left_told",
         params![
-            key_text(outage.key()),
+            outage_key(outage),
             outage
                 .node_id
                 .map(|node| i64::try_from(node).unwrap_or(i64::MAX)),
@@ -147,6 +228,14 @@ fn save(db: &Connection, outage: &Outage) -> rusqlite::Result<()> {
             outage.reachable,
             outage.notified(),
             outage.advised(),
+            outage.device_id,
+            outage.left_at,
+            outage.left_by.map(LeftBy::as_str),
+            Value::from(outage.labels.clone()).to_string(),
+            outage.serial_number,
+            outage.software_version,
+            outage.thread_parent,
+            outage.left_told(),
         ],
     )?;
     Ok(())
@@ -158,6 +247,23 @@ fn record(state: &AppState, change: &Change) {
     let (node_id, endpoint) = (outage.node_id, outage.endpoint);
     let name = outage.name.as_str();
     match (change, outage.key()) {
+        // A light leaving the fabric: told by Down when it was up, by Updated when it was down.
+        (Change::Down(_) | Change::Updated(_), _)
+            if outage.left_at.is_some() && !outage.left_told() =>
+        {
+            tracing::warn!(
+                name,
+                device_id = outage.device_id,
+                node_id,
+                endpoint,
+                serial_number = outage.serial_number.as_deref().unwrap_or("-"),
+                left_at = outage.left_at.map(crate::schedule::utc),
+                left_by = outage.left_by.map_or("-", crate::watch::LeftBy::as_str),
+                software_version = outage.software_version.as_deref().unwrap_or("-"),
+                thread_parent = outage.thread_parent.as_deref().unwrap_or("-"),
+                "light left the fabric"
+            );
+        }
         (Change::Down(_), Some(_)) => tracing::info!(
             name,
             node_id,
@@ -193,7 +299,16 @@ fn keep_check(state: &AppState, at: i64) -> rusqlite::Result<()> {
         let lights: Vec<Value> = watch
             .connected()
             .into_iter()
-            .map(|((node, endpoint), name, connected)| json!([node, endpoint, name, connected]))
+            .map(|(key, device, name, state)| {
+                json!([
+                    key.map(|k| k.0),
+                    key.map(|k| k.1),
+                    name,
+                    state == "connected",
+                    device,
+                    state
+                ])
+            })
             .collect();
         (watch.status().server_reachable == Some(true), lights)
     };
@@ -208,12 +323,140 @@ fn keep_check(state: &AppState, at: i64) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// What one check saw: every light with its name, availability and, when due, whether it
-/// answered a read; `Ok(None)` when matterjs-server was out of reach.
+/// What a ledger device last was while matterjs-server served it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Trace {
+    kind: Option<&'static str>,
+    node_id: u64,
+    endpoint: u16,
+    network: Option<&'static str>,
+    software_version: Option<String>,
+    thread_parent: Option<String>,
+}
+
+/// What each ledger device matterjs-server serves is now.
+fn traces_of(devices: &[Device], nodes: &[Value]) -> Vec<(i64, Trace)> {
+    devices
+        .iter()
+        .filter_map(|device| {
+            let (node_id, endpoint) = place(device, nodes)?;
+            let network = matter::network(nodes, node_id);
+            Some((
+                device.id,
+                Trace {
+                    kind: matter::kind(nodes, node_id, endpoint).map(|(kind, _)| kind.as_str()),
+                    node_id,
+                    endpoint,
+                    network,
+                    software_version: matter::software_version(nodes, node_id, endpoint),
+                    thread_parent: (network == Some("thread"))
+                        .then(|| matter::thread_parent(nodes, node_id))
+                        .flatten(),
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Keeps what each ledger device served is now, and reads back what every device last was.
+fn keep_traces(
+    db: &Connection,
+    traces: &[(i64, Trace)],
+    at: i64,
+) -> rusqlite::Result<BTreeMap<i64, Trace>> {
+    for (device, trace) in traces {
+        db.execute(
+            "INSERT OR REPLACE INTO device_traces (device_id, kind, node_id, endpoint, network,
+                software_version, thread_parent, seen_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                device,
+                trace.kind,
+                i64::try_from(trace.node_id).unwrap_or(i64::MAX),
+                trace.endpoint,
+                trace.network,
+                trace.software_version,
+                trace.thread_parent,
+                at,
+            ],
+        )?;
+    }
+    db.prepare(
+        "SELECT device_id, kind, node_id, endpoint, network, software_version, thread_parent
+         FROM device_traces",
+    )?
+    .query_map([], |row| {
+        let kind = row.get::<_, Option<String>>(1)?;
+        Ok((
+            row.get(0)?,
+            Trace {
+                kind: ["light", "plug", "aircon", "other"]
+                    .into_iter()
+                    .find(|k| kind.as_deref() == Some(*k)),
+                node_id: u64::try_from(row.get::<_, i64>(2)?).unwrap_or_default(),
+                endpoint: row.get(3)?,
+                network: network_of(row.get::<_, Option<String>>(4)?.as_deref()),
+                software_version: row.get(5)?,
+                thread_parent: row.get(6)?,
+            },
+        ))
+    })?
+    .collect()
+}
+
+/// The ledger lights matterjs-server does not serve: each device once served, by its serial
+/// number, that it serves no more and that was last a light or is not known to be anything
+/// else, with what it last was and when matterjs-server sent it removed the node.
+fn left_lights(
+    devices: &[Device],
+    nodes: &[Value],
+    traces: &BTreeMap<i64, Trace>,
+    removed: &[(u64, i64)],
+) -> Vec<Left> {
+    devices
+        .iter()
+        .filter(|device| crate::is_missing(device, nodes))
+        .filter_map(|device| {
+            let trace = traces.get(&device.id);
+            if trace.is_some_and(|trace| trace.kind.is_some_and(|kind| kind != "light")) {
+                return None;
+            }
+            Some(Left {
+                device: device.id,
+                name: device.name.clone(),
+                labels: device
+                    .labels
+                    .iter()
+                    .map(|label| label.name.clone())
+                    .collect(),
+                serial: device.serial_number.clone(),
+                ignored: device.ignored,
+                network: trace.and_then(|trace| trace.network),
+                software_version: trace.and_then(|trace| trace.software_version.clone()),
+                thread_parent: trace.and_then(|trace| trace.thread_parent.clone()),
+                removed_at: trace.and_then(|trace| {
+                    removed
+                        .iter()
+                        .filter(|(node, _)| *node == trace.node_id)
+                        .map(|(_, at)| *at)
+                        .max()
+                }),
+            })
+        })
+        .collect()
+}
+
+/// What one check saw: every light with its name, ledger row, availability and, when due,
+/// whether it answered a read, and the ledger lights not served; `Ok(None)` when
+/// matterjs-server was out of reach.
 ///
 /// # Errors
 /// When the ledger cannot be read: which lights it ignores is not known, so nothing is judged.
-async fn observe(state: &AppState, url: &str, at: i64) -> rusqlite::Result<Option<Vec<Seen>>> {
+async fn observe(
+    state: &AppState,
+    url: &str,
+    at: i64,
+) -> rusqlite::Result<Option<(Vec<Seen>, Vec<Left>)>> {
     let deadline = Instant::now() + CHECK_TIMEOUT;
     let Ok(mut link) = Link::open(url, deadline).await else {
         return Ok(None);
@@ -223,14 +466,27 @@ async fn observe(state: &AppState, url: &str, at: i64) -> rusqlite::Result<Optio
         return Ok(None);
     };
     let lights = matter::lights(&nodes);
-    let devices = ledger(&state.db.lock().expect(UNPOISONED));
-    let names = match devices {
-        Ok(devices) => match_ledger(&devices, &nodes, &lights).0,
+    let read = {
+        let db = state.db.lock().expect(UNPOISONED);
+        ledger(&db).and_then(|devices| {
+            let traces = keep_traces(&db, &traces_of(&devices, &nodes), at)?;
+            Ok((devices, traces))
+        })
+    };
+    let (devices, traces) = match read {
+        Ok(read) => read,
         Err(error) => {
             link.close().await;
             return Err(error);
         }
     };
+    let names = match_ledger(&devices, &nodes, &lights).0;
+    let left = left_lights(
+        &devices,
+        &nodes,
+        &traces,
+        &state.removed.lock().expect(UNPOISONED),
+    );
     let mut seen: Vec<Seen> = lights
         .iter()
         .zip(names)
@@ -238,6 +494,9 @@ async fn observe(state: &AppState, url: &str, at: i64) -> rusqlite::Result<Optio
             key: (light.node_id, light.endpoint),
             name: name.unwrap_or_else(|| format!("node {}/{}", light.node_id, light.endpoint)),
             network: matter::network(&nodes, light.node_id),
+            device: devices_of(&devices, &nodes, light)
+                .next()
+                .map(|device| device.id),
             ignored,
             available: light.reachable,
             answered: None,
@@ -267,7 +526,53 @@ async fn observe(state: &AppState, url: &str, at: i64) -> rusqlite::Result<Optio
         }
     }
     link.close().await;
-    Ok(Some(seen))
+    Ok(Some((seen, left)))
+}
+
+/// Keeps that matterjs-server removed `node` at `at`.
+fn removed(state: &AppState, node: u64, at: i64) {
+    tracing::info!(
+        node_id = node,
+        at = crate::schedule::utc(at),
+        "matterjs-server removed a node"
+    );
+    let mut removed = state.removed.lock().expect(UNPOISONED);
+    removed.push((node, at));
+    let over = removed.len().saturating_sub(MAX_REMOVED);
+    removed.drain(..over);
+}
+
+/// Listens to matterjs-server for the nodes it removes, as when a light leaves the fabric, on
+/// one connection opened again whenever it fails or stays quiet too long.
+pub(crate) async fn listen(state: &AppState) {
+    let Some(url) = state.matter_url.as_deref() else {
+        return std::future::pending().await;
+    };
+    loop {
+        if let Err(fault) = listen_once(state, url).await {
+            tracing::debug!(%fault, "listening to matterjs-server again");
+        }
+        tokio::time::sleep(LISTEN_AGAIN).await;
+    }
+}
+
+async fn listen_once(state: &AppState, url: &str) -> Result<(), crate::link::Fault> {
+    let mut link = Link::open(url, Instant::now() + OPEN_TIMEOUT).await?;
+    let request = json!({ "message_id": next_id(), "command": "start_listening" });
+    link.send(&request, Instant::now() + OPEN_TIMEOUT).await?;
+    while let Some(message) = link.next(Instant::now() + LISTEN_IDLE).await? {
+        if message["event"] != "node_removed" {
+            continue;
+        }
+        let node = message["data"]
+            .as_u64()
+            .or_else(|| message["data"].as_str()?.parse().ok());
+        if let Some(node) = node {
+            removed(state, node, (state.clock)());
+        }
+    }
+    link.close().await;
+    Ok(())
 }
 
 /// What a request to matterjs-server about a device came to, in a word and its details.
@@ -358,6 +663,7 @@ fn notice_kind(notice: &Notice) -> &'static str {
         Notice::Down(_) => "down",
         Notice::StillDown(_) => "still_down",
         Notice::Up(_) => "up",
+        Notice::Left(_) => "left_fabric",
         Notice::ServerDown { .. } => "server_down",
         Notice::ServerUp { .. } => "server_up",
         Notice::Test => "test",
@@ -391,12 +697,13 @@ pub(crate) async fn check(state: &AppState, at: i64) {
             return;
         }
     };
-    let step =
-        state
-            .watch
-            .lock()
-            .expect(UNPOISONED)
-            .step(at, seen.as_deref(), state.discord.is_some());
+    let (seen, left) = seen.unzip();
+    let step = state.watch.lock().expect(UNPOISONED).step(
+        at,
+        seen.as_deref(),
+        left.as_deref().unwrap_or_default(),
+        state.discord.is_some(),
+    );
     for change in &step.changes {
         record(state, change);
     }
@@ -485,7 +792,8 @@ pub(crate) async fn outages(
     let db = state.db.lock().expect(UNPOISONED);
     let mut statement = db.prepare(
         "SELECT node_id, endpoint, name, network, started_at, ended_at, found_by, reconnects,
-            reconnect_result, reachable
+            reconnect_result, reachable, device_id, left_at, left_by, labels, serial_number,
+            software_version, thread_parent
          FROM light_outages
          WHERE COALESCE(ended_at, ?1) >= ?1 AND (?2 IS NULL OR key = ?2)
          ORDER BY started_at, rowid",
@@ -503,6 +811,13 @@ pub(crate) async fn outages(
                 "reconnects": row.get::<_, u32>(7)?,
                 "reconnect_result": row.get::<_, Option<String>>(8)?,
                 "reachable": row.get::<_, Option<bool>>(9)?,
+                "device_id": row.get::<_, Option<i64>>(10)?,
+                "left_at": row.get::<_, Option<i64>>(11)?,
+                "left_by": row.get::<_, Option<String>>(12)?,
+                "labels": serde_json::from_str::<Value>(&row.get::<_, String>(13)?).unwrap_or_default(),
+                "serial_number": row.get::<_, Option<String>>(14)?,
+                "software_version": row.get::<_, Option<String>>(15)?,
+                "thread_parent": row.get::<_, Option<String>>(16)?,
             }))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -537,11 +852,27 @@ pub(crate) async fn connected(
             "その時刻には照明を確かめていません（記録は14日分です）".into(),
         ));
     };
-    let lights: Vec<Value> = serde_json::from_str::<Vec<(u64, u16, String, bool)>>(&lights)
+    // Before version 0.1.57 a light was [node, endpoint, name, connected]; a light that left
+    // the fabric, with no node, is there since, with its ledger row and state.
+    let lights: Vec<Value> = serde_json::from_str::<Vec<Vec<Value>>>(&lights)
         .unwrap_or_default()
         .into_iter()
-        .map(|(node_id, endpoint, name, connected)| {
-            json!({ "node_id": node_id, "endpoint": endpoint, "name": name, "connected": server && connected })
+        .map(|light| {
+            let field = |i: usize| light.get(i).cloned().unwrap_or(Value::Null);
+            let connected = server && field(3) == true;
+            let state = match field(5).as_str() {
+                Some("left_fabric") => "left_fabric",
+                _ if connected => "connected",
+                _ => "down",
+            };
+            json!({
+                "node_id": field(0),
+                "endpoint": field(1),
+                "name": field(2),
+                "connected": connected,
+                "device_id": field(4),
+                "state": state,
+            })
         })
         .collect();
     Ok(Json(json!({
