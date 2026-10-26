@@ -71,6 +71,8 @@ WebSocketサーバーを立て、全部オン・全部オフ、エラーや無�
   mockは送られた明るさと色温度を `8/0`・`768/7` に反映します。
 - 最初の何回かの命令に答えないmock（`silent_for`）と `Home::with_schedule_retry`: 抜けた分の予定をまとめて実行し、答えなかった機器だけへ送り直す。
   抜けた分の求め方（`schedule::minutes_due`）は単体テストで確かめます。
+- ファイルのDBを開き直す `Home` で、再起動をまたいだ予定を確かめます。止めている間の分は起動（`Home::start_schedules`）で実行し、11分以上なら実行しない。
+  最初の送信の途中で止めたら起動後に送り直し、送り直しを待つ間に止めたら重ねて送らない（`tokio::spawn` した実行を `abort` して止める）。
 - `Home::supervise` にpanicする処理を渡し、起こし直されて `/healthz` に出ること、終わった処理で503になることを確かめます。
 - エアコンが答えないmockで、`POST /api/aircon/toggle` が `delivered: false` を返すことを確かめます。
 - CANDY HOUSEの代わりのHTTPサーバーで、ChromeのUser-Agentと、答えないときに10秒で打ち切ることを確かめます。

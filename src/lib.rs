@@ -659,6 +659,11 @@ impl Home {
         adjust_aircon(&self.0, unix, "scheduled").await;
     }
 
+    /// Runs the label schedules missed while home-link was stopped, as at its start at `unix`.
+    pub async fn start_schedules(&self, unix: i64) {
+        start_schedules(&self.0, unix).await;
+    }
+
     /// Switches the labels whose schedules fall on `unix`'s minute in Asia/Tokyo, once.
     pub async fn run_schedules(&self, unix: i64) {
         run_schedules(&self.0, unix).await;
@@ -736,9 +741,12 @@ impl Home {
         }
     }
 
-    /// Runs the label schedules at the start of every minute, forever: each minute's run apart,
-    /// so one that takes longer than a minute holds up no later one.
+    /// Runs the label schedules at once, for those missed while home-link was stopped, then at
+    /// the start of every minute, forever: each minute's run apart, so one that takes longer
+    /// than a minute holds up no later one.
     pub async fn every_minute(self) {
+        let home = self.clone();
+        tokio::spawn(async move { home.start_schedules(now()).await });
         loop {
             let wait = 60 - now().rem_euclid(60);
             tokio::time::sleep(Duration::from_secs(wait.unsigned_abs())).await;
@@ -2487,12 +2495,23 @@ async fn label_toggle(
 }
 
 /// Runs the label switches due at `unix`'s minute, and those of the minutes since the last run
-/// that it missed, once each. Each label's switches run in their minutes' order, each label
-/// apart from the others, so one that waits on a silent device holds up no other.
+/// that it missed, as after a restart: each label once, to the last of its switches due, each
+/// label apart from the others, so one that waits on a silent device holds up no other.
+///
+/// The last minute run is kept in the database once every label due was sent its switch once,
+/// before any is sent again: a restart before then runs the minute again, one after it does not
+/// send a switch already sent twice.
 async fn run_schedules(state: &AppState, unix: i64) {
     let minute = unix.div_euclid(60);
     let minutes = {
         let mut last = state.last_schedule.lock().expect(UNPOISONED);
+        if last.is_none() {
+            *last = load::<Option<i64>>(&state.db.lock().expect(UNPOISONED), SCHEDULE_LAST)
+                .unwrap_or_else(|error| {
+                    tracing::warn!(%error, "last label schedule run unreadable");
+                    None
+                });
+        }
         let minutes = schedule::minutes_due(*last, minute);
         if minutes.is_empty() {
             return;
@@ -2501,30 +2520,80 @@ async fn run_schedules(state: &AppState, unix: i64) {
         minutes
     };
     let due = due_schedules(&state.db.lock().expect(UNPOISONED), minutes);
-    let mut by_label: Vec<(i64, Vec<bool>)> = Vec::new();
+    // A label due more than once in the minutes caught up goes straight to its last switch,
+    // rather than on and off again.
+    let mut by_label: Vec<(i64, bool)> = Vec::new();
     for (label, on) in due.unwrap_or_else(|error| {
         tracing::warn!(%error, "label schedules unreadable");
         Vec::new()
     }) {
         match by_label.iter_mut().find(|(l, _)| *l == label) {
-            Some((_, ons)) => ons.push(on),
-            None => by_label.push((label, vec![on])),
+            Some((_, last)) => *last = on,
+            None => by_label.push((label, on)),
         }
     }
-    futures_util::future::join_all(by_label.into_iter().map(|(label, ons)| async move {
-        let lock = state
-            .schedule_locks
+    let (sent, mut first) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let count = by_label.len();
+    let labels = futures_util::future::join_all(by_label.into_iter().map(|(label, on)| {
+        let sent = sent.clone();
+        async move {
+            let lock = state
+                .schedule_locks
+                .lock()
+                .expect(UNPOISONED)
+                .entry(label)
+                .or_default()
+                .clone();
+            let _turn = lock.lock().await;
+            run_schedule(state, label, on, || {
+                let _ = sent.send(());
+            })
+            .await;
+        }
+    }));
+    drop(sent);
+    let keep = async {
+        for _ in 0..count {
+            if first.recv().await.is_none() {
+                break;
+            }
+        }
+        keep_last_schedule(state, minute);
+    };
+    futures_util::future::join(keep, labels).await;
+}
+
+/// Runs the label schedules missed while home-link was stopped, at its start at `unix`. Without
+/// a minute kept from before, as on the first start of a version that keeps it, nothing is
+/// run until the next minute, as before.
+async fn start_schedules(state: &AppState, unix: i64) {
+    let kept = load::<Option<i64>>(&state.db.lock().expect(UNPOISONED), SCHEDULE_LAST);
+    if matches!(kept, Ok(Some(_))) {
+        run_schedules(state, unix).await;
+    } else {
+        let minute = unix.div_euclid(60);
+        state
+            .last_schedule
             .lock()
             .expect(UNPOISONED)
-            .entry(label)
-            .or_default()
-            .clone();
-        let _turn = lock.lock().await;
-        for on in ons {
-            run_schedule(state, label, on).await;
+            .replace(minute);
+        keep_last_schedule(state, minute);
+    }
+}
+
+/// Keeps `minute` as the last one whose label schedules ran, unless a later one is kept.
+fn keep_last_schedule(state: &AppState, minute: i64) {
+    let db = state.db.lock().expect(UNPOISONED);
+    let kept = load::<Option<i64>>(&db, SCHEDULE_LAST).and_then(|last| {
+        if last.is_some_and(|last| last >= minute) {
+            Ok(())
+        } else {
+            store(&db, SCHEDULE_LAST, &Some(minute))
         }
-    }))
-    .await;
+    });
+    if let Err(error) = kept {
+        tracing::warn!(%error, "last label schedule run not kept");
+    }
 }
 
 /// The label switches of `minutes`, by label and in their minutes' order.
@@ -2548,12 +2617,15 @@ fn due_schedules(
 /// Switches label `label` on or off for its schedule, then sends again to the devices that
 /// did not answer, or to all when matterjs-server could not be reached, up to
 /// `SCHEDULE_RETRIES` times: unless the label was switched otherwise meanwhile.
-async fn run_schedule(state: &AppState, label: i64, on: bool) {
+async fn run_schedule(state: &AppState, label: i64, on: bool, sent: impl FnOnce()) {
     let op = if on { Op::On } else { Op::Off };
     let mut only: Option<Vec<(u64, u16)>> = None;
     let mut left = None;
+    // Told once the first send is over, however it ended.
+    let mut first = Some(OnDrop(Some(sent)));
     for attempt in 0..=SCHEDULE_RETRIES {
         if attempt > 0 {
+            drop(first.take());
             tokio::time::sleep(state.schedule_retry).await;
             let now = find_label(&state.db.lock().expect(UNPOISONED), label).map(|l| l.traits.on);
             if now.ok() != left {
@@ -2588,6 +2660,17 @@ async fn run_schedule(state: &AppState, label: i64, on: bool) {
         }
     }
     tracing::warn!(label, on, "label schedule left devices that never answered");
+}
+
+/// Calls its function when dropped.
+struct OnDrop<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
+    }
 }
 
 /// The node and endpoint of each device a switch's response says did not answer, or that
@@ -3209,6 +3292,8 @@ async fn switch_lights(
 }
 
 const SCHEDULE: &str = "light_schedule";
+/// The last minute, in Unix minutes, whose label schedules were sent, kept across restarts.
+const SCHEDULE_LAST: &str = "label_schedule_last";
 
 fn load<T: DeserializeOwned + Default>(db: &Connection, key: &str) -> rusqlite::Result<T> {
     let value: Option<String> = db

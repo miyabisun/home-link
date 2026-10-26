@@ -5101,6 +5101,129 @@ async fn schedules_switch_a_label_at_their_times_across_midnight() {
 }
 
 #[tokio::test]
+async fn a_schedule_due_while_home_link_was_restarting_runs_once_it_is_back() {
+    let (addr, commands, _) = fake_light_server(plug_nodes(), Fake::default()).await;
+    let path = std::env::temp_dir().join(format!("home-link-restart-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let open = || {
+        home_link::Home::new(
+            home_link::open_db(path.to_str().unwrap()).unwrap(),
+            Some(format!("ws://{addr}/ws")),
+        )
+    };
+    let home = open();
+    let app = home.router();
+    let sql = home_link::open_db(path.to_str().unwrap()).unwrap();
+    let plug = create_label(
+        &app,
+        json!({ "name": "plug", "schedule": [{ "time": "23:30", "on": true }] }),
+    )
+    .await;
+    let device = add_device(
+        &app,
+        &sql,
+        json!({ "vendor": "Plugco", "serial_number": "plug-a" }),
+    )
+    .await;
+    assert_eq!(assign(&app, &device, &[&plug]).await.0, StatusCode::OK);
+    let minute = |h: i64, m: i64| MIDNIGHT - 86_400 + h * 3600 + m * 60;
+    let on = || {
+        switches(&commands)
+            .iter()
+            .filter(|s| **s == (json!(20), json!(1), json!("On")))
+            .count()
+    };
+
+    // Started first at 23:30:20 with no minute kept, it waits for the next minute, as before.
+    home.start_schedules(minute(23, 30) + 20).await;
+    assert_eq!(on(), 0);
+
+    // Stopped after 23:29, as for an update, and started again at 23:31.
+    let day = 86_400;
+    home.run_schedules(minute(23, 29) + day).await;
+    drop((home, app));
+    let home = open();
+    home.start_schedules(minute(23, 31) + day).await;
+    assert_eq!(on(), 1);
+    // Started again within the same minute, it does not send the schedule twice.
+    drop(home);
+    open().start_schedules(minute(23, 31) + day + 30).await;
+    assert_eq!(on(), 1);
+
+    // Stopped for eleven minutes, the schedule is left for the next day.
+    open().run_schedules(minute(23, 29) + 2 * day).await;
+    open().start_schedules(minute(23, 40) + 2 * day).await;
+    assert_eq!(on(), 1);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn a_restart_while_a_schedule_is_sent_again_does_not_send_it_twice() {
+    // The Tapo never answers, so the schedule is sent again after a long wait.
+    let fake = Fake {
+        silent: vec![(5, 1)],
+        ..Fake::default()
+    };
+    let (addr, commands, _) = fake_light_server(plug_nodes(), fake).await;
+    let path = std::env::temp_dir().join(format!("home-link-resend-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let open = || {
+        home_link::Home::new(
+            home_link::open_db(path.to_str().unwrap()).unwrap(),
+            Some(format!("ws://{addr}/ws")),
+        )
+        .with_schedule_retry(Duration::from_mins(1))
+    };
+    let home = open();
+    let app = home.router();
+    let sql = home_link::open_db(path.to_str().unwrap()).unwrap();
+    let both = create_label(
+        &app,
+        json!({ "name": "both", "schedule": [{ "time": "23:30", "on": true }] }),
+    )
+    .await;
+    for (vendor, serial) in [("Tapo", TAPO), ("Plugco", "plug-a")] {
+        let device = add_device(
+            &app,
+            &sql,
+            json!({ "vendor": vendor, "serial_number": serial }),
+        )
+        .await;
+        assert_eq!(assign(&app, &device, &[&both]).await.0, StatusCode::OK);
+    }
+    let minute = |h: i64, m: i64| MIDNIGHT - 86_400 + h * 3600 + m * 60;
+    let plug_ons = || {
+        switches(&commands)
+            .iter()
+            .filter(|s| **s == (json!(20), json!(1), json!("On")))
+            .count()
+    };
+    home.run_schedules(minute(23, 29)).await;
+
+    // Stopped half a second into the first send: started again, it sends the schedule.
+    let running = tokio::spawn({
+        let home = home.clone();
+        async move { home.run_schedules(minute(23, 30)).await }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    running.abort();
+    drop((home, app));
+    let home = open();
+    let running = tokio::spawn({
+        let home = home.clone();
+        async move { home.run_schedules(minute(23, 31)).await }
+    });
+    // Stopped while waiting to send again: started again, it does not send the schedule twice.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(plug_ons(), 2, "sent before the stop and again after it");
+    running.abort();
+    drop(home);
+    open().run_schedules(minute(23, 32)).await;
+    assert_eq!(plug_ons(), 2);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
 async fn schedules_of_missed_minutes_run_and_devices_that_missed_are_sent_again() {
     // The Tapo leaves both sends of the first switch unanswered.
     let fake = Fake {
