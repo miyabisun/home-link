@@ -286,3 +286,77 @@ export function nightMinute(time: string): number | null {
   const match = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(time);
   return match ? Number(match[1]) * 60 + Number(match[2]) : null;
 }
+
+export interface Outage {
+  node_id: number | null;
+  endpoint: number | null;
+  name: string;
+  network: "wifi" | "thread" | "ethernet" | null;
+  started_at: number;
+  ended_at: number | null;
+  found_by: string;
+  reconnects: number;
+  reconnect_result: string | null;
+  reachable: boolean | null;
+}
+
+export interface WatchLight {
+  node_id: number;
+  endpoint: number;
+  name: string;
+  network: "wifi" | "thread" | "ethernet" | null;
+  connected: boolean;
+  since: number | null;
+  last_answer: number | null;
+  outage: Outage | null;
+}
+
+const HOUR_MINUTE = new Intl.DateTimeFormat("ja-JP", {
+  timeZone: "Asia/Tokyo",
+  hour: "2-digit",
+  minute: "2-digit",
+  hourCycle: "h23",
+});
+const DAY = new Intl.DateTimeFormat("ja-JP", {
+  timeZone: "Asia/Tokyo",
+  month: "numeric",
+  day: "numeric",
+});
+
+/** The time alone on `now`'s day in Tokyo, else with the day. */
+function moment(unix: number, now: number): string {
+  const time = HOUR_MINUTE.format(unix * 1000);
+  return DAY.format(unix * 1000) === DAY.format(now * 1000)
+    ? time
+    : `${DAY.format(unix * 1000)} ${time}`;
+}
+
+function span(seconds: number): string {
+  const minutes = Math.max(0, Math.floor(seconds / 60));
+  return minutes < 60
+    ? `${minutes}分`
+    : `${Math.floor(minutes / 60)}時間${minutes % 60}分`;
+}
+
+/** Since when a light has been connected and when it last answered, or since when it is down and what was done. */
+export function watchNote(light: WatchLight, now: number): string {
+  const parts = light.since === null ? [] : [`${moment(light.since, now)}から`];
+  const outage = light.outage;
+  if (light.connected || outage === null) {
+    if (light.last_answer !== null)
+      parts.push(`応答 ${moment(light.last_answer, now)}`);
+  } else {
+    if (outage.reconnects > 0) parts.push(`つなぎ直し${outage.reconnects}回`);
+    if (outage.reachable !== null)
+      parts.push(outage.reachable ? "網では届く" : "網で届かない");
+  }
+  return parts.join("・");
+}
+
+/** When a stretch out of reach began and ended, and how long it lasted. */
+export function outageText(outage: Outage, now: number): string {
+  const start = moment(outage.started_at, now);
+  if (outage.ended_at === null)
+    return `${start}〜（${span(now - outage.started_at)}、続いている）`;
+  return `${start}〜${moment(outage.ended_at, now)}（${span(outage.ended_at - outage.started_at)}）`;
+}

@@ -36,6 +36,10 @@ scripts/smoke.sh
 `/healthz`・`/api/health`（`Cargo.toml` の版）・labelの作成・404・組み込んだ画面とJSが返ることをHTTPで確かめます。
 
 `tests/api.rs` はメモリ上のSQLiteでAPIの要求と応答を検証します。
+照明の接続の見張りは、判断（いつ切れたと数え、つなぎ直し、知らせるか）を `src/watch.rs` の副作用の無い `Watch::step` に分け、
+1分ずつ時刻を進める列の単体テストで確かめます。matterjs-serverへの問い合わせ・Discordへの送信・履歴の書き込みは `src/watcher.rs` が行い、
+`tests/watch.rs` が、mockのmatterjs-serverとmockのDiscordのWebhookを相手に `Home::check_lights` を時刻を進めて呼び、
+見張り→つなぎ直し→知らせ→履歴のAPIを通して確かめます。
 `src/onboarding.rs` はMatterのQRコード（Base38）と手動ペアリングコード（Verhoeff）の検証、
 同じ機器かを判定するキーの取り出しと、そのテストを持ちます。
 `src/link.rs` はmatterjs-serverとの通信の層です。`Link` は接続・送信・応答待ち・切断のすべてに期限を持ちます。
@@ -134,6 +138,8 @@ E2Eテストは、ChromiumとPlaywrightで、ビルドしたhome-link（`target/
 テストは画面を操作し、APIを通じてSQLiteのファイルに入った値を読んで確かめます（機器の名前・label・無視・削除、labelの作成・名前・調光・固定の値・スケジュール・機器・削除・入り切り）。
 エアコンの画面は、mockのエアコンを相手に、入・切と目標の温度の変更がSQLiteに入ること、範囲外の目標を示して送らないことを確かめます。
 `serve.mjs` は国土地理院とOpen-Meteoの代わりも立て（`GSI_URL`・`OPEN_METEO_URL`）、住所の登録の成功と失敗、外気温と理由の表示、夜の時刻の保存を確かめます。
+照明の接続の画面は、`GET /api/lights/watch` と `GET /api/lights/outages` の応答をPlaywrightで差し替え、切れた照明・長い名前・matterjs-serverに届かない状態と14日の履歴を、幅1280と390、明暗の両方で確かめます。
+試しの知らせは差し替えた応答で送れたことを、E2Eのhome-link（送り先が未設定）で押せないことを確かめます。
 温度計の画面は、E2Eのhome-linkに温度計が無いため、`GET /api/meter` の応答をPlaywrightで差し替えて、今の値・途絶え・未受信を確かめます。
 応答しない機器の表示は、`GET /api/devices` とlabelの入り切りの応答をPlaywrightで差し替え、Threadの機器だけが応答しないときと、Wi-Fiの機器も応答しないときを、幅1280と390、明暗の両方で確かめます。
 `screens.spec.ts` は幅1280と390の明暗で全画面を撮り（`client/test-results/screens/`）、横のはみ出しと本文の内側の縦スクロールが無いことを確かめます。

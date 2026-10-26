@@ -68,6 +68,7 @@ curl http://127.0.0.1:5011/healthz
 | `SESAME_UUID` | なし | 解錠するSESAMEのUUID（SESAMEアプリの機器の画面にあります）。 |
 | `SESAME_SECRET_KEY` | なし | SESAMEの秘密鍵（32桁の16進数）。SESAMEアプリで共有する鍵のQRコードを上のページで読み取ると得られます。 |
 | `SWITCHBOT_METER_ADDRESS` | なし | 受信するSwitchBot CO2センサー（W4900010）のBluetoothアドレス（例: `AA:BB:CC:DD:EE:01`）。未設定なら受信しません。 |
+| `DISCORD_WEBHOOK_URL` | なし | 照明の見張りの知らせを送るDiscordのWebhook。WebhookのURL（`https://discord.com/api/webhooks/<id>/<token>`）か、Watchtowerと同じ `discord://<token>@<id>` の形で書きます。未設定なら知らせだけを送りません。 |
 | `GSI_URL` | `https://msearch.gsi.go.jp/address-search/AddressSearch` | 住所から座標を引く国土地理院の住所検索API。試験で差し替えるときだけ設定します。 |
 | `OPEN_METEO_URL` | `https://api.open-meteo.com/v1/forecast` | 外気温を取るOpen-MeteoのAPI。試験で差し替えるときだけ設定します。 |
 
@@ -105,6 +106,56 @@ device missed what="switch" node_id=5 endpoint=1 reason="server_error" details="
 
 命令に1つも答えが無いときは、`warn` の1行を残します（`matterjs-server answered none of the commands`）。
 
+照明の見張りは、状態が変わったときだけ照明ごとに `info` の1行を残します（毎分の確かめで変わらなければ書きません）。
+
+```text
+light down name="玄関" node_id=5 endpoint=1 network="wifi" found_by="unavailable"
+light reconnect asked name="玄関" node_id=5 endpoint=1
+light reconnect done name="玄関" node_id=5 endpoint=1 result="accepted"
+light ping name="玄関" node_id=5 endpoint=1 reachable="no"
+notice sent kind="down"
+light back name="玄関" node_id=5 endpoint=1 down_s=420 reconnects=1
+```
+
+matterjs-serverに届かなくなったときは `warn` の `matterjs-server out of reach`、戻ったときは `info` の `matterjs-server back` です。
+起動時に、知らせの送り先があるか（`light notices go to Discord`、または未設定の旨）を示します。WebhookのURLは出しません。
+
+### 照明の接続の見張り
+
+`MATTER_SERVER_URL` を設定すると、home-linkは照明（無視の照明を除く）と通信できるかを1分ごとに確かめます。
+照明を操作しないときも確かめるので、外出中に切れた照明を帰宅より前に知り、つなぎ直せます。
+
+- 毎分、matterjs-serverが各照明を `available`（ブリッジ配下はブリッジが届くか）としているかを読みます。
+- 5分ごとに、各照明のOn/Offを実際に読みます（照明ごとに5秒まで、全台へ同時に）。`available` のまま答えなくなった照明を見つけるためです。
+  答えなかった照明は、次の分にもう一度読みます。
+- `available` でない照明と、読み取りに2回続けて答えない照明は、切れたと数えます。
+  切れた照明は、matterjs-serverに `interview_node`（nodeの全体を新しいsessionで読み直す）を送ってつなぎ直させます。照明を入り切りする命令や明るさ・色の命令は送りません。
+  同じ照明へのつなぎ直しは10分に1回までです。Wi-Fiの照明は、同時に `ping_node` で、matterjs-serverの動く場所から照明のアドレスにpingが届くか（網の層で届くか）を確かめます。
+- 5分以上つながらない照明は、Discordへ1通知らせます（照明名・Wi-Fi／Thread・切れた時刻。同じ確かめで切れた照明は1通にまとめます）。
+  戻ったら、つながらなかった時間を1通知らせます。5分より前に戻った照明は知らせません。
+- つなぎ直しを3回しても戻らない照明は、壁のスイッチで電源を入れ直す案内と、網の層で届くかを1通知らせます。
+- matterjs-serverに5分以上届かないときは、照明ごとではなく、matterjs-serverが届かないことを1通知らせます。その間は照明を判断しません。
+  matterjs-serverの再起動はhome-linkでは行いません。
+- 知らせの送り先が未設定でも、見張り・つなぎ直し・履歴は同じように動きます。
+
+| API | 内容 |
+| --- | --- |
+| `GET /api/lights/watch` | 今の状態。`server_reachable`（最後の確かめでmatterjs-serverに届いたか）、`server_since`、`server_outage`、`wifi_all_down`（見張るWi-Fiの照明が1台以上あり、全て切れている）、`notify`（送り先があるか）、照明ごとの `connected`・`since`（つながった、または切れた時刻）・`last_answer`（最後に読み取りに答えた時刻）・`outage` |
+| `GET /api/lights/outages` | 14日分の、照明とmatterjs-serverがつながらなかった区間。古い順。`since`（その時刻より後に続いていた区間）、`node_id` と `endpoint`（1台の照明）で絞れます |
+| `GET /api/lights/connected?at=<Unix秒>` | その時刻の分の確かめで、照明ごとにつながっていたか。確かめた記録が無い時刻は404 `not_checked` |
+| `POST /api/lights/watch/test` | 試しの知らせを1通送ります。送り先が未設定なら503 `notify_not_configured`、送れなければ502 `notify_failed` |
+
+区間は `started_at`・`ended_at`（続いていればnull）・`network`・`found_by`（`unavailable`・`no_answer`・matterjs-serverの `unreachable`）・`reconnects`・`reconnect_result`（`accepted` か失敗の理由）・`reachable`（pingが届いたか）を持ちます。
+時刻はUnix秒です。home-linkが止まっていた間の区間は、起動時に最後の確かめの時刻で閉じます。
+
+```sh
+curl http://home-link.example:5011/api/lights/watch
+# {"checked_at":1792941300,"server_reachable":true,"server_since":1792940400,"server_outage":null,"wifi_all_down":false,"notify":true,
+#  "lights":[{"node_id":5,"endpoint":1,"name":"玄関","network":"wifi","connected":false,"since":1792940460,"last_answer":1792940400,
+#             "outage":{"node_id":5,"endpoint":1,"name":"玄関","network":"wifi","started_at":1792940460,"ended_at":null,"found_by":"unavailable",
+#                       "reconnects":1,"reconnect_result":"accepted","reachable":false}},…]}
+```
+
 ## Webの管理画面
 
 サーバーのポートをブラウザで開きます。上の例なら `http://127.0.0.1:5011/`、家のLANやVPN（tailnetなど）の出先からは
@@ -117,6 +168,7 @@ device missed what="switch" node_id=5 endpoint=1 reason="server_error" details="
 | ラベル（右上のメニュー） | labelの一覧と作成。一覧は固定・自動調光の別、機器の台数、入っているかを示します。名前を入れて「追加」で作り、そのlabelの画面を開きます |
 | labelの画面 | 名前の変更、入り切り、調光（なし・自動調光・固定）、固定の明るさ（%）と色温度（K）、毎日の時刻での入・切、機器の割り当て、削除（確認してから） |
 | 温度計（右上のメニュー） | 温度計の今の温度・湿度・CO2・電池と受けた時刻。受信が途絶えたときは、最後に受けた時刻だけを示します |
+| 照明の接続（右上のメニュー） | 照明ごとに、いつからつながっているかと最後に答えた時刻、切れている照明はいつからか・つなぎ直した回数・網の層で届くか。matterjs-serverに届かないときは画面の上部に示します。「14日の履歴」を開くとつながらなかった区間を新しい順に並べます。「試しに知らせる」で送り先へ試しの知らせを1通送ります |
 | エアコン（右上のメニュー） | 目標の温度（18〜30℃）の変更、自動調整の入・切、室温・湿度・外気温とその時刻、エアコンの今の運転（「冷房 25℃」「切」など）、直近の判断の理由。「設定」に家の住所の登録と夜の時間帯 |
 
 変えた値はその場でAPIへ送り、保存ボタンはありません。値の誤りはその入力の下に、サーバーが受け付けなかった理由は画面の上部に示します。

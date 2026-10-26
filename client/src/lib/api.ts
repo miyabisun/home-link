@@ -3,11 +3,23 @@ import {
   errorMessage,
   type LabelTraits,
   type MeterView,
+  type Outage,
   type Outdoor,
   type Place,
   type Switch,
   type SwitchEntry,
+  type WatchLight,
 } from "./admin";
+
+export interface Watch {
+  checked_at: number | null;
+  server_reachable: boolean | null;
+  server_since: number | null;
+  server_outage: Outage | null;
+  wifi_all_down: boolean;
+  notify: boolean;
+  lights: WatchLight[];
+}
 
 export interface LabelRef {
   id: number;
@@ -146,6 +158,17 @@ export const api = {
       missing: number;
       devices: SwitchEntry[];
     }>("POST", `/api/labels/${id}/toggle`),
+  watch: (signal?: AbortSignal) =>
+    request<Watch>("GET", "/api/lights/watch", undefined, signal),
+  outages: (signal?: AbortSignal) =>
+    request<{ outages: Outage[] }>(
+      "GET",
+      "/api/lights/outages",
+      undefined,
+      signal,
+    ),
+  testNotice: () =>
+    request<{ sent: boolean }>("POST", "/api/lights/watch/test"),
 };
 
 export const aborted = (error: unknown) =>

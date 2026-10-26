@@ -808,7 +808,7 @@ fn tune_commands(light: &Light, target: Target, switched_on: bool, transition: u
 }
 
 /// A read of the light's own On/Off.
-fn read_on_off(light: &Light) -> Value {
+pub(crate) fn read_on_off(light: &Light) -> Value {
     json!({
         "command": "read_attribute",
         "args": { "node_id": light.node_id, "attribute_path": [format!("{}/6/0", light.endpoint)] },

@@ -59,6 +59,9 @@
         <a class="menu-item" href="/labels" onclick={() => (menuOpen = false)}>
           ラベル
         </a>
+        <a class="menu-item" href="/lights" onclick={() => (menuOpen = false)}>
+          照明の接続
+        </a>
         <a class="menu-item" href="/meter" onclick={() => (menuOpen = false)}>
           温度計
         </a>

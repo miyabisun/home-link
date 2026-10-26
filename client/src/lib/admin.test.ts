@@ -21,6 +21,8 @@ import {
   receivedTime,
   scheduleInput,
   stateText,
+  outageText,
+  watchNote,
   switchProblem,
   withLabel,
   THREAD_DOWN,
@@ -366,5 +368,75 @@ describe("the outside and the night", () => {
     expect(nightMinute("23:59")).toBe(1439);
     for (const bad of ["", "24:00", "7:00", "aa:bb"])
       expect(nightMinute(bad)).toBeNull();
+  });
+});
+
+describe("the light watch", () => {
+  // 2026-10-26 00:00 in Tokyo.
+  const T0 = 1_792_940_400;
+  const light = {
+    node_id: 5,
+    endpoint: 1,
+    name: "玄関",
+    network: "wifi" as const,
+    connected: true,
+    since: T0 + 8 * 60,
+    last_answer: T0 + 20 * 60,
+    outage: null,
+  };
+  const outage = {
+    node_id: 5,
+    endpoint: 1,
+    name: "玄関",
+    network: "wifi" as const,
+    started_at: T0 + 14 * 60,
+    ended_at: T0 + 21 * 60,
+    found_by: "unavailable",
+    reconnects: 1,
+    reconnect_result: "accepted",
+    reachable: false,
+  };
+
+  it("tells a connected light since when and its last answer", () => {
+    const now = T0 + 21 * 60;
+    expect(watchNote(light, now)).toBe("00:08から・応答 00:20");
+    expect(watchNote({ ...light, last_answer: null }, now)).toBe("00:08から");
+    expect(watchNote({ ...light, since: T0 - 86_400 }, now)).toBe(
+      "10/25 00:00から・応答 00:20",
+    );
+  });
+
+  it("tells a light that is down since when, how often reconnected and its reach", () => {
+    const down = {
+      ...light,
+      connected: false,
+      since: T0 + 14 * 60,
+      outage: { ...outage, ended_at: null },
+    };
+    const now = T0 + 30 * 60;
+    expect(watchNote(down, now)).toBe("00:14から・つなぎ直し1回・網で届かない");
+    expect(
+      watchNote(
+        { ...down, outage: { ...down.outage, reconnects: 0, reachable: null } },
+        now,
+      ),
+    ).toBe("00:14から");
+    expect(
+      watchNote({ ...down, outage: { ...down.outage, reachable: true } }, now),
+    ).toBe("00:14から・つなぎ直し1回・網では届く");
+  });
+
+  it("tells a stretch out of reach by when and how long", () => {
+    const now = T0 + 30 * 60;
+    expect(outageText(outage, now)).toBe("00:14〜00:21（7分）");
+    expect(outageText({ ...outage, ended_at: null }, now)).toBe(
+      "00:14〜（16分、続いている）",
+    );
+    expect(
+      outageText(
+        { ...outage, started_at: T0 - 3 * 3600, ended_at: T0 + 5 * 60 },
+        now,
+      ),
+    ).toBe("10/25 21:00〜00:05（3時間5分）");
   });
 });

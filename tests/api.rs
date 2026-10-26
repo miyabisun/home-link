@@ -5211,7 +5211,7 @@ fn opening_a_v0_1_39_ledger_drops_rooms_and_keeps_everything_else() {
         let version: i64 = db
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
         let broken: i64 = db
             .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
                 r.get(0)
@@ -6171,7 +6171,7 @@ fn moves_changed_schedule_coordinates_to_the_home_location() {
         let version: i64 = db
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
         drop(db);
         let _ = std::fs::remove_file(&path);
     }

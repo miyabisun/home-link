@@ -1,5 +1,6 @@
 pub mod aircon;
 pub mod commission;
+pub mod discord;
 pub mod link;
 pub mod matter;
 mod mcp;
@@ -8,6 +9,8 @@ pub mod onboarding;
 pub mod outside;
 pub mod schedule;
 pub mod sesame;
+pub mod watch;
+mod watcher;
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -275,6 +278,9 @@ pub fn open_db(path: &str) -> rusqlite::Result<Connection> {
     if version < 11 {
         migrate_to_the_home_location(&db)?;
     }
+    if version < 12 {
+        watcher::migrate(&db)?;
+    }
     Ok(db)
 }
 
@@ -420,6 +426,10 @@ struct AppState {
     outside: Option<Outside>,
     /// The latest temperature outside; kept in memory only.
     outdoor: Mutex<Option<Outdoor>>,
+    /// The watch over each light's connection; its history is in the database.
+    watch: Mutex<watch::Watch>,
+    /// Where the watch's messages go, if anywhere.
+    discord: Option<discord::Discord>,
 }
 
 /// Where the home's place and the temperature outside are asked for.
@@ -473,7 +483,21 @@ impl Home {
             aircon_busy: tokio::sync::Mutex::new(()),
             outside: None,
             outdoor: Mutex::new(None),
+            watch: Mutex::new(watch::Watch::default()),
+            discord: None,
         }))
+    }
+
+    /// Sets where the light watch's messages go.
+    ///
+    /// # Panics
+    /// Panics once the router or a clone shares this `Home`.
+    #[must_use]
+    pub fn with_discord(mut self, discord: Option<discord::Discord>) -> Self {
+        Arc::get_mut(&mut self.0)
+            .expect("set before the Home is shared")
+            .discord = discord;
+        self
     }
 
     /// Sets the `SwitchBot` CO2 meter, by its Bluetooth address, that [`Self::receive_meter`] listens to.
@@ -586,6 +610,23 @@ impl Home {
         }
     }
 
+    /// Checks every light's connection as at `at`, on the minute, and does what that calls for.
+    pub async fn check_lights(&self, at: i64) {
+        watcher::check(&self.0, at).await;
+    }
+
+    /// Checks the lights at the start of every minute, forever, after ending the stretches
+    /// left open when home-link last stopped.
+    pub async fn watch_lights(self) {
+        watcher::close_open(&self.0);
+        loop {
+            let wait = 60 - now().rem_euclid(60);
+            tokio::time::sleep(Duration::from_secs(wait.unsigned_abs())).await;
+            let at = now();
+            self.check_lights(at - at.rem_euclid(60)).await;
+        }
+    }
+
     /// Adjusts the lights and the air conditioner every ten minutes on the clock, forever.
     pub async fn every_ten_minutes(self) {
         loop {
@@ -642,6 +683,13 @@ fn router(state: Db) -> Router {
         .route("/lights/off", axum::routing::post(lights_off))
         .route("/lights/boost", axum::routing::post(boost))
         .route("/lights/schedule", get(get_schedule).put(update_schedule))
+        .route("/lights/watch", get(watcher::status))
+        .route(
+            "/lights/watch/test",
+            axum::routing::post(watcher::test_notice),
+        )
+        .route("/lights/outages", get(watcher::outages))
+        .route("/lights/connected", get(watcher::connected))
         .route("/door/unlock", axum::routing::post(unlock_door))
         .route("/door/lock", axum::routing::post(lock_door))
         .fallback(not_found)
