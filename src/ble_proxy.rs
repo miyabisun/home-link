@@ -37,6 +37,8 @@ const DEFAULT_MTU: u16 = 23;
 const PROTOCOL_VERSION: u64 = 1;
 /// How long the proxy stays open after its last peripheral went, for matterjs-server to connect again.
 const LINK_GRACE: Duration = Duration::from_secs(10);
+/// How often [`Radio::gone`] asks whether the adapter is still there, for a signal it missed.
+const GONE_POLL: Duration = Duration::from_secs(5);
 const WRITE_DATA: u8 = 0x01;
 const NOTIFICATION: u8 = 0x02;
 
@@ -510,6 +512,52 @@ impl Radio {
         let changed = MessageStream::for_match_rule(changed, &self.bus, None).await?;
         let objects = MessageStream::for_match_rule(objects, &self.bus, None).await?;
         Ok(futures_util::stream::select(changed, objects).boxed())
+    }
+
+    /// Whether the adapter is still in `BlueZ`: not once it was unplugged or reset, nor when
+    /// `BlueZ` does not answer.
+    pub async fn present(&self) -> bool {
+        self.adapter_properties().await.is_ok()
+    }
+
+    /// Returns once the adapter goes from `BlueZ`: on its signal, or when asked every
+    /// [`GONE_POLL`], for a signal missed or a bus that closed.
+    pub async fn gone(&self) {
+        let removed = MatchRule::builder()
+            .msg_type(Type::Signal)
+            .interface("org.freedesktop.DBus.ObjectManager")
+            .and_then(|rule| rule.member("InterfacesRemoved"))
+            .map(zbus::match_rule::Builder::build);
+        let mut removed = match removed {
+            Ok(rule) => MessageStream::for_match_rule(rule, &self.bus, None)
+                .await
+                .ok(),
+            Err(_) => None,
+        };
+        let mut poll = tokio::time::interval(GONE_POLL);
+        loop {
+            let signal = async {
+                match removed.as_mut() {
+                    Some(stream) => stream.next().await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                signal = signal => match signal {
+                    // Some of the adapter's interfaces may go alone; the adapter's own is asked.
+                    Some(Ok(signal)) if self.concern(&signal) == Concern::Adapter => {
+                        if !self.present().await {
+                            return;
+                        }
+                    }
+                    Some(_) => {}
+                    None => return,
+                },
+                _ = poll.tick() => if !self.present().await {
+                    return;
+                },
+            }
+        }
     }
 
     /// What a signal says about the adapter and the devices under it.

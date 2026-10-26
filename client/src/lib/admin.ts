@@ -314,12 +314,23 @@ export interface Outage {
   left_at?: number | null;
   left_by?: "event" | "check" | "unknown" | null;
   /** For a light that left: home-link registering it again, and how often it left in two weeks. */
-  rejoin?: { attempts: number; reason: RejoinReason | null; rejoined: boolean };
+  rejoin?: {
+    attempts: number;
+    reason: RejoinReason | null;
+    rejoined: boolean;
+    /** Until when the next try waits, after tries in a row that lost the adapter. */
+    slowed_until?: number | null;
+  };
   leaves?: { count: number; previous_at: number | null };
 }
 
 export type RejoinReason =
-  "no_advert" | "connect_failed" | "wrong_code" | "no_code" | "no_bluetooth";
+  | "no_advert"
+  | "connect_failed"
+  | "wrong_code"
+  | "no_code"
+  | "no_bluetooth"
+  | "adapter_lost";
 
 const REJOIN_REASONS: Record<RejoinReason, string> = {
   no_advert: "登録を待っていない",
@@ -327,6 +338,7 @@ const REJOIN_REASONS: Record<RejoinReason, string> = {
   wrong_code: "コードが合わない",
   no_code: "コードがない",
   no_bluetooth: "Bluetoothが使えない",
+  adapter_lost: "Bluetoothが途切れた",
 };
 
 export interface WatchLight {
@@ -388,6 +400,8 @@ export function watchNote(light: WatchLight, now: number): string {
     const { rejoin, leaves } = outage;
     if (rejoin?.reason) parts.push(REJOIN_REASONS[rejoin.reason]);
     if (rejoin?.attempts) parts.push(`${rejoin.attempts}回試した`);
+    if (rejoin?.slowed_until != null)
+      parts.push(`次は${moment(rejoin.slowed_until, now)}に試す`);
     if (leaves && leaves.count > 1) {
       const previous =
         leaves.previous_at != null

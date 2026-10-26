@@ -158,11 +158,15 @@ matterjs-serverに届かなくなったときは `warn` の `matterjs-server out
   home-link自身がmatterjs-serverのBLE Proxy（`MATTER_BLE_PROXY_URL`）のclientになり、電話のアプリと同じ役を務めます。電話のアプリでの登録もそのまま使えます。
   BlueZにはUUIDで絞らずにdiscoveryを頼み、聞いた広告からhome-linkが選びます。BlueZ 5.87は、UUIDを指定したdiscoveryの最中に広告を受けると落ちるためです（[bluez#2282](https://github.com/bluez/bluez/issues/2282)）。
   BlueZが起動し直したときや、アダプタが抜き差し・resetされたときは、探し直します。登録し直しを1回試すたびに、アダプタを開き直します。
+  探している間も、使っているアダプタがBlueZから消えたら、今のアダプタ（`REJOIN_BLUETOOTH_ADAPTER`、無ければ最初のもの）で開き直します。消えた知らせを受け損ねても、5秒ごとの確かめで気づきます。
+  探している照明の広告を60秒聞かなければ、原因を問わず開き直し、BlueZが既に知る広告も読み直します。開き直したときは、ログに `rejoin: adapter opened again`（`adapter`・`previous`・`why`）を1行書きます。
   照明とBluetoothでつないでいる間は、discoveryを止めます。UB500（RTL8761BU）は、つないだまま探すと応答しなくなり、resetされるためです。
 - 登録し直した照明は台帳の同じ行（名前・label）へ戻ります。戻ったら、外れてから戻るまでの時間を1通知らせます。
 - 失敗したら30秒から倍々に最長3分おきに試し直します。コードを受け付けなかったときは10分おきです。広告が出ない間も探し続け、壁のスイッチで電源を入れ直して広告が出れば、その時点で戻します。
-- 戻らない理由は、`no_advert`（登録を待っていない）・`connect_failed`（つながらない）・`wrong_code`（コードが合わない）・`no_code`（コードがない）・`no_bluetooth`（Bluetoothが使えない）に分けます。
-  外れて5分の知らせにその時の理由と取る操作を添え、別の理由が5分続いたらまた1通知らせます。管理画面にも理由と試した回数を示します。
+- 登録し直しの途中でアダプタがBlueZから消えたら、その試みをすぐ終えます（`adapter_lost`）。ログの `rejoin: not commissioned` に `reason="adapter_lost"` とアダプタの名前を書きます。
+  2回続けて消えたら、次の試みまで30分空けます。試みのたびにUB500がresetされる場合に、温度計の受信を守るためです。空けている間は、知らせと管理画面に次に試す時刻を示します。
+- 戻らない理由は、`no_advert`（登録を待っていない）・`connect_failed`（つながらない）・`wrong_code`（コードが合わない）・`no_code`（コードがない）・`no_bluetooth`（Bluetoothが使えない）・`adapter_lost`（登録し直しの途中でBluetoothが途切れた）に分けます。
+  外れて5分の知らせにその時の理由と取る操作を添え、別の理由が5分続いたらまた1通知らせます。試みの間を延ばしたときは、すぐに1通知らせます。管理画面にも理由と試した回数を示します。
 - 14日の履歴で同じ照明が何度外れたかを数え、2回目からは回数と前回の時刻を知らせと管理画面に示します（交換の判断の材料）。
 - 外れた時の手がかりとして、最後のSoftware Version（`0/40/10`）、Threadなら最後の親（RLOC16）を履歴に残し、警告のログを1行書きます（時刻はUTC）。
 - 最後に照明以外の種類（プラグなど）だった機器は見張りません。無視の機器も見張りません。無視はuserが台帳で付けるもので、home-linkは付けません。
@@ -177,7 +181,7 @@ matterjs-serverに届かなくなったときは `warn` の `matterjs-server out
 区間は `started_at`・`ended_at`（続いていればnull）・`network`・`found_by`（`unavailable`・`no_answer`・`left_fabric`・matterjs-serverの `unreachable`）・`reconnects`・`reconnect_result`（`accepted` か失敗の理由）・`reachable`（pingが届いたか）を持ちます。
 登録が外れた照明の区間は、`device_id`・`left_at`・`left_by`（`event`・`check`・`unknown`）・`labels`・`serial_number`・`software_version`・`thread_parent` と、
 登録し直しの `rejoin_attempts`・`rejoin_reason`・`rejoined` と、14日の `leaves`（この回を含む回数）・`previous_left_at` も持ちます。
-`GET /api/lights/watch` の `outage` では、`rejoin`（`attempts`・`attempted_at`・`reason`・`reason_since`・`advert_at`・`rejoined`）と `leaves`（`count`・`previous_at`）の形です。
+`GET /api/lights/watch` の `outage` では、`rejoin`（`attempts`・`attempted_at`・`reason`・`reason_since`・`advert_at`・`rejoined`・`adapter_losses`（続けてアダプタが消えた試みの数）・`slowed_until`（延ばした次の試みの時刻、延ばしていなければnull））と `leaves`（`count`・`previous_at`）の形です。
 応答が無いまま登録が外れた照明は、切れた時からの区間に `left_at` が付きます。
 時刻はUnix秒です。
 

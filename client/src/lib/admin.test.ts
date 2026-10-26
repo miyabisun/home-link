@@ -528,6 +528,25 @@ describe("the light watch", () => {
         now,
       ),
     ).toBe("10/21 09:17から・自動で登録し直し中・登録を待っていない");
+    expect(
+      watchNote(
+        {
+          ...left,
+          outage: {
+            ...left.outage,
+            rejoin: {
+              attempts: 2,
+              reason: "adapter_lost" as const,
+              rejoined: false,
+              slowed_until: now + 25 * 60,
+            },
+          },
+        },
+        now,
+      ),
+    ).toBe(
+      "10/21 09:17から・自動で登録し直し中・Bluetoothが途切れた・2回試した・次は00:55に試す",
+    );
     expect(watchBadge(left)).toBe("登録が外れた");
     expect(watchBadge({ ...light, connected: false, state: "down" })).toBe(
       "切断",

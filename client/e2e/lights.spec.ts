@@ -10,6 +10,13 @@ const schemes = ["light", "dark"] as const;
 
 const now = Math.floor(Date.now() / 1000);
 const minutes = (n: number) => now - n * 60;
+/** The day of `unix` in Tokyo, as the admin screen writes it (`10/17`). */
+const day = (unix: number) =>
+  new Intl.DateTimeFormat("ja-JP", {
+    timeZone: "Asia/Tokyo",
+    month: "numeric",
+    day: "numeric",
+  }).format(unix * 1000);
 
 const light = {
   node_id: 5,
@@ -163,7 +170,7 @@ for (const size of widths) {
       await expect(cards.nth(1)).toContainText("つなぎ直し3回・網で届かない");
       await expect(cards.nth(3).locator(".badge")).toHaveText("登録が外れた");
       await expect(cards.nth(3)).toContainText(
-        "から・自動で登録し直し中・登録を待っていない・4回試した・14日で2回目（前回 10/17 ",
+        `から・自動で登録し直し中・登録を待っていない・4回試した・14日で2回目（前回 ${day(minutes(9 * 1440))} `,
       );
       await expect(page.getByRole("alert")).toContainText(
         "matterjs-serverに届きません",

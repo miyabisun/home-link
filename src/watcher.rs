@@ -153,6 +153,23 @@ pub(crate) fn migrate_rejoin(db: &Connection) -> rusqlite::Result<()> {
     ))
 }
 
+/// Version 15 keeps the tries in a row that lost the adapter, and until when they slow the next.
+pub(crate) fn migrate_adapter_losses(db: &Connection) -> rusqlite::Result<()> {
+    let added = missing_columns(
+        db,
+        &[
+            ("rejoin_adapter_losses", "INTEGER NOT NULL DEFAULT 0"),
+            ("rejoin_slowed_until", "INTEGER"),
+        ],
+    )?;
+    db.execute_batch(&format!(
+        "BEGIN;
+        {added}
+        PRAGMA user_version = 15;
+        COMMIT;"
+    ))
+}
+
 fn network_of(text: Option<&str>) -> Option<&'static str> {
     ["wifi", "thread", "ethernet"]
         .into_iter()
@@ -165,7 +182,7 @@ fn open_outages(db: &Connection) -> rusqlite::Result<Vec<Outage>> {
             reconnect_result, reachable, notified, advised, device_id, left_at, left_by, labels,
             serial_number, software_version, thread_parent, left_told, rejoin_attempts, rejoin_at,
             rejoin_reason, rejoin_reason_since, advert_at, rejoined, rejoin_told, leaves,
-            previous_left_at
+            previous_left_at, rejoin_adapter_losses, rejoin_slowed_until
          FROM light_outages WHERE ended_at IS NULL",
     )?
     .query_map([], |row| {
@@ -214,6 +231,8 @@ fn open_outages(db: &Connection) -> rusqlite::Result<Vec<Outage>> {
             advert_at: row.get(23)?,
             rejoined: row.get(24)?,
             told: row.get(25)?,
+            adapter_losses: row.get(28)?,
+            slowed_until: row.get(29)?,
         };
         outage.leaves = Leaves {
             count: row.get(26)?,
@@ -255,9 +274,9 @@ fn save(db: &Connection, outage: &Outage) -> rusqlite::Result<()> {
             found_by, reconnects, reconnect_result, reachable, notified, advised, device_id,
             left_at, left_by, labels, serial_number, software_version, thread_parent, left_told,
             rejoin_attempts, rejoin_at, rejoin_reason, rejoin_reason_since, advert_at, rejoined,
-            rejoin_told, leaves, previous_left_at)
+            rejoin_told, leaves, previous_left_at, rejoin_adapter_losses, rejoin_slowed_until)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-            ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)
+            ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32)
          ON CONFLICT (key, started_at) DO UPDATE SET name = excluded.name,
             network = excluded.network, ended_at = excluded.ended_at,
             reconnects = excluded.reconnects, reconnect_result = excluded.reconnect_result,
@@ -270,7 +289,9 @@ fn save(db: &Connection, outage: &Outage) -> rusqlite::Result<()> {
             rejoin_reason = excluded.rejoin_reason,
             rejoin_reason_since = excluded.rejoin_reason_since, advert_at = excluded.advert_at,
             rejoined = excluded.rejoined, rejoin_told = excluded.rejoin_told,
-            leaves = excluded.leaves, previous_left_at = excluded.previous_left_at",
+            leaves = excluded.leaves, previous_left_at = excluded.previous_left_at,
+            rejoin_adapter_losses = excluded.rejoin_adapter_losses,
+            rejoin_slowed_until = excluded.rejoin_slowed_until",
         params![
             outage_key(outage),
             outage
@@ -304,6 +325,8 @@ fn save(db: &Connection, outage: &Outage) -> rusqlite::Result<()> {
             outage.rejoin.told,
             outage.leaves.count,
             outage.leaves.previous_at,
+            outage.rejoin.adapter_losses,
+            outage.rejoin.slowed_until,
         ],
     )?;
     Ok(())

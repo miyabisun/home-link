@@ -539,6 +539,9 @@ impl Watch {
             if let Some(outage) = self.left.get_mut(&left.device) {
                 outage.name.clone_from(&left.name);
                 outage.labels.clone_from(&left.labels);
+                if outage.rejoin.still_gone(at) {
+                    step.changes.push(Change::Updated(outage.clone()));
+                }
                 continue;
             }
             let watched = self
@@ -832,6 +835,16 @@ fn told(outage: &Outage) -> Told {
     }
 }
 
+/// Why the light that left is not back, and when it is tried next while the tries are slowed.
+fn pursuit_text(light: &Told, reason: Reason) -> String {
+    use std::fmt::Write as _;
+    let mut text = reason.sentence(&light.name);
+    if let Some(until) = light.rejoin.slowed_until {
+        let _ = write!(text, "次は{}に試します。", hhmm(until));
+    }
+    text
+}
+
 /// How often a light left, when more than this once: `14日で3回目です（前回 10-21 09:17）。`
 fn leaves_text(leaves: Leaves) -> Option<String> {
     (leaves.count > 1).then(|| {
@@ -937,7 +950,7 @@ impl Notice {
                 );
                 text.extend(leaves_text(light.leaves));
                 if let Some(reason) = light.rejoin.reason {
-                    text.push_str(&reason.sentence(&light.name));
+                    text.push_str(&pursuit_text(light, reason));
                 }
                 text
             }),
@@ -958,11 +971,7 @@ impl Notice {
                 text
             }),
             Self::NotRejoined(lights) => sentences(lights, |light| {
-                light
-                    .rejoin
-                    .reason
-                    .unwrap_or(Reason::NoAdvert)
-                    .sentence(&light.name)
+                pursuit_text(light, light.rejoin.reason.unwrap_or(Reason::NoAdvert))
             }),
             Self::Test => {
                 "home-linkからの試しの知らせです。照明の見張りの知らせはここへ届きます。".into()
@@ -1872,6 +1881,47 @@ mod tests {
             text.contains("アプリで登録し直してください"),
             "what to do: {text}"
         );
+    }
+
+    #[test]
+    fn a_light_registered_again_that_leaves_before_the_next_check_is_looked_for_again() {
+        let mut watch = Watch::default();
+        run_left(&mut watch, 0, 2, |_| {
+            Some((vec![other()], vec![storage_left(None)]))
+        });
+        watch.look(STORAGE, minute(2) + 20, true, true, true);
+        watch.attempted(STORAGE, minute(2) + 30, Ok(()));
+        assert_eq!(watch.pursued(), Vec::<i64>::new(), "registered again");
+        run_left(&mut watch, 3, 3, |_| {
+            Some((vec![other()], vec![storage_left(None)]))
+        });
+        assert_eq!(
+            watch.pursued(),
+            vec![STORAGE],
+            "gone again at the check after: looked for again"
+        );
+    }
+
+    #[test]
+    fn tries_slowed_by_a_lost_adapter_are_told_at_once_with_the_next_try() {
+        let mut watch = Watch::default();
+        let mut steps = run_left(&mut watch, 0, 6, |_| {
+            Some((vec![other()], vec![storage_left(None)]))
+        });
+        watch.look(STORAGE, minute(7), true, true, true);
+        watch.attempted(STORAGE, minute(8), Err(Reason::AdapterLost));
+        watch.look(STORAGE, minute(9), true, true, true);
+        watch.attempted(STORAGE, minute(10), Err(Reason::AdapterLost));
+        steps.extend(run_left(&mut watch, 10, 10, |_| {
+            Some((vec![other()], vec![storage_left(None)]))
+        }));
+        let told = rejoin_notices(&steps);
+        let [(10, notice @ Notice::NotRejoined(_))] = told.as_slice() else {
+            panic!("told as the tries slowed: {told:?}");
+        };
+        let text = notice.text();
+        assert!(text.contains("Bluetoothが途切れました"), "why: {text}");
+        assert!(text.contains("次は00:40に試します"), "when: {text}");
     }
 
     #[test]

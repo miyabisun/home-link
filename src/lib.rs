@@ -66,6 +66,9 @@ pub fn open_db(path: &str) -> rusqlite::Result<Connection> {
     if version < 14 {
         watcher::migrate_rejoin(&db)?;
     }
+    if version < 15 {
+        watcher::migrate_adapter_losses(&db)?;
+    }
     Ok(db)
 }
 

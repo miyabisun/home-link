@@ -27,6 +27,14 @@ pub const MAX_RETRY: i64 = 180;
 /// The wait before trying a code the light refused again, in seconds: the refusal may
 /// still be a Bluetooth failure matterjs-server words as one.
 pub const WRONG_CODE_RETRY: i64 = 600;
+/// How long the search listens without hearing any light it looks for before it opens the
+/// adapter again, in seconds: whatever made it deaf, the adapter is asked afresh.
+pub const REOPEN_AFTER: i64 = 60;
+/// Tries in a row whose adapter went before the wait grows to [`ADAPTER_LOST_RETRY`].
+pub const ADAPTER_LOSSES_TO_SLOW: u32 = 2;
+/// The wait after tries that keep losing the adapter, in seconds: should trying be what resets
+/// the UB500, the meter, which the air conditioner's control reads, keeps its adapter meanwhile.
+pub const ADAPTER_LOST_RETRY: i64 = 1800;
 
 /// What a commissionable Matter device says in its `0xFFF6` service data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,6 +115,8 @@ pub enum Reason {
     NoCode,
     /// home-link has no Bluetooth to look with, or matterjs-server no BLE proxy to take it.
     NoBluetooth,
+    /// The adapter went while it was being commissioned, as the UB500 does when btusb resets it.
+    AdapterLost,
 }
 
 impl Reason {
@@ -118,6 +128,7 @@ impl Reason {
             Self::WrongCode => "wrong_code",
             Self::NoCode => "no_code",
             Self::NoBluetooth => "no_bluetooth",
+            Self::AdapterLost => "adapter_lost",
         }
     }
 
@@ -129,6 +140,7 @@ impl Reason {
             Self::WrongCode,
             Self::NoCode,
             Self::NoBluetooth,
+            Self::AdapterLost,
         ]
         .into_iter()
         .find(|reason| reason.as_str() == text)
@@ -164,6 +176,9 @@ impl Reason {
             Self::NoBluetooth => {
                 format!("homeserverのBluetoothが使えず、{name}を登録し直せていません。")
             }
+            Self::AdapterLost => {
+                format!("{name}を登録し直す途中で、homeserverのBluetoothが途切れました。")
+            }
         }
     }
 
@@ -174,9 +189,13 @@ impl Reason {
             Self::WrongCode => 4,
             Self::NoCode => 8,
             Self::NoBluetooth => 16,
+            Self::AdapterLost => 32,
         }
     }
 }
+
+/// The bit of [`Pursuit::told`] for the tries slowing down after losing the adapter.
+const SLOWED: u8 = 64;
 
 /// How long to wait after the `attempts`-th failed try before the next, in seconds: doubling
 /// from 30 s up to [`MAX_RETRY`], so a light that advertises for a few minutes after it is
@@ -192,6 +211,50 @@ pub fn retry_after(attempts: u32, reason: Option<Reason>) -> i64 {
         .min(MAX_RETRY)
 }
 
+/// Why the search opens its adapter again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reopen {
+    /// The adapter is no longer in `BlueZ`.
+    Gone,
+    /// None of the lights looked for was heard for [`REOPEN_AFTER`].
+    Silent,
+}
+
+impl Reopen {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Gone => "gone",
+            Self::Silent => "silent",
+        }
+    }
+}
+
+/// Whether the search opens its adapter again at `at`: whether the adapter is still in `BlueZ`,
+/// and since when the search heard none of the lights it looks for (or since it opened).
+#[must_use]
+pub fn reopen(at: i64, present: bool, quiet_since: i64) -> Option<Reopen> {
+    if !present {
+        Some(Reopen::Gone)
+    } else if at - quiet_since >= REOPEN_AFTER {
+        Some(Reopen::Silent)
+    } else {
+        None
+    }
+}
+
+/// How a try ended, given whether its adapter was still in `BlueZ` after it: a failure beside a
+/// lost adapter is the adapter's, whatever the link said.
+///
+/// # Errors
+/// Why the light is not back, as `result` says or [`Reason::AdapterLost`].
+pub fn ended(result: Result<(), Reason>, present: bool) -> Result<(), Reason> {
+    match result {
+        Err(_) if !present => Err(Reason::AdapterLost),
+        result => result,
+    }
+}
+
 /// The pursuit of one light that left: kept with its stretch out of the fabric.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Pursuit {
@@ -205,6 +268,11 @@ pub struct Pursuit {
     pub advert_at: Option<i64>,
     /// Commissioned again by home-link; the next check finds it back.
     pub rejoined: bool,
+    /// The last tries in a row that ended with the adapter gone ([`Reason::AdapterLost`]).
+    pub adapter_losses: u32,
+    /// Until when the next try waits, once [`ADAPTER_LOSSES_TO_SLOW`] tries in a row lost the
+    /// adapter.
+    pub slowed_until: Option<i64>,
     /// The reasons already told, as bits.
     #[serde(skip)]
     pub told: u8,
@@ -227,14 +295,29 @@ impl Pursuit {
         if heard {
             self.advert_at = Some(at);
         }
+        // Past the slowed wait, the next try is due as usual; the losses in a row still count.
+        if self.slowed_until.is_some_and(|until| at >= until) {
+            self.slowed_until = None;
+        }
         let reason = if !code {
             Some(Reason::NoCode)
         } else if !bluetooth {
             Some(Reason::NoBluetooth)
         } else if self.advertising(at) {
             // A failure stands while the light keeps advertising; the next try may clear it.
+            // So does a lost adapter while the tries are slowed, though Bluetooth was out between.
             self.reason
-                .filter(|reason| matches!(reason, Reason::ConnectFailed | Reason::WrongCode))
+                .filter(|reason| {
+                    matches!(
+                        reason,
+                        Reason::ConnectFailed | Reason::WrongCode | Reason::AdapterLost
+                    )
+                })
+                .or_else(|| {
+                    self.slowed_until
+                        .is_some_and(|until| at < until)
+                        .then_some(Reason::AdapterLost)
+                })
         } else if self.reason == Some(Reason::WrongCode) {
             // Switching the light off and on does not help a wrong code; it stands until tried again.
             self.reason
@@ -269,12 +352,24 @@ impl Pursuit {
             && self
                 .attempted_at
                 .is_none_or(|last| at - last >= retry_after(self.attempts, self.reason))
+            && self.slowed_until.is_none_or(|until| at >= until)
     }
 
     /// Takes in a commissioning that ended at `at`: back, or not and why.
     pub fn attempted(&mut self, at: i64, result: Result<(), Reason>) {
         self.attempts += 1;
         self.attempted_at = Some(at);
+        if result == Err(Reason::AdapterLost) {
+            self.adapter_losses += 1;
+        } else {
+            self.adapter_losses = 0;
+        }
+        self.slowed_until =
+            (self.adapter_losses >= ADAPTER_LOSSES_TO_SLOW).then_some(at + ADAPTER_LOST_RETRY);
+        if self.slowed_until.is_none() {
+            // A later slowing down is told anew.
+            self.told &= !SLOWED;
+        }
         match result {
             Ok(()) => {
                 self.rejoined = true;
@@ -284,10 +379,24 @@ impl Pursuit {
         }
     }
 
+    /// Takes in a check at `at` that still finds the light gone: registered again before that
+    /// check, it left again before it was seen back, and is looked for anew. True if so.
+    pub fn still_gone(&mut self, at: i64) -> bool {
+        let again = self.rejoined && self.attempted_at.is_some_and(|tried| tried < at);
+        if again {
+            self.rejoined = false;
+        }
+        again
+    }
+
     /// The reason to tell at `at`: one that has stood for [`TELL_AFTER`] and was not told in this
-    /// stretch; it is marked told.
+    /// stretch, or any once the tries slowed down; it is marked told.
     pub fn tell(&mut self, at: i64) -> Option<Reason> {
         let reason = self.reason?;
+        if self.slowed_until.is_some() && self.told & SLOWED == 0 {
+            self.told |= SLOWED | reason.bit();
+            return Some(reason);
+        }
         let stood = at - self.reason_since? >= TELL_AFTER;
         (stood && self.told & reason.bit() == 0).then(|| {
             self.told |= reason.bit();
@@ -299,6 +408,9 @@ impl Pursuit {
     pub fn told_now(&mut self) {
         if let Some(reason) = self.reason {
             self.told |= reason.bit();
+            if self.slowed_until.is_some() {
+                self.told |= SLOWED;
+            }
         }
     }
 }
@@ -707,6 +819,150 @@ mod tests {
     }
 
     #[test]
+    fn the_search_opens_the_adapter_again_when_it_went_or_heard_nothing_a_minute() {
+        assert_eq!(reopen(T0 + 5, false, T0), Some(Reopen::Gone), "gone");
+        assert_eq!(
+            reopen(T0 + 5, false, T0 - 600),
+            Some(Reopen::Gone),
+            "gone comes first"
+        );
+        assert_eq!(reopen(T0 + 59, true, T0), None, "under a minute quiet");
+        assert_eq!(
+            reopen(T0 + 60, true, T0),
+            Some(Reopen::Silent),
+            "a minute without any light looked for"
+        );
+    }
+
+    #[test]
+    fn a_try_whose_adapter_went_failed_for_that() {
+        assert_eq!(
+            ended(Err(Reason::ConnectFailed), false),
+            Err(Reason::AdapterLost),
+            "the link went with the adapter"
+        );
+        assert_eq!(
+            ended(Err(Reason::WrongCode), false),
+            Err(Reason::AdapterLost),
+            "nothing a lost adapter said is trusted"
+        );
+        assert_eq!(
+            ended(Err(Reason::ConnectFailed), true),
+            Err(Reason::ConnectFailed),
+            "still there"
+        );
+        assert_eq!(ended(Ok(()), false), Ok(()), "back all the same");
+    }
+
+    #[test]
+    fn two_tries_in_a_row_losing_the_adapter_wait_half_an_hour() {
+        let mut pursuit = heard(T0);
+        pursuit.attempted(T0 + 20, Err(Reason::AdapterLost));
+        pursuit.look(T0 + 25, T0, true, true, true);
+        assert_eq!(
+            pursuit.reason,
+            Some(Reason::AdapterLost),
+            "stands while the light advertises"
+        );
+        assert_eq!(pursuit.slowed_until, None, "once is not slowed");
+        assert!(pursuit.due(T0 + 50), "the usual 30 s");
+        pursuit.attempted(T0 + 60, Err(Reason::AdapterLost));
+        assert_eq!(pursuit.adapter_losses, 2, "two in a row");
+        assert_eq!(
+            pursuit.slowed_until,
+            Some(T0 + 60 + ADAPTER_LOST_RETRY),
+            "slowed"
+        );
+        pursuit.look(T0 + 1859, T0, true, true, true);
+        assert!(!pursuit.due(T0 + 1859), "half an hour");
+        pursuit.look(T0 + 1860, T0, true, true, true);
+        assert!(pursuit.due(T0 + 1860), "then tried again");
+        assert_eq!(pursuit.slowed_until, None, "past: no next try to show");
+        pursuit.attempted(T0 + 1900, Err(Reason::AdapterLost));
+        assert_eq!(
+            pursuit.slowed_until,
+            Some(T0 + 1900 + ADAPTER_LOST_RETRY),
+            "still slowed"
+        );
+        pursuit.attempted(T0 + 3800, Err(Reason::ConnectFailed));
+        assert_eq!(
+            (pursuit.adapter_losses, pursuit.slowed_until),
+            (0, None),
+            "the adapter held: the usual waits again"
+        );
+    }
+
+    #[test]
+    fn slowed_tries_keep_the_lost_adapter_as_the_reason_once_it_is_back() {
+        let mut pursuit = heard(T0);
+        pursuit.attempted(T0 + 20, Err(Reason::AdapterLost));
+        pursuit.attempted(T0 + 80, Err(Reason::AdapterLost));
+        let mut left = pursuit.clone();
+        pursuit.look(T0 + 85, T0, true, false, false);
+        assert_eq!(
+            pursuit.reason,
+            Some(Reason::NoBluetooth),
+            "no adapter for now"
+        );
+        pursuit.look(T0 + 115, T0, true, true, true);
+        assert_eq!(
+            pursuit.reason,
+            Some(Reason::AdapterLost),
+            "back and heard, yet waiting for the slowed try"
+        );
+        left.look(T0 + 85, T0, true, false, false);
+        left.look(T0 + 115, T0, true, true, true);
+        left.reason = None;
+        left.told_now();
+        assert!(
+            left.tell(T0 + 116).is_none(),
+            "nothing to tell without a reason"
+        );
+        left.look(T0 + 120, T0, true, true, true);
+        assert_eq!(
+            left.tell(T0 + 121),
+            Some(Reason::AdapterLost),
+            "the slowing down not yet told is told with its reason"
+        );
+    }
+
+    #[test]
+    fn losses_apart_do_not_slow() {
+        let mut pursuit = heard(T0);
+        pursuit.attempted(T0 + 20, Err(Reason::AdapterLost));
+        pursuit.attempted(T0 + 80, Err(Reason::ConnectFailed));
+        pursuit.attempted(T0 + 200, Err(Reason::AdapterLost));
+        assert_eq!(
+            (pursuit.adapter_losses, pursuit.slowed_until),
+            (1, None),
+            "not in a row"
+        );
+    }
+
+    #[test]
+    fn slowing_down_is_told_at_once_and_once() {
+        let mut pursuit = heard(T0);
+        pursuit.attempted(T0 + 20, Err(Reason::AdapterLost));
+        assert_eq!(pursuit.tell(T0 + 30), None, "a loss under five minutes");
+        pursuit.attempted(T0 + 60, Err(Reason::AdapterLost));
+        assert_eq!(
+            pursuit.tell(T0 + 61),
+            Some(Reason::AdapterLost),
+            "slowed: told now"
+        );
+        assert_eq!(pursuit.tell(T0 + 400), None, "told once");
+        pursuit.attempted(T0 + 1900, Err(Reason::ConnectFailed));
+        pursuit.attempted(T0 + 1990, Err(Reason::AdapterLost));
+        pursuit.attempted(T0 + 2050, Err(Reason::AdapterLost));
+        assert!(pursuit.tell(T0 + 2051).is_some(), "slowed anew: told again");
+        let mut left = heard(T0);
+        left.attempted(T0 + 20, Err(Reason::AdapterLost));
+        left.attempted(T0 + 60, Err(Reason::AdapterLost));
+        left.told_now();
+        assert_eq!(left.tell(T0 + 61), None, "went out with the left message");
+    }
+
+    #[test]
     fn reasons_round_trip_their_names() {
         for reason in [
             Reason::NoAdvert,
@@ -714,6 +970,7 @@ mod tests {
             Reason::WrongCode,
             Reason::NoCode,
             Reason::NoBluetooth,
+            Reason::AdapterLost,
         ] {
             assert_eq!(Reason::parse(reason.as_str()), Some(reason), "{reason:?}");
         }

@@ -10,7 +10,7 @@ use futures_util::StreamExt;
 use crate::{
     AppState, UNPOISONED,
     ble_proxy::{self, Concern, Radio, Signals},
-    rejoin::{self, ATTEMPT_TIMEOUT, COMMISSION_WAIT, MATTER_SERVICE, Reason, Sought},
+    rejoin::{self, ATTEMPT_TIMEOUT, COMMISSION_WAIT, MATTER_SERVICE, Reason, Reopen, Sought},
     watcher,
 };
 
@@ -25,18 +25,20 @@ const RADIO_AGAIN: Duration = Duration::from_secs(30);
 struct Ear {
     radio: Radio,
     signals: Signals,
+    /// Since when none of the lights looked for was heard: when it opened, else last heard.
+    quiet_since: i64,
 }
 
 impl Ear {
-    async fn open(adapter: Option<&str>) -> zbus::Result<Self> {
+    async fn open(adapter: Option<&str>, at: i64) -> zbus::Result<Self> {
         let radio = Radio::open(adapter).await?;
         radio.scan().await?;
         let signals = radio.signals().await?;
-        tracing::info!(
-            adapter = radio.name(),
-            "rejoin: looking for lights that left"
-        );
-        Ok(Self { radio, signals })
+        Ok(Self {
+            radio,
+            signals,
+            quiet_since: at,
+        })
     }
 
     /// The ledger rows of `sought` whose advertisements are heard within [`LOOK`].
@@ -105,6 +107,47 @@ fn sought(state: &AppState, devices: &[i64]) -> Vec<(i64, Option<Sought>)> {
         .collect()
 }
 
+/// Why the search opens its adapter again, for its log line.
+#[derive(Clone, Copy)]
+enum Why {
+    /// After a try, which held the adapter: it may have gone meanwhile, as the UB500 does when
+    /// btusb resets it, and come back under another name.
+    Tried,
+    Reopen(Reopen),
+}
+
+impl Why {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tried => "tried",
+            Self::Reopen(reopen) => reopen.as_str(),
+        }
+    }
+}
+
+/// Opens the adapter to listen on, with one line in the log; `again` says why it is opened again
+/// and is cleared once it opens.
+async fn open_ear(state: &AppState, again: &mut Option<(Why, String)>) -> Option<Ear> {
+    let opened = Ear::open(state.bluetooth_adapter.as_deref(), (state.clock)()).await;
+    let opened = opened
+        .inspect_err(|error| tracing::warn!(%error, "rejoin: Bluetooth unavailable"))
+        .ok()?;
+    if let Some((why, previous)) = again.take() {
+        tracing::info!(
+            adapter = opened.radio.name(),
+            previous,
+            why = why.as_str(),
+            "rejoin: adapter opened again"
+        );
+    } else {
+        tracing::info!(
+            adapter = opened.radio.name(),
+            "rejoin: looking for lights that left"
+        );
+    }
+    Some(opened)
+}
+
 /// Looks for the lights that left and commissions each again once heard, forever.
 pub(crate) async fn run(state: &AppState) {
     let Some(matter_url) = state.matter_url.clone() else {
@@ -115,6 +158,8 @@ pub(crate) async fn run(state: &AppState) {
         .clone()
         .unwrap_or_else(|| rejoin::proxy_url(&matter_url));
     let mut ear: Option<Ear> = None;
+    // Why the adapter is to be opened again, and the one used before, until it opens.
+    let mut again: Option<(Why, String)> = None;
     let mut last_ended: Option<i64> = None;
     loop {
         let pursued = state.watch.lock().expect(UNPOISONED).pursued();
@@ -123,24 +168,38 @@ pub(crate) async fn run(state: &AppState) {
                 ear.radio.stop_scan().await;
                 tracing::info!("rejoin: no light to look for");
             }
+            again = None;
             tokio::time::sleep(IDLE).await;
             continue;
         }
         let sought = sought(state, &pursued);
-        let first = ear.is_none();
+        if let Some(Ear {
+            radio, quiet_since, ..
+        }) = &ear
+            && let Some(reopen) =
+                rejoin::reopen((state.clock)(), radio.present().await, *quiet_since)
+        {
+            again = Some((Why::Reopen(reopen), radio.name().to_owned()));
+        }
+        let first = ear.is_none() || again.is_some();
         if first {
-            match Ear::open(state.bluetooth_adapter.as_deref()).await {
-                Ok(opened) => ear = Some(opened),
-                Err(error) => tracing::warn!(%error, "rejoin: Bluetooth unavailable"),
-            }
+            // The one before goes once this one listens, so discovery never pauses.
+            ear = open_ear(state, &mut again).await;
         }
         let heard = if let Some(open) = ear.as_mut() {
             match open.listen(&sought, first).await {
-                Ok(heard) => heard,
+                Ok(heard) => {
+                    if !heard.is_empty() {
+                        open.quiet_since = (state.clock)();
+                    }
+                    heard
+                }
                 Err(error) => {
-                    tracing::warn!(%error, "rejoin: Bluetooth lost");
+                    // Opened again at once: this look counts neither way.
+                    tracing::debug!(%error, "rejoin: adapter lost while listening");
+                    again = Some((Why::Reopen(Reopen::Gone), open.radio.name().to_owned()));
                     ear = None;
-                    Vec::new()
+                    continue;
                 }
             }
         } else {
@@ -169,9 +228,8 @@ pub(crate) async fn run(state: &AppState) {
         let Some(Ear { radio, .. }) = ear.take() else {
             continue;
         };
-        // The search opens the adapter again after: it may have gone meanwhile, as the UB500
-        // does when btusb resets it, and come back under another name.
         let result = attempt(state, &radio, &proxy, device).await;
+        again = Some((Why::Tried, radio.name().to_owned()));
         let ended = (state.clock)();
         last_ended = Some(ended);
         let change = state
@@ -214,29 +272,38 @@ async fn attempt(state: &AppState, radio: &Radio, proxy: &str, device: i64) -> R
             .map(|_| ())
             .map_err(|error| Reason::of_failure(error.1))
     };
-    tokio::pin!(serve, work);
+    // The try ends as soon as the adapter goes; nothing more comes over it.
+    let lost = radio.gone();
+    tokio::pin!(serve, work, lost);
     let result = tokio::time::timeout(wait + Duration::from_secs(5), async {
         tokio::select! {
+            biased;
+            () = &mut lost => Err(Reason::AdapterLost),
             result = &mut work => {
                 let _ = (&mut serve).await;
                 result
             }
-            served = &mut serve => match served {
-                Err(error) => {
-                    tracing::warn!(%error, "rejoin: no BLE proxy");
-                    Err(Reason::NoBluetooth)
-                }
+            served = &mut serve => if let Err(error) = served {
+                tracing::warn!(%error, "rejoin: no BLE proxy");
+                Err(Reason::NoBluetooth)
+            } else {
                 // matterjs-server answers once its own discovery ends, after the proxy closed.
-                Ok(()) => (&mut work).await,
+                tokio::select! {
+                    biased;
+                    () = &mut lost => Err(Reason::AdapterLost),
+                    result = &mut work => result,
+                }
             },
         }
     })
     .await
     .unwrap_or(Err(Reason::ConnectFailed));
+    let result = rejoin::ended(result, radio.present().await);
     match &result {
         Ok(()) => tracing::info!(device_id = device, "rejoin: light commissioned again"),
         Err(reason) => tracing::warn!(
             device_id = device,
+            adapter = radio.name(),
             reason = reason.as_str(),
             "rejoin: not commissioned"
         ),
