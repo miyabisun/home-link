@@ -388,7 +388,13 @@ export function watchNote(light: WatchLight, now: number): string {
     const { rejoin, leaves } = outage;
     if (rejoin?.reason) parts.push(REJOIN_REASONS[rejoin.reason]);
     if (rejoin?.attempts) parts.push(`${rejoin.attempts}回試した`);
-    if (leaves && leaves.count > 1) parts.push(`14日で${leaves.count}回目`);
+    if (leaves && leaves.count > 1) {
+      const previous =
+        leaves.previous_at != null
+          ? `（前回 ${moment(leaves.previous_at, now)}）`
+          : "";
+      parts.push(`14日で${leaves.count}回目${previous}`);
+    }
     return parts.join("・");
   }
   const parts = light.since === null ? [] : [`${moment(light.since, now)}から`];

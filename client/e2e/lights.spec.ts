@@ -163,7 +163,7 @@ for (const size of widths) {
       await expect(cards.nth(1)).toContainText("つなぎ直し3回・網で届かない");
       await expect(cards.nth(3).locator(".badge")).toHaveText("登録が外れた");
       await expect(cards.nth(3)).toContainText(
-        "から・自動で登録し直し中・登録を待っていない・4回試した・14日で2回目",
+        "から・自動で登録し直し中・登録を待っていない・4回試した・14日で2回目（前回 10/17 ",
       );
       await expect(page.getByRole("alert")).toContainText(
         "matterjs-serverに届きません",
