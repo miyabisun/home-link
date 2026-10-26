@@ -17,24 +17,42 @@ let deviceId = 0;
 // The E2E home-link has no meter; these stand in for what GET /api/meter returns with one.
 const address = "AA:BB:CC:DD:EE:01";
 const now = () => Math.floor(Date.now() / 1000);
+const adapter = { present: true, powered: true, discovering: true };
+const mended = { powered_on_at: null, power_cycled_at: null };
 const meters = {
   fresh: () => ({
     address,
     reading: { temperature: 26.7, humidity: 57, co2: 717, battery: 74 },
     received_at: now() - 3,
     fresh_for: 300,
+    adapter,
+    ...mended,
   }),
   stale: () => ({
     address,
     reading: null,
     received_at: now() - 3600,
     fresh_for: 300,
+    adapter,
+    ...mended,
   }),
   waiting: () => ({
     address,
     reading: null,
     received_at: null,
     fresh_for: 300,
+    adapter,
+    ...mended,
+  }),
+  // Stale while the adapter stays off, after the server powered it on.
+  off: () => ({
+    address,
+    reading: null,
+    received_at: now() - 3600,
+    fresh_for: 300,
+    adapter: { present: true, powered: false, discovering: false },
+    powered_on_at: now() - 30,
+    power_cycled_at: null,
   }),
 };
 
@@ -226,6 +244,18 @@ test("the meter shows its values, a stopped reception, and having none", async (
     );
     await page.screenshot({
       path: `test-results/screens/meter-stale-390-${scheme}.png`,
+    });
+
+    await meterAs(page, "off");
+    await page.goto("/meter");
+    await expect(page.locator(".state")).toHaveText("受信が途絶えています");
+    await expect(page.locator(".note")).toHaveText([
+      /^最後の受信 \d+\/\d+ \d\d:\d\d$/,
+      "アダプタの電源が入っていません",
+      /^電源の入れ直し \d+\/\d+ \d\d:\d\d$/,
+    ]);
+    await page.screenshot({
+      path: `test-results/screens/meter-adapter-off-390-${scheme}.png`,
     });
 
     await meterAs(page, "waiting");

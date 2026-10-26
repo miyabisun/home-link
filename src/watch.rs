@@ -309,6 +309,8 @@ pub enum Notice {
     ServerDown { since: i64 },
     /// matterjs-server, told out of reach, back.
     ServerUp { since: i64, until: i64 },
+    /// The meter not heard, heard again, or low on battery.
+    Meter(crate::meter::care::Notice),
     /// The admin screen's test of the destination.
     Test,
 }
@@ -855,7 +857,7 @@ fn sentences(lights: &[Told], line: impl Fn(&Told) -> String) -> String {
     lights.iter().map(line).collect::<Vec<_>>().join("\n")
 }
 
-fn hhmm(unix: i64) -> String {
+pub(crate) fn hhmm(unix: i64) -> String {
     schedule::clock(schedule::local(unix).1)
 }
 
@@ -866,7 +868,7 @@ fn date_time(unix: i64) -> String {
 }
 
 /// `seconds` in minutes, or hours and minutes.
-fn span(seconds: i64) -> String {
+pub(crate) fn span(seconds: i64) -> String {
     let minutes = seconds.max(0) / 60;
     if minutes < 60 {
         format!("{minutes}分")
@@ -959,6 +961,7 @@ impl Notice {
                         .unwrap_or("自動で登録し直しています。")
                 )
             }),
+            Self::Meter(notice) => notice.text(),
             Self::Test => "home-linkから試しに送りました。".into(),
         }
     }

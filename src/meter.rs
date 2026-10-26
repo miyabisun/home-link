@@ -2,6 +2,10 @@
 //! through `BlueZ` on the system D-Bus without connecting to it.
 //! The bytes follow pySwitchbot's `adv_parsers/meter.py` (`process_wosensorth_c`).
 
+pub mod care;
+
+use care::{Adapter, Care, Mend, Sight, Turn};
+
 use std::{collections::HashMap, sync::Mutex, time::Duration};
 
 use futures_util::StreamExt;
@@ -35,6 +39,8 @@ const RETRY: Duration = Duration::from_mins(1);
 const DBUS_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long discovery may stay quiet before it is started again (another HCI user may have stopped it).
 pub const QUIET_FOR: i64 = 120;
+/// How long a power cycle leaves the adapter off; on homeserver it came back powered on 2-3 s after.
+const CYCLE_PAUSE: Duration = Duration::from_secs(3);
 
 /// One advertisement's values.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
@@ -85,7 +91,7 @@ pub fn address(text: &str) -> Option<String> {
 }
 
 /// What the receiver does with discovery next.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Step {
     Start,
     Stop,
@@ -94,9 +100,13 @@ pub(crate) enum Step {
 }
 
 /// Leaves the adapter to a commissioning while one runs (`busy`), and otherwise keeps
-/// discovery on, starting it again after `quiet` seconds without the meter.
+/// discovery on once the adapter is `powered`, starting it again after `quiet` seconds
+/// without the meter.
 #[must_use]
-pub(crate) fn step(busy: bool, discovering: bool, quiet: i64) -> Step {
+pub(crate) fn step(busy: bool, powered: bool, discovering: bool, quiet: i64) -> Step {
+    if !powered && !busy {
+        return Step::Wait;
+    }
     match (busy, discovering) {
         (true, true) => Step::Stop,
         (false, false) => Step::Start,
@@ -111,6 +121,7 @@ pub(crate) struct Meter {
     latest: Mutex<Option<(Reading, i64)>>,
     /// How many commissionings are using Bluetooth now.
     busy: watch::Sender<usize>,
+    care: Mutex<Care>,
 }
 
 /// Marks a commissioning as using Bluetooth until dropped.
@@ -129,6 +140,7 @@ impl Meter {
             address,
             latest: Mutex::new(None),
             busy: watch::Sender::new(0),
+            care: Mutex::new(Care::default()),
         }
     }
 
@@ -140,6 +152,22 @@ impl Meter {
     /// Keeps `reading`, received at `at` Unix seconds.
     pub(crate) fn record(&self, reading: Reading, at: i64) {
         *self.latest.lock().expect(crate::UNPOISONED) = Some((reading, at));
+    }
+
+    /// Keeps `reading` as heard at `at`, with what it calls for when `tell`.
+    fn heard(&self, reading: Reading, at: i64, tell: bool) -> Vec<care::Notice> {
+        self.record(reading, at);
+        self.care
+            .lock()
+            .expect(crate::UNPOISONED)
+            .heard(at, reading.battery, tell)
+    }
+
+    fn look(&self, now: i64, held: bool, sight: Sight, tell: bool) -> Turn {
+        self.care
+            .lock()
+            .expect(crate::UNPOISONED)
+            .look(now, held, sight, tell)
     }
 
     fn latest(&self) -> Option<(Reading, i64)> {
@@ -154,15 +182,23 @@ impl Meter {
             .map(|(reading, _)| reading)
     }
 
-    /// What `GET /api/meter` returns at `now`: the stale reading is `null`, its time stays.
+    /// What `GET /api/meter` returns at `now`: the stale reading is `null`, its time stays;
+    /// with the adapter as last seen and when it was last powered on or power cycled.
     #[must_use]
     pub(crate) fn view(&self, now: i64) -> serde_json::Value {
-        json!({
+        let mut view = json!({
             "address": self.address,
             "reading": self.reading(now),
             "received_at": self.latest().map(|(_, at)| at),
             "fresh_for": FRESH_FOR,
-        })
+        });
+        if let (Some(view), Ok(serde_json::Value::Object(care))) = (
+            view.as_object_mut(),
+            serde_json::to_value(&*self.care.lock().expect(crate::UNPOISONED)),
+        ) {
+            view.extend(care);
+        }
+        view
     }
 
     /// Takes Bluetooth for a commissioning; the receiver stops discovery until it is dropped.
@@ -175,18 +211,32 @@ impl Meter {
     pub(crate) fn watch_busy(&self) -> watch::Receiver<usize> {
         self.busy.subscribe()
     }
+
+    fn held(&self) -> bool {
+        *self.busy.borrow() > 0
+    }
 }
 
 /// Listens to the configured meter forever; without one it returns at once.
-/// A missing bus or adapter, or one that goes away, is tried again a minute later.
-pub(crate) async fn receive(meter: &Meter, clock: fn() -> i64) {
+/// A missing bus, or one that goes away, is tried again a minute later. Messages for the user
+/// go to `deliver` when `tell`.
+pub(crate) async fn receive<F, Fut>(meter: &Meter, clock: fn() -> i64, tell: bool, deliver: F)
+where
+    F: Fn(care::Notice) -> Fut,
+    Fut: Future<Output = ()>,
+{
     let Some(address) = meter.address() else {
         return;
     };
     let device = format!("/dev_{}", address.replace(':', "_"));
+    let mut logged = Logged::default();
     loop {
-        if let Err(error) = listen(meter, &device, clock).await {
+        if let Err(error) = listen(meter, &device, clock, tell, &deliver, &mut logged).await {
             tracing::warn!(%error, "meter: Bluetooth unavailable, trying again in a minute");
+            let sight = Sight::NoBluetooth;
+            logged.sight(sight);
+            let turn = meter.look(clock(), meter.held(), sight, tell);
+            tell_user(&deliver, turn.notice).await;
         }
         tokio::time::sleep(RETRY).await;
     }
@@ -197,7 +247,18 @@ enum Event {
     Check,
 }
 
-async fn listen(meter: &Meter, device: &str, clock: fn() -> i64) -> zbus::Result<()> {
+async fn listen<F, Fut>(
+    meter: &Meter,
+    device: &str,
+    clock: fn() -> i64,
+    tell: bool,
+    deliver: &F,
+    logged: &mut Logged,
+) -> zbus::Result<()>
+where
+    F: Fn(care::Notice) -> Fut,
+    Fut: Future<Output = ()>,
+{
     let bus = tokio::time::timeout(
         DBUS_TIMEOUT,
         zbus::connection::Builder::system()?
@@ -215,7 +276,10 @@ async fn listen(meter: &Meter, device: &str, clock: fn() -> i64) -> zbus::Result
     let mut signals = MessageStream::for_match_rule(rule, &bus, None).await?;
     let mut busy = meter.watch_busy();
     let mut tick = tokio::time::interval(TICK);
+    // Since discovery was last started or the meter last heard, for restarting discovery.
     let mut heard = clock();
+    // When the meter was last heard, for the log line once it is heard again.
+    let mut last_reading = None;
     loop {
         let event = tokio::select! {
             signal = signals.next() => Event::Signal(signal),
@@ -236,38 +300,167 @@ async fn listen(meter: &Meter, device: &str, clock: fn() -> i64) -> zbus::Result
                 };
                 if let Some(reading) = read(&bus, path.into()).await? {
                     heard = clock();
-                    meter.record(reading, heard);
+                    if let Some(quiet) =
+                        last_reading.map(|at| heard - at).filter(|&q| q > QUIET_FOR)
+                    {
+                        tracing::info!(quiet, "meter: heard again");
+                    }
+                    last_reading = Some(heard);
+                    for notice in meter.heard(reading, heard, tell) {
+                        tell_user(deliver, Some(notice)).await;
+                    }
                 }
             }
             Event::Check => {
-                let busy = *busy.borrow_and_update() > 0;
-                if tend(&bus, busy, clock() - heard).await? {
-                    heard = clock();
+                let held = *busy.borrow_and_update() > 0;
+                let (sight, path) = sense(&bus).await?;
+                logged.sight(sight);
+                let turn = meter.look(clock(), held, sight, tell);
+                tell_user(deliver, turn.notice).await;
+                let (Some(path), Sight::Adapter(adapter)) = (path, sight) else {
+                    continue;
+                };
+                if let Some(mend) = turn.mend {
+                    logged.mend(mend, path.as_str(), mend_adapter(&bus, &path, mend).await);
+                    continue;
+                }
+                let step = step(held, adapter.powered, adapter.discovering, clock() - heard);
+                match tend(&bus, &path, step).await {
+                    Ok(started) => {
+                        logged.discovery(None);
+                        if started {
+                            heard = clock();
+                        }
+                    }
+                    // The next look tries again; BlueZ answering, the meter keeps its adapter.
+                    Err(error) => logged.discovery(Some(&error)),
                 }
             }
         }
     }
 }
 
-/// Starts, stops or restarts discovery on the first adapter as [`step`] says; true once started.
-async fn tend(bus: &Connection, busy: bool, quiet: i64) -> zbus::Result<bool> {
+/// What the log last said of the adapter, so that each change takes one line.
+#[derive(Default)]
+struct Logged {
+    sight: Option<Sight>,
+    mend_failed: bool,
+    discovery_failed: bool,
+}
+
+impl Logged {
+    /// The adapter's state as of the latest look.
+    fn sight(&mut self, sight: Sight) {
+        let state = |sight: Sight| match sight {
+            Sight::NoBluetooth => "no_bluetooth",
+            Sight::NoAdapter => "no_adapter",
+            Sight::Adapter(Adapter { powered: false, .. }) => "powered_off",
+            Sight::Adapter(Adapter { powered: true, .. }) => "powered_on",
+        };
+        if self.sight.is_none_or(|seen| state(seen) != state(sight)) {
+            tracing::info!(state = state(sight), "meter: adapter changed");
+        }
+        self.sight = Some(sight);
+    }
+
+    /// Each power on or power cycle done; of those failing in a row, the first.
+    fn mend(&mut self, mend: Mend, adapter: &str, done: zbus::Result<()>) {
+        let failed = done.is_err();
+        match (mend, done) {
+            (Mend::PowerOn, Ok(())) => tracing::info!(adapter, "meter: adapter powered on"),
+            (Mend::PowerCycle, Ok(())) => tracing::info!(adapter, "meter: adapter power cycled"),
+            (Mend::PowerOn, Err(error)) if !self.mend_failed => {
+                tracing::warn!(adapter, %error, "meter: adapter not powered on");
+            }
+            (Mend::PowerCycle, Err(error)) if !self.mend_failed => {
+                tracing::warn!(adapter, %error, "meter: adapter not power cycled");
+            }
+            (_, Err(_)) => {}
+        }
+        self.mend_failed = failed;
+    }
+
+    /// Starting or stopping discovery failing, the first of a row, and working again.
+    fn discovery(&mut self, error: Option<&zbus::Error>) {
+        match error {
+            Some(error) if !self.discovery_failed => {
+                tracing::warn!(%error, "meter: discovery not started");
+            }
+            None if self.discovery_failed => tracing::info!("meter: discovery works again"),
+            _ => {}
+        }
+        self.discovery_failed = error.is_some();
+    }
+}
+
+async fn tell_user<F, Fut>(deliver: &F, notice: Option<care::Notice>)
+where
+    F: Fn(care::Notice) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    if let Some(notice) = notice {
+        tracing::info!(kind = notice.kind(), "meter: telling the user");
+        deliver(notice).await;
+    }
+}
+
+/// The first adapter and what it is doing, as `BlueZ` says.
+async fn sense(bus: &Connection) -> zbus::Result<(Sight, Option<OwnedObjectPath>)> {
     let objects: HashMap<OwnedObjectPath, HashMap<String, HashMap<String, OwnedValue>>> =
         Proxy::new(bus, BLUEZ, "/", "org.freedesktop.DBus.ObjectManager")
             .await?
             .call("GetManagedObjects", &())
             .await?;
-    let Some((path, discovering)) = objects
-        .iter()
-        .filter_map(|(path, interfaces)| {
-            let discovering = interfaces.get(ADAPTER)?.get("Discovering")?;
-            Some((path, bool::try_from(discovering).unwrap_or(false)))
-        })
-        .min_by_key(|(path, _)| path.as_str())
-    else {
-        return Ok(false);
+    let flag = |properties: &HashMap<String, OwnedValue>, name: &str| {
+        properties
+            .get(name)
+            .and_then(|value| bool::try_from(value).ok())
+            .unwrap_or(false)
     };
+    Ok(objects
+        .iter()
+        .filter_map(|(path, interfaces)| Some((path, interfaces.get(ADAPTER)?)))
+        .min_by_key(|(path, _)| path.as_str())
+        .map_or((Sight::NoAdapter, None), |(path, properties)| {
+            let adapter = Adapter {
+                powered: flag(properties, "Powered"),
+                discovering: flag(properties, "Discovering"),
+            };
+            (Sight::Adapter(adapter), Some(path.clone()))
+        }))
+}
+
+/// Powers the adapter at `path` on, or off and on again.
+async fn mend_adapter(bus: &Connection, path: &OwnedObjectPath, mend: Mend) -> zbus::Result<()> {
+    match mend {
+        Mend::PowerOn => power(bus, path, true).await,
+        Mend::PowerCycle => {
+            power(bus, path, false).await?;
+            tokio::time::sleep(CYCLE_PAUSE).await;
+            power(bus, path, true).await
+        }
+    }
+}
+
+async fn power(bus: &Connection, path: &OwnedObjectPath, on: bool) -> zbus::Result<()> {
+    PropertiesProxy::builder(bus)
+        .destination(BLUEZ)?
+        .path(path.clone())?
+        .build()
+        .await?
+        .set(
+            InterfaceName::from_static_str_unchecked(ADAPTER),
+            "Powered",
+            Value::from(on),
+        )
+        .await
+        .map_err(zbus::Error::from)
+}
+
+/// Starts, stops or restarts discovery on the adapter at `path` as `step` says; true once started.
+async fn tend(bus: &Connection, path: &OwnedObjectPath, step: Step) -> zbus::Result<bool> {
     let adapter = Proxy::new(bus, BLUEZ, path.as_str(), ADAPTER).await?;
-    match step(busy, discovering, quiet) {
+    match step {
         Step::Wait => return Ok(false),
         Step::Stop => {
             // Another client's discovery is not ours to stop; BlueZ refuses and that is fine.
@@ -288,7 +481,12 @@ async fn tend(bus: &Connection, busy: bool, quiet: i64) -> zbus::Result<bool> {
         )
         .await?;
     adapter.call_method("StartDiscovery", &()).await?;
-    tracing::info!(adapter = path.as_str(), "meter: discovery started");
+    // Restarts while the meter is unheard come every two minutes; the log keeps to changes.
+    if step == Step::Restart {
+        tracing::debug!(adapter = path.as_str(), "meter: discovery started again");
+    } else {
+        tracing::info!(adapter = path.as_str(), "meter: discovery started");
+    }
     Ok(true)
 }
 
@@ -359,7 +557,10 @@ mod tests {
         assert_eq!(meter.reading(1301), None, "older than five minutes");
         assert_eq!(
             meter.view(1301),
-            json!({"address": "AA:BB:CC:DD:EE:01", "reading": null, "received_at": 1000, "fresh_for": 300}),
+            json!({
+                "address": "AA:BB:CC:DD:EE:01", "reading": null, "received_at": 1000, "fresh_for": 300,
+                "adapter": null, "powered_on_at": null, "power_cycled_at": null
+            }),
             "the time stays so the screen can say when it stopped"
         );
         assert_eq!(
@@ -373,7 +574,10 @@ mod tests {
     fn an_unconfigured_meter_has_nothing() {
         assert_eq!(
             Meter::new(None).view(0),
-            json!({"address": null, "reading": null, "received_at": null, "fresh_for": 300}),
+            json!({
+                "address": null, "reading": null, "received_at": null, "fresh_for": 300,
+                "adapter": null, "powered_on_at": null, "power_cycled_at": null
+            }),
             "no address"
         );
     }
@@ -392,15 +596,42 @@ mod tests {
 
     #[test]
     fn discovery_gives_way_to_commissioning() {
-        assert_eq!(step(true, true, 0), Step::Stop, "commissioning starts");
-        assert_eq!(step(true, false, 999), Step::Wait, "still commissioning");
-        assert_eq!(step(false, false, 0), Step::Start, "commissioning done");
-        assert_eq!(step(false, true, QUIET_FOR), Step::Wait, "heard recently");
         assert_eq!(
-            step(false, true, QUIET_FOR + 1),
+            step(true, true, true, 0),
+            Step::Stop,
+            "commissioning starts"
+        );
+        assert_eq!(
+            step(true, true, false, 999),
+            Step::Wait,
+            "still commissioning"
+        );
+        assert_eq!(
+            step(false, true, false, 0),
+            Step::Start,
+            "commissioning done"
+        );
+        assert_eq!(
+            step(false, true, true, QUIET_FOR),
+            Step::Wait,
+            "heard recently"
+        );
+        assert_eq!(
+            step(false, true, true, QUIET_FOR + 1),
             Step::Restart,
             "discovering but deaf"
         );
+    }
+
+    #[test]
+    fn discovery_waits_for_the_adapter_to_be_powered() {
+        assert_eq!(step(false, false, false, 0), Step::Wait, "powered off");
+        assert_eq!(
+            step(false, false, true, 999),
+            Step::Wait,
+            "powered off yet discovering"
+        );
+        assert_eq!(step(false, true, false, 0), Step::Start, "powered on");
     }
 
     #[test]

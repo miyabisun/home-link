@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { meterState, receivedTime } from "../lib/admin";
+  import { adapterText, meterState, receivedTime } from "../lib/admin";
   import { aborted, api, type Meter } from "../lib/api";
 
   // The meter advertises every few seconds; the page follows while it is shown.
@@ -38,6 +38,11 @@
   });
 
   const status = $derived(meter ? meterState(meter) : undefined);
+  const adapter = $derived(meter ? adapterText(meter) : null);
+  // The latest the server powered the adapter on, or off and on.
+  const mended = $derived(
+    Math.max(meter?.powered_on_at ?? 0, meter?.power_cycled_at ?? 0) || null,
+  );
 </script>
 
 <div class="sub-header"><h1>温度計</h1></div>
@@ -56,12 +61,20 @@
     </div>
   {:else if status === "unset"}
     <p class="state">温度計が設定されていません</p>
-  {:else if status === "waiting"}
-    <p class="state">まだ受信していません</p>
-  {:else if status === "stale" && meter?.received_at}
+  {:else if status === "waiting" || (status === "stale" && meter?.received_at)}
     <div class="state-wrap">
-      <p class="state error">受信が途絶えています</p>
-      <p class="note">最後の受信 {receivedTime(meter.received_at, true)}</p>
+      {#if status === "waiting"}
+        <p class="state">まだ受信していません</p>
+      {:else if meter?.received_at}
+        <p class="state error">受信が途絶えています</p>
+        <p class="note">最後の受信 {receivedTime(meter.received_at, true)}</p>
+      {/if}
+      {#if adapter}
+        <p class="note" data-testid="adapter">{adapter}</p>
+      {/if}
+      {#if mended}
+        <p class="note">電源の入れ直し {receivedTime(mended, true)}</p>
+      {/if}
     </div>
   {:else if meter?.reading && meter.received_at}
     <dl class="readings">

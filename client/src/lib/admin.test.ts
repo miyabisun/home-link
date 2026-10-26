@@ -15,6 +15,7 @@ import {
   labelSummary,
   levelOf,
   meterState,
+  adapterText,
   targetError,
   overrideInput,
   percentOf,
@@ -311,6 +312,27 @@ describe("the meter", () => {
     const unix = Date.UTC(2026, 9, 17, 9, 55, 7) / 1000;
     expect(receivedTime(unix, false)).toBe("18:55:07");
     expect(receivedTime(unix, true)).toBe("10/17 18:55");
+  });
+
+  it("names what is wrong with the adapter, and nothing when it discovers", () => {
+    const adapter = (
+      present: boolean,
+      powered: boolean,
+      discovering: boolean,
+    ) => ({
+      adapter: { present, powered, discovering },
+    });
+    expect(adapterText({ adapter: null })).toBe("Bluetoothに届きません");
+    expect(adapterText(adapter(false, false, false))).toBe(
+      "アダプタがありません",
+    );
+    expect(adapterText(adapter(true, false, false))).toBe(
+      "アダプタの電源が入っていません",
+    );
+    expect(adapterText(adapter(true, true, false))).toBe(
+      "アダプタが探索していません",
+    );
+    expect(adapterText(adapter(true, true, true))).toBeNull();
   });
 });
 

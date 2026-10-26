@@ -199,6 +199,19 @@ export function meterState(
   return meter.received_at === null ? "waiting" : "stale";
 }
 
+export interface AdapterView {
+  adapter: { present: boolean; powered: boolean; discovering: boolean } | null;
+}
+
+/** What keeps the meter's adapter from listening, or `null` while it discovers. */
+export function adapterText({ adapter }: AdapterView): string | null {
+  if (adapter === null) return "Bluetoothに届きません";
+  if (!adapter.present) return "アダプタがありません";
+  if (!adapter.powered) return "アダプタの電源が入っていません";
+  if (!adapter.discovering) return "アダプタが探索していません";
+  return null;
+}
+
 const TIME = new Intl.DateTimeFormat("ja-JP", {
   timeZone: "Asia/Tokyo",
   hour: "2-digit",

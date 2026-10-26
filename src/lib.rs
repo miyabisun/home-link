@@ -603,9 +603,17 @@ impl Home {
         self.0.meter.record(reading, at);
     }
 
-    /// Receives the meter's advertisements through `BlueZ` forever; returns at once without a meter.
+    /// Receives the meter's advertisements through `BlueZ` forever, keeping its adapter powered
+    /// and telling the user when it stays unheard; returns at once without a meter.
     pub async fn receive_meter(self) {
-        meter::receive(&self.0.meter, self.0.clock).await;
+        let state = &self.0;
+        meter::receive(
+            &state.meter,
+            state.clock,
+            state.discord.is_some(),
+            |notice| watcher::deliver(state, vec![watch::Notice::Meter(notice)]),
+        )
+        .await;
     }
 
     /// Sets the SESAME that `POST /api/door/unlock` and `/lock` act on, or why there is none.

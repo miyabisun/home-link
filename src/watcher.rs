@@ -785,6 +785,7 @@ fn notice_kind(notice: &Notice) -> &'static str {
         Notice::NotRejoined(_) => "not_rejoined",
         Notice::ServerDown { .. } => "server_down",
         Notice::ServerUp { .. } => "server_up",
+        Notice::Meter(notice) => notice.kind(),
         Notice::Test => "test",
     }
 }
@@ -858,7 +859,7 @@ pub(crate) async fn check(state: &AppState, at: i64) {
 }
 
 /// Sends the notices left unsent, oldest first, then `notices`; those that fail wait for the next check.
-async fn deliver(state: &AppState, notices: Vec<Notice>) {
+pub(crate) async fn deliver(state: &AppState, notices: Vec<Notice>) {
     let mut queue = std::mem::take(&mut *state.unsent.lock().expect(UNPOISONED));
     queue.extend(notices);
     let mut unsent = Vec::new();

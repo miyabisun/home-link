@@ -3,6 +3,7 @@ import {
   errorMessage,
   type LabelTraits,
   type MeterView,
+  type AdapterView,
   type Outage,
   type Outdoor,
   type Place,
@@ -51,7 +52,9 @@ export interface Label extends LabelTraits {
   device_count: number;
 }
 
-export interface Meter extends MeterView {
+export interface Meter extends MeterView, AdapterView {
+  powered_on_at: number | null;
+  power_cycled_at: number | null;
   reading: {
     temperature: number;
     humidity: number;
