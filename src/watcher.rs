@@ -18,6 +18,7 @@ use crate::{
     ApiError, ApiResult, AppState, Db, Device, UNPOISONED, devices_of, ledger,
     link::{Link, OPEN_TIMEOUT, Outcome, next_id},
     match_ledger, matter, place,
+    rejoin::{Leaves, Pursuit, Reason},
     watch::{Cause, Change, Key, Left, LeftBy, Notice, Outage, Seen},
 };
 
@@ -78,29 +79,19 @@ pub(crate) fn migrate(db: &Connection) -> rusqlite::Result<()> {
 /// how it left, its labels, serial number, last Software Version and Thread parent, and whether
 /// the user was told; and what each ledger device last was while matterjs-server served it.
 pub(crate) fn migrate_left(db: &Connection) -> rusqlite::Result<()> {
-    let columns: Vec<String> = db
-        .prepare("SELECT name FROM pragma_table_info('light_outages')")?
-        .query_map([], |row| row.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    let added = [
-        ("device_id", "INTEGER"),
-        ("left_at", "INTEGER"),
-        ("left_by", "TEXT"),
-        ("labels", "TEXT NOT NULL DEFAULT '[]'"),
-        ("serial_number", "TEXT"),
-        ("software_version", "TEXT"),
-        ("thread_parent", "TEXT"),
-        ("left_told", "INTEGER NOT NULL DEFAULT 0"),
-    ]
-    .into_iter()
-    .filter(|(column, _)| !columns.iter().any(|c| c == column))
-    .fold(String::new(), |mut added, (column, kind)| {
-        let _ = writeln!(
-            added,
-            "ALTER TABLE light_outages ADD COLUMN {column} {kind};"
-        );
-        added
-    });
+    let added = missing_columns(
+        db,
+        &[
+            ("device_id", "INTEGER"),
+            ("left_at", "INTEGER"),
+            ("left_by", "TEXT"),
+            ("labels", "TEXT NOT NULL DEFAULT '[]'"),
+            ("serial_number", "TEXT"),
+            ("software_version", "TEXT"),
+            ("thread_parent", "TEXT"),
+            ("left_told", "INTEGER NOT NULL DEFAULT 0"),
+        ],
+    )?;
     db.execute_batch(&format!(
         "BEGIN;
         {added}
@@ -119,6 +110,49 @@ pub(crate) fn migrate_left(db: &Connection) -> rusqlite::Result<()> {
     ))
 }
 
+/// The statements adding those of `columns` that `light_outages` lacks.
+fn missing_columns(db: &Connection, columns: &[(&str, &str)]) -> rusqlite::Result<String> {
+    let have: Vec<String> = db
+        .prepare("SELECT name FROM pragma_table_info('light_outages')")?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(columns
+        .iter()
+        .filter(|(column, _)| !have.iter().any(|c| c == column))
+        .fold(String::new(), |mut added, (column, kind)| {
+            let _ = writeln!(
+                added,
+                "ALTER TABLE light_outages ADD COLUMN {column} {kind};"
+            );
+            added
+        }))
+}
+
+/// Version 14 keeps home-link registering a light that left again: its tries, why it is not
+/// back yet, when it was last heard and whether it is back, and how often it left before.
+pub(crate) fn migrate_rejoin(db: &Connection) -> rusqlite::Result<()> {
+    let added = missing_columns(
+        db,
+        &[
+            ("rejoin_attempts", "INTEGER NOT NULL DEFAULT 0"),
+            ("rejoin_at", "INTEGER"),
+            ("rejoin_reason", "TEXT"),
+            ("rejoin_reason_since", "INTEGER"),
+            ("advert_at", "INTEGER"),
+            ("rejoined", "INTEGER NOT NULL DEFAULT 0"),
+            ("rejoin_told", "INTEGER NOT NULL DEFAULT 0"),
+            ("leaves", "INTEGER NOT NULL DEFAULT 0"),
+            ("previous_left_at", "INTEGER"),
+        ],
+    )?;
+    db.execute_batch(&format!(
+        "BEGIN;
+        {added}
+        PRAGMA user_version = 14;
+        COMMIT;"
+    ))
+}
+
 fn network_of(text: Option<&str>) -> Option<&'static str> {
     ["wifi", "thread", "ethernet"]
         .into_iter()
@@ -129,7 +163,9 @@ fn open_outages(db: &Connection) -> rusqlite::Result<Vec<Outage>> {
     db.prepare(
         "SELECT node_id, endpoint, name, network, started_at, found_by, reconnects,
             reconnect_result, reachable, notified, advised, device_id, left_at, left_by, labels,
-            serial_number, software_version, thread_parent, left_told
+            serial_number, software_version, thread_parent, left_told, rejoin_attempts, rejoin_at,
+            rejoin_reason, rejoin_reason_since, advert_at, rejoined, rejoin_told, leaves,
+            previous_left_at
          FROM light_outages WHERE ended_at IS NULL",
     )?
     .query_map([], |row| {
@@ -167,6 +203,22 @@ fn open_outages(db: &Connection) -> rusqlite::Result<Vec<Outage>> {
         outage.serial_number = row.get(15)?;
         outage.software_version = row.get(16)?;
         outage.thread_parent = row.get(17)?;
+        outage.rejoin = Pursuit {
+            attempts: row.get(19)?,
+            attempted_at: row.get(20)?,
+            reason: row
+                .get::<_, Option<String>>(21)?
+                .as_deref()
+                .and_then(Reason::parse),
+            reason_since: row.get(22)?,
+            advert_at: row.get(23)?,
+            rejoined: row.get(24)?,
+            told: row.get(25)?,
+        };
+        outage.leaves = Leaves {
+            count: row.get(26)?,
+            previous_at: row.get(27)?,
+        };
         Ok(outage)
     })?
     .collect()
@@ -201,9 +253,11 @@ fn save(db: &Connection, outage: &Outage) -> rusqlite::Result<()> {
     db.execute(
         "INSERT INTO light_outages (key, node_id, endpoint, name, network, started_at, ended_at,
             found_by, reconnects, reconnect_result, reachable, notified, advised, device_id,
-            left_at, left_by, labels, serial_number, software_version, thread_parent, left_told)
+            left_at, left_by, labels, serial_number, software_version, thread_parent, left_told,
+            rejoin_attempts, rejoin_at, rejoin_reason, rejoin_reason_since, advert_at, rejoined,
+            rejoin_told, leaves, previous_left_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-            ?19, ?20, ?21)
+            ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)
          ON CONFLICT (key, started_at) DO UPDATE SET name = excluded.name,
             network = excluded.network, ended_at = excluded.ended_at,
             reconnects = excluded.reconnects, reconnect_result = excluded.reconnect_result,
@@ -211,7 +265,12 @@ fn save(db: &Connection, outage: &Outage) -> rusqlite::Result<()> {
             advised = excluded.advised, device_id = excluded.device_id,
             left_at = excluded.left_at, left_by = excluded.left_by, labels = excluded.labels,
             serial_number = excluded.serial_number, software_version = excluded.software_version,
-            thread_parent = excluded.thread_parent, left_told = excluded.left_told",
+            thread_parent = excluded.thread_parent, left_told = excluded.left_told,
+            rejoin_attempts = excluded.rejoin_attempts, rejoin_at = excluded.rejoin_at,
+            rejoin_reason = excluded.rejoin_reason,
+            rejoin_reason_since = excluded.rejoin_reason_since, advert_at = excluded.advert_at,
+            rejoined = excluded.rejoined, rejoin_told = excluded.rejoin_told,
+            leaves = excluded.leaves, previous_left_at = excluded.previous_left_at",
         params![
             outage_key(outage),
             outage
@@ -236,9 +295,23 @@ fn save(db: &Connection, outage: &Outage) -> rusqlite::Result<()> {
             outage.software_version,
             outage.thread_parent,
             outage.left_told(),
+            outage.rejoin.attempts,
+            outage.rejoin.attempted_at,
+            outage.rejoin.reason.map(Reason::as_str),
+            outage.rejoin.reason_since,
+            outage.rejoin.advert_at,
+            outage.rejoin.rejoined,
+            outage.rejoin.told,
+            outage.leaves.count,
+            outage.leaves.previous_at,
         ],
     )?;
     Ok(())
+}
+
+/// Logs `change` on one line, and keeps it in the history.
+pub(crate) fn keep(state: &AppState, change: &Change) {
+    record(state, change);
 }
 
 /// Logs `change` on one line, and keeps it in the history.
@@ -404,6 +477,21 @@ fn keep_traces(
     .collect()
 }
 
+/// When each ledger device left the fabric, as far as the history goes.
+fn leaves(db: &Connection) -> rusqlite::Result<BTreeMap<i64, Vec<i64>>> {
+    let mut leaves: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
+    let mut statement = db.prepare(
+        "SELECT device_id, left_at FROM light_outages
+         WHERE device_id IS NOT NULL AND left_at IS NOT NULL ORDER BY left_at",
+    )?;
+    let rows = statement.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
+    for row in rows {
+        let (device, at) = row?;
+        leaves.entry(device).or_default().push(at);
+    }
+    Ok(leaves)
+}
+
 /// The ledger lights matterjs-server does not serve: each device once served, by its serial
 /// number, that it serves no more and that was last a light or is not known to be anything
 /// else, with what it last was and when matterjs-server sent it removed the node.
@@ -412,6 +500,7 @@ fn left_lights(
     nodes: &[Value],
     traces: &BTreeMap<i64, Trace>,
     removed: &[(u64, i64)],
+    leaves: &BTreeMap<i64, Vec<i64>>,
 ) -> Vec<Left> {
     devices
         .iter()
@@ -434,6 +523,7 @@ fn left_lights(
                 network: trace.and_then(|trace| trace.network),
                 software_version: trace.and_then(|trace| trace.software_version.clone()),
                 thread_parent: trace.and_then(|trace| trace.thread_parent.clone()),
+                leaves: leaves.get(&device.id).cloned().unwrap_or_default(),
                 removed_at: trace.and_then(|trace| {
                     removed
                         .iter()
@@ -470,10 +560,10 @@ async fn observe(
         let db = state.db.lock().expect(UNPOISONED);
         ledger(&db).and_then(|devices| {
             let traces = keep_traces(&db, &traces_of(&devices, &nodes), at)?;
-            Ok((devices, traces))
+            Ok((devices, traces, leaves(&db)?))
         })
     };
-    let (devices, traces) = match read {
+    let (devices, traces, leaves) = match read {
         Ok(read) => read,
         Err(error) => {
             link.close().await;
@@ -486,6 +576,7 @@ async fn observe(
         &nodes,
         &traces,
         &state.removed.lock().expect(UNPOISONED),
+        &leaves,
     );
     let mut seen: Vec<Seen> = lights
         .iter()
@@ -664,6 +755,8 @@ fn notice_kind(notice: &Notice) -> &'static str {
         Notice::StillDown(_) => "still_down",
         Notice::Up(_) => "up",
         Notice::Left(_) => "left_fabric",
+        Notice::Rejoined(_) => "rejoined",
+        Notice::NotRejoined(_) => "not_rejoined",
         Notice::ServerDown { .. } => "server_down",
         Notice::ServerUp { .. } => "server_up",
         Notice::Test => "test",
@@ -793,7 +886,8 @@ pub(crate) async fn outages(
     let mut statement = db.prepare(
         "SELECT node_id, endpoint, name, network, started_at, ended_at, found_by, reconnects,
             reconnect_result, reachable, device_id, left_at, left_by, labels, serial_number,
-            software_version, thread_parent
+            software_version, thread_parent, rejoin_attempts, rejoin_reason, rejoined, leaves,
+            previous_left_at
          FROM light_outages
          WHERE COALESCE(ended_at, ?1) >= ?1 AND (?2 IS NULL OR key = ?2)
          ORDER BY started_at, rowid",
@@ -818,6 +912,11 @@ pub(crate) async fn outages(
                 "serial_number": row.get::<_, Option<String>>(14)?,
                 "software_version": row.get::<_, Option<String>>(15)?,
                 "thread_parent": row.get::<_, Option<String>>(16)?,
+                "rejoin_attempts": row.get::<_, u32>(17)?,
+                "rejoin_reason": row.get::<_, Option<String>>(18)?,
+                "rejoined": row.get::<_, bool>(19)?,
+                "leaves": row.get::<_, u32>(20)?,
+                "previous_left_at": row.get::<_, Option<i64>>(21)?,
             }))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;

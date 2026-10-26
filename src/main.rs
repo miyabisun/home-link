@@ -80,6 +80,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
             home_link::discord::ENV
         ),
     }
+    let env = |name| {
+        std::env::var(name)
+            .ok()
+            .filter(|value: &String| !value.is_empty())
+    };
+    let adapter = env("BLUETOOTH_ADAPTER");
+    info!(
+        adapter = adapter.as_deref().unwrap_or("first"),
+        "lights that leave are looked for over Bluetooth"
+    );
+    home = home.with_rejoin(adapter, env("MATTER_BLE_PROXY_URL"));
     home.start();
 
     axum::serve(

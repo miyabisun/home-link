@@ -14,7 +14,10 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use crate::schedule;
+use crate::{
+    rejoin::{Leaves, Pursuit, Reason},
+    schedule,
+};
 
 /// Every light's On/Off is read for real this often, in seconds.
 pub const READ_EVERY: i64 = 300;
@@ -69,6 +72,8 @@ pub struct Left {
     pub thread_parent: Option<String>,
     /// When matterjs-server sent that it removed the node, if it did.
     pub removed_at: Option<i64>,
+    /// When it left the fabric before, as far as the history goes.
+    pub leaves: Vec<i64>,
 }
 
 /// How the time a light left the fabric is known.
@@ -148,6 +153,9 @@ pub struct Outage {
     pub serial_number: Option<String>,
     pub software_version: Option<String>,
     pub thread_parent: Option<String>,
+    /// For a light that left: home-link registering it again, and how often it left.
+    pub rejoin: Pursuit,
+    pub leaves: Leaves,
     #[serde(skip)]
     notified: bool,
     #[serde(skip)]
@@ -183,6 +191,8 @@ impl Outage {
             serial_number: None,
             software_version: None,
             thread_parent: None,
+            rejoin: Pursuit::default(),
+            leaves: Leaves::default(),
             notified: false,
             advised: false,
             left_told: false,
@@ -272,6 +282,8 @@ pub struct Told {
     pub serial_number: Option<String>,
     pub left_at: Option<i64>,
     pub left_by: Option<LeftBy>,
+    pub rejoin: Pursuit,
+    pub leaves: Leaves,
 }
 
 /// A message to the user.
@@ -283,8 +295,13 @@ pub enum Notice {
     StillDown(Vec<Told>),
     /// Lights told down that came back.
     Up(Vec<Told>),
-    /// Ledger lights matterjs-server no longer serves for [`NOTIFY_AFTER`]: register them again.
+    /// Ledger lights matterjs-server no longer serves for [`NOTIFY_AFTER`]: home-link keeps
+    /// looking for them to register them again.
     Left(Vec<Told>),
+    /// Lights that left, registered again and back on their ledger rows.
+    Rejoined(Vec<Told>),
+    /// Lights that left and are not back, for a reason that stood [`crate::rejoin::TELL_AFTER`].
+    NotRejoined(Vec<Told>),
     /// matterjs-server out of reach for [`NOTIFY_AFTER`].
     ServerDown { since: i64 },
     /// matterjs-server, told out of reach, back.
@@ -413,9 +430,9 @@ impl Watch {
     fn lights_seen(&mut self, at: i64, seen: &[Seen], left: &[Left], step: &mut Step) {
         let watched: Vec<&Seen> = seen.iter().filter(|light| !light.ignored).collect();
         let gone: Vec<&Left> = left.iter().filter(|light| !light.ignored).collect();
-        let mut up = Vec::new();
+        let (mut up, mut rejoined) = (Vec::new(), Vec::new());
         self.leave(at, &gone, step);
-        self.come_back(at, &watched, &gone, &mut up, step);
+        self.come_back(at, &watched, &gone, &mut rejoined, step);
         self.forget(at, seen, &watched, step);
         let mut due = Vec::new();
         let (mut down, mut still_down) = (Vec::new(), Vec::new());
@@ -486,12 +503,17 @@ impl Watch {
             }
         }
         self.reconnect(at, due, step);
-        let mut left = Vec::new();
+        let (mut left, mut not_rejoined) = (Vec::new(), Vec::new());
         for outage in self.left.values_mut() {
             let since = outage.left_at.unwrap_or(outage.started_at);
             if !outage.left_told && at - since >= NOTIFY_AFTER {
                 outage.left_told = true;
+                // The reason now goes with the message that it left.
+                outage.rejoin.told_now();
                 left.push(told(outage));
+                step.changes.push(Change::Updated(outage.clone()));
+            } else if outage.left_told && outage.rejoin.tell(at).is_some() {
+                not_rejoined.push(told(outage));
                 step.changes.push(Change::Updated(outage.clone()));
             }
         }
@@ -499,7 +521,9 @@ impl Watch {
             (down, Notice::Down as fn(Vec<Told>) -> Notice),
             (still_down, Notice::StillDown),
             (left, Notice::Left),
+            (not_rejoined, Notice::NotRejoined),
             (up, Notice::Up),
+            (rejoined, Notice::Rejoined),
         ] {
             if !lights.is_empty() {
                 step.notices.push(notice(lights));
@@ -548,13 +572,15 @@ impl Watch {
             outage.serial_number.clone_from(&left.serial);
             outage.software_version.clone_from(&left.software_version);
             outage.thread_parent.clone_from(&left.thread_parent);
+            outage.leaves = Leaves::of(&left.leaves, left_at);
             step.changes.push(change(outage.clone()));
             self.left.insert(left.device, outage);
         }
     }
 
     /// A light that left and is served again, registered again, ends its stretch, told back if
-    /// it was told gone; one no longer in the ledger as a light to watch ends it untold.
+    /// home-link registered it again or it was told gone; one no longer in the ledger as a
+    /// light to watch ends it untold.
     fn come_back(
         &mut self,
         at: i64,
@@ -577,7 +603,7 @@ impl Watch {
                 continue;
             };
             outage.ended_at = Some(at);
-            if back && (outage.left_told || outage.notified) {
+            if back && (outage.rejoin.rejoined || outage.left_told || outage.notified) {
                 up.push(told(&outage));
             }
             step.changes.push(Change::Up(outage));
@@ -630,6 +656,47 @@ impl Watch {
     #[must_use]
     pub fn left_at(&self, device: i64) -> Option<i64> {
         self.left.get(&device).and_then(|outage| outage.left_at)
+    }
+
+    /// The ledger rows of the lights out of the fabric, to look for.
+    #[must_use]
+    pub fn pursued(&self) -> Vec<i64> {
+        self.left
+            .iter()
+            .filter(|(_, outage)| !outage.rejoin.rejoined)
+            .map(|(device, _)| *device)
+            .collect()
+    }
+
+    /// Takes in a look at `at` for the light that left as ledger row `device`: whether the ledger
+    /// holds its code, whether Bluetooth worked, and whether its advertisement was heard.
+    pub fn look(&mut self, device: i64, at: i64, code: bool, bluetooth: bool, heard: bool) {
+        if let Some(outage) = self.left.get_mut(&device) {
+            let since = outage.left_at.unwrap_or(outage.started_at);
+            outage.rejoin.look(at, since, code, bluetooth, heard);
+        }
+    }
+
+    /// The lights that left to commission now, with when each was last tried.
+    #[must_use]
+    pub fn due(&self, at: i64) -> Vec<(i64, Option<i64>)> {
+        self.left
+            .iter()
+            .filter(|(_, outage)| outage.rejoin.due(at))
+            .map(|(device, outage)| (*device, outage.rejoin.attempted_at))
+            .collect()
+    }
+
+    /// Records a commissioning of the light that left as ledger row `device`, ended at `at`.
+    pub fn attempted(
+        &mut self,
+        device: i64,
+        at: i64,
+        result: Result<(), Reason>,
+    ) -> Option<Change> {
+        let outage = self.left.get_mut(&device)?;
+        outage.rejoin.attempted(at, result);
+        Some(Change::Updated(outage.clone()))
     }
 
     /// Takes back the stretches still open when home-link last stopped: what was told stays told.
@@ -760,7 +827,25 @@ fn told(outage: &Outage) -> Told {
         serial_number: outage.serial_number.clone(),
         left_at: outage.left_at,
         left_by: outage.left_by,
+        rejoin: outage.rejoin.clone(),
+        leaves: outage.leaves,
     }
+}
+
+/// How often a light left, when more than this once: `14日で3回目です（前回 10-21 09:17）。`
+fn leaves_text(leaves: Leaves) -> Option<String> {
+    (leaves.count > 1).then(|| {
+        let previous = leaves
+            .previous_at
+            .map(|at| format!("（前回 {}）", date_time(at)))
+            .unwrap_or_default();
+        format!("14日で{}回目です{previous}。", leaves.count)
+    })
+}
+
+/// One sentence or two per light, a line each.
+fn sentences(lights: &[Told], line: impl Fn(&Told) -> String) -> String {
+    lights.iter().map(line).collect::<Vec<_>>().join("\n")
 }
 
 fn network_name(network: Option<&str>) -> &'static str {
@@ -844,36 +929,33 @@ impl Notice {
                 "matterjs-serverに再び届きました（{}届きませんでした）。",
                 span(until - since)
             ),
-            Self::Left(lights) => format!(
-                "照明が網（fabric）から外れました。matterjs-serverはこの照明をもう持っていないため、つなぎ直しでは戻りません。home-linkアプリで登録し直すと、製造番号で台帳の同じ行へ戻ります。\n{}",
-                lines(lights, &|light| {
-                    let mut known = Vec::new();
-                    if !light.labels.is_empty() {
-                        known.push(format!("label {}", light.labels.join("・")));
-                    }
-                    if let Some(serial) = &light.serial_number {
-                        known.push(format!("製造番号 {serial}"));
-                    }
-                    let at = light.left_at.unwrap_or(light.since);
-                    let when = match light.left_by {
-                        Some(LeftBy::Event) => {
-                            format!("{}から（matterjs-serverが外した時刻）", date_time(at))
-                        }
-                        Some(LeftBy::Check) => {
-                            format!("{}から（毎分の確かめで見つけた時刻）", date_time(at))
-                        }
-                        _ => format!(
-                            "{}に見つけました（いつ外れたかは分かりません）",
-                            date_time(at)
-                        ),
-                    };
-                    if known.is_empty() {
-                        when
-                    } else {
-                        format!("{}、{when}", known.join("、"))
-                    }
-                })
-            ),
+            Self::Left(lights) => sentences(lights, |light| {
+                let mut text = format!(
+                    "{}の登録が外れました（{}）。自動で登録し直しています。",
+                    light.name,
+                    hhmm(light.left_at.unwrap_or(light.since))
+                );
+                text.extend(leaves_text(light.leaves));
+                if let Some(reason) = light.rejoin.reason {
+                    text.push_str(&reason.sentence(&light.name));
+                }
+                text
+            }),
+            Self::Rejoined(lights) => sentences(lights, |light| {
+                let back = light.until.unwrap_or(light.since);
+                format!(
+                    "{}を登録し直しました（外れてから{}）。",
+                    light.name,
+                    span(back - light.left_at.unwrap_or(light.since))
+                )
+            }),
+            Self::NotRejoined(lights) => sentences(lights, |light| {
+                light
+                    .rejoin
+                    .reason
+                    .unwrap_or(Reason::NoAdvert)
+                    .sentence(&light.name)
+            }),
             Self::Test => {
                 "home-linkからの試しの知らせです。照明の見張りの知らせはここへ届きます。".into()
             }
@@ -1361,6 +1443,7 @@ mod tests {
             software_version: Some("1.0.0.6".into()),
             thread_parent: Some("0x4c00".into()),
             removed_at,
+            leaves: Vec::new(),
         }
     }
 
@@ -1464,7 +1547,7 @@ mod tests {
     }
 
     #[test]
-    fn the_left_notice_names_the_light_its_labels_serial_since_and_how_to_bring_it_back() {
+    fn the_left_notice_names_the_light_and_when_it_left() {
         let mut watch = Watch::default();
         // matterjs-server removed the node on 10-21 at 09:17 Tokyo time.
         let removed = minute(-5 * 24 * 60 + 9 * 60 + 17);
@@ -1475,25 +1558,17 @@ mod tests {
         let (0, notice @ Notice::Left(_)) = &told[0] else {
             panic!("told at once, being gone over five minutes: {told:?}");
         };
-        let text = notice.text();
-        for part in [
-            "網（fabric）から外れました",
-            "物置き1（Thread）",
-            "room・storage",
-            "54EF441001301194",
-            "10-21 09:17から",
-            "つなぎ直しでは戻りません",
-            "home-linkアプリで登録し直す",
-            "同じ行",
-        ] {
-            assert!(text.contains(part), "{part}: {text}");
-        }
+        assert_eq!(
+            notice.text(),
+            "物置き1の登録が外れました（09:17）。自動で登録し直しています。",
+            "the name, when, and that it is being brought back"
+        );
         let mut watch = Watch::default();
         let steps = run_left(&mut watch, 0, 5, |_| {
             Some((vec![other()], vec![storage_left(None)]))
         });
         let text = notices(&steps)[0].1.text();
-        assert!(text.contains("いつ外れたかは分かりません"), "{text}");
+        assert!(text.contains("（00:00）"), "the time it was found: {text}");
     }
 
     #[test]
@@ -1620,7 +1695,7 @@ mod tests {
         });
         let told = notices(&steps);
         assert_eq!(told.len(), 2, "{told:?}");
-        let (20, Notice::Up(lights)) = &told[1] else {
+        let (20, Notice::Rejoined(lights)) = &told[1] else {
             panic!("{told:?}");
         };
         assert_eq!(
@@ -1659,6 +1734,188 @@ mod tests {
             changes(&steps)
                 .iter()
                 .any(|(n, c)| *n == 2 && matches!(c, Change::Up(_)))
+        );
+    }
+
+    fn rejoin_notices(steps: &[(i64, Step)]) -> Vec<(i64, Notice)> {
+        notices(steps)
+            .into_iter()
+            .filter(|(_, notice)| matches!(notice, Notice::Rejoined(_) | Notice::NotRejoined(_)))
+            .collect()
+    }
+
+    #[test]
+    fn a_light_home_link_registers_again_is_told_back_on_its_row_however_soon() {
+        let mut watch = Watch::default();
+        let mut steps = run_left(&mut watch, 0, 1, |_| {
+            Some((vec![other()], vec![storage_left(None)]))
+        });
+        assert_eq!(watch.pursued(), vec![STORAGE], "looked for");
+        watch.look(STORAGE, minute(2), true, true, true);
+        assert_eq!(watch.due(minute(2)), vec![(STORAGE, None)], "heard: due");
+        let change = watch.attempted(STORAGE, minute(3), Ok(()));
+        assert!(
+            matches!(&change, Some(Change::Updated(o)) if o.rejoin.rejoined && o.rejoin.attempts == 1),
+            "{change:?}"
+        );
+        assert_eq!(watch.due(minute(3)), vec![], "not tried again");
+        steps.extend(run_left(&mut watch, 4, 6, |_| {
+            Some((vec![ledger_light(99, "物置き1", true), other()], vec![]))
+        }));
+        let told = notices(&steps);
+        assert_eq!(
+            told.len(),
+            1,
+            "only the return, under five minutes out: {told:?}"
+        );
+        let (4, notice @ Notice::Rejoined(lights)) = &told[0] else {
+            panic!("{told:?}");
+        };
+        assert_eq!(
+            (lights[0].since, lights[0].until),
+            (minute(0), Some(minute(4))),
+            "from leaving to back"
+        );
+        let text = notice.text();
+        assert_eq!(
+            text, "物置き1を登録し直しました（外れてから4分）。",
+            "name and time out"
+        );
+        assert_eq!(
+            watch.pursued(),
+            Vec::<i64>::new(),
+            "back: no longer looked for"
+        );
+    }
+
+    #[test]
+    fn a_light_registered_again_by_the_app_keeps_its_return_message() {
+        let mut watch = Watch::default();
+        let steps = run_left(&mut watch, 0, 12, |n| {
+            Some(if n < 10 {
+                (vec![other()], vec![storage_left(None)])
+            } else {
+                (vec![ledger_light(99, "物置き1", true), other()], vec![])
+            })
+        });
+        let told = rejoin_notices(&steps);
+        let [(10, notice)] = told.as_slice() else {
+            panic!("{told:?}");
+        };
+        assert!(
+            notice.text().contains("外れてから10分"),
+            "told back as well: {}",
+            notice.text()
+        );
+    }
+
+    #[test]
+    fn the_left_message_says_home_link_keeps_looking_and_why_it_is_not_back() {
+        let mut watch = Watch::default();
+        let mut steps = Vec::new();
+        for n in 0..=5 {
+            steps.extend(run_left(&mut watch, n, n, |_| {
+                Some((vec![other()], vec![storage_left(None)]))
+            }));
+            watch.look(STORAGE, minute(n) + 30, true, true, false);
+        }
+        let left = left_notices(&steps);
+        assert_eq!(left.len(), 1, "{left:?}");
+        let text = Notice::Left(left[0].1.clone()).text();
+        for part in [
+            "物置き1の登録が外れました（00:00）",
+            "自動で登録し直しています",
+            "壁のスイッチ",
+        ] {
+            assert!(text.contains(part), "{part}: {text}");
+        }
+        // The reason went with it, and is not told again on its own.
+        let later = run_left(&mut watch, 6, 30, |_| {
+            Some((vec![other()], vec![storage_left(None)]))
+        });
+        assert_eq!(rejoin_notices(&later), vec![], "told already");
+    }
+
+    #[test]
+    fn each_new_reason_that_stands_five_minutes_is_told_once() {
+        let mut watch = Watch::default();
+        let mut steps = run_left(&mut watch, 0, 6, |_| {
+            Some((vec![other()], vec![storage_left(None)]))
+        });
+        watch.look(STORAGE, minute(7), true, true, true);
+        watch.attempted(STORAGE, minute(8), Err(Reason::WrongCode));
+        for n in 9..=20 {
+            watch.look(STORAGE, minute(n), true, true, true);
+            steps.extend(run_left(&mut watch, n, n, |_| {
+                Some((vec![other()], vec![storage_left(None)]))
+            }));
+        }
+        let told = rejoin_notices(&steps);
+        let [(13, notice @ Notice::NotRejoined(lights))] = told.as_slice() else {
+            panic!("five minutes after the refusal: {told:?}");
+        };
+        assert_eq!(
+            lights[0].rejoin.reason,
+            Some(Reason::WrongCode),
+            "the reason"
+        );
+        let text = notice.text();
+        assert!(
+            text.contains("アプリで登録し直してください"),
+            "what to do: {text}"
+        );
+    }
+
+    #[test]
+    fn how_often_a_light_left_is_kept_and_told() {
+        let mut watch = Watch::default();
+        let before = |days: i64| minute(-days * 24 * 60);
+        let steps = run_left(&mut watch, 0, 5, |_| {
+            Some((
+                vec![other()],
+                vec![Left {
+                    leaves: vec![before(5), before(1)],
+                    ..storage_left(None)
+                }],
+            ))
+        });
+        let status = watch.status();
+        let outage = status.lights[1].outage.as_ref().expect("left");
+        assert_eq!(
+            outage.leaves,
+            Leaves {
+                count: 3,
+                previous_at: Some(before(1))
+            },
+            "two before this one"
+        );
+        let text = Notice::Left(left_notices(&steps)[0].1.clone()).text();
+        assert!(
+            text.contains("14日で3回目です（前回 10-25 00:00）"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_pursuit_carries_on_after_home_link_starts_again() {
+        let mut watch = Watch::default();
+        run_left(&mut watch, 0, 1, |_| {
+            Some((vec![other()], vec![storage_left(None)]))
+        });
+        watch.look(STORAGE, minute(2), true, true, true);
+        let Some(Change::Updated(outage)) =
+            watch.attempted(STORAGE, minute(3), Err(Reason::ConnectFailed))
+        else {
+            panic!("kept");
+        };
+        let mut again = Watch::default();
+        again.resume(vec![outage]);
+        let status = again.status();
+        let pursuit = &status.lights[0].outage.as_ref().expect("left").rejoin;
+        assert_eq!(
+            (pursuit.attempts, pursuit.reason),
+            (1, Some(Reason::ConnectFailed)),
+            "taken back"
         );
     }
 
@@ -1761,7 +2018,7 @@ mod tests {
         });
         let told = notices(&steps);
         assert_eq!(told.len(), 1, "not told again that it left: {told:?}");
-        let (30, Notice::Up(lights)) = &told[0] else {
+        let (30, Notice::Rejoined(lights)) = &told[0] else {
             panic!("{told:?}");
         };
         assert_eq!(lights[0].since, minute(0));

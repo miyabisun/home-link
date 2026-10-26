@@ -7,6 +7,26 @@ pub struct SetupKey {
     pub short_discriminator: u8,
 }
 
+/// The discriminator a code carries: all 12 bits in a QR payload, the top 4 in a manual code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Discriminator {
+    Long(u16),
+    Short(u8),
+}
+
+/// The discriminator of a stored code's first device.
+#[must_use]
+pub fn discriminator(code: &str) -> Option<Discriminator> {
+    match code.strip_prefix("MT:") {
+        Some(rest) => {
+            let bits = qr_bits(rest.split('*').next()?)?;
+            qr_key(rest.split('*').next()?)?;
+            Some(Discriminator::Long(u16::try_from(bits >> 45 & 0xFFF).ok()?))
+        }
+        None => manual_key(code).map(|key| Discriminator::Short(key.short_discriminator)),
+    }
+}
+
 /// Returns whether `payload` is a well-formed Matter QR setup payload.
 #[must_use]
 pub fn is_valid(payload: &str) -> bool {
@@ -142,7 +162,10 @@ fn decode(text: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ALPHABET, SetupKey, ids, is_valid, keys, normalize_manual, verhoeff_ok};
+    use super::{
+        ALPHABET, Discriminator, SetupKey, discriminator, ids, is_valid, keys, normalize_manual,
+        verhoeff_ok,
+    };
 
     // Matter specification example: vendor 0xFFF1, product 0x8000,
     // discriminator 3840, passcode 20202021.
@@ -292,6 +315,21 @@ mod tests {
         );
         assert_eq!(ids("34970112332"), None);
         assert_eq!(ids("MT:abc"), None);
+    }
+
+    #[test]
+    fn a_qr_payload_carries_the_whole_discriminator_and_a_manual_code_its_top_bits() {
+        assert_eq!(
+            discriminator(SPEC_EXAMPLE),
+            Some(Discriminator::Long(3840)),
+            "QR"
+        );
+        assert_eq!(
+            discriminator("34970112332"),
+            Some(Discriminator::Short(15)),
+            "manual"
+        );
+        assert_eq!(discriminator("MT:abc"), None, "malformed");
     }
 
     /// Builds an 11-digit manual code from its fields.

@@ -587,15 +587,11 @@ async fn a_thread_bulb_leaves_the_fabric(rig: &Rig) {
     {
         let messages = messages.lock().unwrap();
         assert_eq!(messages.len(), 1, "{messages:?}");
-        for part in [
-            "網（fabric）から外れました",
-            "寝室（Thread）",
-            "製造番号 thread-bulb",
-            "10-26 00:00から（matterjs-serverが外した時刻）",
-            "home-linkアプリで登録し直す",
-        ] {
-            assert!(messages[0].contains(part), "{part}: {}", messages[0]);
-        }
+        assert!(
+            messages[0].starts_with("寝室の登録が外れました（00:00）"),
+            "{}",
+            messages[0]
+        );
     }
 }
 
@@ -740,7 +736,7 @@ async fn the_bulb_registered_again_is_back(rig: &Rig) {
         let messages = messages.lock().unwrap();
         assert_eq!(messages.len(), 2, "{messages:?}");
         assert!(
-            messages[1].contains("寝室（Thread）: 9分つながっていませんでした"),
+            messages[1].contains("寝室を登録し直しました（外れてから9分）"),
             "{}",
             messages[1]
         );

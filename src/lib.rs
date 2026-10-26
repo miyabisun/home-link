@@ -1,4 +1,5 @@
 pub mod aircon;
+mod ble_proxy;
 pub mod commission;
 pub mod discord;
 pub mod link;
@@ -7,6 +8,8 @@ mod mcp;
 pub mod meter;
 pub mod onboarding;
 pub mod outside;
+pub mod rejoin;
+mod rejoiner;
 pub mod schedule;
 pub mod sesame;
 pub mod watch;
@@ -59,6 +62,9 @@ pub fn open_db(path: &str) -> rusqlite::Result<Connection> {
     }
     if version < 13 {
         watcher::migrate_left(&db)?;
+    }
+    if version < 14 {
+        watcher::migrate_rejoin(&db)?;
     }
     Ok(db)
 }
@@ -464,6 +470,10 @@ struct AppState {
     unsent: Mutex<Vec<watch::Notice>>,
     /// The nodes matterjs-server sent it removed, and when.
     removed: Mutex<Vec<(u64, i64)>>,
+    /// The Bluetooth adapter lights that left are looked for on (`hci1`), else the first one.
+    bluetooth_adapter: Option<String>,
+    /// matterjs-server's BLE proxy, else the one beside its WebSocket API.
+    ble_proxy_url: Option<String>,
 }
 
 /// How a task run forever under [`Home::supervise`] is doing.
@@ -542,6 +552,8 @@ impl Home {
             discord: None,
             unsent: Mutex::new(Vec::new()),
             removed: Mutex::new(Vec::new()),
+            bluetooth_adapter: None,
+            ble_proxy_url: None,
         }))
     }
 
@@ -554,6 +566,20 @@ impl Home {
         Arc::get_mut(&mut self.0)
             .expect("set before the Home is shared")
             .discord = discord;
+        self
+    }
+
+    /// Sets the Bluetooth adapter (`hci1`) lights that left are looked for on, and the BLE proxy
+    /// of matterjs-server they are commissioned again through; `None` for the first adapter
+    /// and the proxy beside the WebSocket API.
+    ///
+    /// # Panics
+    /// Panics once the router or a clone shares this `Home`.
+    #[must_use]
+    pub fn with_rejoin(mut self, adapter: Option<String>, proxy: Option<String>) -> Self {
+        let state = Arc::get_mut(&mut self.0).expect("set before the Home is shared");
+        state.bluetooth_adapter = adapter;
+        state.ble_proxy_url = proxy;
         self
     }
 
@@ -745,6 +771,7 @@ impl Home {
             self.supervise("watch_removals", Self::watch_removals);
             self.supervise("every_ten_minutes", Self::every_ten_minutes);
             self.supervise("every_minute", Self::every_minute);
+            self.supervise("rejoin_lights", Self::rejoin_lights);
         }
     }
 
@@ -782,6 +809,11 @@ impl Home {
             let at = now();
             self.check_lights(at - at.rem_euclid(60)).await;
         }
+    }
+
+    /// Looks for the lights that left the fabric and commissions each again once heard, forever.
+    pub async fn rejoin_lights(self) {
+        rejoiner::run(&self.0).await;
     }
 
     /// Listens to matterjs-server for the nodes it removes, forever: a light that leaves the
@@ -2011,6 +2043,19 @@ async fn commission_device(
     State(state): State<Db>,
     Path(id): Path<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let bluetooth = state.meter.hold();
+    let (node_id, device) = recommission(&state, id, state.commission_timeout).await?;
+    drop(bluetooth);
+    let device = observed(&state, device).await;
+    Ok(Json(json!({
+        "node_id": node_id,
+        "device": device,
+    })))
+}
+
+/// Has matterjs-server commission the ledger device `id` with its stored code within
+/// `timeout`, and fills in the row's identifiers: the device and the row it is now.
+async fn recommission(state: &AppState, id: i64, timeout: Duration) -> ApiResult<(u64, Device)> {
     let (code, wifi) = {
         let db = state.db.lock().expect(UNPOISONED);
         let device = find_device(&db, id, true)?;
@@ -2023,31 +2068,25 @@ async fn commission_device(
         })?;
         (code, saved_wifi(&db)?)
     };
-    let url = matter_url(&state)?;
+    let url = matter_url(state)?;
     let network = commission::Network::Any(
         wifi.as_ref()
             .map(|(ssid, password)| (ssid.as_str(), password.as_str())),
     );
     let ssid = wifi.as_ref().map_or("", |(ssid, _)| ssid.as_str());
-    let bluetooth = state.meter.hold();
-    let commissioned = commission::commission(url, &code, &network, state.commission_timeout)
+    let commissioned = commission::commission(url, &code, &network, timeout)
         .await
         .map_err(|error| match error {
             commission::Error::Unreachable(error) => matter_unreachable(error),
             commission::Error::Failed(failure) => commission_failed(failure, ssid),
         })?;
-    drop(bluetooth);
     let device = connect_row(&state.db.lock().expect(UNPOISONED), id, &commissioned)?;
     tracing::info!(
         node_id = commissioned.node_id,
         device = device.id,
         "device commissioned"
     );
-    let device = observed(&state, device).await;
-    Ok(Json(json!({
-        "node_id": commissioned.node_id,
-        "device": device,
-    })))
+    Ok((commissioned.node_id, device))
 }
 
 /// Fills row `id` with the commissioned device's identifiers. When another row
