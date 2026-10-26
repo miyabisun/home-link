@@ -166,11 +166,11 @@ pub(crate) async fn run(state: &AppState) {
         let Some(device) = rejoin::pick(at, &due, last_ended).filter(|_| !busy) else {
             continue;
         };
-        let Some(open) = ear.take() else {
+        let Some(Ear { radio, .. }) = ear.take() else {
             continue;
         };
-        // The search's signals wait unread while the proxy works; they are opened again after.
-        let radio = open.radio;
+        // The search opens the adapter again after: it may have gone meanwhile, as the UB500
+        // does when btusb resets it, and come back under another name.
         let result = attempt(state, &radio, &proxy, device).await;
         let ended = (state.clock)();
         last_ended = Some(ended);
@@ -181,10 +181,6 @@ pub(crate) async fn run(state: &AppState) {
             .attempted(device, ended, result);
         if let Some(change) = change {
             watcher::keep(state, &change);
-        }
-        match radio.signals().await {
-            Ok(signals) => ear = Some(Ear { radio, signals }),
-            Err(error) => tracing::warn!(%error, "rejoin: Bluetooth lost"),
         }
     }
 }

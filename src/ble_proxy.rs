@@ -570,6 +570,8 @@ struct Held {
     /// Addresses reported in a scan that asked for no duplicates.
     reported: Option<Vec<String>>,
     links: HashMap<u16, Link>,
+    /// How many peripherals are being connected now.
+    connecting: usize,
     next: u16,
     /// Since when no peripheral is connected, once one was.
     unlinked_since: Option<Instant>,
@@ -584,6 +586,18 @@ impl Held {
             && self
                 .unlinked_since
                 .is_some_and(|since| now.duration_since(since) >= LINK_GRACE)
+    }
+
+    /// Whether a peripheral is connected or being connected.
+    fn linked(&self) -> bool {
+        !self.links.is_empty() || self.connecting > 0
+    }
+
+    /// Whether this client's discovery may run: matterjs-server asked for a scan and no
+    /// peripheral is connected or being connected. The UB500 (RTL8761BU) stalls when it scans
+    /// beside a link: its link times out and it no longer answers, until btusb resets it.
+    fn may_scan(&self) -> bool {
+        self.scanning.is_some() && !self.linked()
     }
 
     fn link(&mut self, link: Link) -> u16 {
@@ -721,6 +735,15 @@ pub(crate) async fn serve(
     }
     release(radio, &held).await;
     Ok(())
+}
+
+/// Starts this client's discovery again once matterjs-server's scan may run ([`Held::may_scan`]).
+async fn resume(radio: &Radio, held: &Shared) {
+    if held.lock().expect(crate::UNPOISONED).may_scan()
+        && let Err(error) = radio.scan().await
+    {
+        tracing::debug!(%error, "BLE proxy scan not resumed");
+    }
 }
 
 /// Disconnects every peripheral the proxy holds and ends its discovery.
@@ -874,10 +897,13 @@ async fn execute(
                         .collect()
                 })
                 .unwrap_or_default();
-            radio
-                .scan()
-                .await
-                .map_err(refused("bluetooth_unavailable"))?;
+            // Beside a link the scan waits; the devices already heard are still reported.
+            if !held.lock().expect(crate::UNPOISONED).linked() {
+                radio
+                    .scan()
+                    .await
+                    .map_err(refused("bluetooth_unavailable"))?;
+            }
             let known = radio.known().await.unwrap_or_default();
             {
                 let mut held = held.lock().expect(crate::UNPOISONED);
@@ -913,11 +939,25 @@ async fn execute(
             let device = device(radio, &path)
                 .await
                 .map_err(refused("device_not_found"))?;
-            tokio::time::timeout_at(deadline, device.call_method("Connect", &()))
-                .await
-                .map_err(|_| Refusal("timeout", format!("connecting to {address}")))?
-                .map_err(refused("connection_failed"))?;
-            resolved(&device, deadline).await?;
+            // This client's discovery, the search's included, ends before connecting and
+            // stays off while a peripheral is linked ([`Held::may_scan`]).
+            held.lock().expect(crate::UNPOISONED).connecting += 1;
+            radio.stop_scan().await;
+            let connected = async {
+                tokio::time::timeout_at(deadline, device.call_method("Connect", &()))
+                    .await
+                    .map_err(|_| Refusal("timeout", format!("connecting to {address}")))?
+                    .map_err(refused("connection_failed"))?;
+                resolved(&device, deadline).await
+            }
+            .await;
+            held.lock().expect(crate::UNPOISONED).connecting -= 1;
+            if connected.is_err() {
+                // A link whose services never resolved is not kept, so it may not stay up.
+                let _ = device.call_method("Disconnect", &()).await;
+                resume(radio, held).await;
+            }
+            connected?;
             let mtu = mtu(radio, &path).await;
             let handle = held.lock().expect(crate::UNPOISONED).link(Link {
                 path,
@@ -934,6 +974,7 @@ async fn execute(
             if let Ok(device) = device(radio, &path).await {
                 let _ = device.call_method("Disconnect", &()).await;
             }
+            resume(radio, held).await;
             Ok(json!({}))
         }
         name => gatt_command(radio, held, name, args).await,
@@ -1134,14 +1175,18 @@ async fn forward(
                     .get("Connected")
                     .is_some_and(|value| matches!(unwrap(value), Variant::Bool(false)))
             {
-                dropped(held, out, &path);
+                if dropped(held, out, &path) {
+                    resume(radio, held).await;
+                }
                 continue;
             }
         }
         let path = match radio.concern(&signal) {
             Concern::Device(path) => path,
             Concern::Gone(path) => {
-                dropped(held, out, &path);
+                if dropped(held, out, &path) {
+                    resume(radio, held).await;
+                }
                 continue;
             }
             Concern::Adapter | Concern::Other => continue,
@@ -1176,7 +1221,8 @@ fn notify(held: &Shared, out: &mpsc::UnboundedSender<Message>, path: &str, value
     }
 }
 
-fn dropped(held: &Shared, out: &mpsc::UnboundedSender<Message>, path: &str) {
+/// Tells matterjs-server of the links to the peripheral at `path` that went; true if any did.
+fn dropped(held: &Shared, out: &mpsc::UnboundedSender<Message>, path: &str) -> bool {
     let mut held = held.lock().expect(crate::UNPOISONED);
     let handles: Vec<u16> = held
         .links
@@ -1184,13 +1230,14 @@ fn dropped(held: &Shared, out: &mpsc::UnboundedSender<Message>, path: &str) {
         .filter(|(_, link)| link.path == path)
         .map(|(handle, _)| *handle)
         .collect();
-    for handle in handles {
+    for &handle in &handles {
         held.unlink(handle, Instant::now());
         let event = json!({ "event": "disconnected", "data": {
             "connection_handle": handle, "reason": "peripheral disconnected",
         }});
         let _ = out.send(Message::text(event.to_string()));
     }
+    !handles.is_empty()
 }
 
 #[cfg(test)]
@@ -1418,6 +1465,21 @@ mod tests {
         assert_ne!(first, second, "a new handle");
         assert!(!held.done(start + LINK_GRACE * 2), "connected again");
         assert!(held.unlink(first, start).is_none(), "already gone");
+    }
+
+    #[test]
+    fn the_adapter_never_scans_beside_a_link() {
+        let mut held = Held::default();
+        assert!(!held.may_scan(), "matterjs-server asked for no scan");
+        held.scanning = Some(Vec::new());
+        assert!(held.may_scan(), "asked, nothing connected");
+        held.connecting += 1;
+        assert!(!held.may_scan(), "connecting");
+        held.connecting -= 1;
+        let link = held.link(Link::default());
+        assert!(!held.may_scan(), "connected");
+        held.unlink(link, Instant::now());
+        assert!(held.may_scan(), "the link went");
     }
 
     #[test]

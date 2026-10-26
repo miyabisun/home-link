@@ -157,7 +157,8 @@ matterjs-serverに届かなくなったときは `warn` の `matterjs-server out
   台帳のコードの識別子（discriminator。QRコードなら12ビットと製品、手動のコードなら上位4ビット）が合う広告を聞いたら、すぐにそのコードで登録し直します。
   home-link自身がmatterjs-serverのBLE Proxy（`MATTER_BLE_PROXY_URL`）のclientになり、電話のアプリと同じ役を務めます。電話のアプリでの登録もそのまま使えます。
   BlueZにはUUIDで絞らずにdiscoveryを頼み、聞いた広告からhome-linkが選びます。BlueZ 5.87は、UUIDを指定したdiscoveryの最中に広告を受けると落ちるためです（[bluez#2282](https://github.com/bluez/bluez/issues/2282)）。
-  BlueZが起動し直したときや、アダプタが抜き差し・resetされたときは、探し直します。
+  BlueZが起動し直したときや、アダプタが抜き差し・resetされたときは、探し直します。登録し直しを1回試すたびに、アダプタを開き直します。
+  照明とBluetoothでつないでいる間は、discoveryを止めます。UB500（RTL8761BU）は、つないだまま探すと応答しなくなり、resetされるためです。
 - 登録し直した照明は台帳の同じ行（名前・label）へ戻ります。戻ったら、外れてから戻るまでの時間を1通知らせます。
 - 失敗したら30秒から倍々に最長3分おきに試し直します。コードを受け付けなかったときは10分おきです。広告が出ない間も探し続け、壁のスイッチで電源を入れ直して広告が出れば、その時点で戻します。
 - 戻らない理由は、`no_advert`（登録を待っていない）・`connect_failed`（つながらない）・`wrong_code`（コードが合わない）・`no_code`（コードがない）・`no_bluetooth`（Bluetoothが使えない）に分けます。
