@@ -122,13 +122,26 @@ async fn fake_matter(matter: Arc<Mutex<Matter>>) -> SocketAddr {
 
 /// A Discord webhook that keeps each message's content.
 async fn fake_discord() -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+    failing_discord(Arc::new(Mutex::new(0))).await
+}
+
+/// A Discord webhook that refuses the first `failures` messages, then keeps each one's content.
+async fn failing_discord(failures: Arc<Mutex<usize>>) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
     let messages = Arc::new(Mutex::new(Vec::new()));
     let kept = messages.clone();
     let app = Router::new().route(
         "/api/webhooks/1/token",
         axum::routing::post(move |body: axum::body::Bytes| {
             let kept = kept.clone();
+            let failures = failures.clone();
             async move {
+                {
+                    let mut failures = failures.lock().unwrap();
+                    if *failures > 0 {
+                        *failures -= 1;
+                        return StatusCode::SERVICE_UNAVAILABLE;
+                    }
+                }
                 let body: Value = serde_json::from_slice(&body).unwrap();
                 kept.lock()
                     .unwrap()
@@ -144,14 +157,19 @@ async fn fake_discord() -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
 }
 
 fn home(matter: SocketAddr, discord: Option<SocketAddr>) -> home_link::Home {
-    let db = home_link::open_db(":memory:").unwrap();
+    home_on(":memory:", matter, discord)
+}
+
+/// A home on the database at `path`, with the three bulbs in its ledger.
+fn home_on(path: &str, matter: SocketAddr, discord: Option<SocketAddr>) -> home_link::Home {
+    let db = home_link::open_db(path).unwrap();
     for (serial, name, ignored) in [
         ("wifi-bulb", "玄関", false),
         ("thread-bulb", "寝室", false),
         ("dead-bulb", "物置", true),
     ] {
         db.execute(
-            "INSERT INTO devices (vendor, serial_number, name, ignored) VALUES ('Repro', ?1, ?2, ?3)",
+            "INSERT OR IGNORE INTO devices (vendor, serial_number, name, ignored) VALUES ('Repro', ?1, ?2, ?3)",
             rusqlite::params![serial, name, ignored],
         )
         .unwrap();
@@ -429,4 +447,65 @@ async fn without_a_destination_the_watch_tells_nothing_and_keeps_the_rest() {
     let (status, error) = call(&app, "POST", "/api/lights/watch/test").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(error["error"], "notify_not_configured");
+}
+
+#[tokio::test]
+async fn a_notice_the_destination_refused_is_sent_at_the_next_check() {
+    let matter = Arc::new(Mutex::new(Matter {
+        unavailable: vec![5],
+        ..Matter::default()
+    }));
+    let failures = Arc::new(Mutex::new(1));
+    let (discord, messages) = failing_discord(failures.clone()).await;
+    let home = home(fake_matter(matter.clone()).await, Some(discord));
+    for n in 0..=5 {
+        home.check_lights(minute(n)).await;
+    }
+    assert_eq!(*failures.lock().unwrap(), 0, "the down notice was refused");
+    assert!(messages.lock().unwrap().is_empty());
+    home.check_lights(minute(6)).await;
+    let messages = messages.lock().unwrap();
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert!(
+        messages[0].contains("玄関（Wi-Fi）: 00:00から"),
+        "{}",
+        messages[0]
+    );
+}
+
+#[tokio::test]
+async fn after_a_restart_a_light_told_down_is_not_told_again_and_is_told_back() {
+    let matter = Arc::new(Mutex::new(Matter {
+        unavailable: vec![5],
+        ..Matter::default()
+    }));
+    let (discord, messages) = fake_discord().await;
+    let addr = fake_matter(matter.clone()).await;
+    let path = format!(
+        "file:watch-restart-{}?mode=memory&cache=shared",
+        std::process::id()
+    );
+    let before = home_on(&path, addr, Some(discord));
+    for n in 0..=5 {
+        before.check_lights(minute(n)).await;
+    }
+    assert_eq!(messages.lock().unwrap().len(), 1);
+
+    // home-link restarts, as Watchtower does on a release, while the bulb is still down.
+    let after = home_on(&path, addr, Some(discord));
+    after.resume_watch();
+    for n in 20..=26 {
+        after.check_lights(minute(n)).await;
+    }
+    assert_eq!(messages.lock().unwrap().len(), 1, "not told down again");
+    matter.lock().unwrap().unavailable.clear();
+    after.check_lights(minute(27)).await;
+    let messages = messages.lock().unwrap();
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    assert!(
+        messages[1].contains("27分つながっていませんでした"),
+        "{}",
+        messages[1]
+    );
+    drop(before);
 }

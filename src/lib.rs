@@ -430,6 +430,8 @@ struct AppState {
     watch: Mutex<watch::Watch>,
     /// Where the watch's messages go, if anywhere.
     discord: Option<discord::Discord>,
+    /// The watch's messages not delivered yet, to send again.
+    unsent: Mutex<Vec<watch::Notice>>,
 }
 
 /// Where the home's place and the temperature outside are asked for.
@@ -485,6 +487,7 @@ impl Home {
             outdoor: Mutex::new(None),
             watch: Mutex::new(watch::Watch::default()),
             discord: None,
+            unsent: Mutex::new(Vec::new()),
         }))
     }
 
@@ -615,10 +618,15 @@ impl Home {
         watcher::check(&self.0, at).await;
     }
 
-    /// Checks the lights at the start of every minute, forever, after ending the stretches
-    /// left open when home-link last stopped.
+    /// Takes back the light watch's stretches left open when home-link last stopped.
+    pub fn resume_watch(&self) {
+        watcher::resume(&self.0);
+    }
+
+    /// Checks the lights at the start of every minute, forever, after taking back the
+    /// stretches left open when home-link last stopped.
     pub async fn watch_lights(self) {
-        watcher::close_open(&self.0);
+        self.resume_watch();
         loop {
             let wait = 60 - now().rem_euclid(60);
             tokio::time::sleep(Duration::from_secs(wait.unsigned_abs())).await;

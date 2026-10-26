@@ -18,7 +18,7 @@ use crate::{
     ApiError, ApiResult, AppState, Db, UNPOISONED, ledger,
     link::{Link, Outcome},
     match_ledger, matter,
-    watch::{Change, Key, Notice, Outage, Seen},
+    watch::{Cause, Change, Key, Notice, Outage, Seen},
 };
 
 /// One check's reading of every node and of the lights due a read.
@@ -31,6 +31,8 @@ const RECONNECT_TIMEOUT: Duration = Duration::from_secs(40);
 const PING_TIMEOUT: Duration = Duration::from_secs(20);
 /// The history is kept this many seconds.
 const KEPT: i64 = 14 * 86_400;
+/// Notices kept to send again while the destination fails; the oldest go first.
+const MAX_UNSENT: usize = 20;
 /// A check this close before a moment answers for it, in seconds: a minute and its slack.
 const CHECK_COVERS: i64 = 90;
 
@@ -51,6 +53,8 @@ pub(crate) fn migrate(db: &Connection) -> rusqlite::Result<()> {
             reconnects INTEGER NOT NULL DEFAULT 0,
             reconnect_result TEXT,
             reachable INTEGER,
+            notified INTEGER NOT NULL DEFAULT 0,
+            advised INTEGER NOT NULL DEFAULT 0,
             UNIQUE (key, started_at)
         );
         CREATE INDEX IF NOT EXISTS light_outages_started_at ON light_outages (started_at);
@@ -64,16 +68,50 @@ pub(crate) fn migrate(db: &Connection) -> rusqlite::Result<()> {
     )
 }
 
-/// Ends the stretches left open when home-link last stopped, at its last check.
-pub(crate) fn close_open(state: &AppState) {
-    let closed = state.db.lock().expect(UNPOISONED).execute(
-        "UPDATE light_outages
-         SET ended_at = MAX(started_at, COALESCE((SELECT MAX(at) FROM light_checks), started_at))
-         WHERE ended_at IS NULL",
-        [],
-    );
-    if let Err(error) = closed {
-        tracing::warn!(%error, "open light stretches not ended");
+fn network_of(text: Option<&str>) -> Option<&'static str> {
+    ["wifi", "thread", "ethernet"]
+        .into_iter()
+        .find(|network| text == Some(*network))
+}
+
+fn open_outages(db: &Connection) -> rusqlite::Result<Vec<Outage>> {
+    db.prepare(
+        "SELECT node_id, endpoint, name, network, started_at, found_by, reconnects,
+            reconnect_result, reachable, notified, advised
+         FROM light_outages WHERE ended_at IS NULL",
+    )?
+    .query_map([], |row| {
+        let key = row
+            .get::<_, Option<i64>>(0)?
+            .and_then(|node| u64::try_from(node).ok())
+            .zip(row.get::<_, Option<u16>>(1)?);
+        let found_by = match row.get::<_, String>(5)?.as_str() {
+            "no_answer" => Cause::NoAnswer,
+            "unreachable" => Cause::Unreachable,
+            _ => Cause::Unavailable,
+        };
+        let mut outage = Outage::new(
+            key,
+            &row.get::<_, String>(2)?,
+            network_of(row.get::<_, Option<String>>(3)?.as_deref()),
+            row.get(4)?,
+            found_by,
+        )
+        .told(row.get(9)?, row.get(10)?);
+        outage.reconnects = row.get(6)?;
+        outage.reconnect_result = row.get(7)?;
+        outage.reachable = row.get(8)?;
+        Ok(outage)
+    })?
+    .collect()
+}
+
+/// Takes back the stretches still open when home-link last stopped, so what was told is not
+/// told again and a light back is told back.
+pub(crate) fn resume(state: &AppState) {
+    match open_outages(&state.db.lock().expect(UNPOISONED)) {
+        Ok(outages) => state.watch.lock().expect(UNPOISONED).resume(outages),
+        Err(error) => tracing::warn!(%error, "open light stretches not taken back"),
     }
 }
 
@@ -87,11 +125,12 @@ fn key_text(key: Option<Key>) -> String {
 fn save(db: &Connection, outage: &Outage) -> rusqlite::Result<()> {
     db.execute(
         "INSERT INTO light_outages (key, node_id, endpoint, name, network, started_at, ended_at,
-            found_by, reconnects, reconnect_result, reachable)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            found_by, reconnects, reconnect_result, reachable, notified, advised)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
          ON CONFLICT (key, started_at) DO UPDATE SET name = excluded.name,
             ended_at = excluded.ended_at, reconnects = excluded.reconnects,
-            reconnect_result = excluded.reconnect_result, reachable = excluded.reachable",
+            reconnect_result = excluded.reconnect_result, reachable = excluded.reachable,
+            notified = excluded.notified, advised = excluded.advised",
         params![
             key_text(outage.key()),
             outage
@@ -106,6 +145,8 @@ fn save(db: &Connection, outage: &Outage) -> rusqlite::Result<()> {
             outage.reconnects,
             outage.reconnect_result,
             outage.reachable,
+            outage.notified(),
+            outage.advised(),
         ],
     )?;
     Ok(())
@@ -162,28 +203,32 @@ fn keep_check(state: &AppState, at: i64) -> rusqlite::Result<()> {
         params![at, server, Value::from(lights).to_string()],
     )?;
     db.execute("DELETE FROM light_checks WHERE at < ?1", [at - KEPT])?;
-    db.execute(
-        "DELETE FROM light_outages WHERE COALESCE(ended_at, started_at) < ?1",
-        [at - KEPT],
-    )?;
+    // A stretch still going is kept however long it has lasted.
+    db.execute("DELETE FROM light_outages WHERE ended_at < ?1", [at - KEPT])?;
     Ok(())
 }
 
 /// What one check saw: every light with its name, availability and, when due, whether it
-/// answered a read; `None` when matterjs-server was out of reach.
-async fn observe(state: &AppState, url: &str, at: i64) -> Option<Vec<Seen>> {
+/// answered a read; `Ok(None)` when matterjs-server was out of reach.
+///
+/// # Errors
+/// When the ledger cannot be read: which lights it ignores is not known, so nothing is judged.
+async fn observe(state: &AppState, url: &str, at: i64) -> rusqlite::Result<Option<Vec<Seen>>> {
     let deadline = Instant::now() + CHECK_TIMEOUT;
-    let mut link = Link::open(url, deadline).await.ok()?;
+    let Ok(mut link) = Link::open(url, deadline).await else {
+        return Ok(None);
+    };
     let Ok(nodes) = link.nodes(deadline).await else {
         link.close().await;
-        return None;
+        return Ok(None);
     };
     let lights = matter::lights(&nodes);
-    let names = match ledger(&state.db.lock().expect(UNPOISONED)) {
+    let devices = ledger(&state.db.lock().expect(UNPOISONED));
+    let names = match devices {
         Ok(devices) => match_ledger(&devices, &nodes, &lights).0,
         Err(error) => {
-            tracing::warn!(%error, "ledger not read for the light watch");
-            vec![(None, false); lights.len()]
+            link.close().await;
+            return Err(error);
         }
     };
     let mut seen: Vec<Seen> = lights
@@ -222,7 +267,7 @@ async fn observe(state: &AppState, url: &str, at: i64) -> Option<Vec<Seen>> {
         }
     }
     link.close().await;
-    Some(seen)
+    Ok(Some(seen))
 }
 
 /// What a request to matterjs-server about a device came to, in a word and its details.
@@ -339,7 +384,13 @@ pub(crate) async fn check(state: &AppState, at: i64) {
     let Some(url) = state.matter_url.as_deref() else {
         return;
     };
-    let seen = observe(state, url, at).await;
+    let seen = match observe(state, url, at).await {
+        Ok(seen) => seen,
+        Err(error) => {
+            tracing::warn!(%error, "ledger not read; lights not checked");
+            return;
+        }
+    };
     let step =
         state
             .watch
@@ -373,14 +424,30 @@ pub(crate) async fn check(state: &AppState, at: i64) {
         .ping
         .iter()
         .map(|key| ping(state, url, *key, name(key)));
-    let notices = step.notices.iter().map(|notice| async move {
-        let _ = send(state, notice).await;
-    });
     tokio::join!(
         futures_util::future::join_all(reconnects),
         futures_util::future::join_all(pings),
-        futures_util::future::join_all(notices),
+        deliver(state, step.notices),
     );
+}
+
+/// Sends the notices left unsent, oldest first, then `notices`; those that fail wait for the next check.
+async fn deliver(state: &AppState, notices: Vec<Notice>) {
+    let mut queue = std::mem::take(&mut *state.unsent.lock().expect(UNPOISONED));
+    queue.extend(notices);
+    let mut unsent = Vec::new();
+    for notice in queue {
+        if send(state, &notice).await.is_err() {
+            unsent.push(notice);
+        }
+    }
+    let mut kept = state.unsent.lock().expect(UNPOISONED);
+    unsent.append(&mut kept);
+    let over = unsent.len().saturating_sub(MAX_UNSENT);
+    if over > 0 {
+        tracing::warn!(dropped = over, "unsent notices dropped");
+    }
+    *kept = unsent.split_off(over);
 }
 
 /// The watch's state: matterjs-server, each light, and whether messages have somewhere to go.

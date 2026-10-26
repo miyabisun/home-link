@@ -130,13 +130,14 @@ matterjs-serverに届かなくなったときは `warn` の `matterjs-server out
   答えなかった照明は、次の分にもう一度読みます。
 - `available` でない照明と、読み取りに2回続けて答えない照明は、切れたと数えます。
   切れた照明は、matterjs-serverに `interview_node`（nodeの全体を新しいsessionで読み直す）を送ってつなぎ直させます。照明を入り切りする命令や明るさ・色の命令は送りません。
-  同じ照明へのつなぎ直しは10分に1回までです。Wi-Fiの照明は、同時に `ping_node` で、matterjs-serverの動く場所から照明のアドレスにpingが届くか（網の層で届くか）を確かめます。
+  同じ照明へのつなぎ直しは10分に1回まで、1回の確かめで送るのは3台までです（待っている時間の長い照明から送ります）。Wi-Fiの照明は、同時に `ping_node` で、matterjs-serverの動く場所から照明のアドレスにpingが届くか（網の層で届くか）を確かめます。
 - 5分以上つながらない照明は、Discordへ1通知らせます（照明名・Wi-Fi／Thread・切れた時刻。同じ確かめで切れた照明は1通にまとめます）。
   戻ったら、つながらなかった時間を1通知らせます。5分より前に戻った照明は知らせません。
 - つなぎ直しを3回しても戻らない照明は、壁のスイッチで電源を入れ直す案内と、網の層で届くかを1通知らせます。
 - matterjs-serverに5分以上届かないときは、照明ごとではなく、matterjs-serverが届かないことを1通知らせます。その間は照明を判断しません。
   matterjs-serverの再起動はhome-linkでは行いません。
-- 知らせの送り先が未設定でも、見張り・つなぎ直し・履歴は同じように動きます。
+- 知らせの送り先が未設定でも、見張り・つなぎ直し・履歴は同じように動きます。送り先が受け付けなかった知らせは、次の確かめで送り直します（20通まで）。
+- home-linkを起動し直しても、続いている区間と知らせた事実を引き継ぎます。同じ照明を重ねて知らせず、戻ったら知らせます。
 
 | API | 内容 |
 | --- | --- |
@@ -146,7 +147,7 @@ matterjs-serverに届かなくなったときは `warn` の `matterjs-server out
 | `POST /api/lights/watch/test` | 試しの知らせを1通送ります。送り先が未設定なら503 `notify_not_configured`、送れなければ502 `notify_failed` |
 
 区間は `started_at`・`ended_at`（続いていればnull）・`network`・`found_by`（`unavailable`・`no_answer`・matterjs-serverの `unreachable`）・`reconnects`・`reconnect_result`（`accepted` か失敗の理由）・`reachable`（pingが届いたか）を持ちます。
-時刻はUnix秒です。home-linkが止まっていた間の区間は、起動時に最後の確かめの時刻で閉じます。
+時刻はUnix秒です。
 
 ```sh
 curl http://home-link.example:5011/api/lights/watch

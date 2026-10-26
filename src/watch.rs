@@ -17,6 +17,9 @@ use crate::schedule;
 pub const READ_EVERY: i64 = 300;
 /// A light down this long, in seconds, is told to the user; so is matterjs-server out of reach.
 pub const NOTIFY_AFTER: i64 = 300;
+/// At most this many lights are asked to reconnect in one check, so lights that all go down
+/// at once, as when matterjs-server or the Thread border router restarts, do not flood it.
+pub const MAX_RECONNECTS_PER_CHECK: usize = 3;
 /// One light is asked to reconnect at most this often, in seconds.
 pub const RECONNECT_EVERY: i64 = 600;
 /// Reads in a row a light that stays `available` leaves unanswered before it is down.
@@ -89,7 +92,8 @@ pub struct Outage {
 }
 
 impl Outage {
-    fn new(
+    #[must_use]
+    pub fn new(
         key: Option<Key>,
         name: &str,
         network: Option<&'static str>,
@@ -110,6 +114,26 @@ impl Outage {
             notified: false,
             advised: false,
         }
+    }
+
+    /// The stretch as kept, with whether the user was told of it and told to switch the light off and on.
+    #[must_use]
+    pub const fn told(mut self, notified: bool, advised: bool) -> Self {
+        self.notified = notified;
+        self.advised = advised;
+        self
+    }
+
+    /// Whether the user was told of it.
+    #[must_use]
+    pub const fn notified(&self) -> bool {
+        self.notified
+    }
+
+    /// Whether the user was told to switch the light off and on.
+    #[must_use]
+    pub const fn advised(&self) -> bool {
+        self.advised
     }
 
     /// The light, or `None` for matterjs-server.
@@ -282,19 +306,8 @@ impl Watch {
 
     fn lights_seen(&mut self, at: i64, seen: &[Seen], step: &mut Step) {
         let watched: Vec<&Seen> = seen.iter().filter(|light| !light.ignored).collect();
-        // Lights no longer served, or ignored since, end their stretch untold.
-        let gone: Vec<Key> = self
-            .lights
-            .keys()
-            .filter(|key| !watched.iter().any(|light| light.key == **key))
-            .copied()
-            .collect();
-        for key in gone {
-            if let Some(mut outage) = self.lights.remove(&key).and_then(|light| light.outage) {
-                outage.ended_at = Some(at);
-                step.changes.push(Change::Up(outage));
-            }
-        }
+        self.forget(at, seen, &watched, step);
+        let mut due = Vec::new();
         let (mut down, mut still_down, mut up) = (Vec::new(), Vec::new(), Vec::new());
         for seen in watched {
             let light = self.lights.entry(seen.key).or_default();
@@ -336,19 +349,13 @@ impl Watch {
                 step.changes.push(Change::Down(outage.clone()));
                 outage
             });
-            let mut updated = false;
             if light
                 .last_reconnect
                 .is_none_or(|last| at - last >= RECONNECT_EVERY)
             {
-                light.last_reconnect = Some(at);
-                outage.reconnects += 1;
-                step.reconnect.push(seen.key);
-                if seen.network == Some("wifi") {
-                    step.ping.push(seen.key);
-                }
-                updated = true;
+                due.push((light.last_reconnect, seen.key));
             }
+            let mut updated = false;
             if !outage.notified && at - outage.started_at >= NOTIFY_AFTER {
                 outage.notified = true;
                 down.push(told(outage));
@@ -367,6 +374,7 @@ impl Watch {
                 step.changes.push(Change::Updated(outage.clone()));
             }
         }
+        self.reconnect(at, due, step);
         for (lights, notice) in [
             (down, Notice::Down as fn(Vec<Told>) -> Notice),
             (still_down, Notice::StillDown),
@@ -378,8 +386,66 @@ impl Watch {
         }
     }
 
+    /// A light ignored since ends its stretch untold. One matterjs-server no longer serves
+    /// stays as it was while down, and is no longer watched while up.
+    fn forget(&mut self, at: i64, seen: &[Seen], watched: &[&Seen], step: &mut Step) {
+        let gone: Vec<Key> = self
+            .lights
+            .iter()
+            .filter(|(key, light)| {
+                !watched.iter().any(|light| light.key == **key)
+                    && (light.outage.is_none() || seen.iter().any(|light| light.key == **key))
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        for key in gone {
+            if let Some(mut outage) = self.lights.remove(&key).and_then(|light| light.outage) {
+                outage.ended_at = Some(at);
+                step.changes.push(Change::Up(outage));
+            }
+        }
+    }
+
+    /// Asks the lights `due` to reconnect, those waiting longest first and at most
+    /// [`MAX_RECONNECTS_PER_CHECK`]; the rest wait for the next check.
+    fn reconnect(&mut self, at: i64, mut due: Vec<(Option<i64>, Key)>, step: &mut Step) {
+        due.sort();
+        for (_, key) in due.into_iter().take(MAX_RECONNECTS_PER_CHECK) {
+            let light = self.lights.get_mut(&key).expect("a light due is watched");
+            light.last_reconnect = Some(at);
+            if let Some(outage) = light.outage.as_mut() {
+                outage.reconnects += 1;
+                step.changes.push(Change::Updated(outage.clone()));
+            }
+            step.reconnect.push(key);
+            if light.network == Some("wifi") {
+                step.ping.push(key);
+            }
+        }
+    }
+
     fn outage_mut(&mut self, key: Key) -> Option<&mut Outage> {
         self.lights.get_mut(&key)?.outage.as_mut()
+    }
+
+    /// Takes back the stretches still open when home-link last stopped: what was told stays told.
+    pub fn resume(&mut self, outages: Vec<Outage>) {
+        for outage in outages {
+            match outage.key() {
+                None => self.server = Some(outage),
+                Some(key) => {
+                    self.lights.insert(
+                        key,
+                        Light {
+                            name: outage.name.clone(),
+                            network: outage.network,
+                            outage: Some(outage),
+                            ..Light::default()
+                        },
+                    );
+                }
+            }
+        }
     }
 
     /// Records what asking matterjs-server to reconnect `key` came to.
@@ -683,7 +749,18 @@ mod tests {
     #[test]
     fn a_light_is_reconnected_at_most_once_in_ten_minutes_even_when_all_go_down() {
         let mut watch = Watch::default();
-        let names = ["玄関", "廊下", "階段", "寝室", "居間"];
+        let names = [
+            "玄関",
+            "廊下",
+            "階段",
+            "寝室",
+            "居間",
+            "台所",
+            "書斎",
+            "洗面",
+            "物干し",
+            "納戸",
+        ];
         let steps = run(&mut watch, 0, 60, true, |n| {
             Some(
                 names
@@ -693,14 +770,87 @@ mod tests {
                     .collect(),
             )
         });
-        for node in 1..=5 {
+        for (n, step) in &steps {
+            assert!(
+                step.reconnect.len() <= MAX_RECONNECTS_PER_CHECK,
+                "minute {n}: {:?}",
+                step.reconnect
+            );
+        }
+        for node in 1..=10 {
             let at = reconnects(&steps, (node, 1));
-            assert_eq!(at, vec![2, 12, 22, 32, 42, 52], "light {node}");
+            assert!(at[0] <= 2 + 3, "light {node} waits its turn: {at:?}");
             assert!(
                 at.windows(2).all(|w| w[1] - w[0] >= 10),
                 "light {node}: {at:?}"
             );
+            assert!(
+                at.len() >= 5,
+                "light {node} keeps being reconnected: {at:?}"
+            );
         }
+    }
+
+    #[test]
+    fn a_light_matterjs_server_stops_serving_stays_as_it_was() {
+        let mut watch = Watch::default();
+        let both = |first: bool| vec![light(1, "玄関", first, None), light(2, "廊下", true, None)];
+        watch.step(minute(0), Some(&both(true)), true);
+        watch.step(minute(1), Some(&both(false)), true);
+        // The first light goes missing from the nodes while down: still down, untold back.
+        let steps = run(&mut watch, 2, 30, true, |_| {
+            Some(vec![light(2, "廊下", true, None)])
+        });
+        let told = notices(&steps);
+        assert!(
+            told.iter()
+                .all(|(_, notice)| !matches!(notice, Notice::Up(_))),
+            "{told:?}"
+        );
+        assert!(
+            steps
+                .iter()
+                .all(|(_, step)| !step.changes.iter().any(|c| matches!(c, Change::Up(_)))),
+            "its stretch stays open"
+        );
+        assert_eq!(reconnects(&steps, (1, 1)), Vec::<i64>::new());
+        assert_eq!(
+            watch.connected(),
+            vec![
+                ((1, 1), "玄関".into(), false),
+                ((2, 1), "廊下".into(), true)
+            ]
+        );
+        // A light up when it goes missing is no longer watched.
+        watch.step(minute(31), Some(&[light(1, "玄関", true, None)]), true);
+        assert_eq!(watch.connected(), vec![((1, 1), "玄関".into(), true)]);
+    }
+
+    #[test]
+    fn stretches_open_when_home_link_stopped_carry_on_after_it_starts() {
+        let mut before = Watch::default();
+        let mut open = Vec::new();
+        for n in 0..=10 {
+            let step = before.step(minute(n), Some(&[light(1, "玄関", n < 1, None)]), true);
+            open.extend(step.changes.into_iter().filter_map(|c| match c {
+                Change::Down(o) | Change::Updated(o) => Some(o),
+                Change::Up(_) => None,
+            }));
+        }
+        let last = open.last().cloned().expect("the stretch was kept");
+        assert!(last.notified(), "told before the restart");
+
+        let mut after = Watch::default();
+        after.resume(vec![last]);
+        let steps = run(&mut after, 20, 25, true, |n| {
+            Some(vec![light(1, "玄関", n >= 24, None)])
+        });
+        let told = notices(&steps);
+        assert_eq!(told.len(), 1, "not told down again: {told:?}");
+        let (24, Notice::Up(lights)) = &told[0] else {
+            panic!("{told:?}");
+        };
+        assert_eq!(lights[0].since, minute(1));
     }
 
     #[test]
@@ -779,7 +929,6 @@ mod tests {
         });
         assert_eq!(notices(&steps), vec![]);
         assert_eq!(reconnects(&steps, (1, 1)), Vec::<i64>::new());
-        assert!(!watch.read_due(minute(31), (1, 1)) || watch.status().lights.is_empty());
         assert!(watch.status().lights.is_empty(), "not watched");
     }
 
