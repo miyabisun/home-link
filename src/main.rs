@@ -51,7 +51,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         None => info!("SwitchBot meter unset"),
         Some(text) => match home_link::meter::address(&text) {
             Some(address) => {
-                info!(%address, "SwitchBot meter");
+                // The address stays out of the logs, as out of the repository.
+                info!("SwitchBot meter set");
                 home = home.with_meter(address);
             }
             None => {

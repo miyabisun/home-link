@@ -282,6 +282,10 @@ struct Fake {
     silent_reads: Vec<(u64, u64)>,
     /// Only the first `get_nodes` on each connection is answered.
     nodes_once: bool,
+    /// `(node_id, endpoint)` whose commands matterjs-server fails itself, with these details.
+    server_errors: Vec<((u64, u64), &'static str)>,
+    /// Milliseconds every reply, `get_nodes` included, waits; changeable while serving.
+    slow_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Serves `get_nodes` and On/Off `device_command` the way matterjs-server does,
@@ -305,18 +309,24 @@ async fn fake_light_server(
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
             *count.lock().unwrap() += 1;
             let info = json!({ "fabric_id": 1, "schema_version": 13 });
-            ws.send(Message::text(info.to_string())).await.unwrap();
+            // A client that gave up waiting for this connection has gone.
+            if ws.send(Message::text(info.to_string())).await.is_err() {
+                continue;
+            }
             // Delayed replies with when they are due.
             let mut later: Vec<(tokio::time::Instant, Value)> = Vec::new();
             let mut nodes_read = false;
-            loop {
+            'connection: loop {
                 let due = later.iter().map(|(at, _)| *at).min();
                 let message = tokio::select! {
                     message = ws.next() => message,
                     () = tokio::time::sleep_until(due.unwrap_or_else(tokio::time::Instant::now)), if due.is_some() => {
                         let now = tokio::time::Instant::now();
                         for (_, reply) in later.extract_if(.., |(at, _)| *at <= now) {
-                            ws.send(Message::text(reply.to_string())).await.unwrap();
+                            // The client may have given up on the connection meanwhile.
+                            if ws.send(Message::text(reply.to_string())).await.is_err() {
+                                break 'connection;
+                            }
                         }
                         continue;
                     }
@@ -375,8 +385,13 @@ async fn fake_light_server(
                                 continue;
                             }
                         }
-                        if fake.failing.contains(&target) {
-                            json!({ "message_id": id, "error_code": 0, "details": "failed" })
+                        if let Some((_, details)) =
+                            fake.server_errors.iter().find(|(t, _)| *t == target)
+                        {
+                            json!({ "message_id": id, "error_code": 0, "details": details })
+                        } else if fake.failing.contains(&target) {
+                            // The device answered with an Interaction Model status: FAILURE.
+                            json!({ "message_id": id, "error_code": 0, "details": "failed", "status": 1 })
                         } else {
                             let lights = args["command_name"] == "MoveToLevelWithOnOff";
                             if (args["cluster_id"] == 6 || lights)
@@ -420,6 +435,14 @@ async fn fake_light_server(
                     }
                     other => panic!("unexpected command {other}"),
                 };
+                let slow = fake.slow_ms.load(Ordering::Relaxed);
+                if slow > 0 {
+                    later.push((
+                        tokio::time::Instant::now() + Duration::from_millis(slow),
+                        reply,
+                    ));
+                    continue;
+                }
                 ws.send(Message::text(reply.to_string())).await.unwrap();
             }
         }
@@ -3414,6 +3437,7 @@ fn capture_logs() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard) {
     let writer = Logs(logs.clone());
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
         .with_writer(move || writer.clone())
         .finish();
     (logs, tracing::subscriber::set_default(subscriber))
@@ -4042,14 +4066,14 @@ async fn plugs_get_their_kind_and_are_switched_one_at_a_time() {
     let (_, device) = call(&app, "GET", &format!("/api/devices/{}", ids[5]), None).await;
     assert_eq!(device["on"], true);
 
-    // No answer, or unavailable and so not sent to.
+    // No answer, sent again as a label's plugs are, or unavailable and so not sent to.
     commands.lock().unwrap().clear();
     let (status, body) = call(&app, "POST", &switch(&ids[3], "off"), None).await;
     assert_eq!(
-        (status, &body["state"]),
-        (StatusCode::OK, &json!("no_response"))
+        (status, &body["state"], &body["reason"]),
+        (StatusCode::OK, &json!("no_response"), &json!("no_answer"))
     );
-    assert_eq!(sent(&commands).len(), 1);
+    assert_eq!(sent(&commands).len(), 2);
     commands.lock().unwrap().clear();
     let (status, body) = call(&app, "POST", &switch(&ids[4], "off"), None).await;
     assert_eq!(
@@ -6151,4 +6175,427 @@ fn moves_changed_schedule_coordinates_to_the_home_location() {
         drop(db);
         let _ = std::fs::remove_file(&path);
     }
+}
+
+// The connection to matterjs-server: every step has a deadline, and each light's result tells
+// apart a light not sent to, one that did not answer, matterjs-server's own error and the
+// device's refusal.
+
+/// Within this a request returns when matterjs-server takes the connection but never answers
+/// the WebSocket upgrade: the three seconds a connection may take to open, and a margin.
+const HUNG_WITHIN: Duration = Duration::from_secs(5);
+/// `HUNG_WITHIN` for a request that tries two connections, one to act and one to read back.
+const HUNG_TWICE_WITHIN: Duration = Duration::from_secs(8);
+
+/// The longest a light request may take however slowly matterjs-server answers: the fifteen
+/// seconds of its budget, and a margin.
+const BUDGET_WITHIN: Duration = Duration::from_secs(16);
+
+async fn within<T>(what: &str, limit: Duration, future: impl Future<Output = T>) -> T {
+    tokio::time::timeout(limit, future)
+        .await
+        .unwrap_or_else(|_| panic!("{what} still running after {limit:?}"))
+}
+
+/// Takes every TCP connection, but passes on to `behind` only those `serves` picks by their
+/// order, from 0; the rest are held unanswered, as by a matterjs-server whose event loop is stuck.
+async fn hanging(behind: Option<SocketAddr>, serves: fn(usize) -> bool) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        for n in 0.. {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            match behind.filter(|_| serves(n)) {
+                Some(behind) => {
+                    tokio::spawn(async move {
+                        let mut upstream = tokio::net::TcpStream::connect(behind).await.unwrap();
+                        let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
+                    });
+                }
+                None => held.push(stream),
+            }
+        }
+    });
+    addr
+}
+
+/// Records a device by its identifiers alone, without reading matterjs-server; its id.
+fn insert_device(db: &rusqlite::Connection, vendor: &str, serial: &str, name: &str) -> i64 {
+    db.execute(
+        "INSERT INTO devices (vendor, serial_number, name) VALUES (?1, ?2, ?3)",
+        rusqlite::params![vendor, serial, name],
+    )
+    .unwrap();
+    db.last_insert_rowid()
+}
+
+fn night() -> i64 {
+    NIGHT
+}
+
+#[tokio::test]
+async fn a_matter_server_that_never_answers_the_upgrade_holds_up_no_request_or_loop() {
+    let hung = hanging(None, |_| false).await;
+    let path = std::env::temp_dir().join(format!("home-link-hung-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let sql = home_link::open_db(path.to_str().unwrap()).unwrap();
+    let home = home_link::Home::new(
+        home_link::open_db(path.to_str().unwrap()).unwrap(),
+        Some(format!("ws://{hung}/ws")),
+    )
+    .with_clock(night);
+    let app = home.router();
+    let light = insert_device(&sql, "Tapo", TAPO, "読書灯");
+    let plug = insert_device(&sql, "Plugco", "plug-a", "プラグ");
+    insert_device(&sql, "Airco", "ac-1", "エアコン");
+    sql.execute(
+        "INSERT INTO wifi_networks (ssid, password, for_devices) VALUES ('home-2g', ?1, 1)",
+        [PASSWORD],
+    )
+    .unwrap();
+    let room = create_label(&app, json!({ "name": "room" })).await;
+    for id in [light, plug] {
+        sql.execute(
+            "INSERT INTO device_labels (device_id, label_id) VALUES (?1, ?2)",
+            rusqlite::params![id, room["id"].as_i64().unwrap()],
+        )
+        .unwrap();
+    }
+    // 23:00 in Tokyo, NIGHT's minute.
+    sql.execute(
+        "INSERT INTO label_schedules (label_id, minute, \"on\") VALUES (?1, 1380, 1)",
+        [room["id"].as_i64().unwrap()],
+    )
+    .unwrap();
+    home.record_meter(HOT, NIGHT);
+
+    for (method, uri, body, limit) in [
+        ("POST", "/api/lights/on".to_owned(), None, HUNG_WITHIN),
+        (
+            "POST",
+            format!("/api/labels/{}/on", room["id"]),
+            None,
+            HUNG_WITHIN,
+        ),
+        ("POST", format!("/api/devices/{plug}/on"), None, HUNG_WITHIN),
+        (
+            "POST",
+            "/api/commission".to_owned(),
+            Some(commission_body()),
+            HUNG_WITHIN,
+        ),
+        (
+            "PUT",
+            "/api/aircon".to_owned(),
+            Some(json!({ "on": true })),
+            HUNG_TWICE_WITHIN,
+        ),
+        ("GET", "/api/lights".to_owned(), None, HUNG_WITHIN),
+    ] {
+        let (status, error) = within(uri.as_str(), limit, call(&app, method, &uri, body)).await;
+        if method == "POST" {
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{uri} {error}");
+            assert_eq!(error["error"], "matter_server_unreachable", "{uri} {error}");
+        }
+    }
+    // Each minute's label schedules and each ten minutes' adjustments end, so the next comes.
+    within("label schedules", HUNG_WITHIN, home.run_schedules(NIGHT)).await;
+    within(
+        "light adjustment",
+        HUNG_WITHIN,
+        home.adjust(NIGHT, "scheduled"),
+    )
+    .await;
+    within("aircon adjustment", HUNG_WITHIN, home.adjust_aircon(NIGHT)).await;
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn a_matter_server_that_stops_answering_after_the_nodes_holds_up_no_device() {
+    let mut nodes = aircon_nodes();
+    let mut bulb = wifi_bulb();
+    bulb["attributes"]["0/40/15"] = json!("bulb-w");
+    nodes.as_array_mut().unwrap().push(bulb);
+    let (behind, _, _) = fake_light_server(nodes, Fake::default()).await;
+    // Each request reads the nodes on one connection, then opens another to act.
+    let hung = hanging(Some(behind), |n| n % 2 == 0).await;
+    let (db, sql) = ledger();
+    let home = home_link::Home::new(db, Some(format!("ws://{hung}/ws"))).with_clock(night);
+    let app = home.router();
+    let plug = insert_device(&sql, "Plugco", "plug-a", "プラグ");
+    let bulb = insert_device(&sql, "Tapo", "bulb-w", "電球");
+    insert_device(&sql, "Airco", "ac-1", "エアコン");
+    sql.execute(
+        "INSERT INTO wifi_networks (ssid, password, for_devices) VALUES ('iot-2g', ?1, 1)",
+        [IOT_PASSWORD],
+    )
+    .unwrap();
+
+    for uri in [
+        format!("/api/devices/{plug}/on"),
+        format!("/api/devices/{bulb}/wifi"),
+    ] {
+        let (status, error) = within(&uri, HUNG_WITHIN, call(&app, "POST", &uri, None)).await;
+        assert_eq!(
+            (status, &error["error"]),
+            (StatusCode::BAD_GATEWAY, &json!("matter_server_unreachable")),
+            "{uri} {error}"
+        );
+    }
+    home.record_meter(HOT, NIGHT);
+    within("aircon adjustment", HUNG_WITHIN, home.adjust_aircon(NIGHT)).await;
+}
+
+/// The line of `logs` holding every one of `parts`.
+fn log_line<'a>(logs: &'a str, parts: &[&str]) -> Option<&'a str> {
+    logs.lines()
+        .find(|line| parts.iter().all(|part| line.contains(part)))
+}
+
+fn logged(logs: &Arc<Mutex<Vec<u8>>>) -> String {
+    String::from_utf8_lossy(&logs.lock().unwrap()).into_owned()
+}
+
+#[tokio::test]
+async fn lights_that_all_stay_silent_are_told_from_lights_that_each_miss() {
+    let (logs, _guard) = capture_logs();
+    let fake = Fake {
+        silent: vec![(1, 3), (5, 1)],
+        ..Fake::default()
+    };
+    let (addr, _, _) = fake_light_server(home_nodes(), fake).await;
+    let (app, sql) = light_app(addr).await;
+    let room = create_label(&app, json!({ "name": "room" })).await;
+    for id in [1, 2] {
+        assert_eq!(
+            assign(&app, &json!({ "id": id }), &[&room]).await.0,
+            StatusCode::OK
+        );
+    }
+    drop(sql);
+
+    for uri in [
+        "/api/lights/on".to_owned(),
+        format!("/api/labels/{}/on", room["id"]),
+    ] {
+        let (status, body) = call(&app, "POST", &uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri} {body}");
+        assert_eq!(body["none_answered"], true, "{uri} {body}");
+        assert_eq!(body["switched"], 0, "{uri} {body}");
+    }
+    let logs = logged(&logs);
+    assert!(
+        log_line(
+            &logs,
+            &["WARN", "matterjs-server answered none of the commands"]
+        )
+        .is_some(),
+        "{logs}"
+    );
+    assert!(
+        log_line(&logs, &["WARN", "node_id=5", "endpoint=1", "no_answer"]).is_some(),
+        "{logs}"
+    );
+
+    // One light answering is not the server going silent.
+    let fake = Fake {
+        silent: vec![(1, 3)],
+        ..Fake::default()
+    };
+    let (addr, _, _) = fake_light_server(home_nodes(), fake).await;
+    let (app, _) = light_app(addr).await;
+    let (status, body) = call(&app, "POST", "/api/lights/on", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["none_answered"], false, "{body}");
+}
+
+#[tokio::test]
+async fn matter_server_errors_are_told_from_refusals_and_logged_with_their_details() {
+    let (logs, _guard) = capture_logs();
+    let fake = Fake {
+        server_errors: vec![((5, 1), "Node 5 is not connected")],
+        failing: vec![(1, 3)],
+        ..Fake::default()
+    };
+    let (addr, _, _) = fake_light_server(home_nodes(), fake).await;
+    let (app, _) = light_app(addr).await;
+
+    let (status, body) = call(&app, "POST", "/api/lights/on", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let entries: Vec<_> = body["lights"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| {
+            (
+                l["node_id"].clone(),
+                l["result"].clone(),
+                l["reason"].clone(),
+                l["details"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        entries,
+        [
+            (
+                json!(1),
+                json!("no_response"),
+                json!("not_connected"),
+                Value::Null
+            ),
+            (
+                json!(1),
+                json!("failed"),
+                json!("refused"),
+                json!("failed (status 1)")
+            ),
+            (
+                json!(5),
+                json!("failed"),
+                json!("server_error"),
+                json!("Node 5 is not connected")
+            ),
+            (
+                json!(16),
+                json!("no_response"),
+                json!("not_connected"),
+                Value::Null
+            ),
+        ],
+        "{body}"
+    );
+    assert_eq!(body["none_answered"], false, "{body}");
+    let logs = logged(&logs);
+    assert!(
+        log_line(
+            &logs,
+            &[
+                "WARN",
+                "node_id=5",
+                "server_error",
+                "Node 5 is not connected"
+            ]
+        )
+        .is_some(),
+        "{logs}"
+    );
+    assert!(
+        log_line(&logs, &["WARN", "node_id=1", "endpoint=3", "refused"]).is_some(),
+        "{logs}"
+    );
+
+    // A plug matterjs-server could not reach did not answer; one that refused failed.
+    let fake = Fake {
+        server_errors: vec![((20, 1), "Node 20 is not connected")],
+        failing: vec![(21, 1)],
+        ..Fake::default()
+    };
+    let (addr, _, _) = fake_light_server(plug_nodes(), fake).await;
+    let (db, sql) = ledger();
+    let app = home_link::app(db, Some(format!("ws://{addr}/ws")));
+    let unreached = insert_device(&sql, "Plugco", "plug-a", "A");
+    let refusing = insert_device(&sql, "Plugco", "plug-b", "B");
+    let (status, body) = call(&app, "POST", &format!("/api/devices/{unreached}/on"), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        (&body["state"], &body["reason"], &body["details"]),
+        (
+            &json!("no_response"),
+            &json!("server_error"),
+            &json!("Node 20 is not connected")
+        )
+    );
+    let (status, body) = call(&app, "POST", &format!("/api/devices/{refusing}/on"), None).await;
+    assert_eq!(
+        (status, &body["error"]),
+        (StatusCode::BAD_GATEWAY, &json!("switch_failed")),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn a_light_that_answers_after_the_window_counts_by_the_state_it_reports() {
+    let fake = Fake {
+        delayed: vec![((5, 1), 3000)],
+        ..Fake::default()
+    };
+    let (addr, _, _) = fake_light_server(home_nodes(), fake).await;
+    let (app, _) = light_app(addr).await;
+
+    let (status, body) = within(
+        "all on",
+        ANSWERED_WITHIN + Duration::from_secs(1),
+        call(&app, "POST", "/api/lights/on", None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["lights"][2]["result"], "switched", "{body}");
+
+    // Silent and already in the state asked for: nothing tells it switched.
+    let fake = Fake {
+        silent: vec![(5, 1)],
+        ..Fake::default()
+    };
+    let (addr, _, _) = fake_light_server(home_nodes(), fake).await;
+    let (app, _) = light_app(addr).await;
+    let (status, body) = call(&app, "POST", "/api/lights/off", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["lights"][2]["result"], "no_response", "{body}");
+}
+
+#[tokio::test]
+async fn light_requests_answer_within_their_budget_however_slow_the_server() {
+    let fake = Fake::default();
+    let slow = fake.slow_ms.clone();
+    let (addr, _, _) = fake_light_server(tuning_nodes(), fake).await;
+    let (_, app, _) = auto_home(addr, Some(night)).await;
+    enable(&app).await;
+    // Every reply just within each step's own limit.
+    slow.store(2900, Ordering::Relaxed);
+
+    for uri in ["/api/labels/1/on", "/api/lights/on"] {
+        let (status, body) = within(uri, BUDGET_WITHIN, call(&app, "POST", uri, None)).await;
+        assert_eq!(status, StatusCode::OK, "{uri} {body}");
+    }
+}
+
+#[tokio::test]
+async fn each_request_is_logged_on_one_line_without_secrets() {
+    let (logs, _guard) = capture_logs();
+    let app = app();
+    call(
+        &app,
+        "POST",
+        "/api/wifi",
+        Some(json!({ "ssid": "home-2g", "password": PASSWORD })),
+    )
+    .await;
+    call(&app, "GET", "/api/aircon/runs?since=1791208800", None).await;
+    call(&app, "GET", "/api/nothing", None).await;
+    door_from(&door_app(Err("unset")), "unlock", PEER).await;
+
+    let logs = logged(&logs);
+    assert!(
+        log_line(
+            &logs,
+            &["request", "path=/api/door/unlock", "peer=192.168.1.50"]
+        )
+        .is_some(),
+        "{logs}"
+    );
+    for (method, path, status) in [
+        ("POST", "path=/api/wifi", "status=201"),
+        ("GET", "path=/api/aircon/runs", "status=200"),
+        ("GET", "path=/api/nothing", "status=404"),
+    ] {
+        let line = log_line(
+            &logs,
+            &["request", &format!("method={method}"), path, status, "ms="],
+        );
+        assert!(line.is_some(), "{method} {path}: {logs}");
+    }
+    assert!(!logs.contains(PASSWORD), "{logs}");
+    assert!(!logs.contains("1791208800"), "query logged: {logs}");
 }

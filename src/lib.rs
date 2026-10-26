@@ -1,5 +1,6 @@
 pub mod aircon;
 pub mod commission;
+pub mod link;
 pub mod matter;
 mod mcp;
 pub mod meter;
@@ -25,7 +26,6 @@ use axum::{
 use rusqlite::{Connection, ErrorCode, OptionalExtension, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
-use tower_http::trace::TraceLayer;
 
 const MAX_NAME_CHARS: usize = 100;
 const MAX_QR_CHARS: usize = 512;
@@ -564,7 +564,7 @@ impl Home {
 
     /// Adjusts the lights that are on for `unix` seconds and records the run.
     pub async fn adjust(&self, unix: i64, trigger: &'static str) {
-        adjust(&self.0, unix, trigger, &[]).await;
+        adjust(&self.0, unix, trigger, &[], link::budget()).await;
     }
 
     /// Sends the air conditioner what the meter's reading at `unix` calls for, if anything.
@@ -659,7 +659,28 @@ fn router(state: Db) -> Router {
             axum::routing::post(move |body: axum::body::Bytes| mcp::handle(tools.clone(), body)),
         )
         .fallback_service(get(admin_screen))
-        .layer(TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn(log_request))
+}
+
+/// Logs each request on one line once answered: method, path without its query, the peer,
+/// status and milliseconds. The container's health check polls `/healthz`, logged at debug.
+async fn log_request(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let peer = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map_or_else(|| "-".to_owned(), |info| info.0.ip().to_string());
+    let started = std::time::Instant::now();
+    let response = next.run(request).await;
+    let status = response.status().as_u16();
+    let ms = started.elapsed().as_millis();
+    if path == "/healthz" {
+        tracing::debug!(%method, %path, %peer, status, ms, "request");
+    } else {
+        tracing::info!(%method, %path, %peer, status, ms, "request");
+    }
+    response
 }
 
 /// The admin screen built into `client/dist`.
@@ -894,7 +915,7 @@ async fn observe(state: &AppState, devices: &mut [Device]) {
     let Some(url) = &state.matter_url else {
         return;
     };
-    let nodes = match matter::fetch_nodes(url).await {
+    let nodes = match matter::fetch_nodes(url, link::budget()).await {
         Ok(nodes) => nodes,
         Err(error) => {
             tracing::warn!(%error, "matterjs-server unreachable; device states unknown");
@@ -949,7 +970,9 @@ async fn move_wifi(
         (find_device(&db, id, false)?, wifi_for_devices(&db)?)
     };
     let url = matter_url(&state)?;
-    let nodes = matter::fetch_nodes(url).await.map_err(matter_unreachable)?;
+    let nodes = matter::fetch_nodes(url, link::budget())
+        .await
+        .map_err(matter_unreachable)?;
     let (node_id, from) = wifi_of(&device, &nodes).ok_or_else(|| {
         ApiError(
             StatusCode::CONFLICT,
@@ -997,8 +1020,8 @@ async fn device_off(state: State<Db>, id: Path<i64>) -> ApiResult<Json<serde_jso
     switch_device(state, id, false).await
 }
 
-/// Switches one device that is not a light, such as a plug: `on`, `off` or `no_response`.
-/// Lights are left to "all on" and "all off".
+/// Switches one device that is not a light, such as a plug: `on`, `off` or `no_response`
+/// with why, sent and sent again as a label's devices are. Lights are left to labels.
 async fn switch_device(
     State(state): State<Db>,
     Path(id): Path<i64>,
@@ -1006,7 +1029,10 @@ async fn switch_device(
 ) -> ApiResult<Json<serde_json::Value>> {
     let device = find_device(&state.db.lock().expect(UNPOISONED), id, false)?;
     let url = matter_url(&state)?;
-    let nodes = matter::fetch_nodes(url).await.map_err(matter_unreachable)?;
+    let deadline = link::budget();
+    let nodes = matter::fetch_nodes(url, deadline)
+        .await
+        .map_err(matter_unreachable)?;
     let (node_id, endpoint) = place(&device, &nodes).ok_or_else(|| {
         ApiError(
             StatusCode::CONFLICT,
@@ -1014,31 +1040,44 @@ async fn switch_device(
             "機器がつながっていません".into(),
         )
     })?;
-    let Some((matter::Kind::Plug | matter::Kind::Other, Some((switch, _)))) =
-        matter::kind(&nodes, node_id, endpoint)
-    else {
+    if matter::outlet(&nodes, node_id, endpoint).is_none() {
         return Err(ApiError(
             StatusCode::CONFLICT,
             "not_switchable",
             "入り切りできない機器です".into(),
         ));
+    }
+    let outlet = |nodes: &[serde_json::Value]| {
+        matter::outlet(nodes, node_id, endpoint)
+            .into_iter()
+            .collect()
     };
-    let answered = if matter::describe(&nodes, node_id, endpoint).0 {
-        matter::switch_one(url, node_id, switch, on)
-            .await
-            .map_err(matter_unreachable)?
-    } else {
-        None
-    };
-    tracing::info!(device = id, on, ?answered, "device switched");
-    match answered {
-        None => Ok(Json(json!({ "state": "no_response" }))),
-        Some(true) => Ok(Json(json!({ "state": if on { "on" } else { "off" } }))),
-        Some(false) => Err(ApiError(
+    let switched = matter::switch_among(url, deadline, on, outlet, |_, _| false)
+        .await
+        .map_err(matter_unreachable)?;
+    let outcome = switched
+        .results
+        .into_iter()
+        .next()
+        .map_or(matter::Outcome::NotSent, |(_, outcome)| outcome);
+    tracing::info!(
+        device = id,
+        on,
+        result = outcome.result(),
+        "device switched"
+    );
+    match outcome {
+        matter::Outcome::Accepted => Ok(Json(json!({ "state": if on { "on" } else { "off" } }))),
+        matter::Outcome::Refused(_) => Err(ApiError(
             StatusCode::BAD_GATEWAY,
             "switch_failed",
             "機器が入り切りを受け付けませんでした".into(),
         )),
+        missed => Ok(Json(json!({
+            "state": "no_response",
+            "reason": missed.reason(),
+            "details": missed.details(),
+        }))),
     }
 }
 
@@ -1933,12 +1972,18 @@ fn matter_url(state: &AppState) -> ApiResult<&str> {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn matter_unreachable(error: String) -> ApiError {
-    tracing::warn!(%error, "matterjs-server unreachable");
+fn matter_unreachable(fault: link::Fault) -> ApiError {
+    tracing::warn!(%fault, "matterjs-server unreachable");
+    let message = match fault {
+        link::Fault::Unreachable(_) => "matterjs-serverに接続できませんでした",
+        link::Fault::Timeout(_) => "matterjs-serverが時間内に応答しませんでした",
+        link::Fault::Dropped(_) => "matterjs-serverとの接続が途中で切れました",
+        link::Fault::Failed(_) => "matterjs-serverから機器を読めませんでした",
+    };
     ApiError(
         StatusCode::BAD_GATEWAY,
         "matter_server_unreachable",
-        "matterjs-serverから機器を読めませんでした".into(),
+        message.into(),
     )
 }
 
@@ -1957,7 +2002,7 @@ struct DeviceStatus {
 /// registering again.
 // ponytail: reads every node per request; cache with subscriptions if polled often.
 async fn status(State(state): State<Db>) -> ApiResult<Json<serde_json::Value>> {
-    let nodes = matter::fetch_nodes(matter_url(&state)?)
+    let nodes = matter::fetch_nodes(matter_url(&state)?, link::budget())
         .await
         .map_err(matter_unreachable)?;
     let db = state.db.lock().expect(UNPOISONED);
@@ -2095,7 +2140,7 @@ fn count(values: &[&str], value: &str) -> usize {
 /// and the ledger devices it does not serve.
 // ponytail: reads every node per request; cache with subscriptions if polled often.
 async fn light_states(State(state): State<Db>) -> ApiResult<Json<serde_json::Value>> {
-    let nodes = matter::fetch_nodes(matter_url(&state)?)
+    let nodes = matter::fetch_nodes(matter_url(&state)?, link::budget())
         .await
         .map_err(matter_unreachable)?;
     let lights = matter::lights(&nodes);
@@ -2130,16 +2175,17 @@ async fn light_states(State(state): State<Db>) -> ApiResult<Json<serde_json::Val
 /// without an override is on, and a light under override labels alone is left to them.
 /// When the schedule is on, the lights are brought to the current values.
 async fn lights_on(State(state): State<Db>) -> ApiResult<Json<serde_json::Value>> {
-    let (response, switched) = switch_lights(&state, true).await?;
+    let deadline = link::budget();
+    let (response, switched) = switch_lights(&state, true, deadline).await?;
     if load::<schedule::Settings>(&state.db.lock().expect(UNPOISONED), SCHEDULE)?.enabled {
-        adjust(&state, (state.clock)(), "lights_on", &switched).await;
+        adjust(&state, (state.clock)(), "lights_on", &switched, deadline).await;
     }
     Ok(response)
 }
 
 /// Switches every light off and every label with it, as the app's "all off" did.
 async fn lights_off(State(state): State<Db>) -> ApiResult<Json<serde_json::Value>> {
-    Ok(switch_lights(&state, false).await?.0)
+    Ok(switch_lights(&state, false, link::budget()).await?.0)
 }
 
 /// The label whose lights to boost or release.
@@ -2311,16 +2357,6 @@ async fn switch_label(state: &AppState, id: i64, op: Op) -> ApiResult<serde_json
         targets
     };
     let key = |light: &matter::Light| (light.node_id, light.endpoint);
-    let outcome = |outcome: matter::Outcome| match outcome {
-        matter::Outcome::NoResponse => "no_response",
-        matter::Outcome::Failed => "failed",
-        _ => "switched",
-    };
-    let decision = |decision: matter::Decision| match decision {
-        matter::Decision::NoResponse => "no_response",
-        matter::Decision::Failed => "failed",
-        _ => "switched",
-    };
     let rule_of = |nodes: &[serde_json::Value], light: &matter::Light, labels: &[Label]| {
         schedule::rule(
             labels_of(&devices, nodes, light, labels)
@@ -2328,142 +2364,154 @@ async fn switch_label(state: &AppState, id: i64, op: Op) -> ApiResult<serde_json
                 .map(|l| &l.traits),
         )
     };
-    let (nodes, results, tuned) = match action {
-        "on" => {
-            let mut after = labels.clone();
-            for l in after.iter_mut().filter(|l| l.id == id) {
-                l.traits.on = Some(true);
-            }
-            let (nodes, switched) = matter::switch_among(url, true, targets, |_, _| false)
-                .await
-                .map_err(matter_unreachable)?;
-            let on: Vec<_> = switched
-                .iter()
-                .filter(|(_, o)| *o == matter::Outcome::Switched)
-                .map(|(light, _)| key(light))
-                .collect();
-            let tuned = matter::tune(url, &on, matter::TRANSITION, |nodes, light| {
-                match rule_of(nodes, light, &after) {
-                    schedule::Rule::Fixed(level, kelvin) if on.contains(&key(light)) => {
-                        Ok(schedule::fit(level, kelvin, light))
+    let deadline = link::budget();
+    let (nodes, results, tuned, none_answered) =
+        match action {
+            "on" => {
+                let mut after = labels.clone();
+                for l in after.iter_mut().filter(|l| l.id == id) {
+                    l.traits.on = Some(true);
+                }
+                let switched = matter::switch_among(url, deadline, true, targets, |_, _| false)
+                    .await
+                    .map_err(matter_unreachable)?;
+                let on: Vec<_> = switched
+                    .results
+                    .iter()
+                    .filter(|(_, o)| *o == matter::Outcome::Accepted)
+                    .map(|(light, _)| key(light))
+                    .collect();
+                let tuned = matter::tune(url, deadline, &on, matter::TRANSITION, |nodes, light| {
+                    match rule_of(nodes, light, &after) {
+                        schedule::Rule::Fixed(level, kelvin) if on.contains(&key(light)) => {
+                            Ok(schedule::fit(level, kelvin, light))
+                        }
+                        _ => Err(schedule::Skip::Unchanged),
                     }
-                    _ => Err(schedule::Skip::Unchanged),
-                }
-            })
-            .await
-            .map_err(matter_unreachable)?;
-            let results: Vec<_> = switched
-                .into_iter()
-                .map(|(light, switch)| {
-                    let tune = tuned
-                        .lights
-                        .iter()
-                        .find(|(l, _)| key(l) == key(&light))
-                        .map_or("switched", |(_, d)| decision(*d));
-                    let done = match outcome(switch) {
-                        "switched" => tune,
-                        other => other,
-                    };
-                    (light, done)
                 })
-                .collect();
-            if !on.is_empty() {
-                state
-                    .db
-                    .lock()
-                    .expect(UNPOISONED)
-                    .execute("UPDATE labels SET \"on\" = 1 WHERE id = ?1", [id])?;
-                let adjusted = results.iter().any(|(light, _)| {
-                    on.contains(&key(light))
-                        && rule_of(&nodes, light, &after) == schedule::Rule::Auto
-                });
-                if adjusted && settings.enabled {
-                    adjust(state, (state.clock)(), "label_on", &on).await;
-                }
-            }
-            (nodes, results, Some(tuned))
-        }
-        "off" => {
-            {
-                let db = state.db.lock().expect(UNPOISONED);
-                db.execute("UPDATE labels SET \"on\" = 0 WHERE id = ?1", [id])?;
-                for device in &members {
-                    db.execute(
-                        "UPDATE labels SET \"on\" = 0 WHERE override_level IS NOT NULL
-                            AND id IN (SELECT label_id FROM device_labels WHERE device_id = ?1)",
-                        [device.id],
-                    )?;
-                }
-            }
-            let (nodes, switched) = matter::switch_among(url, false, targets, |_, _| false)
                 .await
                 .map_err(matter_unreachable)?;
-            let results = switched
-                .into_iter()
-                .map(|(light, o)| (light, outcome(o)))
-                .collect();
-            (nodes, results, None)
-        }
-        _ => {
-            let after = {
-                let db = state.db.lock().expect(UNPOISONED);
-                db.execute("UPDATE labels SET \"on\" = 0 WHERE id = ?1", [id])?;
-                self::labels(&db)?
-            };
-            let stays = |nodes: &[serde_json::Value], light: &matter::Light| {
-                matches!(
-                    rule_of(nodes, light, &after),
-                    schedule::Rule::Fixed(..) | schedule::Rule::Auto
-                )
-            };
-            let (nodes, switched) = matter::switch_among(url, false, targets, stays)
-                .await
-                .map_err(matter_unreachable)?;
-            let mine: Vec<_> = switched.iter().map(|(light, _)| key(light)).collect();
-            let (day, minute) = schedule::local((state.clock)());
-            let home = load::<outside::Location>(&state.db.lock().expect(UNPOISONED), LOCATION)?;
-            let goal = schedule::target(
-                minute,
-                schedule::sun_times(day, home.latitude, home.longitude),
-                &settings,
-            );
-            let tuned = matter::tune(url, &[], 0, |nodes, light| {
-                if mine.contains(&key(light))
-                    && rule_of(nodes, light, &after) == schedule::Rule::Auto
+                let results: Vec<_> = switched
+                    .results
+                    .into_iter()
+                    .map(|(light, switch)| {
+                        let done = match switch {
+                            matter::Outcome::Accepted => tuned
+                                .lights
+                                .iter()
+                                .find(|(l, _)| key(l) == key(&light))
+                                .map_or_else(Done::switched, |(_, d)| Done::tuned(d)),
+                            missed => Done::of(missed),
+                        };
+                        (light, done)
+                    })
+                    .collect();
+                if !on.is_empty() {
+                    state
+                        .db
+                        .lock()
+                        .expect(UNPOISONED)
+                        .execute("UPDATE labels SET \"on\" = 1 WHERE id = ?1", [id])?;
+                    let adjusted = results.iter().any(|(light, _)| {
+                        on.contains(&key(light))
+                            && rule_of(&switched.nodes, light, &after) == schedule::Rule::Auto
+                    });
+                    if adjusted && settings.enabled {
+                        adjust(state, (state.clock)(), "label_on", &on, deadline).await;
+                    }
+                }
+                (switched.nodes, results, Some(tuned), switched.none_answered)
+            }
+            "off" => {
                 {
-                    Ok(schedule::fit(goal.0, goal.1, light))
-                } else {
-                    Err(schedule::Skip::Unchanged)
+                    let db = state.db.lock().expect(UNPOISONED);
+                    db.execute("UPDATE labels SET \"on\" = 0 WHERE id = ?1", [id])?;
+                    for device in &members {
+                        db.execute(
+                            "UPDATE labels SET \"on\" = 0 WHERE override_level IS NOT NULL
+                            AND id IN (SELECT label_id FROM device_labels WHERE device_id = ?1)",
+                            [device.id],
+                        )?;
+                    }
                 }
-            })
-            .await
-            .map_err(matter_unreachable)?;
-            let results = switched
-                .into_iter()
-                .map(|(light, o)| {
-                    let done = match rule_of(&nodes, &light, &after) {
-                        schedule::Rule::Fixed(..) => "switched",
-                        schedule::Rule::Auto => tuned
-                            .lights
-                            .iter()
-                            .find(|(l, _)| key(l) == key(&light))
-                            .map_or("switched", |(_, d)| decision(*d)),
-                        _ => outcome(o),
-                    };
-                    (light, done)
+                let switched = matter::switch_among(url, deadline, false, targets, |_, _| false)
+                    .await
+                    .map_err(matter_unreachable)?;
+                let results = switched
+                    .results
+                    .into_iter()
+                    .map(|(light, o)| (light, Done::of(o)))
+                    .collect();
+                (switched.nodes, results, None, switched.none_answered)
+            }
+            _ => {
+                let after = {
+                    let db = state.db.lock().expect(UNPOISONED);
+                    db.execute("UPDATE labels SET \"on\" = 0 WHERE id = ?1", [id])?;
+                    self::labels(&db)?
+                };
+                let stays = |nodes: &[serde_json::Value], light: &matter::Light| {
+                    matches!(
+                        rule_of(nodes, light, &after),
+                        schedule::Rule::Fixed(..) | schedule::Rule::Auto
+                    )
+                };
+                let switched = matter::switch_among(url, deadline, false, targets, stays)
+                    .await
+                    .map_err(matter_unreachable)?;
+                let mine: Vec<_> = switched
+                    .results
+                    .iter()
+                    .map(|(light, _)| key(light))
+                    .collect();
+                let (day, minute) = schedule::local((state.clock)());
+                let home =
+                    load::<outside::Location>(&state.db.lock().expect(UNPOISONED), LOCATION)?;
+                let goal = schedule::target(
+                    minute,
+                    schedule::sun_times(day, home.latitude, home.longitude),
+                    &settings,
+                );
+                let tuned = matter::tune(url, deadline, &[], 0, |nodes, light| {
+                    if mine.contains(&key(light))
+                        && rule_of(nodes, light, &after) == schedule::Rule::Auto
+                    {
+                        Ok(schedule::fit(goal.0, goal.1, light))
+                    } else {
+                        Err(schedule::Skip::Unchanged)
+                    }
                 })
-                .collect();
-            (nodes, results, Some(tuned))
-        }
-    };
+                .await
+                .map_err(matter_unreachable)?;
+                let nodes = switched.nodes;
+                let results = switched
+                    .results
+                    .into_iter()
+                    .map(|(light, o)| {
+                        let done = match rule_of(&nodes, &light, &after) {
+                            schedule::Rule::Fixed(..) => Done::switched(),
+                            schedule::Rule::Auto => tuned
+                                .lights
+                                .iter()
+                                .find(|(l, _)| key(l) == key(&light))
+                                .map_or_else(Done::switched, |(_, d)| Done::tuned(d)),
+                            _ => Done::of(o),
+                        };
+                        (light, done)
+                    })
+                    .collect();
+                (nodes, results, Some(tuned), switched.none_answered)
+            }
+        };
     if let Some(tuned) = &tuned {
         let mut memory = state.sent.lock().expect(UNPOISONED);
         for (light, decision) in &tuned.lights {
-            decide(&mut memory, light, *decision, &mut json!({}));
+            decide(&mut memory, light, decision, &mut json!({}));
         }
     }
     let label = find_label(&state.db.lock().expect(UNPOISONED), id)?;
-    let (lights, outcomes): (Vec<_>, Vec<_>) = results.into_iter().unzip();
+    let (lights, done): (Vec<_>, Vec<Done>) = results.into_iter().unzip();
+    let outcomes: Vec<&str> = done.iter().map(|d| d.result).collect();
     let (names, _) = match_ledger(&devices, &nodes, &lights);
     let missing: Vec<_> = members
         .iter()
@@ -2477,9 +2525,15 @@ async fn switch_label(state: &AppState, id: i64, op: Op) -> ApiResult<serde_json
         label = label.name,
         action,
         switched = count(&outcomes, "switched"),
+        no_response = count(&outcomes, "no_response"),
+        failed = count(&outcomes, "failed"),
+        missing = missing.len(),
+        none_answered,
         devices = lights.len(),
         "label switched"
     );
+    let mut entries = light_entries(&nodes, &lights, names, &outcomes, "result");
+    Done::explain(&mut entries, &done);
     Ok(json!({
         "label": label.name,
         "action": action,
@@ -2489,9 +2543,58 @@ async fn switch_label(state: &AppState, id: i64, op: Op) -> ApiResult<serde_json
         "no_response": count(&outcomes, "no_response"),
         "failed": count(&outcomes, "failed"),
         "missing": missing.len(),
-        "devices": light_entries(&nodes, &lights, names, &outcomes, "result"),
+        "none_answered": none_answered,
+        "devices": entries,
         "missing_devices": missing,
     }))
+}
+
+/// One device's result as the API names it, and the outcome behind it when it was not
+/// switched: why, and matterjs-server's details.
+struct Done {
+    result: &'static str,
+    missed: Option<matter::Outcome>,
+}
+
+impl Done {
+    fn switched() -> Self {
+        Self {
+            result: "switched",
+            missed: None,
+        }
+    }
+
+    fn of(outcome: matter::Outcome) -> Self {
+        let result = outcome.result();
+        Self {
+            result,
+            missed: outcome.reason().is_some().then_some(outcome),
+        }
+    }
+
+    /// A switched light's result after the values it was then sent.
+    fn tuned(decision: &matter::Decision) -> Self {
+        match decision {
+            matter::Decision::NoResponse(outcome) => Self {
+                result: "no_response",
+                missed: Some(outcome.clone()),
+            },
+            matter::Decision::Failed(outcome) => Self {
+                result: "failed",
+                missed: Some(outcome.clone()),
+            },
+            _ => Self::switched(),
+        }
+    }
+
+    /// Adds to each of `entries` why its device missed, and the details, as `reason` and `details`.
+    fn explain(entries: &mut [serde_json::Value], done: &[Self]) {
+        for (entry, done) in entries.iter_mut().zip(done) {
+            let missed = done.missed.as_ref();
+            entry["reason"] = json!(missed.and_then(matter::Outcome::reason));
+            entry["details"] = json!(missed.and_then(matter::Outcome::details));
+        }
+    }
 }
 
 /// Switches every light matterjs-server serves on or off and reports each light's
@@ -2501,6 +2604,7 @@ async fn switch_label(state: &AppState, id: i64, op: Op) -> ApiResult<serde_json
 async fn switch_lights(
     state: &AppState,
     on: bool,
+    deadline: tokio::time::Instant,
 ) -> ApiResult<(Json<serde_json::Value>, Vec<(u64, u16)>)> {
     let url = matter_url(state)?;
     let (devices, labels) = {
@@ -2520,46 +2624,59 @@ async fn switch_lights(
         let mine = labels_of(&devices, nodes, light, &labels);
         on && !mine.is_empty() && mine.iter().all(|l| l.traits.override_level.is_some())
     };
-    let (nodes, results) = matter::switch(url, on, |nodes, light| {
+    let switched = matter::switch(url, deadline, on, |nodes, light| {
         is_ignored(&devices, nodes, light) || held(nodes, light)
     })
     .await
     .map_err(matter_unreachable)?;
-    let (lights, outcomes): (Vec<_>, Vec<_>) = results.into_iter().unzip();
-    let switched = lights
+    let nodes = switched.nodes;
+    let (lights, outcomes): (Vec<_>, Vec<_>) = switched.results.into_iter().unzip();
+    let on_now = lights
         .iter()
         .zip(&outcomes)
-        .filter(|(_, outcome)| **outcome == matter::Outcome::Switched)
+        .filter(|(_, outcome)| **outcome == matter::Outcome::Accepted)
         .map(|(light, _)| (light.node_id, light.endpoint))
         .collect();
-    let outcomes: Vec<&str> = lights
+    let done: Vec<Done> = lights
         .iter()
         .zip(outcomes)
         .map(|(light, outcome)| match outcome {
-            matter::Outcome::Switched => "switched",
-            matter::Outcome::NoResponse => "no_response",
-            matter::Outcome::Failed => "failed",
-            matter::Outcome::Ignored if is_ignored(&devices, &nodes, light) => "ignored",
-            matter::Outcome::Ignored => "override",
+            matter::Outcome::Ignored if is_ignored(&devices, &nodes, light) => Done {
+                result: "ignored",
+                missed: None,
+            },
+            matter::Outcome::Ignored => Done {
+                result: "override",
+                missed: None,
+            },
+            outcome => Done::of(outcome),
         })
         .collect();
+    let outcomes: Vec<&str> = done.iter().map(|d| d.result).collect();
     let (names, missing) = match_ledger(&devices, &nodes, &lights);
     tracing::info!(
         on,
         switched = count(&outcomes, "switched"),
+        no_response = count(&outcomes, "no_response"),
+        failed = count(&outcomes, "failed"),
+        missing = missing.len(),
+        none_answered = switched.none_answered,
         lights = lights.len(),
         "lights switched"
     );
+    let mut entries = light_entries(&nodes, &lights, names, &outcomes, "result");
+    Done::explain(&mut entries, &done);
     let response = Json(json!({
         "action": if on { "on" } else { "off" },
         "switched": count(&outcomes, "switched"),
         "no_response": count(&outcomes, "no_response"),
         "failed": count(&outcomes, "failed"),
         "missing": missing.len(),
-        "lights": light_entries(&nodes, &lights, names, &outcomes, "result"),
+        "none_answered": switched.none_answered,
+        "lights": entries,
         "missing_devices": missing,
     }));
-    Ok((response, switched))
+    Ok((response, on_now))
 }
 
 const SCHEDULE: &str = "light_schedule";
@@ -2590,7 +2707,13 @@ fn store<T: Serialize>(db: &Connection, key: &str, value: &T) -> rusqlite::Resul
 /// is disabled, nor what was already sent unless `switched_on` holds the light: just
 /// switched on, it gets all values.
 #[allow(clippy::too_many_lines)]
-async fn adjust(state: &AppState, unix: i64, trigger: &'static str, switched_on: &[(u64, u16)]) {
+async fn adjust(
+    state: &AppState,
+    unix: i64,
+    trigger: &'static str,
+    switched_on: &[(u64, u16)],
+    deadline: tokio::time::Instant,
+) {
     let loaded = {
         let db = state.db.lock().expect(UNPOISONED);
         load::<schedule::Settings>(&db, SCHEDULE).and_then(|settings| {
@@ -2625,23 +2748,30 @@ async fn adjust(state: &AppState, unix: i64, trigger: &'static str, switched_on:
                 };
                 (names, rule, target)
             };
-            matter::tune(url, switched_on, matter::TRANSITION, |nodes, light| {
-                if is_ignored(devices, nodes, light) {
-                    return Err(schedule::Skip::Ignored);
-                }
-                let key = (light.node_id, light.endpoint);
-                let last = sent
-                    .get(&key)
-                    .copied()
-                    .filter(|_| !switched_on.contains(&key));
-                match goal_of(nodes, light).1 {
-                    schedule::Rule::Fixed(..) => Err(schedule::Skip::Overridden),
-                    schedule::Rule::AutoOff => Err(schedule::Skip::AllOff),
-                    schedule::Rule::Manual => Err(schedule::Skip::Manual),
-                    schedule::Rule::Auto => schedule::plan(light, settings, goal, last),
-                }
-            })
+            matter::tune(
+                url,
+                deadline,
+                switched_on,
+                matter::TRANSITION,
+                |nodes, light| {
+                    if is_ignored(devices, nodes, light) {
+                        return Err(schedule::Skip::Ignored);
+                    }
+                    let key = (light.node_id, light.endpoint);
+                    let last = sent
+                        .get(&key)
+                        .copied()
+                        .filter(|_| !switched_on.contains(&key));
+                    match goal_of(nodes, light).1 {
+                        schedule::Rule::Fixed(..) => Err(schedule::Skip::Overridden),
+                        schedule::Rule::AutoOff => Err(schedule::Skip::AllOff),
+                        schedule::Rule::Manual => Err(schedule::Skip::Manual),
+                        schedule::Rule::Auto => schedule::plan(light, settings, goal, last),
+                    }
+                },
+            )
             .await
+            .map_err(|fault| fault.to_string())
             .map(|tuned| {
                 let goals: Vec<_> = tuned
                     .lights
@@ -2672,7 +2802,7 @@ async fn adjust(state: &AppState, unix: i64, trigger: &'static str, switched_on:
                         "target_level": goal.0,
                         "target_kelvin": goal.1,
                     });
-                    entry["decision"] = decide(&mut memory, light, *decision, &mut entry);
+                    entry["decision"] = decide(&mut memory, light, decision, &mut entry);
                     entry
                 })
                 .collect();
@@ -2710,22 +2840,25 @@ fn labels_of<'a>(
         .unwrap_or_default()
 }
 
-/// `decision` for the run's `entry`, remembering what was sent `light`.
+/// `decision` for the run's `entry`, with why a light missed, remembering what was sent `light`.
 fn decide(
     memory: &mut HashMap<(u64, u16), schedule::Target>,
     light: &matter::Light,
-    decision: matter::Decision,
+    decision: &matter::Decision,
     entry: &mut serde_json::Value,
 ) -> serde_json::Value {
     match decision {
         matter::Decision::Skipped(skip) => json!(skip),
         matter::Decision::Off => json!("off"),
-        matter::Decision::NoResponse => json!("no_response"),
-        matter::Decision::Failed => json!("failed"),
+        matter::Decision::NoResponse(outcome) | matter::Decision::Failed(outcome) => {
+            entry["reason"] = json!(outcome.reason());
+            entry["details"] = json!(outcome.details());
+            json!(Done::tuned(decision).result)
+        }
         matter::Decision::Sent(target) => {
             let last = memory
                 .entry((light.node_id, light.endpoint))
-                .or_insert(target);
+                .or_insert(*target);
             last.level = target.level.or(last.level);
             last.mireds = target.mireds.or(last.mireds);
             entry["level"] = json!(target.level);
@@ -3013,7 +3146,10 @@ async fn send_aircon(
         .matter_url
         .as_deref()
         .ok_or("MATTER_SERVER_URL is not set")?;
-    let nodes = matter::fetch_nodes(url).await?;
+    let deadline = link::budget();
+    let nodes = matter::fetch_nodes(url, deadline)
+        .await
+        .map_err(|fault| fault.to_string())?;
     let Some((_, node, endpoint)) = find_aircon(devices, &nodes) else {
         return Ok("no_aircon");
     };
@@ -3026,13 +3162,16 @@ async fn send_aircon(
         .map(|n| &n["attributes"]);
     let cooling =
         attributes.and_then(|a| a[format!("{endpoint}/{}", aircon::COOLING_SETPOINT)].as_i64());
-    Ok(
-        match matter::drive(url, node, endpoint, &aircon::steps(command, cooling)).await? {
-            None => "no_response",
-            Some(false) => "refused",
-            Some(true) => "sent",
-        },
-    )
+    let steps = aircon::steps(command, cooling);
+    let outcome = matter::drive(url, deadline, node, endpoint, &steps)
+        .await
+        .map_err(|fault| fault.to_string())?;
+    // matterjs-server's own error, such as the node not connected, is no answer from the device.
+    Ok(match outcome {
+        matter::Outcome::Accepted => "sent",
+        matter::Outcome::Refused(_) => "refused",
+        _ => "no_response",
+    })
 }
 
 /// The runs recorded by `sql` with `param`, as JSON.
@@ -3089,7 +3228,7 @@ async fn get_aircon(State(state): State<Db>) -> ApiResult<Json<serde_json::Value
     };
     let mut device = serde_json::Value::Null;
     if let Some(url) = &state.matter_url {
-        match matter::fetch_nodes(url).await {
+        match matter::fetch_nodes(url, link::budget()).await {
             Ok(nodes) => {
                 if let Some((found, node, endpoint)) = find_aircon(&devices, &nodes) {
                     let attributes =

@@ -1,13 +1,13 @@
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::time::Instant;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-use crate::schedule::{Skip, Target};
-
-const TIMEOUT: Duration = Duration::from_secs(10);
+pub use crate::link::{Fault, Outcome};
+use crate::{
+    link::{self, Link, next_id},
+    schedule::{Skip, Target},
+};
 
 /// Basic Information (0x0028) on a node, Bridged Device Basic Information
 /// (0x0039) on each device behind a bridge.
@@ -258,55 +258,47 @@ fn narrow<T: TryFrom<u64>>(value: u64, fallback: T) -> T {
     T::try_from(value).unwrap_or(fallback)
 }
 
-pub(crate) type Socket =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-
-/// Reads every node from the matterjs-server WebSocket API at `url`.
+/// Reads every node from the matterjs-server WebSocket API at `url` by `deadline`.
 ///
 /// # Errors
 /// Fails when the server cannot be reached, times out, or answers with an error.
-pub async fn fetch_nodes(url: &str) -> Result<Vec<Value>, String> {
-    tokio::time::timeout(TIMEOUT, async {
-        let mut ws = connect(url).await?;
-        let nodes = get_nodes(&mut ws).await.map_err(|e| e.0);
-        let _ = ws.close(None).await;
-        nodes
-    })
-    .await
-    .map_err(|_| "timed out".to_owned())?
+pub async fn fetch_nodes(url: &str, deadline: Instant) -> Result<Vec<Value>, Fault> {
+    let mut link = Link::open(url, deadline).await?;
+    let nodes = link.nodes(deadline).await;
+    link.close().await;
+    nodes
 }
 
-/// What became of the command to one light.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Outcome {
-    /// The device, or the bridge in front of it, accepted the command.
-    Switched,
-    /// Unavailable, unreachable behind its bridge, or no answer in time.
-    NoResponse,
-    /// matterjs-server answered with an error.
-    Failed,
-    /// Ignored in the ledger: nothing sent.
-    Ignored,
+/// A switch: the nodes read in its session and each device's outcome.
+pub struct Switched {
+    pub nodes: Vec<Value>,
+    pub results: Vec<(Light, Outcome)>,
+    /// Commands went out, and matterjs-server answered none of them: neither an
+    /// acceptance nor an error came back for any device, though one may since show switched.
+    pub none_answered: bool,
 }
 
-/// Sends On or Off to every reachable light but those `ignored` and reports each light's outcome,
-/// with the nodes read in the same session.
+/// Sends On or Off to every reachable light but those `ignored` and reports each light's
+/// outcome, with the nodes read in the same session.
 ///
 /// All lights are sent their command at once, so a light that never answers holds up none of
 /// the others. Those still unanswered after `RESEND_AFTER` are sent it again with the nodes
 /// read again, and whatever has answered by `ANSWER_WINDOW` is reported: an answer to either
-/// send counts. A connection dropped mid-session is opened again and the command sent again
-/// to the lights yet to answer (On and Off are absolute) within the same window; a server that
-/// refuses the first connection fails at once.
+/// send counts. A light still unanswered then, whose On/Off the nodes read once more show
+/// changed to the one sent, switched too. A connection dropped mid-session is opened again
+/// and the command sent again to the lights yet to answer (On and Off are absolute) within
+/// the same window; a server that refuses the first connection fails at once. Nothing runs
+/// past `deadline`.
 ///
 /// # Errors
 /// Fails when the server cannot be reached or its nodes cannot be read in time.
 pub async fn switch(
     url: &str,
+    deadline: Instant,
     on: bool,
     ignored: impl Fn(&[Value], &Light) -> bool,
-) -> Result<(Vec<Value>, Vec<(Light, Outcome)>), String> {
-    switch_among(url, on, lights, ignored).await
+) -> Result<Switched, Fault> {
+    switch_among(url, deadline, on, lights, ignored).await
 }
 
 /// `switch` over the endpoints `targets` picks from the nodes, lights or not.
@@ -315,60 +307,76 @@ pub async fn switch(
 /// As `switch`.
 pub async fn switch_among(
     url: &str,
+    deadline: Instant,
     on: bool,
     targets: impl Fn(&[Value]) -> Vec<Light>,
     ignored: impl Fn(&[Value], &Light) -> bool,
-) -> Result<(Vec<Value>, Vec<(Light, Outcome)>), String> {
-    let mut ws = connect(url).await?;
-    let nodes = tokio::time::timeout(TIMEOUT, get_nodes(&mut ws))
-        .await
-        .map_err(|_| "timed out".to_owned())?
-        .map_err(|e| e.0)?;
+) -> Result<Switched, Fault> {
+    let mut link = Link::open(url, deadline).await?;
+    let nodes = match link.nodes(deadline).await {
+        Ok(nodes) => nodes,
+        Err(fault) => {
+            link.close().await;
+            return Err(fault);
+        }
+    };
     let mut switching = Switching::new(nodes, on, &targets, &ignored);
-    let deadline = Instant::now() + ANSWER_WINDOW;
-    let resend_at = Instant::now() + RESEND_AFTER;
+    let read_at = Instant::now();
+    let window = deadline.min(read_at + ANSWER_WINDOW);
+    let resend_at = read_at + RESEND_AFTER;
     loop {
-        let result = switching.run(&mut ws, resend_at, deadline, &targets).await;
-        let _ = ws.close(None).await;
-        let Err(Dropped(error)) = result else {
+        let result = switching.run(&mut link, resend_at, window, &targets).await;
+        let result = match result {
+            Ok(()) if switching.settled() => Ok(()),
+            // Whatever answers while the nodes are read once more still counts.
+            Ok(()) => {
+                let late = deadline.min(Instant::now() + LATE_READ);
+                switching.confirm(&mut link, late).await
+            }
+            Err(fault) => Err(fault),
+        };
+        link.close().await;
+        let Err(Fault::Dropped(error)) = result else {
             break;
         };
         tracing::warn!(%error, "matterjs-server connection dropped; reconnecting");
-        let Some(again) = reconnect(url, deadline).await else {
+        let Some(again) = reconnect(url, window).await else {
             break;
         };
-        ws = again;
+        link = again;
     }
-    Ok((switching.nodes, switching.results))
+    Ok(switching.finish())
 }
 
 /// A new connection to `url` before `deadline`, tried every `RECONNECT_DELAY`.
-async fn reconnect(url: &str, deadline: Instant) -> Option<Socket> {
+async fn reconnect(url: &str, deadline: Instant) -> Option<Link> {
     loop {
-        tokio::time::sleep(RECONNECT_DELAY).await;
+        tokio::time::sleep_until(deadline.min(Instant::now() + RECONNECT_DELAY)).await;
         if Instant::now() >= deadline {
             return None;
         }
-        if let Ok(Ok(ws)) = tokio::time::timeout_at(deadline, connect(url)).await {
-            return Some(ws);
+        if let Ok(link) = Link::open(url, deadline).await {
+            return Some(link);
         }
     }
 }
 
 const RECONNECT_DELAY: Duration = Duration::from_millis(500);
 
-/// The connection ended or failed before the expected replies arrived.
-pub(crate) struct Dropped(pub(crate) String);
-
 /// One switch across connections: each light's outcome so far and the sends awaiting an answer.
 struct Switching {
     nodes: Vec<Value>,
-    results: Vec<(Light, Outcome)>,
-    command: &'static str,
+    on: bool,
+    /// Each light with its outcome once there is one.
+    results: Vec<(Light, Option<Outcome>)>,
+    /// Each light's On/Off as first read.
+    before: Vec<Option<bool>>,
     /// Message id of each send awaiting an answer on the current connection, and its light.
     awaiting: std::collections::HashMap<String, usize>,
     sends: Vec<usize>,
     resent: bool,
+    /// Some command was answered, accepted or not.
+    replied: bool,
 }
 
 impl Switching {
@@ -381,66 +389,64 @@ impl Switching {
         let results: Vec<_> = targets(&nodes)
             .into_iter()
             .map(|light| {
-                let outcome = if ignored(&nodes, &light) {
-                    Outcome::Ignored
-                } else {
-                    Outcome::NoResponse
-                };
+                let outcome = ignored(&nodes, &light).then_some(Outcome::Ignored);
                 (light, outcome)
             })
             .collect();
         Self {
             sends: vec![0; results.len()],
+            before: results.iter().map(|(light, _)| light.on).collect(),
             nodes,
             results,
-            command: if on { "On" } else { "Off" },
+            on,
             awaiting: std::collections::HashMap::new(),
             resent: false,
+            replied: false,
         }
     }
 
     fn settled(&self) -> bool {
-        self.results.iter().all(|(_, o)| *o != Outcome::NoResponse)
+        self.results.iter().all(|(_, o)| o.is_some())
     }
 
     /// Sends to every reachable light yet to answer that has been sent fewer than `ATTEMPTS`
-    /// commands, then takes answers until all have answered or `deadline`, sending again
+    /// commands, then takes answers until all have answered or `window` ends, sending again
     /// once at `resend_at` with the nodes read again.
     async fn run(
         &mut self,
-        ws: &mut Socket,
+        link: &mut Link,
         resend_at: Instant,
-        deadline: Instant,
+        window: Instant,
         targets: &impl Fn(&[Value]) -> Vec<Light>,
-    ) -> Result<(), Dropped> {
+    ) -> Result<(), Fault> {
         // Sends on an earlier connection will not be answered on this one.
         self.awaiting.clear();
-        self.send(ws).await?;
+        self.send(link, window).await?;
         while !self.settled() {
             let wait = if self.resent {
-                deadline
+                window
             } else {
-                resend_at.min(deadline)
+                resend_at.min(window)
             };
-            match tokio::time::timeout_at(wait, receive(ws)).await {
-                Ok(reply) => self.answer(&reply?),
-                Err(_) if wait == deadline => break,
-                Err(_) => {
+            match link.next(wait).await? {
+                Some(reply) => self.answer(&reply),
+                None if wait == window => break,
+                None => {
                     self.resent = true;
-                    if !self.reread(ws, deadline, targets).await? {
+                    if !self.reread(link, window, targets).await? {
                         break;
                     }
-                    self.send(ws).await?;
+                    self.send(link, window).await?;
                 }
             }
         }
         Ok(())
     }
 
-    async fn send(&mut self, ws: &mut Socket) -> Result<(), Dropped> {
+    async fn send(&mut self, link: &mut Link, deadline: Instant) -> Result<(), Fault> {
+        let command = if self.on { "On" } else { "Off" };
         for (index, (light, outcome)) in self.results.iter().enumerate() {
-            if !light.reachable || *outcome != Outcome::NoResponse || self.sends[index] >= ATTEMPTS
-            {
+            if !light.reachable || outcome.is_some() || self.sends[index] >= ATTEMPTS {
                 continue;
             }
             let id = next_id();
@@ -451,11 +457,11 @@ impl Switching {
                     "node_id": light.node_id,
                     "endpoint_id": light.endpoint,
                     "cluster_id": 6,
-                    "command_name": self.command,
+                    "command_name": command,
                     "payload": {},
                 },
             });
-            send(ws, &request).await?;
+            link.send(&request, deadline).await?;
             self.sends[index] += 1;
             self.awaiting.insert(id, index);
         }
@@ -469,49 +475,53 @@ impl Switching {
         else {
             return;
         };
+        self.replied = true;
         let outcome = &mut self.results[index].1;
-        if *outcome == Outcome::NoResponse {
-            *outcome = if reply.get("error_code").is_some() {
-                Outcome::Failed
-            } else {
-                Outcome::Switched
-            };
+        if outcome.is_none() {
+            *outcome = Some(Outcome::of(Some(reply)));
         }
     }
 
-    /// Reads the nodes again, taking answers that arrive meanwhile, and refreshes the lights
-    /// yet to answer; `false` when the nodes do not come by `deadline`.
-    async fn reread(
+    /// Reads the nodes again, taking answers that arrive meanwhile; `None` when the nodes do
+    /// not come by `deadline`.
+    async fn read_nodes(
         &mut self,
-        ws: &mut Socket,
+        link: &mut Link,
         deadline: Instant,
-        targets: &impl Fn(&[Value]) -> Vec<Light>,
-    ) -> Result<bool, Dropped> {
-        send(
-            ws,
-            &json!({ "message_id": "get_nodes", "command": "get_nodes" }),
+    ) -> Result<Option<Vec<Value>>, Fault> {
+        let id = next_id();
+        link.send(
+            &json!({ "message_id": id, "command": "get_nodes" }),
+            deadline,
         )
         .await?;
-        let nodes = loop {
-            let Ok(reply) = tokio::time::timeout_at(deadline, receive(ws)).await else {
-                return Ok(false);
-            };
-            let mut reply = reply?;
-            if reply["message_id"] != "get_nodes" {
+        while let Some(reply) = link.next(deadline).await? {
+            if reply["message_id"] != id.as_str() {
                 self.answer(&reply);
                 continue;
             }
-            match nodes_of(&mut reply) {
-                Ok(nodes) => break nodes,
-                Err(_) => return Ok(false),
-            }
+            return Ok(link::nodes_of(reply).ok());
+        }
+        Ok(None)
+    }
+
+    /// Reads the nodes again and refreshes the lights yet to answer; `false` when the nodes
+    /// do not come by `deadline`.
+    async fn reread(
+        &mut self,
+        link: &mut Link,
+        deadline: Instant,
+        targets: &impl Fn(&[Value]) -> Vec<Light>,
+    ) -> Result<bool, Fault> {
+        let Some(nodes) = self.read_nodes(link, deadline).await? else {
+            return Ok(false);
         };
         for light in targets(&nodes) {
             let key = (light.node_id, light.endpoint);
             if let Some((known, _)) = self
                 .results
                 .iter_mut()
-                .find(|(l, o)| (l.node_id, l.endpoint) == key && *o == Outcome::NoResponse)
+                .find(|(l, o)| (l.node_id, l.endpoint) == key && o.is_none())
             {
                 *known = light;
             }
@@ -519,54 +529,92 @@ impl Switching {
         self.nodes = nodes;
         Ok(true)
     }
+
+    /// Reads the nodes once more by `deadline`, and counts as switched each light sent the
+    /// command and yet to answer whose On/Off they show changed to the one sent: its answer
+    /// came too late, or never, but matterjs-server has heard from it since.
+    async fn confirm(&mut self, link: &mut Link, deadline: Instant) -> Result<(), Fault> {
+        if !(0..self.results.len()).any(|i| self.results[i].1.is_none() && self.sends[i] > 0) {
+            return Ok(());
+        }
+        let Some(nodes) = self.read_nodes(link, deadline).await? else {
+            tracing::warn!(
+                "matterjs-server did not serve the nodes again in time; late answers uncounted"
+            );
+            return Ok(());
+        };
+        for (i, (light, outcome)) in self.results.iter_mut().enumerate() {
+            let reported = nodes
+                .iter()
+                .find(|n| n["node_id"] == light.node_id)
+                .and_then(|n| n["attributes"][format!("{}/6/0", light.endpoint)].as_bool());
+            if outcome.is_none()
+                && self.sends[i] > 0
+                && self.before[i] != Some(self.on)
+                && reported == Some(self.on)
+            {
+                tracing::info!(
+                    node_id = light.node_id,
+                    endpoint = light.endpoint,
+                    "device answered late; its reported On/Off shows it switched"
+                );
+                *outcome = Some(Outcome::Accepted);
+            }
+        }
+        Ok(())
+    }
+
+    /// Each light's outcome, those yet to answer as not answered or, never sent, not sent,
+    /// logging every one not accepted and a server that answered none.
+    fn finish(self) -> Switched {
+        let sent = self.sends.iter().filter(|s| **s > 0).count();
+        let results: Vec<_> = self
+            .results
+            .into_iter()
+            .zip(&self.sends)
+            .map(|((light, outcome), sends)| {
+                let outcome = outcome.unwrap_or(if *sends > 0 {
+                    Outcome::NoAnswer
+                } else {
+                    Outcome::NotSent
+                });
+                outcome.warn("switch", light.node_id, light.endpoint);
+                (light, outcome)
+            })
+            .collect();
+        let none_answered = sent > 0 && !self.replied;
+        if none_answered {
+            tracing::warn!(sent, "matterjs-server answered none of the commands");
+        }
+        Switched {
+            nodes: self.nodes,
+            results,
+            none_answered,
+        }
+    }
 }
 
 /// At most two sends to a light that has not answered, the second after `RESEND_AFTER`; the
-/// switch reports what has answered by `ANSWER_WINDOW` after the nodes are read.
+/// switch reports what has answered by `ANSWER_WINDOW` after the nodes are read, and what
+/// the nodes read once more within `LATE_READ` after it show switched.
 const ATTEMPTS: usize = 2;
 const RESEND_AFTER: Duration = Duration::from_secs(1);
 const ANSWER_WINDOW: Duration = Duration::from_millis(2500);
+const LATE_READ: Duration = Duration::from_millis(400);
 
-/// Sends On or Off to one device's `endpoint`: `Some(true)` once accepted,
-/// `Some(false)` on an error and `None` without an answer in time.
-///
-/// # Errors
-/// Fails when the server cannot be reached or drops the connection.
-pub async fn switch_one(
-    url: &str,
-    node_id: u64,
-    endpoint: u16,
-    on: bool,
-) -> Result<Option<bool>, String> {
-    let mut ws = connect(url).await?;
-    let command = json!({
-        "command": "device_command",
-        "args": {
-            "node_id": node_id,
-            "endpoint_id": endpoint,
-            "cluster_id": 6,
-            "command_name": if on { "On" } else { "Off" },
-            "payload": {},
-        },
-    });
-    let reply = request(&mut ws, command).await.map_err(|e| e.0);
-    let _ = ws.close(None).await;
-    Ok(reply?.map(|reply| reply.get("error_code").is_none()))
-}
-
-/// Writes `steps` to `endpoint` of `node_id` in order, stopping at the first one refused or
-/// unanswered: `Some(true)` once all are accepted, `Some(false)` on a refusal and `None`
-/// without an answer in time.
+/// Writes `steps` to `endpoint` of `node_id` in order, stopping at the first one not
+/// accepted, and reports it, or `Accepted` once all are; nothing runs past `deadline`.
 ///
 /// # Errors
 /// Fails when the server cannot be reached or drops the connection.
 pub async fn drive(
     url: &str,
+    deadline: Instant,
     node_id: u64,
     endpoint: u16,
     steps: &[crate::aircon::Step],
-) -> Result<Option<bool>, String> {
-    let mut ws = connect(url).await?;
+) -> Result<Outcome, Fault> {
+    let mut link = Link::open(url, deadline).await?;
     let result = async {
         for step in steps {
             let command = match *step {
@@ -585,37 +633,33 @@ pub async fn drive(
                     },
                 }),
             };
-            let Some(reply) = request(&mut ws, command).await? else {
-                return Ok(None);
-            };
-            // A write answers with each attribute's status; anything but 0 refused it.
-            let refused = reply.get("error_code").is_some()
-                || reply["result"]
-                    .as_array()
-                    .is_some_and(|statuses| statuses.iter().any(|s| s["Status"].as_u64().is_some_and(|s| s != 0)));
-            if refused {
-                return Ok(Some(false));
+            let by = deadline.min(Instant::now() + REPLY_TIMEOUT);
+            let outcome = Outcome::of(link.request(command, by).await?.as_ref());
+            if outcome != Outcome::Accepted {
+                return Ok(outcome);
             }
         }
-        Ok(Some(true))
+        Ok(Outcome::Accepted)
     }
-    .await
-    .map_err(|e: Dropped| e.0);
-    let _ = ws.close(None).await;
+    .await;
+    link.close().await;
+    if let Ok(outcome) = &result {
+        outcome.warn("drive", node_id, endpoint);
+    }
     result
 }
 
 /// What became of one light in an adjustment.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Decision {
     /// Left alone before its On/Off was read.
     Skipped(Skip),
     /// Read as off just before writing: nothing sent.
     Off,
-    /// No answer to the read or to a command in time.
-    NoResponse,
-    /// matterjs-server answered a command with an error.
-    Failed,
+    /// Not read or written: not sent, no answer, or an error to the read.
+    NoResponse(Outcome),
+    /// A command not accepted: matterjs-server's error or the device's refusal.
+    Failed(Outcome),
     Sent(Target),
 }
 
@@ -626,7 +670,6 @@ pub struct Tuned {
     pub commands: usize,
 }
 
-const TUNE_TIMEOUT: Duration = Duration::from_mins(1);
 const REPLY_TIMEOUT: Duration = Duration::from_secs(3);
 /// Each scheduled change fades over 30 s (tenths of a second) so a step every ten minutes goes unnoticed.
 pub const TRANSITION: u16 = 300;
@@ -635,39 +678,41 @@ pub const TRANSITION: u16 = 300;
 /// light to write to again, and sends the level and colour temperature only to
 /// lights read as on, fading over `transition` tenths of a second. Commands
 /// never carry `ExecuteIfOff`, so a light switched off in between ignores them
-/// and stays off.
+/// and stays off. Nothing runs past `deadline`.
 ///
 /// A light in `switched_on`, just switched on, is not read: its On may not be
 /// reported yet. It gets the values at once, lighting it if still off.
 ///
 /// # Errors
-/// Fails when the server cannot be reached, drops the connection or the whole
-/// adjustment overruns.
+/// Fails when the server cannot be reached, drops the connection or its nodes cannot be
+/// read in time.
 pub async fn tune(
     url: &str,
+    deadline: Instant,
     switched_on: &[(u64, u16)],
     transition: u16,
     plan: impl Fn(&[Value], &Light) -> Result<Target, Skip>,
-) -> Result<Tuned, String> {
-    tokio::time::timeout(TUNE_TIMEOUT, async {
-        let mut ws = connect(url).await?;
-        let result = tune_all(&mut ws, switched_on, transition, plan)
-            .await
-            .map_err(|e| e.0);
-        let _ = ws.close(None).await;
-        result
-    })
-    .await
-    .map_err(|_| "timed out".to_owned())?
+) -> Result<Tuned, Fault> {
+    let mut link = Link::open(url, deadline).await?;
+    let result = tune_all(&mut link, deadline, switched_on, transition, plan).await;
+    link.close().await;
+    let tuned = result?;
+    for (light, decision) in &tuned.lights {
+        if let Decision::NoResponse(outcome) | Decision::Failed(outcome) = decision {
+            outcome.warn("tune", light.node_id, light.endpoint);
+        }
+    }
+    Ok(tuned)
 }
 
 async fn tune_all(
-    ws: &mut Socket,
+    link: &mut Link,
+    deadline: Instant,
     switched_on: &[(u64, u16)],
     transition: u16,
     plan: impl Fn(&[Value], &Light) -> Result<Target, Skip>,
-) -> Result<Tuned, Dropped> {
-    let nodes = get_nodes(ws).await?;
+) -> Result<Tuned, Fault> {
+    let nodes = link.nodes(deadline).await?;
     let lights = lights(&nodes);
     let mut decisions: Vec<Result<Target, Decision>> = lights
         .iter()
@@ -681,31 +726,33 @@ async fn tune_all(
         .filter(|(i, light)| decisions[*i].is_ok() && !just_on(light))
         .map(|(i, light)| (i, read_on_off(light)))
         .collect();
-    for (i, reply) in exchange(ws, reads, Instant::now() + REPLY_TIMEOUT).await? {
+    let by = deadline.min(Instant::now() + REPLY_TIMEOUT);
+    for (i, reply) in link.exchange(reads, by).await? {
         let path = format!("{}/6/0", lights[i].endpoint);
-        match reply.filter(|reply| reply.get("error_code").is_none()) {
-            None => decisions[i] = Err(Decision::NoResponse),
-            Some(reply) if reply["result"][&path] != true => decisions[i] = Err(Decision::Off),
-            Some(_) => {}
+        match Outcome::of(reply.as_ref()) {
+            Outcome::Accepted if reply.is_some_and(|r| r["result"][&path] == true) => {}
+            Outcome::Accepted => decisions[i] = Err(Decision::Off),
+            missed => decisions[i] = Err(Decision::NoResponse(missed)),
         }
     }
     let mut commands = Vec::new();
     for (i, light) in lights.iter().enumerate() {
-        if let Ok(target) = decisions[i] {
-            for command in tune_commands(light, target, just_on(light), transition) {
+        if let Ok(target) = &decisions[i] {
+            for command in tune_commands(light, *target, just_on(light), transition) {
                 commands.push((i, command));
             }
         }
     }
     let sent = commands.len();
-    for (i, reply) in exchange(ws, commands, Instant::now() + REPLY_TIMEOUT).await? {
-        let decision = match reply {
-            None => Decision::NoResponse,
-            Some(reply) if reply.get("error_code").is_some() => Decision::Failed,
-            Some(_) => continue,
+    let by = deadline.min(Instant::now() + REPLY_TIMEOUT);
+    for (i, reply) in link.exchange(commands, by).await? {
+        let decision = match Outcome::of(reply.as_ref()) {
+            Outcome::Accepted => continue,
+            Outcome::NoAnswer => Decision::NoResponse(Outcome::NoAnswer),
+            refused => Decision::Failed(refused),
         };
         // No answer outweighs a refusal of the light's other command.
-        if decisions[i].is_ok() || decision == Decision::NoResponse {
+        if decisions[i].is_ok() || matches!(decision, Decision::NoResponse(_)) {
             decisions[i] = Err(decision);
         }
     }
@@ -766,157 +813,6 @@ fn read_on_off(light: &Light) -> Value {
         "command": "read_attribute",
         "args": { "node_id": light.node_id, "attribute_path": [format!("{}/6/0", light.endpoint)] },
     })
-}
-
-/// Reads from each light `pick` chooses its own On/Off, with the nodes read.
-///
-/// # Errors
-/// Fails when the server cannot be reached, drops the connection or the reads overrun.
-pub async fn read_on(
-    url: &str,
-    pick: impl Fn(&[Value], &Light) -> bool,
-) -> Result<(Vec<Value>, Vec<(Light, Option<bool>)>), String> {
-    tokio::time::timeout(TUNE_TIMEOUT, async {
-        let mut ws = connect(url).await?;
-        let result = async {
-            let nodes = get_nodes(&mut ws).await?;
-            let picked: Vec<_> = lights(&nodes)
-                .into_iter()
-                .filter(|l| pick(&nodes, l))
-                .collect();
-            let reads = picked.iter().map(read_on_off).enumerate().collect();
-            let replies = exchange(&mut ws, reads, Instant::now() + REPLY_TIMEOUT).await?;
-            let read = picked
-                .into_iter()
-                .zip(replies)
-                .map(|(light, (_, reply))| {
-                    let path = format!("{}/6/0", light.endpoint);
-                    let on = reply
-                        .filter(|reply| reply.get("error_code").is_none())
-                        .map(|reply| reply["result"][&path] == true);
-                    (light, on)
-                })
-                .collect();
-            Ok((nodes, read))
-        }
-        .await
-        .map_err(|e: Dropped| e.0);
-        let _ = ws.close(None).await;
-        result
-    })
-    .await
-    .map_err(|_| "timed out".to_owned())?
-}
-
-/// Sends every request at once, each under a fresh message id, and returns each one's
-/// reply in order, `None` for those unanswered by `deadline`.
-async fn exchange<K>(
-    ws: &mut Socket,
-    requests: Vec<(K, Value)>,
-    deadline: Instant,
-) -> Result<Vec<(K, Option<Value>)>, Dropped> {
-    let mut ids = Vec::with_capacity(requests.len());
-    let mut replies = Vec::with_capacity(requests.len());
-    for (key, mut request) in requests {
-        let id = next_id();
-        request["message_id"] = json!(id);
-        send(ws, &request).await?;
-        ids.push(id);
-        replies.push((key, None));
-    }
-    let mut unanswered = replies.len();
-    while unanswered > 0 {
-        let Ok(reply) = tokio::time::timeout_at(deadline, receive(ws)).await else {
-            break;
-        };
-        let reply = reply?;
-        if let Some(i) = ids.iter().position(|id| reply["message_id"] == id.as_str())
-            && replies[i].1.is_none()
-        {
-            replies[i].1 = Some(reply);
-            unanswered -= 1;
-        }
-    }
-    Ok(replies)
-}
-
-fn next_id() -> String {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    format!(
-        "request-{}",
-        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    )
-}
-
-/// Sends `request` under a fresh message id and waits for its reply; `None`
-/// when none arrives in time. Late replies to earlier requests are skipped.
-async fn request(ws: &mut Socket, request: Value) -> Result<Option<Value>, Dropped> {
-    request_until(ws, request, Instant::now() + REPLY_TIMEOUT).await
-}
-
-/// `request`, waiting for the reply until `deadline`.
-pub(crate) async fn request_until(
-    ws: &mut Socket,
-    mut request: Value,
-    deadline: Instant,
-) -> Result<Option<Value>, Dropped> {
-    let id = next_id();
-    request["message_id"] = json!(id);
-    send(ws, &request).await?;
-    loop {
-        let Ok(reply) = tokio::time::timeout_at(deadline, receive(ws)).await else {
-            return Ok(None);
-        };
-        let reply = reply?;
-        if reply["message_id"] == id.as_str() {
-            return Ok(Some(reply));
-        }
-    }
-}
-
-pub(crate) async fn connect(url: &str) -> Result<Socket, String> {
-    let (ws, _) = connect_async(url).await.map_err(|e| e.to_string())?;
-    Ok(ws)
-}
-
-pub(crate) async fn send(ws: &mut Socket, request: &Value) -> Result<(), Dropped> {
-    ws.send(Message::text(request.to_string()))
-        .await
-        .map_err(|e| Dropped(e.to_string()))
-}
-
-/// The next reply or event; JSON that does not parse is a protocol failure.
-pub(crate) async fn receive(ws: &mut Socket) -> Result<Value, Dropped> {
-    while let Some(message) = ws.next().await {
-        if let Message::Text(text) = message.map_err(|e| Dropped(e.to_string()))? {
-            return serde_json::from_str(&text).map_err(|e| Dropped(e.to_string()));
-        }
-    }
-    Err(Dropped("connection closed before the reply".into()))
-}
-
-async fn get_nodes(ws: &mut Socket) -> Result<Vec<Value>, Dropped> {
-    send(
-        ws,
-        &json!({ "message_id": "get_nodes", "command": "get_nodes" }),
-    )
-    .await?;
-    loop {
-        let mut reply = receive(ws).await?;
-        if reply["message_id"] == "get_nodes" {
-            return nodes_of(&mut reply);
-        }
-    }
-}
-
-fn nodes_of(reply: &mut Value) -> Result<Vec<Value>, Dropped> {
-    match reply["result"].take() {
-        Value::Array(nodes) => Ok(nodes),
-        _ => Err(Dropped(format!(
-            "get_nodes failed: {}",
-            reply["error_code"]
-        ))),
-    }
 }
 
 #[cfg(test)]

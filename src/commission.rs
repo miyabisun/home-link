@@ -3,7 +3,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tokio::time::Instant;
 
-use crate::matter::{Dropped, Socket, connect, receive, request_until, send};
+use crate::link::{self, Fault, Link};
 
 /// A device matterjs-server commissioned, and its own identifiers.
 #[derive(Debug, PartialEq, Eq)]
@@ -18,7 +18,7 @@ pub struct Commissioned {
 #[derive(Debug)]
 pub enum Error {
     /// The WebSocket API could not be reached or dropped the connection.
-    Unreachable(String),
+    Unreachable(Fault),
     Failed(Failure),
 }
 
@@ -52,8 +52,10 @@ pub async fn commission(
     timeout: Duration,
 ) -> Result<Commissioned, Error> {
     let deadline = Instant::now() + timeout;
-    let mut ws = connect(url).await.map_err(Error::Unreachable)?;
-    let result = session(&mut ws, code, network, deadline).await;
+    let mut link = Link::open(url, deadline)
+        .await
+        .map_err(Error::Unreachable)?;
+    let result = session(&mut link, code, network, deadline).await;
     // Refused before anything was sent, there is nothing to forget.
     if !matches!(
         result,
@@ -61,19 +63,19 @@ pub async fn commission(
             Failure::BluetoothDisabled | Failure::ThreadNotReady
         ))
     ) {
-        forget_wifi(&mut ws).await;
+        forget_wifi(&mut link).await;
     }
-    let _ = ws.close(None).await;
+    link.close().await;
     result
 }
 
 const FORGET_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Clears the Wi-Fi credentials matterjs-server keeps once handed them; nothing needs them after.
-async fn forget_wifi(ws: &mut Socket) {
+async fn forget_wifi(link: &mut Link) {
     let request = json!({ "message_id": "forget", "command": "remove_wifi_credentials" });
-    match call(ws, &request, Instant::now() + FORGET_TIMEOUT).await {
-        Ok(reply) if error(&reply).is_none() => {}
+    match call(link, &request, Instant::now() + FORGET_TIMEOUT).await {
+        Ok(reply) if link::error(&reply).is_none() => {}
         _ => tracing::warn!("matterjs-server may still hold Wi-Fi credentials"),
     }
 }
@@ -140,7 +142,8 @@ pub enum Move {
 /// The password goes only to the device, through matterjs-server.
 ///
 /// # Errors
-/// Fails when matterjs-server cannot be reached or drops the connection.
+/// Fails when matterjs-server cannot be reached, does not greet the connection in time or
+/// drops it.
 pub async fn move_wifi(
     url: &str,
     node_id: u64,
@@ -148,39 +151,42 @@ pub async fn move_wifi(
     ssid: &str,
     password: &str,
     times: MoveTimes,
-) -> Result<Move, String> {
-    let mut ws = connect(url).await?;
-    let result = moving(&mut ws, node_id, from, ssid, password, times).await;
+) -> Result<Move, Fault> {
+    let mut link = Link::open(url, Instant::now() + link::OPEN_TIMEOUT).await?;
+    let result = moving(&mut link, node_id, from, ssid, password, times).await;
     if matches!(result, Ok(Move::Done)) {
-        reinterview(&mut ws, node_id).await;
+        reinterview(&mut link, node_id).await;
     }
-    forget_wifi(&mut ws).await;
-    let _ = ws.close(None).await;
-    result.map_err(|Dropped(error)| error)
+    forget_wifi(&mut link).await;
+    link.close().await;
+    result
 }
 
 const INTERVIEW_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Has matterjs-server read the node again, whose cache keeps the old network after a move.
 /// The move stands either way.
-async fn reinterview(ws: &mut Socket, node_id: u64) {
+async fn reinterview(link: &mut Link, node_id: u64) {
     let request = json!({ "command": "interview_node", "args": { "node_id": node_id } });
-    match request_until(ws, request, Instant::now() + INTERVIEW_TIMEOUT).await {
+    match link
+        .request(request, Instant::now() + INTERVIEW_TIMEOUT)
+        .await
+    {
         Ok(Some(reply)) if reply.get("error_code").is_none() => {}
         _ => tracing::warn!(node_id, "matterjs-server may still show the old Wi-Fi"),
     }
 }
 
 async fn moving(
-    ws: &mut Socket,
+    link: &mut Link,
     node_id: u64,
     from: &str,
     ssid: &str,
     password: &str,
     times: MoveTimes,
-) -> Result<Move, Dropped> {
+) -> Result<Move, Fault> {
     // matterjs-server greets every connection with its server info.
-    receive(ws).await?;
+    link.info(Instant::now() + link::OPEN_TIMEOUT).await?;
     let command = |cluster: u16, name: &str, payload: Value| {
         json!({ "command": "device_command", "args": {
             "node_id": node_id, "endpoint_id": 0, "cluster_id": cluster,
@@ -217,7 +223,7 @@ async fn moving(
     ];
     let mut prepared = true;
     for (step, status) in steps {
-        if !succeeded(request_until(ws, step, expires).await?.as_ref(), status) {
+        if !succeeded(link.request(step, expires).await?.as_ref(), status) {
             prepared = false;
             break;
         }
@@ -229,7 +235,7 @@ async fn moving(
     );
     let joined = prepared
         // A device leaving its network rarely answers; one refusing the new network does.
-        && match request_until(ws, connect, expires.min(Instant::now() + times.connect)).await? {
+        && match link.request(connect, expires.min(Instant::now() + times.connect)).await? {
             Some(reply) if reply.get("error_code").is_none() => succeeded(Some(&reply), "networkingStatus"),
             _ => true,
         };
@@ -237,7 +243,7 @@ async fn moving(
         let complete = || command(GENERAL_COMMISSIONING, "CommissioningComplete", json!({}));
         while Instant::now() < expires {
             if succeeded(
-                request_until(ws, complete(), expires).await?.as_ref(),
+                link.request(complete(), expires).await?.as_ref(),
                 "errorCode",
             ) {
                 return Ok(Move::Done);
@@ -246,14 +252,14 @@ async fn moving(
         }
     }
     // Ending the fail-safe takes the device back at once; else it goes back when the fail-safe runs out.
-    let disarm = request_until(ws, arm(0), Instant::now() + times.connect).await?;
+    let disarm = link.request(arm(0), Instant::now() + times.connect).await?;
     if !succeeded(disarm.as_ref(), "errorCode") {
         tokio::time::sleep_until(expires).await;
     }
     let settled = Instant::now() + times.settle;
     let read = || json!({ "command": "read_attribute", "args": { "node_id": node_id, "attribute_path": ["0/49/1"] } });
     while Instant::now() < settled {
-        if let Some(reply) = request_until(ws, read(), settled).await?
+        if let Some(reply) = link.request(read(), settled).await?
             && let Some(networks) = reply["result"]["0/49/1"].as_array()
         {
             let on_new = networks
@@ -278,26 +284,23 @@ fn succeeded(reply: Option<&Value>, status: &str) -> bool {
 ///
 /// # Errors
 /// Fails when matterjs-server cannot be reached in time.
-pub async fn thread_ready(url: &str, timeout: Duration) -> Result<bool, String> {
-    tokio::time::timeout(timeout, async {
-        let mut ws = connect(url).await?;
-        // matterjs-server greets every connection with its server info.
-        let info = receive(&mut ws).await.map_err(|e| e.0);
-        let _ = ws.close(None).await;
-        Ok(info?["thread_credentials_set"] == true)
-    })
-    .await
-    .map_err(|_| "timed out".to_owned())?
+pub async fn thread_ready(url: &str, timeout: Duration) -> Result<bool, Fault> {
+    let deadline = Instant::now() + timeout;
+    let mut link = Link::open(url, deadline).await?;
+    // matterjs-server greets every connection with its server info.
+    let info = link.info(deadline).await;
+    link.close().await;
+    Ok(info?["thread_credentials_set"] == true)
 }
 
 async fn session(
-    ws: &mut Socket,
+    link: &mut Link,
     code: &str,
     network: &Network<'_>,
     deadline: Instant,
 ) -> Result<Commissioned, Error> {
     // matterjs-server greets every connection with its server info.
-    let info = within(deadline, receive(ws)).await?;
+    let info = within(link.info(deadline)).await?;
     if info["bluetooth_enabled"] == false {
         return Err(Error::Failed(Failure::BluetoothDisabled));
     }
@@ -315,8 +318,8 @@ async fn session(
             "command": "set_wifi_credentials",
             "args": { "ssid": ssid, "credentials": password },
         });
-        let reply = call(ws, &wifi, deadline).await?;
-        if let Some(details) = error(&reply) {
+        let reply = call(link, &wifi, deadline).await?;
+        if let Some(details) = link::error(&reply) {
             return Err(Error::Failed(Failure::Other(details)));
         }
     }
@@ -325,14 +328,16 @@ async fn session(
         "command": "commission_with_code",
         "args": { "code": code, "network_only": false },
     });
-    let mut reply = call(ws, &request, deadline).await?;
-    if let Some(details) = error(&reply) {
+    let mut reply = call(link, &request, deadline).await?;
+    if let Some(details) = link::error(&reply) {
         return Err(Error::Failed(classify(&details)));
     }
     let node = reply["result"].take();
-    let node_id = node["node_id"]
-        .as_u64()
-        .ok_or_else(|| Error::Unreachable("commission_with_code returned no node_id".into()))?;
+    let node_id = node["node_id"].as_u64().ok_or_else(|| {
+        Error::Unreachable(Fault::Failed(
+            "commission_with_code returned no node_id".into(),
+        ))
+    })?;
     let mut attributes = node["attributes"].clone();
     let wifi = matches!(network, Network::Wifi { .. });
     if identity(&attributes).is_none() || (wifi && wifi_mac(&attributes).is_none()) {
@@ -343,7 +348,7 @@ async fn session(
             "args": { "node_id": node_id, "attribute_path": IDENTITY_PATHS },
         });
         let deadline = deadline.min(Instant::now() + READ_TIMEOUT);
-        if let Ok(Value::Object(read)) = call(ws, &read, deadline)
+        if let Ok(Value::Object(read)) = call(link, &read, deadline)
             .await
             .map(|mut reply| reply["result"].take())
         {
@@ -362,35 +367,27 @@ async fn session(
     })
 }
 
-/// Sends `request` and waits for the reply under its message id, skipping events.
-async fn call(ws: &mut Socket, request: &Value, deadline: Instant) -> Result<Value, Error> {
-    within(deadline, send(ws, request)).await?;
+/// Sends `request` and waits for the reply under its message id until `deadline`, skipping events.
+async fn call(link: &mut Link, request: &Value, deadline: Instant) -> Result<Value, Error> {
+    within(link.send(request, deadline)).await?;
     loop {
-        let reply = within(deadline, receive(ws)).await?;
-        if reply["message_id"] == request["message_id"] {
-            return Ok(reply);
+        let reply = within(link.next(deadline)).await?;
+        match reply {
+            Some(reply) if reply["message_id"] == request["message_id"] => return Ok(reply),
+            Some(_) => {}
+            None => return Err(Error::Failed(Failure::Timeout)),
         }
     }
 }
 
-async fn within<T>(
-    deadline: Instant,
-    future: impl Future<Output = Result<T, Dropped>>,
-) -> Result<T, Error> {
-    match tokio::time::timeout_at(deadline, future).await {
-        Err(_) => Err(Error::Failed(Failure::Timeout)),
-        Ok(Err(Dropped(error))) => Err(Error::Unreachable(error)),
-        Ok(Ok(value)) => Ok(value),
+/// A step's fault as a commissioning's: a deadline missed is a timeout, anything else the
+/// connection's.
+async fn within<T>(future: impl Future<Output = Result<T, Fault>>) -> Result<T, Error> {
+    match future.await {
+        Err(Fault::Timeout(_)) => Err(Error::Failed(Failure::Timeout)),
+        Err(fault) => Err(Error::Unreachable(fault)),
+        Ok(value) => Ok(value),
     }
-}
-
-fn error(reply: &Value) -> Option<String> {
-    reply.get("error_code").map(|_| {
-        reply["details"]
-            .as_str()
-            .unwrap_or("unknown error")
-            .to_owned()
-    })
 }
 
 /// Why matterjs-server could not commission a device.

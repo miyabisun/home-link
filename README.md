@@ -86,6 +86,24 @@ docker run -d --name home-link -p 5011:3000 -v home-link-data:/data \
 - 受けた値は5分間だけ今の値として扱い、それより古い値は返しません（受けた時刻は残します）。
 - アダプタが外れたり、BlueZやD-Busに届かなかったりしても、ほかの機能はそのまま動き、1分ごとに受信をやり直します。
 - 機器の登録（`POST /api/commission` など）の間は受信を止め、BluetoothをBLE Proxyに譲ります。終わると受信に戻ります。
+- 起動時のログは温度計が設定されたことだけを示し、アドレスの値は出しません。
+
+### ログ
+
+要求ごとに、応答の後で `info` の1行を残します。
+
+```text
+request method=POST path=/api/labels/1/on peer=100.64.0.5 status=200 ms=41
+```
+
+クエリと本文は含めません。コンテナのヘルスチェックが叩く `/healthz` だけは `debug` です。
+機器が命令を受け付けなかったときは、機器ごとに `warn` の1行を残します。
+
+```text
+device missed what="switch" node_id=5 endpoint=1 reason="server_error" details="Node 5 is not connected"
+```
+
+命令に1つも答えが無いときは、`warn` の1行を残します（`matterjs-server answered none of the commands`）。
 
 ## Webの管理画面
 
@@ -301,7 +319,7 @@ Thread網の資格情報（dataset）は、matterjs-serverに `set_thread_datase
 | `PATCH /api/devices/{id}` | 機器の名前・labelの割り当て・無視の設定。本文は送った項目だけを変えます。`{"name": "押入れ1"}`、`{"label_ids": [1, 2]}`（割り当てを置き換え、`[]` で外す）、`{"ignored": true}`（`false` で戻す） | 400 `invalid_device_update`・`invalid_device_name`、404 `device_not_found`・`label_not_found` |
 | `POST /api/devices/{id}/commission` | 台帳の機器を、記録したコードでmatterjs-serverへBluetoothで登録（commissioning）し、その行に識別子を補います。本文は要りません | 404 `device_not_found`、409 `no_setup_code`、422 `device_not_found`・`wrong_code`・`wifi_failed`・`thread_failed`・`commission_failed`、504 `commission_timeout`、502 `matter_server_unreachable`、503 `matter_server_not_configured`・`bluetooth_unavailable` |
 | `POST /api/devices/{id}/wifi` | 接続済みのWi-Fiの機器を、初期化せずに機器に渡すWi-Fi（`for_devices`）へ移します。本文は要りません。既にそのWi-Fiにいれば何も送りません。成功すると `{"device": {…}}` を200で返します | 404 `device_not_found`、409 `wifi_not_set`・`not_on_wifi`、422 `wifi_reverted`、504 `wifi_reverting`、502 `matter_server_unreachable`、503 `matter_server_not_configured` |
-| `POST /api/devices/{id}/on`・`/off` | プラグなど、照明以外で入り切りできる機器1台を入・切にします。応答は `{"state": "on"}`・`"off"`・`"no_response"`（応答しない・時間内に答えない機器） | 404 `device_not_found`、409 `not_connected`・`not_switchable`（照明とエアコンと、入り切りの無い機器）、502 `switch_failed`・`matter_server_unreachable`、503 `matter_server_not_configured` |
+| `POST /api/devices/{id}/on`・`/off` | プラグなど、照明以外で入り切りできる機器1台を入・切にします。応答は `{"state": "on"}`・`"off"`・`"no_response"`（応答しない・時間内に答えない機器。理由 `reason` と、matterjs-serverの説明 `details` を付けます）。答えない機器へは、labelと同じく1秒後にもう一度送ります | 404 `device_not_found`、409 `not_connected`・`not_switchable`（照明とエアコンと、入り切りの無い機器）、502 `switch_failed`・`matter_server_unreachable`、503 `matter_server_not_configured` |
 | `DELETE /api/devices/{id}` | 機器の削除 | 404 `device_not_found` |
 | `GET /api/labels` | labelの一覧。性質（`auto`・`override_level`・`override_kelvin`）、毎日の切り替え `schedule`、最後のON・OFF `on`（`true`・`false`・未操作の `null`）、割り当てた機器の台数 `device_count`、上書き中か `boosted` つき | |
 | `POST /api/labels` | labelの作成。本文は `{"name": "work", "override_level": 254, "override_kelvin": 5000}`、`{"name": "ambient", "auto": true}`、`{"name": "razor", "schedule": [{"time": "00:00", "on": true}, {"time": "05:00", "on": false}]}` など（下の「label」） | 400 `invalid_label_name`・`invalid_label`、409 `duplicate_label_name` |
@@ -402,8 +420,27 @@ nodeが使えない照明と、ブリッジが届かないと報告している�
 命令は全部の照明へ一度に送るので、応答しない照明が他の照明を待たせません。
 命令を受け付けた照明だけを `switched` に数え、エラーが返った照明は `failed`、2.5秒以内に応答の無かった照明は `no_response` です。
 応答の無い照明へは、1秒後に全nodeを読み直し、届くようになった照明も含めて同じ要求の中でもう一度送ります。どちらの命令への応答も数えます。
+2.5秒を過ぎても応答の無い照明は、全nodeをもう一度読み、On/Offが送った値へ変わっていれば `switched` に数えます（遅れて点いた照明）。
+もとから送った値だった照明は、変わったと分からないので `no_response` のままです。
 途中で接続が切れた場合は、2.5秒の間につなぎ直して、まだ応答の無い照明へ送り直します（オン・オフは状態に依らない指定なので、二重に届いても結果は同じです）。
 期限までに受けた結果は、接続が戻らなくても返します。照明ごとの項目の `network` は、その機器がつながるネットワーク（`wifi`・`thread`・`ethernet`、ブリッジ配下はブリッジのもの）です。
+
+`switched` 以外の照明には、理由 `reason` と、matterjs-serverの説明 `details`（エラーのときだけ）を付けます。
+
+| `reason` | `result` | 意味 |
+| --- | --- | --- |
+| `not_connected` | `no_response` | nodeが使えないか、ブリッジが届かないと報告しているので送っていない |
+| `no_answer` | `no_response` | 送ったが、時間内に答えが無い |
+| `server_error` | `failed` | matterjs-serverが自分で断った（`Node 17 is not connected` など、機器へ届けられない） |
+| `refused` | `failed` | 機器が断った（Matterの状態コード付き） |
+
+送った命令に、受け付けかエラーの答えが1つも返らなかったとき、応答の `none_answered` は `true` です。
+照明がそれぞれ応答しないのではなく、matterjs-serverが命令を処理していないことを示します。labelの入り切りの応答にもあります。
+
+matterjs-serverとの通信は、接続（3秒）・全nodeの読み取り（5秒）・応答待ち・切断のどれにも期限があります。
+接続は受けるが応答しないmatterjs-serverでも、要求と10分ごと・1分ごとの処理は止まりません。
+照明・label・プラグの1回の要求がmatterjs-serverに使う時間は、全部で約15秒までです。
+アプリが接続の後に応答を待つ20秒より短くしています。
 照明の `name` は台帳の機器名で、台帳に無い照明は製品名です。台帳の機器のうちmatterjs-serverに見えないものは `missing_devices` に並び、
 `missing` に数えます。状態の `GET /api/lights` は、matterjs-serverが最後に読んだOn/Offの値を返します。
 

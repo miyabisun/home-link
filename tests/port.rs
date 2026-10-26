@@ -114,3 +114,38 @@ fn invalid_port_fails_startup_with_an_explicit_error() {
         assert!(error.contains("PORT"), "{port:?}: {error}");
     }
 }
+
+#[test]
+fn startup_tells_the_meter_is_set_without_its_address() {
+    let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = reservation.local_addr().unwrap().port();
+    drop(reservation);
+    let mut server = Server(
+        command()
+            .env("PORT", port.to_string())
+            .env("LOG_LEVEL", "info")
+            .env("NO_COLOR", "1")
+            .env("SWITCHBOT_METER_ADDRESS", "aa:bb:cc:dd:ee:01")
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let stdout = server.0.stdout.take().unwrap();
+    let (lines, received) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        for line in std::io::BufRead::lines(std::io::BufReader::new(stdout)) {
+            if lines.send(line.unwrap()).is_err() {
+                break;
+            }
+        }
+    });
+    let mut logs = String::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !logs.contains("SwitchBot meter") {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let line = received.recv_timeout(left).expect("no meter line logged");
+        logs.push_str(&line);
+        logs.push('\n');
+    }
+    assert!(!logs.to_uppercase().contains("AA:BB:CC:DD:EE:01"), "{logs}");
+}

@@ -38,12 +38,27 @@ scripts/smoke.sh
 `tests/api.rs` はメモリ上のSQLiteでAPIの要求と応答を検証します。
 `src/onboarding.rs` はMatterのQRコード（Base38）と手動ペアリングコード（Verhoeff）の検証、
 同じ機器かを判定するキーの取り出しと、そのテストを持ちます。
-`src/matter.rs` はmatterjs-serverのWebSocket APIから全nodeを読み、識別子からnodeとendpointを引きます。
+`src/link.rs` はmatterjs-serverとの通信の層です。`Link` は接続・送信・応答待ち・切断のすべてに期限を持ちます。
+機器への要求の応答は、1つの関数 `Outcome::of` で分けます。
+分類は「受け付けた」「送っていない」「答えが無い」「matterjs-serverのエラー」「機器の拒否」です。
+matterjs-serverと話す処理（照明・プラグ・エアコン・自動調光・登録・Wi-Fiの移動）はすべてこの層を使い、`tokio_tungstenite` を直接使いません。
+`src/matter.rs` はこの層でmatterjs-serverのWebSocket APIから全nodeを読み、識別子からnodeとendpointを引きます。
 照明の選び方（Descriptorのdevice typeとOn/Off、ブリッジ配下の展開、届くかどうか）も同じファイルで単体テストします。
 状態APIと照明APIのテストは、`tests/api.rs` の中でmatterjs-serverと同じ形で `get_nodes` と `device_command` に応答する
 WebSocketサーバーを立て、全部オン・全部オフ、エラーや無応答の照明、最初のオンに応答しない照明への送り直し、接続断からの再接続、
 遅れて届く応答と、無応答の照明があっても他の照明の結果が3秒以内に返ることを検証します。
 無応答の照明のテストは、応答を待つ2.5秒の期限まで待ちます。
+通信の層の期限は、TCPは受けるがWebSocketのupgradeに答えないmock（`hanging`）で確かめます。
+全部オン・label・プラグ・登録・エアコン・Wi-Fiの移動と、1分ごとのlabelの予定・10分ごとの調整が、期限内に終わります。
+全部の応答を2.9秒遅らせるmock（`slow_ms`）では、labelのONと全部オンが15秒の予算の内に返ります（約15秒かかります）。
+結果の分け方は、次のmockで応答の項目とwarnのログを確かめます。
+
+- `get_nodes` には答えて、命令に答えないmock
+- `Node 5 is not connected` を返すmock（matterjs-serverのエラー）
+- `status` 付きのエラーを返すmock（機器の拒否）
+- 3秒遅れて答えるmock
+
+要求のログは `capture_logs` で、起動時に温度計のアドレスを出さないことは `tests/port.rs` で実行ファイルを起動して確かめます。
 機器の種類とプラグの入り切りは、同じmockに照明・プラグ（0x010A・0x010B）・ブリッジ配下のプラグ・センサーを並べ、
 種類と入・切の値、そのnodeとendpointへのOn/Off、応答しない・使えないプラグ、照明と入り切りの無い機器の拒否、
 全部オン・全部オフと自動調整がプラグへ命令を送らないことを検証します。
