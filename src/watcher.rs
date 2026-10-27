@@ -786,7 +786,6 @@ fn notice_kind(notice: &Notice) -> &'static str {
         Notice::ServerDown { .. } => "server_down",
         Notice::ServerUp { .. } => "server_up",
         Notice::Meter(notice) => notice.kind(),
-        Notice::Test => "test",
     }
 }
 
@@ -1007,26 +1006,4 @@ pub(crate) async fn connected(
         "server_reachable": server,
         "lights": lights,
     })))
-}
-
-/// Sends a test message to the destination, so its setting can be checked without a light going down.
-pub(crate) async fn test_notice(State(state): State<Db>) -> ApiResult<Json<Value>> {
-    if state.discord.is_none() {
-        return Err(ApiError(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "notify_not_configured",
-            format!(
-                "知らせの送り先（{}）が設定されていません",
-                crate::discord::ENV
-            ),
-        ));
-    }
-    send(&state, &Notice::Test).await.map_err(|_| {
-        ApiError(
-            StatusCode::BAD_GATEWAY,
-            "notify_failed",
-            "知らせを送れませんでした。送り先の設定を確かめてください".into(),
-        )
-    })?;
-    Ok(Json(json!({ "sent": true })))
 }

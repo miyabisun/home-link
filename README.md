@@ -127,6 +127,7 @@ light back name="玄関" node_id=5 endpoint=1 down_s=420 reconnects=1
 
 matterjs-serverに届かなくなったときは `warn` の `matterjs-server out of reach`、戻ったときは `info` の `matterjs-server back` です。
 起動時に、知らせの送り先があるか（`light notices go to Discord`、または未設定の旨）を示します。WebhookのURLは出しません。
+送れなかった知らせは `warn` の `notice not sent`（`kind` と理由）です。送り先の設定の誤りは、この行で確かめます。
 
 ### 照明の接続の見張り
 
@@ -177,7 +178,6 @@ matterjs-serverに届かなくなったときは `warn` の `matterjs-server out
 | `GET /api/lights/watch` | 今の状態。`server_reachable`（最後の確かめでmatterjs-serverに届いたか）、`server_since`、`server_outage`、`wifi_all_down`（見張るWi-Fiの照明が1台以上あり、全て切れている。登録が外れた照明は数えません）、`notify`（送り先があるか）、照明ごとの `connected`・`state`（`connected`・`down`・`left_fabric`）・`device_id`（台帳の行）・`since`（つながった、または切れた時刻）・`last_answer`（最後に読み取りに答えた時刻）・`outage`。登録が外れた照明は `node_id`・`endpoint`・`network` がnullで、最後の網は `outage` にあります |
 | `GET /api/lights/outages` | 14日分の、照明とmatterjs-serverがつながらなかった区間。古い順。`since`（その時刻より後に続いていた区間）、`node_id` と `endpoint`（1台の照明）で絞れます |
 | `GET /api/lights/connected?at=<Unix秒>` | その時刻の分の確かめで、照明ごとにつながっていたか（`connected`・`state`・`device_id`）。確かめた記録が無い時刻は404 `not_checked` |
-| `POST /api/lights/watch/test` | 試しの知らせを1通送ります。送り先が未設定なら503 `notify_not_configured`、送れなければ502 `notify_failed` |
 
 区間は `started_at`・`ended_at`（続いていればnull）・`network`・`found_by`（`unavailable`・`no_answer`・`left_fabric`・matterjs-serverの `unreachable`）・`reconnects`・`reconnect_result`（`accepted` か失敗の理由）・`reachable`（pingが届いたか）を持ちます。
 登録が外れた照明の区間は、`device_id`・`left_at`・`left_by`（`event`・`check`・`unknown`）・`labels`・`serial_number`・`software_version`・`thread_parent` と、
@@ -206,7 +206,7 @@ curl http://home-link.example:5011/api/lights/watch
 | ラベル（右上のメニュー） | labelの一覧と作成。一覧は固定・自動調光の別、機器の台数、入っているかを示します。名前を入れて「追加」で作り、そのlabelの画面を開きます |
 | labelの画面 | 名前の変更、入り切り、調光（なし・自動調光・固定）、固定の明るさ（%）と色温度（K）、毎日の時刻での入・切、機器の割り当て、削除（確認してから） |
 | 温度計（右上のメニュー） | 温度計の今の温度・湿度・CO2・電池と受けた時刻。受信が途絶えたときは、最後に受けた時刻だけを示します |
-| 照明の接続（右上のメニュー） | 照明ごとに、いつからつながっているかと最後に答えた時刻、切れている照明はいつからか・つなぎ直した回数・網の層で届くか。登録が外れた照明は「登録が外れた」といつから、自動で登録し直していること、戻らない理由・試した回数・14日で何回目かを示します。matterjs-serverに届かないときは画面の上部に示します。「14日の履歴」を開くとつながらなかった区間を新しい順に並べます。「試しに知らせる」で送り先へ試しの知らせを1通送ります |
+| 照明の接続（右上のメニュー） | 照明ごとに、いつからつながっているかと最後に答えた時刻、切れている照明はいつからか・つなぎ直した回数・網の層で届くか。登録が外れた照明は「登録が外れた」といつから、自動で登録し直していること、戻らない理由・試した回数・14日で何回目かを示します。matterjs-serverに届かないときは画面の上部に示します。「14日の履歴」を開くとつながらなかった区間を新しい順に並べます |
 | エアコン（右上のメニュー） | 目標の温度（18〜30℃）の変更、自動調整の入・切、室温・湿度・外気温とその時刻、エアコンの今の運転（「冷房 25℃」「切」など）、直近の判断の理由。「設定」に家の住所の登録と夜の時間帯 |
 
 変えた値はその場でAPIへ送り、保存ボタンはありません。値の誤りはその入力の下に、サーバーが受け付けなかった理由は画面の上部に示します。

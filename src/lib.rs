@@ -891,10 +891,6 @@ fn router(state: Db) -> Router {
         .route("/lights/boost", axum::routing::post(boost))
         .route("/lights/schedule", get(get_schedule).put(update_schedule))
         .route("/lights/watch", get(watcher::status))
-        .route(
-            "/lights/watch/test",
-            axum::routing::post(watcher::test_notice),
-        )
         .route("/lights/outages", get(watcher::outages))
         .route("/lights/connected", get(watcher::connected))
         .route("/door/unlock", axum::routing::post(unlock_door))

@@ -311,8 +311,6 @@ pub enum Notice {
     ServerUp { since: i64, until: i64 },
     /// The meter not heard, heard again, or low on battery.
     Meter(crate::meter::care::Notice),
-    /// The admin screen's test of the destination.
-    Test,
 }
 
 /// What one check calls for.
@@ -962,7 +960,6 @@ impl Notice {
                 )
             }),
             Self::Meter(notice) => notice.text(),
-            Self::Test => "home-linkから試しに送りました。".into(),
         }
     }
 }

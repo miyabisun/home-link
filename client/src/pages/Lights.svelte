@@ -9,8 +9,6 @@
   let outages = $state<Outage[]>([]);
   let pageState = $state<"loading" | "error" | "success">("loading");
   let now = $state(Math.floor(Date.now() / 1000));
-  let sending = $state(false);
-  let sent = $state<{ ok: boolean; text: string } | undefined>();
   let controller: AbortController | undefined;
 
   async function load() {
@@ -27,19 +25,6 @@
       pageState = "success";
     } catch (error) {
       if (!aborted(error)) pageState = "error";
-    }
-  }
-
-  async function test() {
-    sending = true;
-    sent = undefined;
-    try {
-      await api.testNotice();
-      sent = { ok: true, text: "送りました" };
-    } catch (error) {
-      sent = { ok: false, text: (error as Error).message };
-    } finally {
-      sending = false;
     }
   }
 
@@ -115,20 +100,6 @@
         </ul>
       {/if}
     </details>
-
-    <div class="notify">
-      {#if sent}
-        <p class="result" class:error={!sent.ok} role="status">{sent.text}</p>
-      {:else if !watch.notify}
-        <p class="result" role="status">知らせの送り先が未設定です</p>
-      {/if}
-      <button
-        class="btn"
-        type="button"
-        disabled={sending || !watch.notify}
-        onclick={() => void test()}>試しに知らせる</button
-      >
-    </div>
   {/if}
 </section>
 
@@ -164,20 +135,4 @@
   .note
     color: var(--c-muted)
     font-size: var(--fs-xs)
-
-  .notify
-    display: flex
-    flex-wrap: wrap
-    align-items: center
-    justify-content: flex-end
-    gap: var(--sp-2)
-    margin-top: var(--sp-3)
-
-  .result
-    margin: 0
-    color: var(--c-muted)
-    font-size: var(--fs-sm)
-
-    &.error
-      color: var(--c-danger)
 </style>

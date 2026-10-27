@@ -105,7 +105,7 @@ const server = {
 
 async function watching(
   page: Page,
-  { notify, serverDown }: { notify: boolean; serverDown: boolean },
+  { serverDown }: { serverDown: boolean },
 ) {
   await page.route("/api/lights/watch", (route) =>
     route.fulfill({
@@ -115,7 +115,6 @@ async function watching(
         server_since: serverDown ? server.started_at : minutes(600),
         server_outage: serverDown ? server : null,
         wifi_all_down: false,
-        notify,
         lights: [light, down, thread, left],
       },
     }),
@@ -158,7 +157,7 @@ for (const size of widths) {
     }) => {
       await page.setViewportSize(size);
       await page.emulateMedia({ colorScheme: scheme });
-      await watching(page, { notify: true, serverDown: true });
+      await watching(page, { serverDown: true });
       await page.goto("/lights");
 
       const cards = page.locator(".card");
@@ -196,33 +195,6 @@ for (const size of widths) {
     });
   }
 }
-
-test("a test message is sent from the page, and refused without a destination", async ({
-  page,
-}) => {
-  await watching(page, { notify: true, serverDown: false });
-  let posted = 0;
-  await page.route("/api/lights/watch/test", (route) => {
-    posted += 1;
-    return route.fulfill({ json: { sent: true } });
-  });
-  await page.goto("/lights");
-  await expect(page.getByRole("alert")).toHaveCount(0);
-  await page.getByRole("button", { name: "試しに知らせる" }).click();
-  await expect(page.getByRole("status")).toHaveText("送りました");
-  expect(posted).toBe(1);
-
-  // The server under test has no destination.
-  await page.unroute("/api/lights/watch");
-  await page.unroute("/api/lights/outages");
-  await page.goto("/lights");
-  await expect(page.getByRole("status")).toHaveText(
-    "知らせの送り先が未設定です",
-  );
-  await expect(
-    page.getByRole("button", { name: "試しに知らせる" }),
-  ).toBeDisabled();
-});
 
 test("the menu leads to the light watch", async ({ page }) => {
   await page.goto("/");

@@ -402,8 +402,8 @@ async fn the_history_holds_both_stretches(rig: &Rig) {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
-/// The Thread bulb stops answering reads at 00:21; then a test message goes out, and no light was switched.
-async fn a_silent_thread_bulb_is_reconnected_and_a_test_is_sent(rig: &Rig) {
+/// The Thread bulb stops answering reads at 00:21; no light was switched, and there is no test message to send.
+async fn a_silent_thread_bulb_is_reconnected_and_nothing_is_sent_on_request(rig: &Rig) {
     let Rig {
         matter,
         messages,
@@ -427,16 +427,10 @@ async fn a_silent_thread_bulb_is_reconnected_and_a_test_is_sent(rig: &Rig) {
         "a Thread bulb is not pinged"
     );
 
-    let (status, sent) = call(app, "POST", "/api/lights/watch/test").await;
-    assert_eq!((status, sent), (StatusCode::OK, json!({ "sent": true })));
-    assert!(
-        messages
-            .lock()
-            .unwrap()
-            .last()
-            .unwrap()
-            .contains("試しに送りました")
-    );
+    let told = messages.lock().unwrap().len();
+    let (status, _) = call(app, "POST", "/api/lights/watch/test").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(messages.lock().unwrap().len(), told, "nothing was sent");
     assert_eq!(
         asked(matter, "device_command"),
         Vec::<u64>::new(),
@@ -458,7 +452,7 @@ async fn the_watch_reconnects_tells_and_keeps_the_history_of_a_light_and_of_matt
     a_wifi_bulb_drops_out_and_comes_back(&rig).await;
     matterjs_server_drops_out_and_comes_back(&rig).await;
     the_history_holds_both_stretches(&rig).await;
-    a_silent_thread_bulb_is_reconnected_and_a_test_is_sent(&rig).await;
+    a_silent_thread_bulb_is_reconnected_and_nothing_is_sent_on_request(&rig).await;
 }
 
 #[tokio::test]
@@ -478,9 +472,6 @@ async fn without_a_destination_the_watch_tells_nothing_and_keeps_the_rest() {
     assert_eq!(watch["lights"][0]["connected"], false);
     let (_, outages) = call(&app, "GET", "/api/lights/outages").await;
     assert_eq!(outages["outages"][0]["started_at"], minute(0));
-    let (status, error) = call(&app, "POST", "/api/lights/watch/test").await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(error["error"], "notify_not_configured");
 }
 
 #[tokio::test]

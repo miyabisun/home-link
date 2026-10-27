@@ -18,7 +18,6 @@ export interface Watch {
   server_since: number | null;
   server_outage: Outage | null;
   wifi_all_down: boolean;
-  notify: boolean;
   lights: WatchLight[];
 }
 
@@ -174,8 +173,6 @@ export const api = {
       undefined,
       signal,
     ),
-  testNotice: () =>
-    request<{ sent: boolean }>("POST", "/api/lights/watch/test"),
 };
 
 export const aborted = (error: unknown) =>
