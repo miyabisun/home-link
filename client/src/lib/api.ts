@@ -1,5 +1,6 @@
 import {
   type AirconDevice,
+  type Attention,
   errorMessage,
   type LabelTraits,
   type MeterView,
@@ -166,6 +167,8 @@ export const api = {
     }>("POST", `/api/labels/${id}/toggle`),
   watch: (signal?: AbortSignal) =>
     request<Watch>("GET", "/api/lights/watch", undefined, signal),
+  attention: (signal?: AbortSignal) =>
+    request<{ items: Attention[] }>("GET", "/api/attention", undefined, signal),
   outages: (signal?: AbortSignal) =>
     request<{ outages: Outage[] }>(
       "GET",

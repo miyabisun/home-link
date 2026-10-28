@@ -20,8 +20,9 @@ pub const COMMISSION_WAIT: i64 = 240;
 pub const METER_GAP: i64 = 60;
 /// How long an advertisement stands for a light waiting to be commissioned, in seconds.
 pub const ADVERT_FRESH: i64 = 60;
-/// How long a reason stands before it is told, in seconds, as the watch's other messages.
-pub const TELL_AFTER: i64 = crate::watch::NOTIFY_AFTER;
+/// How long a reason the user can act on stands before it asks for the user, in seconds, as
+/// the watch's other states do.
+pub const ASK_AFTER: i64 = crate::watch::ASK_AFTER;
 /// The longest wait between two tries at a light that is advertising, in seconds.
 pub const MAX_RETRY: i64 = 180;
 /// The wait before trying a code the light refused again, in seconds: the refusal may
@@ -157,25 +158,14 @@ impl Reason {
         }
     }
 
-    /// What the user can do to bring the light back, as a message tells it: nothing when
-    /// home-link only has to keep trying.
+    /// Whether the user can do something to bring the light back: switch it off and on for
+    /// no advertisement, register it again in the app for a code; not when home-link only has
+    /// to keep trying.
     #[must_use]
-    pub const fn action(self) -> Option<&'static str> {
+    pub const fn asks_user(self) -> bool {
         match self {
-            Self::NoAdvert => Some("壁のスイッチで電源を入れ直してください。"),
-            Self::WrongCode | Self::NoCode => Some("アプリで登録し直してください。"),
-            Self::ConnectFailed | Self::NoBluetooth | Self::AdapterLost => None,
-        }
-    }
-
-    const fn bit(self) -> u8 {
-        match self {
-            Self::NoAdvert => 1,
-            Self::ConnectFailed => 2,
-            Self::WrongCode => 4,
-            Self::NoCode => 8,
-            Self::NoBluetooth => 16,
-            Self::AdapterLost => 32,
+            Self::NoAdvert | Self::WrongCode | Self::NoCode => true,
+            Self::ConnectFailed | Self::NoBluetooth | Self::AdapterLost => false,
         }
     }
 }
@@ -256,9 +246,6 @@ pub struct Pursuit {
     /// Until when the next try waits, once [`ADAPTER_LOSSES_TO_SLOW`] tries in a row lost the
     /// adapter.
     pub slowed_until: Option<i64>,
-    /// The reasons already told, as bits.
-    #[serde(skip)]
-    pub told: u8,
 }
 
 impl Pursuit {
@@ -368,23 +355,12 @@ impl Pursuit {
         again
     }
 
-    /// The reason to tell at `at`: one the user can do something about, that has stood for
-    /// [`TELL_AFTER`] and was not told in this stretch; it is marked told. Slowed tries are not
-    /// told: they ask nothing of the user.
-    pub fn tell(&mut self, at: i64) -> Option<Reason> {
-        let reason = self.reason.filter(|reason| reason.action().is_some())?;
-        let stood = at - self.reason_since? >= TELL_AFTER;
-        (stood && self.told & reason.bit() == 0).then(|| {
-            self.told |= reason.bit();
-            reason
-        })
-    }
-
-    /// Marks the reason now as told, when it went out with the message that the light left.
-    pub fn told_now(&mut self) {
-        if let Some(reason) = self.reason {
-            self.told |= reason.bit();
-        }
+    /// The reason that asks for the user at `at`: one the user can do something about, that
+    /// has stood for [`ASK_AFTER`]. Slowed tries ask nothing of the user.
+    #[must_use]
+    pub fn asks(&self, at: i64) -> Option<Reason> {
+        let reason = self.reason.filter(|reason| reason.asks_user())?;
+        (at - self.reason_since? >= ASK_AFTER).then_some(reason)
     }
 }
 
@@ -632,46 +608,31 @@ mod tests {
     }
 
     #[test]
-    fn each_reason_is_told_once_after_five_minutes() {
+    fn a_reason_the_user_can_act_on_asks_after_five_minutes_while_it_stands() {
         let mut pursuit = Pursuit::default();
         pursuit.look(T0 + 60, T0, true, true, false);
-        assert_eq!(pursuit.tell(T0 + 359), None, "under five minutes");
+        assert_eq!(pursuit.asks(T0 + 359), None, "under five minutes");
         assert_eq!(
-            pursuit.tell(T0 + 360),
+            pursuit.asks(T0 + 360),
             Some(Reason::NoAdvert),
             "five minutes"
         );
-        assert_eq!(pursuit.tell(T0 + 420), None, "told once");
-        pursuit.look(T0 + 500, T0, true, true, true);
-        pursuit.attempted(T0 + 540, Err(Reason::ConnectFailed));
-        for at in (600..=840).step_by(5) {
+        assert_eq!(pursuit.asks(T0 + 3600), Some(Reason::NoAdvert), "still");
+        pursuit.look(T0 + 3700, T0, true, true, true);
+        pursuit.attempted(T0 + 3740, Err(Reason::ConnectFailed));
+        for at in (3800..=4400).step_by(5) {
             pursuit.look(T0 + at, T0, true, true, true);
         }
-        assert_eq!(pursuit.tell(T0 + 839), None, "a failure under five minutes");
         assert_eq!(
-            pursuit.tell(T0 + 840),
+            pursuit.asks(T0 + 4400),
             None,
             "nothing for the user to do: home-link keeps trying"
         );
-        pursuit.look(T0 + 900, T0, true, true, false);
-        pursuit.look(T0 + 2000, T0, true, true, false);
-        assert_eq!(
-            pursuit.tell(T0 + 2000),
-            None,
-            "no advertisement again: told already"
-        );
-    }
-
-    #[test]
-    fn the_reason_sent_with_the_left_message_is_not_told_again() {
-        let mut pursuit = Pursuit::default();
-        pursuit.look(T0 + 60, T0, true, true, false);
-        pursuit.told_now();
-        assert_eq!(
-            pursuit.tell(T0 + 3600),
-            None,
-            "went out with the left message"
-        );
+        pursuit.attempted(T0 + 4410, Err(Reason::WrongCode));
+        assert_eq!(pursuit.asks(T0 + 4709), None, "a new reason counts anew");
+        assert_eq!(pursuit.asks(T0 + 4710), Some(Reason::WrongCode));
+        pursuit.attempted(T0 + 4800, Ok(()));
+        assert_eq!(pursuit.asks(T0 + 6000), None, "back");
     }
 
     #[test]
@@ -885,17 +846,10 @@ mod tests {
         );
         left.look(T0 + 85, T0, true, false, false);
         left.look(T0 + 115, T0, true, true, true);
-        left.reason = None;
-        left.told_now();
-        assert!(
-            left.tell(T0 + 116).is_none(),
-            "nothing to tell without a reason"
-        );
-        left.look(T0 + 120, T0, true, true, true);
         assert_eq!(
-            left.tell(T0 + 421),
+            left.asks(T0 + 421),
             None,
-            "a lost adapter asks nothing of the user: not told"
+            "a lost adapter asks nothing of the user"
         );
     }
 
@@ -913,13 +867,13 @@ mod tests {
     }
 
     #[test]
-    fn slowing_down_is_not_told() {
+    fn slowing_down_asks_nothing_of_the_user() {
         let mut pursuit = heard(T0);
         pursuit.attempted(T0 + 20, Err(Reason::AdapterLost));
         pursuit.attempted(T0 + 60, Err(Reason::AdapterLost));
         assert!(pursuit.slowed_until.is_some(), "slowed");
-        assert_eq!(pursuit.tell(T0 + 61), None, "nothing for the user to do");
-        assert_eq!(pursuit.tell(T0 + 400), None, "nor after five minutes");
+        assert_eq!(pursuit.asks(T0 + 61), None, "nothing for the user to do");
+        assert_eq!(pursuit.asks(T0 + 400), None, "nor after five minutes");
     }
 
     #[test]

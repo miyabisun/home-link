@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import {
   airconText,
+  attentionHref,
+  attentionText,
   nightMinute,
   nightTime,
   outdoorText,
@@ -577,5 +579,88 @@ describe("the light watch", () => {
     expect(outageText(left.outage, now)).toBe(
       "10/21 09:17〜（4日15時間13分、続いている）・登録が外れた",
     );
+  });
+});
+
+describe("what asks for the user", () => {
+  // 2026-10-26 00:00 in Tokyo.
+  const T0 = 1_792_940_400;
+  const now = T0 + 30 * 60;
+
+  it("tells matterjs-server out of reach since when, on the lights' page", () => {
+    const item = { kind: "server_down" as const, since: T0 + 10 * 60 };
+    expect(attentionText(item, now)).toBe(
+      "matterjs-serverに00:10からつながりません。照明を操作できません。",
+    );
+    expect(attentionHref(item)).toBe("/lights");
+  });
+
+  it("tells a light still down to be switched off and on at the wall", () => {
+    const item = {
+      kind: "power_cycle" as const,
+      name: "寝室",
+      device_id: 2,
+      since: T0 - 86_400 + 21 * 60,
+    };
+    expect(attentionText(item, now)).toBe(
+      "寝室が10/25 00:21からつながっていません。壁のスイッチで電源を入れ直してください。",
+    );
+    expect(attentionHref(item)).toBe("/lights");
+  });
+
+  it("tells a light out of the fabric when it left and what the user does", () => {
+    const left = {
+      kind: "left_fabric" as const,
+      name: "物置き1",
+      device_id: 19,
+      left_at: T0 + 9 * 60 + 17 * 60,
+      left_by: "event" as const,
+      reason: "no_advert" as const,
+    };
+    expect(attentionText(left, now)).toBe(
+      "物置き1の登録が00:26に外れました。壁のスイッチで電源を入れ直してください。",
+    );
+    expect(attentionText({ ...left, reason: "wrong_code" }, now)).toBe(
+      "物置き1の登録が00:26に外れました。アプリで登録し直してください。",
+    );
+    expect(
+      attentionText({ ...left, left_by: "unknown", reason: "no_code" }, now),
+    ).toBe(
+      "00:26に、物置き1の登録が外れているのを見つけました。アプリで登録し直してください。",
+    );
+    expect(attentionHref(left)).toBe("/lights");
+  });
+
+  it("tells the meter unheard with what to do for what Bluetooth shows", () => {
+    const lost = {
+      kind: "meter_lost" as const,
+      since: T0 + 5 * 60,
+      trouble: "meter_silent" as const,
+      battery: 55 as number | null,
+    };
+    expect(attentionText(lost, now)).toBe(
+      "温度計を00:05から読めていません。温度計の電池（最後は55%）と置き場所を確かめてください。",
+    );
+    expect(attentionText({ ...lost, battery: null }, now)).toBe(
+      "温度計を00:05から読めていません。温度計の電池と置き場所を確かめてください。",
+    );
+    expect(attentionText({ ...lost, trouble: "no_adapter" }, now)).toBe(
+      "温度計を00:05から読めていません。UB500が外れています。挿し直してください。",
+    );
+    expect(attentionText({ ...lost, trouble: "adapter_down" }, now)).toBe(
+      "温度計を00:05から読めていません。UB500を挿し直してください。",
+    );
+    expect(attentionText({ ...lost, trouble: "no_bluetooth" }, now)).toBe(
+      "温度計を00:05から読めていません。",
+    );
+    expect(attentionHref(lost)).toBe("/meter");
+  });
+
+  it("tells the meter's battery to be changed", () => {
+    const item = { kind: "meter_battery" as const, battery: 19 };
+    expect(attentionText(item, now)).toBe(
+      "温度計の電池が残り19%です。交換してください。",
+    );
+    expect(attentionHref(item)).toBe("/meter");
   });
 });

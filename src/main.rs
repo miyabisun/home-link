@@ -62,24 +62,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         },
     }
-    let discord = std::env::var(home_link::discord::ENV)
-        .ok()
-        .filter(|value| !value.is_empty());
-    match discord.as_deref().map(home_link::discord::Discord::new) {
-        // The URL holds the webhook's token and stays out of the logs.
-        Some(Some(discord)) => {
-            info!("light notices go to Discord");
-            home = home.with_discord(Some(discord));
-        }
-        Some(None) => tracing::warn!(
-            "{} is neither a webhook URL nor discord://token@id; light notices are not sent",
-            home_link::discord::ENV
-        ),
-        None => info!(
-            "{} unset; light notices are not sent",
-            home_link::discord::ENV
-        ),
-    }
     let env = |name| {
         std::env::var(name)
             .ok()

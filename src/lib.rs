@@ -1,7 +1,6 @@
 pub mod aircon;
 mod ble_proxy;
 pub mod commission;
-pub mod discord;
 pub mod link;
 pub mod matter;
 mod mcp;
@@ -467,10 +466,6 @@ struct AppState {
     tasks: Mutex<std::collections::BTreeMap<&'static str, Task>>,
     /// The watch over each light's connection; its history is in the database.
     watch: Mutex<watch::Watch>,
-    /// Where the watch's messages go, if anywhere.
-    discord: Option<discord::Discord>,
-    /// The watch's messages not delivered yet, to send again.
-    unsent: Mutex<Vec<watch::Notice>>,
     /// The nodes matterjs-server sent it removed, and when.
     removed: Mutex<Vec<(u64, i64)>>,
     /// The Bluetooth adapter lights that left are looked for on (`hci1`), else the first one.
@@ -552,24 +547,10 @@ impl Home {
             outside: None,
             outdoor: Mutex::new(None),
             watch: Mutex::new(watch::Watch::default()),
-            discord: None,
-            unsent: Mutex::new(Vec::new()),
             removed: Mutex::new(Vec::new()),
             bluetooth_adapter: None,
             ble_proxy_url: None,
         }))
-    }
-
-    /// Sets where the light watch's messages go.
-    ///
-    /// # Panics
-    /// Panics once the router or a clone shares this `Home`.
-    #[must_use]
-    pub fn with_discord(mut self, discord: Option<discord::Discord>) -> Self {
-        Arc::get_mut(&mut self.0)
-            .expect("set before the Home is shared")
-            .discord = discord;
-        self
     }
 
     /// Sets the Bluetooth adapter (`hci1`) lights that left are looked for on, and the BLE proxy
@@ -603,17 +584,10 @@ impl Home {
         self.0.meter.record(reading, at);
     }
 
-    /// Receives the meter's advertisements through `BlueZ` forever, keeping its adapter powered
-    /// and telling the user when it stays unheard; returns at once without a meter.
+    /// Receives the meter's advertisements through `BlueZ` forever, keeping its adapter
+    /// powered; returns at once without a meter.
     pub async fn receive_meter(self) {
-        let state = &self.0;
-        meter::receive(
-            &state.meter,
-            state.clock,
-            state.discord.is_some(),
-            |notice| watcher::deliver(state, vec![watch::Notice::Meter(notice)]),
-        )
-        .await;
+        meter::receive(&self.0.meter, self.0.clock).await;
     }
 
     /// Sets the SESAME that `POST /api/door/unlock` and `/lock` act on, or why there is none.
@@ -893,6 +867,7 @@ fn router(state: Db) -> Router {
         .route("/lights/watch", get(watcher::status))
         .route("/lights/outages", get(watcher::outages))
         .route("/lights/connected", get(watcher::connected))
+        .route("/attention", get(watcher::attention))
         .route("/door/unlock", axum::routing::post(unlock_door))
         .route("/door/lock", axum::routing::post(lock_door))
         .fallback(not_found)

@@ -1,5 +1,5 @@
-//! The light watch at work: a check every minute against matterjs-server, the reconnections,
-//! pings and messages it calls for, and two weeks of history. [`crate::watch`] decides; this
+//! The light watch at work: a check every minute against matterjs-server, the reconnections
+//! and pings it calls for, and two weeks of history. [`crate::watch`] decides; this
 //! module only carries the decisions out.
 
 use std::{collections::BTreeMap, fmt::Write as _, time::Duration};
@@ -19,7 +19,7 @@ use crate::{
     link::{Link, OPEN_TIMEOUT, Outcome, next_id},
     match_ledger, matter, place,
     rejoin::{Leaves, Pursuit, Reason},
-    watch::{Cause, Change, Key, Left, LeftBy, Notice, Outage, Seen},
+    watch::{Cause, Change, Key, Left, LeftBy, Outage, Seen},
 };
 
 /// One check's reading of every node and of the lights due a read.
@@ -32,8 +32,6 @@ const RECONNECT_TIMEOUT: Duration = Duration::from_secs(40);
 const PING_TIMEOUT: Duration = Duration::from_secs(20);
 /// The history is kept this many seconds.
 const KEPT: i64 = 14 * 86_400;
-/// Notices kept to send again while the destination fails; the oldest go first.
-const MAX_UNSENT: usize = 20;
 /// A check this close before a moment answers for it, in seconds: a minute and its slack.
 const CHECK_COVERS: i64 = 90;
 /// The connection listening for removed nodes is opened again after this long without a message.
@@ -179,10 +177,10 @@ fn network_of(text: Option<&str>) -> Option<&'static str> {
 fn open_outages(db: &Connection) -> rusqlite::Result<Vec<Outage>> {
     db.prepare(
         "SELECT node_id, endpoint, name, network, started_at, found_by, reconnects,
-            reconnect_result, reachable, notified, advised, device_id, left_at, left_by, labels,
-            serial_number, software_version, thread_parent, left_told, rejoin_attempts, rejoin_at,
-            rejoin_reason, rejoin_reason_since, advert_at, rejoined, rejoin_told, leaves,
-            previous_left_at, rejoin_adapter_losses, rejoin_slowed_until
+            reconnect_result, reachable, device_id, left_at, left_by, labels, serial_number,
+            software_version, thread_parent, rejoin_attempts, rejoin_at, rejoin_reason,
+            rejoin_reason_since, advert_at, rejoined, leaves, previous_left_at,
+            rejoin_adapter_losses, rejoin_slowed_until
          FROM light_outages WHERE ended_at IS NULL",
     )?
     .query_map([], |row| {
@@ -202,49 +200,46 @@ fn open_outages(db: &Connection) -> rusqlite::Result<Vec<Outage>> {
             network_of(row.get::<_, Option<String>>(3)?.as_deref()),
             row.get(4)?,
             found_by,
-        )
-        .told(row.get(9)?, row.get(10)?)
-        .told_left(row.get(18)?);
+        );
         outage.reconnects = row.get(6)?;
         outage.reconnect_result = row.get(7)?;
         outage.reachable = row.get(8)?;
-        outage.device_id = row.get(11)?;
-        outage.left_at = row.get(12)?;
-        outage.left_by = match row.get::<_, Option<String>>(13)?.as_deref() {
+        outage.device_id = row.get(9)?;
+        outage.left_at = row.get(10)?;
+        outage.left_by = match row.get::<_, Option<String>>(11)?.as_deref() {
             Some("event") => Some(LeftBy::Event),
             Some("check") => Some(LeftBy::Check),
             Some(_) => Some(LeftBy::Unknown),
             None => None,
         };
-        outage.labels = serde_json::from_str(&row.get::<_, String>(14)?).unwrap_or_default();
-        outage.serial_number = row.get(15)?;
-        outage.software_version = row.get(16)?;
-        outage.thread_parent = row.get(17)?;
+        outage.labels = serde_json::from_str(&row.get::<_, String>(12)?).unwrap_or_default();
+        outage.serial_number = row.get(13)?;
+        outage.software_version = row.get(14)?;
+        outage.thread_parent = row.get(15)?;
         outage.rejoin = Pursuit {
-            attempts: row.get(19)?,
-            attempted_at: row.get(20)?,
+            attempts: row.get(16)?,
+            attempted_at: row.get(17)?,
             reason: row
-                .get::<_, Option<String>>(21)?
+                .get::<_, Option<String>>(18)?
                 .as_deref()
                 .and_then(Reason::parse),
-            reason_since: row.get(22)?,
-            advert_at: row.get(23)?,
-            rejoined: row.get(24)?,
-            told: row.get(25)?,
-            adapter_losses: row.get(28)?,
-            slowed_until: row.get(29)?,
+            reason_since: row.get(19)?,
+            advert_at: row.get(20)?,
+            rejoined: row.get(21)?,
+            adapter_losses: row.get(24)?,
+            slowed_until: row.get(25)?,
         };
         outage.leaves = Leaves {
-            count: row.get(26)?,
-            previous_at: row.get(27)?,
+            count: row.get(22)?,
+            previous_at: row.get(23)?,
         };
         Ok(outage)
     })?
     .collect()
 }
 
-/// Takes back the stretches still open when home-link last stopped, so what was told is not
-/// told again and a light back is told back.
+/// Takes back the stretches still open when home-link last stopped, so a stretch carries on
+/// across a restart.
 pub(crate) fn resume(state: &AppState) {
     match open_outages(&state.db.lock().expect(UNPOISONED)) {
         Ok(outages) => state.watch.lock().expect(UNPOISONED).resume(outages),
@@ -271,24 +266,23 @@ fn outage_key(outage: &Outage) -> String {
 fn save(db: &Connection, outage: &Outage) -> rusqlite::Result<()> {
     db.execute(
         "INSERT INTO light_outages (key, node_id, endpoint, name, network, started_at, ended_at,
-            found_by, reconnects, reconnect_result, reachable, notified, advised, device_id,
-            left_at, left_by, labels, serial_number, software_version, thread_parent, left_told,
-            rejoin_attempts, rejoin_at, rejoin_reason, rejoin_reason_since, advert_at, rejoined,
-            rejoin_told, leaves, previous_left_at, rejoin_adapter_losses, rejoin_slowed_until)
+            found_by, reconnects, reconnect_result, reachable, device_id, left_at, left_by, labels,
+            serial_number, software_version, thread_parent, rejoin_attempts, rejoin_at,
+            rejoin_reason, rejoin_reason_since, advert_at, rejoined, leaves, previous_left_at,
+            rejoin_adapter_losses, rejoin_slowed_until)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-            ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32)
+            ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)
          ON CONFLICT (key, started_at) DO UPDATE SET name = excluded.name,
             network = excluded.network, ended_at = excluded.ended_at,
             reconnects = excluded.reconnects, reconnect_result = excluded.reconnect_result,
-            reachable = excluded.reachable, notified = excluded.notified,
-            advised = excluded.advised, device_id = excluded.device_id,
+            reachable = excluded.reachable, device_id = excluded.device_id,
             left_at = excluded.left_at, left_by = excluded.left_by, labels = excluded.labels,
             serial_number = excluded.serial_number, software_version = excluded.software_version,
-            thread_parent = excluded.thread_parent, left_told = excluded.left_told,
+            thread_parent = excluded.thread_parent,
             rejoin_attempts = excluded.rejoin_attempts, rejoin_at = excluded.rejoin_at,
             rejoin_reason = excluded.rejoin_reason,
             rejoin_reason_since = excluded.rejoin_reason_since, advert_at = excluded.advert_at,
-            rejoined = excluded.rejoined, rejoin_told = excluded.rejoin_told,
+            rejoined = excluded.rejoined,
             leaves = excluded.leaves, previous_left_at = excluded.previous_left_at,
             rejoin_adapter_losses = excluded.rejoin_adapter_losses,
             rejoin_slowed_until = excluded.rejoin_slowed_until",
@@ -306,8 +300,6 @@ fn save(db: &Connection, outage: &Outage) -> rusqlite::Result<()> {
             outage.reconnects,
             outage.reconnect_result,
             outage.reachable,
-            outage.notified(),
-            outage.advised(),
             outage.device_id,
             outage.left_at,
             outage.left_by.map(LeftBy::as_str),
@@ -315,14 +307,12 @@ fn save(db: &Connection, outage: &Outage) -> rusqlite::Result<()> {
             outage.serial_number,
             outage.software_version,
             outage.thread_parent,
-            outage.left_told(),
             outage.rejoin.attempts,
             outage.rejoin.attempted_at,
             outage.rejoin.reason.map(Reason::as_str),
             outage.rejoin.reason_since,
             outage.rejoin.advert_at,
             outage.rejoin.rejoined,
-            outage.rejoin.told,
             outage.leaves.count,
             outage.leaves.previous_at,
             outage.rejoin.adapter_losses,
@@ -334,7 +324,10 @@ fn save(db: &Connection, outage: &Outage) -> rusqlite::Result<()> {
 
 /// Keeps `change` in the history; its own module logs it.
 pub(crate) fn keep(state: &AppState, change: &Change) {
-    let (Change::Down(outage) | Change::Updated(outage) | Change::Up(outage)) = change;
+    let (Change::Down(outage)
+    | Change::Left(outage)
+    | Change::Updated(outage)
+    | Change::Up(outage)) = change;
     if let Err(error) = save(&state.db.lock().expect(UNPOISONED), outage) {
         tracing::warn!(%error, "light history not saved");
     }
@@ -342,14 +335,14 @@ pub(crate) fn keep(state: &AppState, change: &Change) {
 
 /// Logs `change` on one line, and keeps it in the history.
 fn record(state: &AppState, change: &Change) {
-    let (Change::Down(outage) | Change::Updated(outage) | Change::Up(outage)) = change;
+    let (Change::Down(outage)
+    | Change::Left(outage)
+    | Change::Updated(outage)
+    | Change::Up(outage)) = change;
     let (node_id, endpoint) = (outage.node_id, outage.endpoint);
     let name = outage.name.as_str();
     match (change, outage.key()) {
-        // A light leaving the fabric: told by Down when it was up, by Updated when it was down.
-        (Change::Down(_) | Change::Updated(_), _)
-            if outage.left_at.is_some() && !outage.left_told() =>
-        {
+        (Change::Left(_), _) => {
             tracing::warn!(
                 name,
                 device_id = outage.device_id,
@@ -775,35 +768,6 @@ async fn ping(state: &AppState, url: &str, key: Key, name: String) {
     }
 }
 
-fn notice_kind(notice: &Notice) -> &'static str {
-    match notice {
-        Notice::Down(_) => "down",
-        Notice::StillDown(_) => "still_down",
-        Notice::Up(_) => "up",
-        Notice::Left(_) => "left_fabric",
-        Notice::Rejoined(_) => "rejoined",
-        Notice::NotRejoined(_) => "not_rejoined",
-        Notice::ServerDown { .. } => "server_down",
-        Notice::ServerUp { .. } => "server_up",
-        Notice::Meter(notice) => notice.kind(),
-    }
-}
-
-async fn send(state: &AppState, notice: &Notice) -> Result<(), String> {
-    let discord = state.discord.as_ref().ok_or("no destination")?;
-    let kind = notice_kind(notice);
-    match discord.send(&notice.text()).await {
-        Ok(()) => {
-            tracing::info!(kind, "notice sent");
-            Ok(())
-        }
-        Err(error) => {
-            tracing::warn!(kind, %error, "notice not sent");
-            Err(error)
-        }
-    }
-}
-
 /// One check at `at`, on the minute, and whatever it calls for.
 pub(crate) async fn check(state: &AppState, at: i64) {
     let Some(url) = state.matter_url.as_deref() else {
@@ -821,7 +785,6 @@ pub(crate) async fn check(state: &AppState, at: i64) {
         at,
         seen.as_deref(),
         left.as_deref().unwrap_or_default(),
-        state.discord.is_some(),
     );
     for change in &step.changes {
         record(state, change);
@@ -853,35 +816,21 @@ pub(crate) async fn check(state: &AppState, at: i64) {
     tokio::join!(
         futures_util::future::join_all(reconnects),
         futures_util::future::join_all(pings),
-        deliver(state, step.notices),
     );
 }
 
-/// Sends the notices left unsent, oldest first, then `notices`; those that fail wait for the next check.
-pub(crate) async fn deliver(state: &AppState, notices: Vec<Notice>) {
-    let mut queue = std::mem::take(&mut *state.unsent.lock().expect(UNPOISONED));
-    queue.extend(notices);
-    let mut unsent = Vec::new();
-    for notice in queue {
-        if send(state, &notice).await.is_err() {
-            unsent.push(notice);
-        }
-    }
-    let mut kept = state.unsent.lock().expect(UNPOISONED);
-    unsent.append(&mut kept);
-    let over = unsent.len().saturating_sub(MAX_UNSENT);
-    if over > 0 {
-        tracing::warn!(dropped = over, "unsent notices dropped");
-    }
-    *kept = unsent.split_off(over);
-}
-
-/// The watch's state: matterjs-server, each light, and whether messages have somewhere to go.
+/// The watch's state: matterjs-server and each light.
 pub(crate) async fn status(State(state): State<Db>) -> Json<Value> {
     let status = state.watch.lock().expect(UNPOISONED).status();
-    let mut value = serde_json::to_value(status).unwrap_or_default();
-    value["notify"] = json!(state.discord.is_some());
-    Json(value)
+    Json(serde_json::to_value(status).unwrap_or_default())
+}
+
+/// What asks for the user now, of the lights, matterjs-server and the meter.
+pub(crate) async fn attention(State(state): State<Db>) -> Json<Value> {
+    let now = (state.clock)();
+    let mut items = state.watch.lock().expect(UNPOISONED).attention(now);
+    items.extend(state.meter.attention());
+    Json(json!({ "items": items }))
 }
 
 #[derive(Deserialize)]
@@ -1006,4 +955,41 @@ pub(crate) async fn connected(
         "server_reachable": server,
         "lights": lights,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_open_stretch_is_taken_back_as_it_was_saved() {
+        let db = crate::open_db(":memory:").unwrap();
+        let mut outage = Outage::new(Some((7, 1)), "寝室", Some("thread"), 100, Cause::NoAnswer);
+        outage.reconnects = 3;
+        outage.reconnect_result = Some("accepted".into());
+        outage.reachable = Some(false);
+        outage.device_id = Some(2);
+        outage.left_at = Some(140);
+        outage.left_by = Some(LeftBy::Event);
+        outage.labels = vec!["room".into()];
+        outage.serial_number = Some("thread-bulb".into());
+        outage.software_version = Some("1.0.0.6".into());
+        outage.thread_parent = Some("0x4c00".into());
+        outage.rejoin = Pursuit {
+            attempts: 2,
+            attempted_at: Some(200),
+            reason: Some(Reason::WrongCode),
+            reason_since: Some(210),
+            advert_at: Some(190),
+            rejoined: false,
+            adapter_losses: 1,
+            slowed_until: Some(2000),
+        };
+        outage.leaves = Leaves {
+            count: 3,
+            previous_at: Some(50),
+        };
+        save(&db, &outage).unwrap();
+        assert_eq!(open_outages(&db).unwrap(), vec![outage]);
+    }
 }

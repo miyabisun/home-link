@@ -1,5 +1,13 @@
 <script lang="ts">
-  import { outageText, type Outage, watchBadge, watchNote } from "../lib/admin";
+  import Attention from "../lib/Attention.svelte";
+  import {
+    type Attention as Item,
+    attentionHref,
+    outageText,
+    type Outage,
+    watchBadge,
+    watchNote,
+  } from "../lib/admin";
   import { aborted, api, type Watch } from "../lib/api";
 
   // The server checks every light once a minute; the page follows while it is shown.
@@ -7,6 +15,7 @@
 
   let watch = $state<Watch | undefined>();
   let outages = $state<Outage[]>([]);
+  let attention = $state<Item[]>([]);
   let pageState = $state<"loading" | "error" | "success">("loading");
   let now = $state(Math.floor(Date.now() / 1000));
   let controller: AbortController | undefined;
@@ -15,12 +24,18 @@
     controller?.abort();
     controller = new AbortController();
     try {
-      const [current, history] = await Promise.all([
+      const [current, history, asking] = await Promise.all([
         api.watch(controller.signal),
         api.outages(controller.signal),
+        api.attention(controller.signal),
       ]);
       watch = current;
       outages = history.outages.toReversed();
+      // matterjs-server out of reach has its own banner here, from when it went.
+      attention = asking.items.filter(
+        (item) =>
+          attentionHref(item) === "/lights" && item.kind !== "server_down",
+      );
       now = Math.floor(Date.now() / 1000);
       pageState = "success";
     } catch (error) {
@@ -66,6 +81,7 @@
         matterjs-serverに届きません {outageText(watch.server_outage, now)}
       </p>
     {/if}
+    <Attention items={attention} {now} />
     {#if watch.checked_at === null}
       <p class="state">まだ確かめていません</p>
     {:else if watch.lights.length === 0}

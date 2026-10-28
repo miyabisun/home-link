@@ -444,3 +444,79 @@ export function outageText(outage: Outage, now: number): string {
     return `${start}〜（${span(now - outage.started_at)}、続いている）${left}`;
   return `${start}〜${moment(outage.ended_at, now)}（${span(outage.ended_at - outage.started_at)}）${left}`;
 }
+
+/** A state that asks for the user, as `GET /api/attention` lists it. */
+export type Attention =
+  | { kind: "server_down"; since: number }
+  | {
+      kind: "power_cycle";
+      name: string;
+      device_id: number | null;
+      since: number;
+    }
+  | {
+      kind: "left_fabric";
+      name: string;
+      device_id: number;
+      left_at: number;
+      left_by: "event" | "check" | "unknown" | null;
+      reason: RejoinReason;
+    }
+  | {
+      kind: "meter_lost";
+      since: number;
+      trouble: "no_bluetooth" | "no_adapter" | "adapter_down" | "meter_silent";
+      battery: number | null;
+    }
+  | { kind: "meter_battery"; battery: number };
+
+const POWER_CYCLE = "壁のスイッチで電源を入れ直してください。";
+const REGISTER_AGAIN = "アプリで登録し直してください。";
+
+/** What is wrong, since when, and what the user does about it. */
+export function attentionText(item: Attention, now: number): string {
+  switch (item.kind) {
+    case "server_down":
+      return `matterjs-serverに${moment(item.since, now)}からつながりません。照明を操作できません。`;
+    case "power_cycle":
+      return `${item.name}が${moment(item.since, now)}からつながっていません。${POWER_CYCLE}`;
+    case "left_fabric": {
+      const at = moment(item.left_at, now);
+      const what =
+        item.left_by === "unknown"
+          ? `${at}に、${item.name}の登録が外れているのを見つけました。`
+          : `${item.name}の登録が${at}に外れました。`;
+      return (
+        what + (item.reason === "no_advert" ? POWER_CYCLE : REGISTER_AGAIN)
+      );
+    }
+    case "meter_lost":
+      return `温度計を${moment(item.since, now)}から読めていません。${meterTodo(item)}`;
+    case "meter_battery":
+      return `温度計の電池が残り${item.battery}%です。交換してください。`;
+  }
+}
+
+/** What the user does for the meter unheard, by what Bluetooth shows. */
+function meterTodo({
+  trouble,
+  battery,
+}: Extract<Attention, { kind: "meter_lost" }>): string {
+  switch (trouble) {
+    case "no_adapter":
+      return "UB500が外れています。挿し直してください。";
+    case "adapter_down":
+      return "UB500を挿し直してください。";
+    case "meter_silent":
+      return `温度計の電池${battery === null ? "" : `（最後は${battery}%）`}と置き場所を確かめてください。`;
+    case "no_bluetooth":
+      return "";
+  }
+}
+
+/** The page that shows more of it. */
+export function attentionHref(item: Attention): string {
+  return item.kind === "meter_lost" || item.kind === "meter_battery"
+    ? "/meter"
+    : "/lights";
+}

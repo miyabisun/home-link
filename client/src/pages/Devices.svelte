@@ -1,16 +1,37 @@
 <script lang="ts">
-  import { deviceName, stateText, THREAD_DOWN, threadDown } from "../lib/admin";
+  import Attention from "../lib/Attention.svelte";
+  import {
+    type Attention as Item,
+    deviceName,
+    stateText,
+    THREAD_DOWN,
+    threadDown,
+  } from "../lib/admin";
   import { aborted, api, type Device } from "../lib/api";
 
+  // The server checks the lights once a minute; the page follows while it is shown.
+  const REFRESH_MS = 60_000;
+
   let devices = $state<Device[]>([]);
+  let attention = $state<Item[]>([]);
+  let now = $state(Math.floor(Date.now() / 1000));
   let listState = $state<"loading" | "empty" | "error" | "success">("loading");
   let controller: AbortController | undefined;
 
   async function load() {
     controller?.abort();
     controller = new AbortController();
+    const { signal } = controller;
+    // What asks for the user is shown on its own: the devices still list without it.
+    api.attention(signal).then(
+      (body) => {
+        attention = body.items;
+        now = Math.floor(Date.now() / 1000);
+      },
+      () => {},
+    );
     try {
-      devices = await api.devices(controller.signal);
+      devices = await api.devices(signal);
       listState = devices.length === 0 ? "empty" : "success";
     } catch (error) {
       if (!aborted(error)) listState = "error";
@@ -23,8 +44,12 @@
 
   $effect(() => {
     void load();
+    const timer = setInterval(() => {
+      if (document.visibilityState === "visible") void load();
+    }, REFRESH_MS);
     document.addEventListener("visibilitychange", onVisibilityChange);
     return () => {
+      clearInterval(timer);
       controller?.abort();
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
@@ -32,6 +57,7 @@
 </script>
 
 <section class="content" data-state={listState}>
+  <Attention items={attention} {now} />
   {#if listState === "loading"}
     <p class="state">
       <span class="spinner" aria-hidden="true"></span>読み込み中…

@@ -4,7 +4,7 @@
 
 pub mod care;
 
-use care::{Adapter, Care, Mend, Sight, Turn};
+use care::{Adapter, Care, Mend, Sight};
 
 use std::{collections::HashMap, sync::Mutex, time::Duration};
 
@@ -154,20 +154,26 @@ impl Meter {
         *self.latest.lock().expect(crate::UNPOISONED) = Some((reading, at));
     }
 
-    /// Keeps `reading` as heard at `at`, with what it calls for when `tell`.
-    fn heard(&self, reading: Reading, at: i64, tell: bool) -> Vec<care::Notice> {
+    /// Keeps `reading` as heard at `at`.
+    fn heard(&self, reading: Reading, at: i64) {
         self.record(reading, at);
         self.care
             .lock()
             .expect(crate::UNPOISONED)
-            .heard(at, reading.battery, tell)
+            .heard(at, reading.battery);
     }
 
-    fn look(&self, now: i64, held: bool, sight: Sight, tell: bool) -> Turn {
+    fn look(&self, now: i64, held: bool, sight: Sight) -> Option<Mend> {
         self.care
             .lock()
             .expect(crate::UNPOISONED)
-            .look(now, held, sight, tell)
+            .look(now, held, sight)
+    }
+
+    /// What of the meter asks for the user now; nothing without a meter.
+    #[must_use]
+    pub(crate) fn attention(&self) -> Vec<crate::watch::Attention> {
+        self.care.lock().expect(crate::UNPOISONED).attention()
     }
 
     fn latest(&self) -> Option<(Reading, i64)> {
@@ -218,25 +224,19 @@ impl Meter {
 }
 
 /// Listens to the configured meter forever; without one it returns at once.
-/// A missing bus, or one that goes away, is tried again a minute later. Messages for the user
-/// go to `deliver` when `tell`.
-pub(crate) async fn receive<F, Fut>(meter: &Meter, clock: fn() -> i64, tell: bool, deliver: F)
-where
-    F: Fn(care::Notice) -> Fut,
-    Fut: Future<Output = ()>,
-{
+/// A missing bus, or one that goes away, is tried again a minute later.
+pub(crate) async fn receive(meter: &Meter, clock: fn() -> i64) {
     let Some(address) = meter.address() else {
         return;
     };
     let device = format!("/dev_{}", address.replace(':', "_"));
     let mut logged = Logged::default();
     loop {
-        if let Err(error) = listen(meter, &device, clock, tell, &deliver, &mut logged).await {
+        if let Err(error) = listen(meter, &device, clock, &mut logged).await {
             tracing::warn!(%error, "meter: Bluetooth unavailable, trying again in a minute");
             let sight = Sight::NoBluetooth;
             logged.sight(sight);
-            let turn = meter.look(clock(), meter.held(), sight, tell);
-            tell_user(&deliver, turn.notice).await;
+            meter.look(clock(), meter.held(), sight);
         }
         tokio::time::sleep(RETRY).await;
     }
@@ -247,18 +247,12 @@ enum Event {
     Check,
 }
 
-async fn listen<F, Fut>(
+async fn listen(
     meter: &Meter,
     device: &str,
     clock: fn() -> i64,
-    tell: bool,
-    deliver: &F,
     logged: &mut Logged,
-) -> zbus::Result<()>
-where
-    F: Fn(care::Notice) -> Fut,
-    Fut: Future<Output = ()>,
-{
+) -> zbus::Result<()> {
     let bus = tokio::time::timeout(
         DBUS_TIMEOUT,
         zbus::connection::Builder::system()?
@@ -306,21 +300,18 @@ where
                         tracing::info!(quiet, "meter: heard again");
                     }
                     last_reading = Some(heard);
-                    for notice in meter.heard(reading, heard, tell) {
-                        tell_user(deliver, Some(notice)).await;
-                    }
+                    meter.heard(reading, heard);
                 }
             }
             Event::Check => {
                 let held = *busy.borrow_and_update() > 0;
                 let (sight, path) = sense(&bus).await?;
                 logged.sight(sight);
-                let turn = meter.look(clock(), held, sight, tell);
-                tell_user(deliver, turn.notice).await;
+                let mend = meter.look(clock(), held, sight);
                 let (Some(path), Sight::Adapter(adapter)) = (path, sight) else {
                     continue;
                 };
-                if let Some(mend) = turn.mend {
+                if let Some(mend) = mend {
                     logged.mend(mend, path.as_str(), mend_adapter(&bus, &path, mend).await);
                     continue;
                 }
@@ -390,17 +381,6 @@ impl Logged {
             _ => {}
         }
         self.discovery_failed = error.is_some();
-    }
-}
-
-async fn tell_user<F, Fut>(deliver: &F, notice: Option<care::Notice>)
-where
-    F: Fn(care::Notice) -> Fut,
-    Fut: Future<Output = ()>,
-{
-    if let Some(notice) = notice {
-        tracing::info!(kind = notice.kind(), "meter: telling the user");
-        deliver(notice).await;
     }
 }
 

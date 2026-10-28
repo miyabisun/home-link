@@ -1,6 +1,6 @@
 //! Keeping watch on each light's connection: when a light counts as down, when to ask
-//! matterjs-server to reconnect it, and what to tell the user. Nothing here talks to
-//! matterjs-server, Discord or the database; [`Watch::step`] decides from what one check saw.
+//! matterjs-server to reconnect it, and what asks for the user. Nothing here talks to
+//! matterjs-server or the database; [`Watch::step`] decides from what one check saw.
 //!
 //! A check runs every minute on the minute. It reads every node's `available` and, every
 //! [`READ_EVERY`], reads each light's On/Off for real, since a light can stay `available`
@@ -15,14 +15,15 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 use crate::{
+    meter::care::Trouble,
     rejoin::{Leaves, Pursuit, Reason},
-    schedule,
 };
 
 /// Every light's On/Off is read for real this often, in seconds.
 pub const READ_EVERY: i64 = 300;
-/// A light down this long, in seconds, is told to the user; so is matterjs-server out of reach.
-pub const NOTIFY_AFTER: i64 = 300;
+/// matterjs-server out of reach this long, in seconds, asks for the user; so does a light out
+/// of the fabric this long for a reason the user can act on.
+pub const ASK_AFTER: i64 = 300;
 /// At most this many lights are asked to reconnect in one check, so lights that all go down
 /// at once, as when matterjs-server or the Thread border router restarts, do not flood it.
 pub const MAX_RECONNECTS_PER_CHECK: usize = 3;
@@ -30,7 +31,7 @@ pub const MAX_RECONNECTS_PER_CHECK: usize = 3;
 pub const RECONNECT_EVERY: i64 = 600;
 /// Reads in a row a light that stays `available` leaves unanswered before it is down.
 pub const MISSES_TO_RECONNECT: u32 = 2;
-/// Reconnections after which a light still down is told to be switched off and on at the wall.
+/// Reconnections after which a light still down asks to be switched off and on at the wall.
 pub const RECONNECTS_TO_ADVISE: u32 = 3;
 
 /// A light: its node and endpoint.
@@ -45,7 +46,7 @@ pub struct Seen {
     pub network: Option<&'static str>,
     /// The ledger row it is, if any.
     pub device: Option<i64>,
-    /// The ledger ignores it: it is neither watched nor told.
+    /// The ledger ignores it: it is not watched.
     pub ignored: bool,
     /// matterjs-server serves it as available and, behind a bridge, the bridge reaches it.
     pub available: bool,
@@ -62,7 +63,7 @@ pub struct Left {
     pub name: String,
     pub labels: Vec<String>,
     pub serial: Option<String>,
-    /// The ledger ignores it: it is neither watched nor told.
+    /// The ledger ignores it: it is not watched.
     pub ignored: bool,
     /// The network it was last on, when known.
     pub network: Option<&'static str>,
@@ -156,12 +157,6 @@ pub struct Outage {
     /// For a light that left: home-link registering it again, and how often it left.
     pub rejoin: Pursuit,
     pub leaves: Leaves,
-    #[serde(skip)]
-    notified: bool,
-    #[serde(skip)]
-    advised: bool,
-    #[serde(skip)]
-    left_told: bool,
 }
 
 impl Outage {
@@ -193,43 +188,7 @@ impl Outage {
             thread_parent: None,
             rejoin: Pursuit::default(),
             leaves: Leaves::default(),
-            notified: false,
-            advised: false,
-            left_told: false,
         }
-    }
-
-    /// The stretch as kept, with whether the user was told of it and told to switch the light off and on.
-    #[must_use]
-    pub const fn told(mut self, notified: bool, advised: bool) -> Self {
-        self.notified = notified;
-        self.advised = advised;
-        self
-    }
-
-    /// Whether the user was told of it.
-    #[must_use]
-    pub const fn notified(&self) -> bool {
-        self.notified
-    }
-
-    /// Whether the user was told to switch the light off and on.
-    #[must_use]
-    pub const fn advised(&self) -> bool {
-        self.advised
-    }
-
-    /// The stretch as kept, with whether the user was told the light left the fabric.
-    #[must_use]
-    pub const fn told_left(mut self, told: bool) -> Self {
-        self.left_told = told;
-        self
-    }
-
-    /// Whether the user was told the light left the fabric.
-    #[must_use]
-    pub const fn left_told(&self) -> bool {
-        self.left_told
     }
 
     /// The light, or `None` for matterjs-server.
@@ -262,55 +221,44 @@ struct Light {
 pub enum Change {
     /// A stretch began.
     Down(Outage),
-    /// A stretch still open was reconnected, pinged or told.
+    /// A light left the fabric: its stretch began then, or it was down and is now out of it.
+    Left(Outage),
+    /// A stretch still open was reconnected, pinged, or its pursuit moved on.
     Updated(Outage),
     /// A stretch ended: back, or no longer watched.
     Up(Outage),
 }
 
-/// A light in a notice.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Told {
-    pub name: String,
-    pub network: Option<&'static str>,
-    pub since: i64,
-    /// Until when, for a light that came back.
-    pub until: Option<i64>,
-    pub reachable: Option<bool>,
-    /// For a light that left the fabric: its labels, serial number, and when and how it left.
-    pub labels: Vec<String>,
-    pub serial_number: Option<String>,
-    pub left_at: Option<i64>,
-    pub left_by: Option<LeftBy>,
-    pub rejoin: Pursuit,
-    pub leaves: Leaves,
-    /// Whether the message that it left went out.
-    pub left_told: bool,
-}
-
-/// A message to the user.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Notice {
-    /// Lights down for [`NOTIFY_AFTER`].
-    Down(Vec<Told>),
-    /// Lights still down after [`RECONNECTS_TO_ADVISE`] reconnections: switch them off and on.
-    StillDown(Vec<Told>),
-    /// Lights told down that came back.
-    Up(Vec<Told>),
-    /// Ledger lights matterjs-server no longer serves for [`NOTIFY_AFTER`]: home-link keeps
-    /// looking for them to register them again.
-    Left(Vec<Told>),
-    /// Lights that left, registered again and back on their ledger rows.
-    Rejoined(Vec<Told>),
-    /// Lights that left and are not back, for a reason that stood [`crate::rejoin::TELL_AFTER`]
-    /// and that the user can do something about.
-    NotRejoined(Vec<Told>),
-    /// matterjs-server out of reach for [`NOTIFY_AFTER`].
+/// A state that asks for the user, as the admin screen shows it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Attention {
+    /// matterjs-server out of reach for [`ASK_AFTER`].
     ServerDown { since: i64 },
-    /// matterjs-server, told out of reach, back.
-    ServerUp { since: i64, until: i64 },
-    /// The meter not heard, heard again, or low on battery.
-    Meter(crate::meter::care::Notice),
+    /// A light still down after [`RECONNECTS_TO_ADVISE`] reconnections: switch it off and on.
+    PowerCycle {
+        name: String,
+        device_id: Option<i64>,
+        since: i64,
+    },
+    /// A light out of the fabric for a reason the user can act on, that stood
+    /// [`crate::rejoin::ASK_AFTER`].
+    #[serde(rename = "left_fabric")]
+    Left {
+        name: String,
+        device_id: i64,
+        left_at: i64,
+        left_by: Option<LeftBy>,
+        reason: Reason,
+    },
+    /// The meter unheard for [`crate::meter::care::ASK_AFTER`].
+    MeterLost {
+        since: i64,
+        trouble: Trouble,
+        battery: Option<u8>,
+    },
+    /// The meter's battery below [`crate::meter::care::LOW_BATTERY`].
+    MeterBattery { battery: u8 },
 }
 
 /// What one check calls for.
@@ -320,7 +268,6 @@ pub struct Step {
     pub reconnect: Vec<Key>,
     /// Lights whose network reach to check, being down on Wi-Fi.
     pub ping: Vec<Key>,
-    pub notices: Vec<Notice>,
     pub changes: Vec<Change>,
 }
 
@@ -382,9 +329,8 @@ impl Watch {
     }
 
     /// Takes in one check at `at`, on the minute: the lights it saw, or `None` when
-    /// matterjs-server was out of reach. Without a destination (`notify` false) no notice
-    /// comes out, and every other decision is the same.
-    pub fn step(&mut self, at: i64, seen: Option<&[Seen]>, left: &[Left], notify: bool) -> Step {
+    /// matterjs-server was out of reach.
+    pub fn step(&mut self, at: i64, seen: Option<&[Seen]>, left: &[Left]) -> Step {
         self.checked_at = Some(at);
         let mut step = Step::default();
         match seen {
@@ -394,38 +340,22 @@ impl Watch {
                 self.lights_seen(at, seen, left, &mut step);
             }
         }
-        if !notify {
-            step.notices.clear();
-        }
         step
     }
 
     fn server_down(&mut self, at: i64, step: &mut Step) {
         self.server_up_since = None;
-        let outage = self.server.get_or_insert_with(|| {
+        self.server.get_or_insert_with(|| {
             let outage = Outage::new(None, "matterjs-server", None, at, Cause::Unreachable);
             step.changes.push(Change::Down(outage.clone()));
             outage
         });
-        if !outage.notified && at - outage.started_at >= NOTIFY_AFTER {
-            outage.notified = true;
-            step.notices.push(Notice::ServerDown {
-                since: outage.started_at,
-            });
-            step.changes.push(Change::Updated(outage.clone()));
-        }
     }
 
     fn server_up(&mut self, at: i64, step: &mut Step) {
         self.server_up_since.get_or_insert(at);
         if let Some(mut outage) = self.server.take() {
             outage.ended_at = Some(at);
-            if outage.notified {
-                step.notices.push(Notice::ServerUp {
-                    since: outage.started_at,
-                    until: at,
-                });
-            }
             step.changes.push(Change::Up(outage));
         }
     }
@@ -433,12 +363,10 @@ impl Watch {
     fn lights_seen(&mut self, at: i64, seen: &[Seen], left: &[Left], step: &mut Step) {
         let watched: Vec<&Seen> = seen.iter().filter(|light| !light.ignored).collect();
         let gone: Vec<&Left> = left.iter().filter(|light| !light.ignored).collect();
-        let (mut up, mut rejoined) = (Vec::new(), Vec::new());
         self.leave(at, &gone, step);
-        self.come_back(at, &watched, &gone, &mut rejoined, step);
+        self.come_back(at, &gone, step);
         self.forget(at, seen, &watched, step);
         let mut due = Vec::new();
-        let (mut down, mut still_down) = (Vec::new(), Vec::new());
         for seen in watched {
             let light = self.lights.entry(seen.key).or_default();
             light.name.clone_from(&seen.name);
@@ -461,16 +389,13 @@ impl Watch {
             if seen.available && light.misses < MISSES_TO_RECONNECT {
                 if let Some(mut outage) = light.outage.take() {
                     outage.ended_at = Some(at);
-                    if outage.notified {
-                        up.push(told(&outage));
-                    }
                     step.changes.push(Change::Up(outage));
                 }
                 light.up_since.get_or_insert(at);
                 continue;
             }
             light.up_since = None;
-            let outage = light.outage.get_or_insert_with(|| {
+            light.outage.get_or_insert_with(|| {
                 let (cause, since) = if seen.available {
                     (Cause::NoAnswer, light.first_miss.unwrap_or(at))
                 } else {
@@ -486,52 +411,8 @@ impl Watch {
             {
                 due.push((light.last_reconnect, seen.key));
             }
-            let mut updated = false;
-            if !outage.notified && at - outage.started_at >= NOTIFY_AFTER {
-                outage.notified = true;
-                down.push(told(outage));
-                updated = true;
-            }
-            if outage.notified
-                && !outage.advised
-                && outage.reconnects >= RECONNECTS_TO_ADVISE
-                && light.last_reconnect.is_some_and(|last| last < at)
-            {
-                outage.advised = true;
-                still_down.push(told(outage));
-                updated = true;
-            }
-            if updated {
-                step.changes.push(Change::Updated(outage.clone()));
-            }
         }
         self.reconnect(at, due, step);
-        let (mut left, mut not_rejoined) = (Vec::new(), Vec::new());
-        for outage in self.left.values_mut() {
-            let since = outage.left_at.unwrap_or(outage.started_at);
-            if !outage.left_told && at - since >= NOTIFY_AFTER {
-                outage.left_told = true;
-                // The reason now goes with the message that it left.
-                outage.rejoin.told_now();
-                left.push(told(outage));
-                step.changes.push(Change::Updated(outage.clone()));
-            } else if outage.left_told && outage.rejoin.tell(at).is_some() {
-                not_rejoined.push(told(outage));
-                step.changes.push(Change::Updated(outage.clone()));
-            }
-        }
-        for (lights, notice) in [
-            (down, Notice::Down as fn(Vec<Told>) -> Notice),
-            (still_down, Notice::StillDown),
-            (left, Notice::Left),
-            (not_rejoined, Notice::NotRejoined),
-            (up, Notice::Up),
-            (rejoined, Notice::Rejoined),
-        ] {
-            if !lights.is_empty() {
-                step.notices.push(notice(lights));
-            }
-        }
     }
 
     /// Ledger lights matterjs-server no longer serves have left the fabric: a light watched
@@ -562,14 +443,9 @@ impl Watch {
                 .as_ref()
                 .and_then(|light| light.network)
                 .or(left.network);
-            let (mut outage, change): (Outage, fn(Outage) -> Change) =
-                match light.and_then(|light| light.outage) {
-                    Some(outage) => (outage, Change::Updated),
-                    None => (
-                        Outage::new(watched, &left.name, network, left_at, Cause::Left),
-                        Change::Down,
-                    ),
-                };
+            let mut outage = light
+                .and_then(|light| light.outage)
+                .unwrap_or_else(|| Outage::new(watched, &left.name, network, left_at, Cause::Left));
             outage.device_id = Some(left.device);
             outage.left_at = Some(left_at);
             outage.left_by = Some(left_by);
@@ -579,44 +455,30 @@ impl Watch {
             outage.software_version.clone_from(&left.software_version);
             outage.thread_parent.clone_from(&left.thread_parent);
             outage.leaves = Leaves::of(&left.leaves, left_at);
-            step.changes.push(change(outage.clone()));
+            step.changes.push(Change::Left(outage.clone()));
             self.left.insert(left.device, outage);
         }
     }
 
-    /// A light that left and is served again, registered again, ends its stretch, told back if
-    /// home-link registered it again or it was told gone; one no longer in the ledger as a
-    /// light to watch ends it untold.
-    fn come_back(
-        &mut self,
-        at: i64,
-        watched: &[&Seen],
-        gone: &[&Left],
-        up: &mut Vec<Told>,
-        step: &mut Step,
-    ) {
-        let ended: Vec<(i64, bool)> = self
+    /// A light that left and is served again, registered again, ends its stretch; so does one
+    /// no longer in the ledger as a light to watch.
+    fn come_back(&mut self, at: i64, gone: &[&Left], step: &mut Step) {
+        let ended: Vec<i64> = self
             .left
             .keys()
             .filter(|device| !gone.iter().any(|left| left.device == **device))
-            .map(|device| {
-                let back = watched.iter().any(|seen| seen.device == Some(*device));
-                (*device, back)
-            })
+            .copied()
             .collect();
-        for (device, back) in ended {
+        for device in ended {
             let Some(mut outage) = self.left.remove(&device) else {
                 continue;
             };
             outage.ended_at = Some(at);
-            if back && (outage.rejoin.rejoined || outage.left_told || outage.notified) {
-                up.push(told(&outage));
-            }
             step.changes.push(Change::Up(outage));
         }
     }
 
-    /// A light ignored since ends its stretch untold. One matterjs-server no longer serves
+    /// A light ignored since ends its stretch. One matterjs-server no longer serves
     /// and the ledger does not hold stays as it was while down, and is no longer watched while up.
     fn forget(&mut self, at: i64, seen: &[Seen], watched: &[&Seen], step: &mut Step) {
         let gone: Vec<Key> = self
@@ -705,7 +567,7 @@ impl Watch {
         Some(Change::Updated(outage.clone()))
     }
 
-    /// Takes back the stretches still open when home-link last stopped: what was told stays told.
+    /// Takes back the stretches still open when home-link last stopped.
     pub fn resume(&mut self, outages: Vec<Outage>) {
         for outage in outages {
             if let Some(device) = outage.device_id.filter(|_| outage.left_at.is_some()) {
@@ -820,147 +682,45 @@ impl Watch {
                 .collect(),
         }
     }
-}
 
-fn told(outage: &Outage) -> Told {
-    Told {
-        name: outage.name.clone(),
-        network: outage.network,
-        since: outage.started_at,
-        until: outage.ended_at,
-        reachable: outage.reachable,
-        labels: outage.labels.clone(),
-        serial_number: outage.serial_number.clone(),
-        left_at: outage.left_at,
-        left_by: outage.left_by,
-        rejoin: outage.rejoin.clone(),
-        leaves: outage.leaves,
-        left_told: outage.left_told,
-    }
-}
-
-/// How often a light left, when more than this once: `14日で3回目です（前回 10-21 09:17）。`
-fn leaves_text(leaves: Leaves) -> Option<String> {
-    (leaves.count > 1).then(|| {
-        let previous = leaves
-            .previous_at
-            .map(|at| format!("（前回 {}）", date_time(at)))
-            .unwrap_or_default();
-        format!("14日で{}回目です{previous}。", leaves.count)
-    })
-}
-
-/// One sentence or two per light, a line each.
-fn sentences(lights: &[Told], line: impl Fn(&Told) -> String) -> String {
-    lights.iter().map(line).collect::<Vec<_>>().join("\n")
-}
-
-pub(crate) fn hhmm(unix: i64) -> String {
-    schedule::clock(schedule::local(unix).1)
-}
-
-/// `unix` as month, day and time in Tokyo: `10-21 09:17`.
-fn date_time(unix: i64) -> String {
-    let stamp = schedule::timestamp(unix);
-    stamp.get(5..16).unwrap_or_default().replace('T', " ")
-}
-
-/// `seconds` in minutes, or hours and minutes.
-pub(crate) fn span(seconds: i64) -> String {
-    let minutes = seconds.max(0) / 60;
-    if minutes < 60 {
-        format!("{minutes}分")
-    } else {
-        format!("{}時間{}分", minutes / 60, minutes % 60)
-    }
-}
-
-impl Notice {
-    /// The message as sent, in Japanese.
+    /// What of the lights and matterjs-server asks for the user at `now`: matterjs-server out
+    /// of reach for [`ASK_AFTER`], a light a check found still down after its
+    /// [`RECONNECTS_TO_ADVISE`]-th reconnection, and a light out of the fabric for a reason the
+    /// user can act on. A light home-link is still bringing back by itself asks nothing.
     #[must_use]
-    pub fn text(&self) -> String {
-        match self {
-            Self::Down(lights) => sentences(lights, |light| {
-                format!(
-                    "{}が{}からつながっていません。",
-                    light.name,
-                    hhmm(light.since)
-                )
-            }),
-            Self::StillDown(lights) => sentences(lights, |light| {
-                format!(
-                    "{}が{}からつながっていません。壁のスイッチで電源を入れ直してください。",
-                    light.name,
-                    hhmm(light.since)
-                )
-            }),
-            Self::Up(lights) => sentences(lights, |light| {
-                format!(
-                    "{}が{}ぶりにつながりました。",
-                    light.name,
-                    span(light.until.unwrap_or(light.since) - light.since)
-                )
-            }),
-            Self::ServerDown { since } => format!(
-                "matterjs-serverに{}からつながりません。照明を操作できません。",
-                hhmm(*since)
-            ),
-            Self::ServerUp { since, until } => {
-                format!(
-                    "matterjs-serverに{}ぶりにつながりました。",
-                    span(until - since)
-                )
-            }
-            Self::Left(lights) => sentences(lights, |light| {
-                let at = hhmm(light.left_at.unwrap_or(light.since));
-                // Gone before the watch first saw it: only when it was found is known.
-                let mut text = if light.left_by == Some(LeftBy::Unknown) {
-                    format!("{at}に、{}の登録が外れているのを見つけました。", light.name)
-                } else {
-                    format!("{}の登録が{at}に外れました。", light.name)
-                };
-                text.extend(leaves_text(light.leaves));
-                text.push_str(
-                    light
-                        .rejoin
-                        .reason
-                        .and_then(Reason::action)
-                        .unwrap_or("自動で登録し直しています。"),
-                );
-                text
-            }),
-            Self::Rejoined(lights) => sentences(lights, |light| {
-                // Back when home-link registered it again, else when the check found it.
-                let back = light
-                    .rejoin
-                    .attempted_at
-                    .filter(|_| light.rejoin.rejoined)
-                    .or(light.until)
-                    .unwrap_or(light.since);
-                let mut text = format!(
-                    "{}の登録が{}ぶりに戻りました。",
-                    light.name,
-                    span(back - light.left_at.unwrap_or(light.since))
-                );
-                // The message that it left told how often already.
-                if !light.left_told {
-                    text.extend(leaves_text(light.leaves));
-                }
-                text
-            }),
-            Self::NotRejoined(lights) => sentences(lights, |light| {
-                format!(
-                    "{}は、{}",
-                    light.name,
-                    light
-                        .rejoin
-                        .reason
-                        .and_then(Reason::action)
-                        .unwrap_or("自動で登録し直しています。")
-                )
-            }),
-            Self::Meter(notice) => notice.text(),
-        }
+    pub fn attention(&self, now: i64) -> Vec<Attention> {
+        let server = self
+            .server
+            .as_ref()
+            .filter(|outage| now - outage.started_at >= ASK_AFTER)
+            .map(|outage| Attention::ServerDown {
+                since: outage.started_at,
+            });
+        let still_down = self.lights.values().filter_map(|light| {
+            let outage = light.outage.as_ref()?;
+            // A check after that reconnection found it still down; later ones keep it asking.
+            let checked_after = light
+                .last_reconnect
+                .zip(self.checked_at)
+                .is_some_and(|(reconnect, checked)| reconnect < checked);
+            let asks = outage.reconnects > RECONNECTS_TO_ADVISE
+                || (outage.reconnects == RECONNECTS_TO_ADVISE && checked_after);
+            asks.then(|| Attention::PowerCycle {
+                name: light.name.clone(),
+                device_id: light.device,
+                since: outage.started_at,
+            })
+        });
+        let left = self.left.iter().filter_map(|(device, outage)| {
+            Some(Attention::Left {
+                name: outage.name.clone(),
+                device_id: *device,
+                left_at: outage.left_at.unwrap_or(outage.started_at),
+                left_by: outage.left_by,
+                reason: outage.rejoin.asks(now)?,
+            })
+        });
+        server.into_iter().chain(still_down).chain(left).collect()
     }
 }
 
@@ -993,21 +753,30 @@ mod tests {
         watch: &mut Watch,
         from: i64,
         to: i64,
-        notify: bool,
         seen: impl Fn(i64) -> Option<Vec<Seen>>,
     ) -> Vec<(i64, Step)> {
         (from..=to)
             .map(|n| {
                 let lights = seen(n);
-                (n, watch.step(minute(n), lights.as_deref(), &[], notify))
+                (n, watch.step(minute(n), lights.as_deref(), &[]))
             })
             .collect()
     }
 
-    fn notices(steps: &[(i64, Step)]) -> Vec<(i64, Notice)> {
-        steps
-            .iter()
-            .flat_map(|(n, step)| step.notices.iter().map(move |notice| (*n, notice.clone())))
+    /// The minutes from `from` to `to` at which the watch asks for the user, after a check each.
+    fn asked(
+        watch: &mut Watch,
+        from: i64,
+        to: i64,
+        seen: impl Fn(i64) -> Option<Vec<Seen>>,
+    ) -> Vec<(i64, Vec<Attention>)> {
+        (from..=to)
+            .filter_map(|n| {
+                let lights = seen(n);
+                watch.step(minute(n), lights.as_deref(), &[]);
+                let attention = watch.attention(minute(n));
+                (!attention.is_empty()).then_some((n, attention))
+            })
             .collect()
     }
 
@@ -1020,43 +789,30 @@ mod tests {
     }
 
     #[test]
-    fn a_light_down_five_minutes_is_told_once_and_once_more_when_back() {
+    fn a_light_down_is_kept_from_when_it_went_until_it_is_back_and_asks_nothing_meanwhile() {
         let mut watch = Watch::default();
-        // Down from minute 1 to 11, back at 12.
-        let steps = run(&mut watch, 0, 14, true, |n| {
-            Some(vec![light(1, "玄関", !(1..12).contains(&n), None)])
-        });
-        let told = notices(&steps);
-        assert_eq!(told.len(), 2, "one down and one back: {told:?}");
-        let (at, Notice::Down(lights)) = &told[0] else {
-            panic!("first a down notice: {told:?}");
+        // Down from minute 1 to 11, back at 12: reconnected at 1 and 11.
+        let seen = |n| Some(vec![light(1, "玄関", !(1..12).contains(&n), None)]);
+        assert_eq!(asked(&mut Watch::default(), 0, 14, seen), vec![]);
+        let steps = run(&mut watch, 0, 14, seen);
+        let changes: Vec<_> = steps.iter().flat_map(|(_, s)| s.changes.clone()).collect();
+        let Some(Change::Down(down)) = changes.first() else {
+            panic!("{changes:?}");
         };
-        assert_eq!(*at, 6, "told five minutes after it went down");
-        assert_eq!(lights[0].name, "玄関");
-        assert_eq!(lights[0].network, Some("wifi"));
-        assert_eq!(lights[0].since, minute(1));
-        let (at, Notice::Up(lights)) = &told[1] else {
-            panic!("then a back notice: {told:?}");
-        };
-        assert_eq!(*at, 12);
-        assert_eq!(
-            (lights[0].since, lights[0].until),
-            (minute(1), Some(minute(12)))
-        );
+        assert_eq!((down.name.as_str(), down.network), ("玄関", Some("wifi")));
+        assert_eq!(down.started_at, minute(1));
         assert!(
-            told[1].1.text().contains("11分ぶりにつながりました"),
-            "{}",
-            told[1].1.text()
+            matches!(changes.last(), Some(Change::Up(o)) if o.ended_at == Some(minute(12))),
+            "{changes:?}"
         );
     }
 
     #[test]
-    fn a_light_back_within_four_minutes_is_not_told() {
+    fn a_light_back_within_four_minutes_keeps_its_stretch() {
         let mut watch = Watch::default();
-        let steps = run(&mut watch, 0, 10, true, |n| {
+        let steps = run(&mut watch, 0, 10, |n| {
             Some(vec![light(1, "玄関", !(1..5).contains(&n), None)])
         });
-        assert_eq!(notices(&steps), vec![]);
         assert_eq!(
             reconnects(&steps, (1, 1)),
             vec![1],
@@ -1078,12 +834,7 @@ mod tests {
             let answered = watch.read_due(minute(n), key).then_some(n < 5);
             steps.push((
                 n,
-                watch.step(
-                    minute(n),
-                    Some(&[light(1, "廊下", true, answered)]),
-                    &[],
-                    true,
-                ),
+                watch.step(minute(n), Some(&[light(1, "廊下", true, answered)]), &[]),
             ));
         }
         // Read at 0 (answered) and 5 (missed); a miss is read again at once, at 6.
@@ -1107,16 +858,10 @@ mod tests {
             let answered = watch.read_due(minute(n), key).then_some(n != 5);
             steps.push((
                 n,
-                watch.step(
-                    minute(n),
-                    Some(&[light(1, "廊下", true, answered)]),
-                    &[],
-                    true,
-                ),
+                watch.step(minute(n), Some(&[light(1, "廊下", true, answered)]), &[]),
             ));
         }
         assert_eq!(reconnects(&steps, key), Vec::<i64>::new());
-        assert_eq!(notices(&steps), vec![]);
     }
 
     #[test]
@@ -1134,7 +879,7 @@ mod tests {
             "物干し",
             "納戸",
         ];
-        let steps = run(&mut watch, 0, 60, true, |n| {
+        let steps = run(&mut watch, 0, 60, |n| {
             Some(
                 names
                     .iter()
@@ -1168,18 +913,12 @@ mod tests {
     fn a_light_matterjs_server_stops_serving_stays_as_it_was() {
         let mut watch = Watch::default();
         let both = |first: bool| vec![light(1, "玄関", first, None), light(2, "廊下", true, None)];
-        watch.step(minute(0), Some(&both(true)), &[], true);
-        watch.step(minute(1), Some(&both(false)), &[], true);
-        // The first light goes missing from the nodes while down: still down, untold back.
-        let steps = run(&mut watch, 2, 30, true, |_| {
+        watch.step(minute(0), Some(&both(true)), &[]);
+        watch.step(minute(1), Some(&both(false)), &[]);
+        // The first light goes missing from the nodes while down: still down.
+        let steps = run(&mut watch, 2, 30, |_| {
             Some(vec![light(2, "廊下", true, None)])
         });
-        let told = notices(&steps);
-        assert!(
-            told.iter()
-                .all(|(_, notice)| !matches!(notice, Notice::Up(_))),
-            "{told:?}"
-        );
         assert!(
             steps
                 .iter()
@@ -1195,7 +934,7 @@ mod tests {
             ]
         );
         // A light up when it goes missing is no longer watched.
-        watch.step(minute(31), Some(&[light(1, "玄関", true, None)]), &[], true);
+        watch.step(minute(31), Some(&[light(1, "玄関", true, None)]), &[]);
         assert_eq!(
             watch.connected(),
             vec![(Some((1, 1)), None, "玄関".into(), "connected")]
@@ -1207,62 +946,38 @@ mod tests {
         let mut before = Watch::default();
         let mut open = Vec::new();
         for n in 0..=10 {
-            let step = before.step(minute(n), Some(&[light(1, "玄関", n < 1, None)]), &[], true);
+            let step = before.step(minute(n), Some(&[light(1, "玄関", n < 1, None)]), &[]);
             open.extend(step.changes.into_iter().filter_map(|c| match c {
-                Change::Down(o) | Change::Updated(o) => Some(o),
+                Change::Down(o) | Change::Left(o) | Change::Updated(o) => Some(o),
                 Change::Up(_) => None,
             }));
         }
         let last = open.last().cloned().expect("the stretch was kept");
-        assert!(last.notified(), "told before the restart");
 
         let mut after = Watch::default();
         after.resume(vec![last]);
-        let steps = run(&mut after, 20, 25, true, |n| {
+        let steps = run(&mut after, 20, 25, |n| {
             Some(vec![light(1, "玄関", n >= 24, None)])
         });
-        let told = notices(&steps);
-        assert_eq!(told.len(), 1, "not told down again: {told:?}");
-        let (24, Notice::Up(lights)) = &told[0] else {
-            panic!("{told:?}");
-        };
-        assert_eq!(lights[0].since, minute(1));
-    }
-
-    #[test]
-    fn lights_down_at_the_same_time_are_told_in_one_notice() {
-        let mut watch = Watch::default();
-        let steps = run(&mut watch, 0, 8, true, |n| {
-            Some(vec![
-                light(1, "玄関", n < 1, None),
-                light(2, "廊下", n < 1, None),
-                light(3, "階段", n < 1, None),
-                light(4, "寝室", true, None),
-            ])
-        });
-        let told = notices(&steps);
-        assert_eq!(told.len(), 1, "{told:?}");
-        let Notice::Down(lights) = &told[0].1 else {
-            panic!("{told:?}");
-        };
-        let names: Vec<_> = lights.iter().map(|l| l.name.as_str()).collect();
-        assert_eq!(names, ["玄関", "廊下", "階段"]);
-        let text = told[0].1.text();
-        assert_eq!(text.lines().count(), 3, "a line each: {text}");
+        let changes: Vec<_> = steps.iter().flat_map(|(_, s)| s.changes.clone()).collect();
         assert!(
-            text.contains("玄関が00:01からつながっていません。"),
-            "{text}"
+            !changes.iter().any(|c| matches!(c, Change::Down(_))),
+            "the same stretch: {changes:?}"
+        );
+        assert!(
+            matches!(changes.last(), Some(Change::Up(o)) if o.started_at == minute(1) && o.ended_at == Some(minute(24))),
+            "{changes:?}"
         );
     }
 
     #[test]
-    fn a_light_still_down_after_three_reconnects_is_told_to_be_switched_off_and_on() {
+    fn a_light_still_down_after_three_reconnects_asks_to_be_switched_off_and_on() {
         let mut watch = Watch::default();
         let key = (1, 1);
-        let mut told = Vec::new();
+        let mut asked = Vec::new();
         let mut pings = Vec::new();
         for n in 0..=40 {
-            let step = watch.step(minute(n), Some(&[light(1, "玄関", n < 1, None)]), &[], true);
+            let step = watch.step(minute(n), Some(&[light(1, "玄関", n < 1, None)]), &[]);
             for &k in &step.ping {
                 pings.push(n);
                 // The bulb is on the Wi-Fi: Matter alone is cut.
@@ -1271,19 +986,22 @@ mod tests {
             for &k in &step.reconnect {
                 assert!(watch.reconnected(k, "no_answer".into()).is_some());
             }
-            told.extend(step.notices.into_iter().map(|notice| (n, notice)));
+            if !watch.attention(minute(n)).is_empty() {
+                asked.push(n);
+            }
         }
         assert!(!pings.is_empty(), "a Wi-Fi light down is pinged");
-        assert_eq!(told.len(), 2, "{told:?}");
-        assert!(matches!(&told[0], (6, Notice::Down(_))), "{told:?}");
-        // Reconnected at 1, 11 and 21; still down at the next check.
-        let (22, Notice::StillDown(lights)) = &told[1] else {
-            panic!("{told:?}");
-        };
-        assert_eq!(lights[0].reachable, Some(true));
-        let text = told[1].1.text();
-        assert!(text.contains("電源を入れ直してください"), "{text}");
-        // Its reach is for the admin screen, not the message.
+        // Reconnected at 1, 11 and 21; still down at the next check, and from then on.
+        assert_eq!(asked.first(), Some(&22), "{asked:?}");
+        assert_eq!(asked.len(), 19, "until it is back: {asked:?}");
+        assert_eq!(
+            watch.attention(minute(40)),
+            [Attention::PowerCycle {
+                name: "玄関".into(),
+                device_id: None,
+                since: minute(1)
+            }]
+        );
         let status = watch.status();
         let outage = status.lights[0].outage.clone().expect("down");
         assert_eq!(outage.reconnects, 4);
@@ -1295,73 +1013,45 @@ mod tests {
                 .map(|c| matches!(c, Change::Updated(_))),
             Some(true)
         );
+        watch.step(minute(41), Some(&[light(1, "玄関", true, None)]), &[]);
+        assert_eq!(watch.attention(minute(41)), [], "back");
     }
 
     #[test]
-    fn an_ignored_light_is_neither_watched_nor_told() {
+    fn an_ignored_light_is_not_watched() {
         let mut watch = Watch::default();
-        let steps = run(&mut watch, 0, 30, true, |_| {
+        let steps = run(&mut watch, 0, 30, |_| {
             Some(vec![Seen {
                 ignored: true,
                 ..light(1, "物置", false, None)
             }])
         });
-        assert_eq!(notices(&steps), vec![]);
+        assert_eq!(watch.attention(minute(30)), []);
         assert_eq!(reconnects(&steps, (1, 1)), Vec::<i64>::new());
         assert!(watch.status().lights.is_empty(), "not watched");
     }
 
     #[test]
-    fn matterjs_server_out_of_reach_five_minutes_is_told_once_instead_of_each_light() {
-        let mut watch = Watch::default();
-        let steps = run(&mut watch, 0, 20, true, |n| {
+    fn matterjs_server_out_of_reach_five_minutes_asks_for_the_user_instead_of_each_light() {
+        let seen = |n: i64| {
             (!(2..12).contains(&n))
                 .then(|| vec![light(1, "玄関", true, None), light(2, "廊下", true, None)])
-        });
-        let told = notices(&steps);
+        };
+        let asked = asked(&mut Watch::default(), 0, 20, seen);
         assert_eq!(
-            told,
-            vec![
-                (7, Notice::ServerDown { since: minute(2) }),
-                (
-                    12,
-                    Notice::ServerUp {
-                        since: minute(2),
-                        until: minute(12)
-                    }
-                )
-            ]
+            asked.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            (7..12).collect::<Vec<_>>(),
+            "from five minutes until it answers"
         );
+        assert_eq!(asked[0].1, [Attention::ServerDown { since: minute(2) }]);
+        let mut watch = Watch::default();
+        let steps = run(&mut watch, 0, 20, seen);
         let changes: Vec<_> = steps.iter().flat_map(|(_, s)| s.changes.clone()).collect();
         assert!(
             changes.iter().any(|c| matches!(c, Change::Up(o) if o.key().is_none() && o.found_by == Cause::Unreachable)),
             "the history keeps matterjs-server's stretch: {changes:?}"
         );
         assert_eq!(reconnects(&steps, (1, 1)), Vec::<i64>::new());
-    }
-
-    #[test]
-    fn without_a_destination_nothing_is_told_and_all_else_is_the_same() {
-        let scenario = |n: i64| {
-            Some(vec![
-                light(1, "玄関", !(1..30).contains(&n), None),
-                light(2, "廊下", true, None),
-            ])
-            .filter(|_| !(40..50).contains(&n))
-        };
-        let mut told = Watch::default();
-        let mut untold = Watch::default();
-        let with = run(&mut told, 0, 60, true, scenario);
-        let without = run(&mut untold, 0, 60, false, scenario);
-        assert!(!notices(&with).is_empty());
-        assert_eq!(notices(&without), vec![]);
-        for ((_, a), (_, b)) in with.iter().zip(&without) {
-            assert_eq!(
-                (&a.reconnect, &a.ping, &a.changes),
-                (&b.reconnect, &b.ping, &b.changes)
-            );
-        }
-        assert_eq!(told.status(), untold.status());
     }
 
     #[test]
@@ -1375,7 +1065,6 @@ mod tests {
             minute(0),
             Some(&[light(1, "玄関", true, None), thread(true)]),
             &[],
-            true,
         );
         let status = watch.status();
         assert_eq!(status.server_reachable, Some(true));
@@ -1386,7 +1075,6 @@ mod tests {
             minute(1),
             Some(&[light(1, "玄関", false, None), thread(true)]),
             &[],
-            true,
         );
         let status = watch.status();
         assert!(status.wifi_all_down, "the one Wi-Fi light is down");
@@ -1401,7 +1089,7 @@ mod tests {
             ]
         );
 
-        watch.step(minute(2), None, &[], true);
+        watch.step(minute(2), None, &[]);
         let status = watch.status();
         assert_eq!(status.server_reachable, Some(false));
         assert_eq!(status.server_since, Some(minute(2)));
@@ -1415,12 +1103,7 @@ mod tests {
             watch.read_due(minute(0), (1, 1)),
             "a light never read is read"
         );
-        watch.step(
-            minute(0),
-            Some(&[light(1, "玄関", true, Some(true))]),
-            &[],
-            true,
-        );
+        watch.step(minute(0), Some(&[light(1, "玄関", true, Some(true))]), &[]);
         assert!(!watch.read_due(minute(4), (1, 1)));
         assert!(watch.read_due(minute(5), (1, 1)));
         assert_eq!(watch.status().lights[0].last_answer, Some(minute(0)));
@@ -1469,8 +1152,8 @@ mod tests {
         (from..=to)
             .map(|n| {
                 let step = match seen(n) {
-                    Some((lights, left)) => watch.step(minute(n), Some(&lights), &left, true),
-                    None => watch.step(minute(n), None, &[], true),
+                    Some((lights, left)) => watch.step(minute(n), Some(&lights), &left),
+                    None => watch.step(minute(n), None, &[]),
                 };
                 (n, step)
             })
@@ -1484,32 +1167,26 @@ mod tests {
             .collect()
     }
 
-    fn left_notices(steps: &[(i64, Step)]) -> Vec<(i64, Vec<Told>)> {
-        notices(steps)
+    fn lefts(steps: &[(i64, Step)]) -> Vec<(i64, Outage)> {
+        changes(steps)
             .into_iter()
-            .filter_map(|(n, notice)| match notice {
-                Notice::Left(lights) => Some((n, lights)),
+            .filter_map(|(n, c)| match c {
+                Change::Left(o) => Some((n, o)),
                 _ => None,
             })
             .collect()
     }
 
     #[test]
-    fn a_ledger_light_never_served_has_left_the_fabric_and_is_told_once_after_five_minutes() {
+    fn a_ledger_light_never_served_has_left_the_fabric_from_the_first_check() {
         let mut watch = Watch::default();
         let steps = run_left(&mut watch, 0, 30, |_| {
             Some((vec![other()], vec![storage_left(None)]))
         });
-        let downs: Vec<_> = changes(&steps)
-            .into_iter()
-            .filter_map(|(n, c)| match c {
-                Change::Down(o) => Some((n, o)),
-                _ => None,
-            })
-            .collect();
+        let downs = lefts(&steps);
         assert_eq!(downs.len(), 1, "{downs:?}");
         let (0, outage) = &downs[0] else {
-            panic!("down at the first check: {downs:?}");
+            panic!("left at the first check: {downs:?}");
         };
         assert_eq!(outage.found_by, Cause::Left);
         assert_eq!(outage.device_id, Some(STORAGE));
@@ -1521,11 +1198,17 @@ mod tests {
         assert_eq!(outage.thread_parent.as_deref(), Some("0x4c00"));
         assert_eq!(outage.network, Some("thread"));
 
-        let told = left_notices(&steps);
-        assert_eq!(told.len(), 1, "{told:?}");
-        assert_eq!(told[0].0, 5, "told five minutes after it was found");
-        assert_eq!(told[0].1[0].name, "物置き1");
-        assert_eq!(notices(&steps).len(), 1, "nothing else is told");
+        assert!(
+            !changes(&steps)
+                .iter()
+                .any(|(_, c)| matches!(c, Change::Down(_))),
+            "a stretch out of the fabric, not down"
+        );
+        assert_eq!(
+            watch.attention(minute(30)),
+            [],
+            "nothing heard of it yet: home-link looks for it"
+        );
         assert!(
             steps
                 .iter()
@@ -1551,34 +1234,6 @@ mod tests {
     }
 
     #[test]
-    fn the_left_notice_names_the_light_and_when_it_left() {
-        let mut watch = Watch::default();
-        // matterjs-server removed the node on 10-21 at 09:17 Tokyo time.
-        let removed = minute(-5 * 24 * 60 + 9 * 60 + 17);
-        let steps = run_left(&mut watch, 0, 1, |_| {
-            Some((vec![other()], vec![storage_left(Some(removed))]))
-        });
-        let told = notices(&steps);
-        let (0, notice @ Notice::Left(_)) = &told[0] else {
-            panic!("told at once, being gone over five minutes: {told:?}");
-        };
-        assert_eq!(
-            notice.text(),
-            "物置き1の登録が09:17に外れました。自動で登録し直しています。",
-            "the name, when, and that it is being brought back"
-        );
-        let mut watch = Watch::default();
-        let steps = run_left(&mut watch, 0, 5, |_| {
-            Some((vec![other()], vec![storage_left(None)]))
-        });
-        let text = notices(&steps)[0].1.text();
-        assert!(
-            text.starts_with("00:00に、物置き1の登録が外れているのを見つけました。"),
-            "gone before the watch saw it: the time it was found: {text}"
-        );
-    }
-
-    #[test]
     fn a_light_whose_node_goes_while_up_has_left_from_when_matterjs_server_removed_it() {
         let mut watch = Watch::default();
         let removed = minute(3) - 20;
@@ -1589,13 +1244,7 @@ mod tests {
                 (vec![other()], vec![storage_left(Some(removed))])
             })
         });
-        let downs: Vec<_> = changes(&steps)
-            .into_iter()
-            .filter_map(|(n, c)| match c {
-                Change::Down(o) => Some((n, o)),
-                _ => None,
-            })
-            .collect();
+        let downs = lefts(&steps);
         assert_eq!(downs.len(), 1, "{downs:?}");
         let (3, outage) = &downs[0] else {
             panic!("{downs:?}");
@@ -1604,9 +1253,6 @@ mod tests {
         assert_eq!((outage.node_id, outage.endpoint), (Some(7), Some(1)));
         assert_eq!(outage.started_at, removed);
         assert_eq!(outage.left_by, Some(LeftBy::Event));
-        let told = left_notices(&steps);
-        assert_eq!(told.len(), 1, "{told:?}");
-        assert_eq!(told[0].0, 8, "five minutes from the removal");
         assert!(steps.iter().all(|(_, s)| s.reconnect.is_empty()));
         let status = watch.status();
         assert_eq!(
@@ -1632,18 +1278,17 @@ mod tests {
                 (vec![], vec![storage_left(None)])
             })
         });
-        let Some((3, Change::Down(outage))) = changes(&steps).into_iter().next() else {
+        let Some((3, Change::Left(outage))) = changes(&steps).into_iter().next() else {
             panic!("{steps:?}");
         };
         assert_eq!(
             (outage.started_at, outage.left_by),
             (minute(3), Some(LeftBy::Check))
         );
-        assert_eq!(left_notices(&steps)[0].0, 8);
     }
 
     #[test]
-    fn a_light_down_whose_node_goes_keeps_its_stretch_and_is_told_it_left() {
+    fn a_light_down_whose_node_goes_keeps_its_stretch_out_of_the_fabric() {
         let mut watch = Watch::default();
         let steps = run_left(&mut watch, 0, 30, |n| {
             Some(if n < 10 {
@@ -1662,13 +1307,15 @@ mod tests {
             !all.iter().any(|(_, c)| matches!(c, Change::Up(_))),
             "{all:?}"
         );
-        let told = notices(&steps);
-        assert!(matches!(told[0], (6, Notice::Down(_))), "{told:?}");
-        let left = left_notices(&steps);
-        assert_eq!(left.len(), 1, "{told:?}");
-        assert_eq!(left[0].0, 15);
-        assert_eq!(left[0].1[0].since, minute(1), "down since the first minute");
-        assert_eq!(left[0].1[0].left_at, Some(minute(10)));
+        let left = lefts(&steps);
+        assert_eq!(left.len(), 1, "{all:?}");
+        assert_eq!(left[0].0, 10);
+        assert_eq!(
+            left[0].1.started_at,
+            minute(1),
+            "down since the first minute"
+        );
+        assert_eq!(left[0].1.left_at, Some(minute(10)));
         let last_reconnect = steps
             .iter()
             .filter(|(_, s)| !s.reconnect.is_empty())
@@ -1690,7 +1337,7 @@ mod tests {
     }
 
     #[test]
-    fn a_light_registered_again_is_back_on_its_ledger_row_and_told_once() {
+    fn a_light_registered_again_is_back_on_its_ledger_row() {
         let mut watch = Watch::default();
         let steps = run_left(&mut watch, 0, 30, |n| {
             Some(if n < 20 {
@@ -1700,15 +1347,6 @@ mod tests {
                 (vec![ledger_light(99, "物置き1", true), other()], vec![])
             })
         });
-        let told = notices(&steps);
-        assert_eq!(told.len(), 2, "{told:?}");
-        let (20, Notice::Rejoined(lights)) = &told[1] else {
-            panic!("{told:?}");
-        };
-        assert_eq!(
-            (lights[0].name.as_str(), lights[0].since, lights[0].until),
-            ("物置き1", minute(0), Some(minute(20)))
-        );
         let ups: Vec<_> = changes(&steps)
             .into_iter()
             .filter_map(|(n, c)| match c {
@@ -1718,7 +1356,14 @@ mod tests {
             .collect();
         assert_eq!(ups.len(), 1, "{ups:?}");
         assert_eq!(ups[0].1.found_by, Cause::Left);
-        assert_eq!(ups[0].1.ended_at, Some(minute(20)));
+        assert_eq!(
+            (
+                ups[0].1.name.as_str(),
+                ups[0].1.started_at,
+                ups[0].1.ended_at
+            ),
+            ("物置き1", minute(0), Some(minute(20)))
+        );
         let status = watch.status();
         assert_eq!(status.lights.len(), 2);
         assert_eq!(status.lights[0].node_id, Some(52));
@@ -1727,7 +1372,7 @@ mod tests {
             (Some(99), "connected")
         );
 
-        // Back before it was told: the history keeps it, nothing is told.
+        // Back within two minutes: the history keeps it.
         let mut watch = Watch::default();
         let steps = run_left(&mut watch, 0, 10, |n| {
             Some(if n < 2 {
@@ -1736,7 +1381,6 @@ mod tests {
                 (vec![ledger_light(99, "物置き1", true)], vec![])
             })
         });
-        assert_eq!(notices(&steps), vec![]);
         assert!(
             changes(&steps)
                 .iter()
@@ -1744,15 +1388,8 @@ mod tests {
         );
     }
 
-    fn rejoin_notices(steps: &[(i64, Step)]) -> Vec<(i64, Notice)> {
-        notices(steps)
-            .into_iter()
-            .filter(|(_, notice)| matches!(notice, Notice::Rejoined(_) | Notice::NotRejoined(_)))
-            .collect()
-    }
-
     #[test]
-    fn a_light_home_link_registers_again_is_told_back_on_its_row_however_soon() {
+    fn a_light_home_link_registers_again_is_back_on_its_row_however_soon() {
         let mut watch = Watch::default();
         let mut steps = run_left(&mut watch, 0, 1, |_| {
             Some((vec![other()], vec![storage_left(None)]))
@@ -1769,24 +1406,21 @@ mod tests {
         steps.extend(run_left(&mut watch, 4, 6, |_| {
             Some((vec![ledger_light(99, "物置き1", true), other()], vec![]))
         }));
-        let told = notices(&steps);
-        assert_eq!(
-            told.len(),
-            1,
-            "only the return, under five minutes out: {told:?}"
-        );
-        let (4, notice @ Notice::Rejoined(lights)) = &told[0] else {
-            panic!("{told:?}");
+        let ups: Vec<_> = changes(&steps)
+            .into_iter()
+            .filter(|(_, c)| matches!(c, Change::Up(_)))
+            .collect();
+        let [(4, Change::Up(outage))] = ups.as_slice() else {
+            panic!("{ups:?}");
         };
         assert_eq!(
-            (lights[0].since, lights[0].until),
-            (minute(0), Some(minute(4))),
-            "from leaving to back"
-        );
-        let text = notice.text();
-        assert_eq!(
-            text, "物置き1の登録が3分ぶりに戻りました。",
-            "out until home-link registered it again, not until the check after"
+            (
+                outage.started_at,
+                outage.ended_at,
+                outage.rejoin.attempted_at
+            ),
+            (minute(0), Some(minute(4)), Some(minute(3))),
+            "from leaving to back, and when home-link registered it again"
         );
         assert_eq!(
             watch.pursued(),
@@ -1796,78 +1430,58 @@ mod tests {
     }
 
     #[test]
-    fn a_light_registered_again_by_the_app_keeps_its_return_message() {
+    fn a_light_unheard_asks_to_be_switched_off_and_on_once_that_stood_five_minutes() {
         let mut watch = Watch::default();
-        let steps = run_left(&mut watch, 0, 12, |n| {
-            Some(if n < 10 {
-                (vec![other()], vec![storage_left(None)])
-            } else {
-                (vec![ledger_light(99, "物置き1", true), other()], vec![])
-            })
-        });
-        let told = rejoin_notices(&steps);
-        let [(10, notice)] = told.as_slice() else {
-            panic!("{told:?}");
-        };
-        assert!(
-            notice.text().contains("10分ぶりに戻りました"),
-            "told back as well: {}",
-            notice.text()
-        );
-    }
-
-    #[test]
-    fn the_left_message_says_what_to_do_when_the_light_waits_on_the_user() {
-        let mut watch = Watch::default();
-        let mut steps = Vec::new();
-        for n in 0..=5 {
-            steps.extend(run_left(&mut watch, n, n, |_| {
-                Some((vec![other()], vec![storage_left(None)]))
-            }));
+        let removed = minute(-5 * 24 * 60 + 9 * 60 + 17);
+        let left = || Some((vec![other()], vec![storage_left(Some(removed))]));
+        for n in 0..=7 {
+            run_left(&mut watch, n, n, |_| left());
+            // Unheard since it left: no advertisement from the first look.
             watch.look(STORAGE, minute(n) + 30, true, true, false);
         }
-        let left = left_notices(&steps);
-        assert_eq!(left.len(), 1, "{left:?}");
-        let text = Notice::Left(left[0].1.clone()).text();
-        assert!(
-            text.ends_with("壁のスイッチで電源を入れ直してください。"),
-            "{text}"
+        assert_eq!(watch.attention(minute(5) + 29), [], "under five minutes");
+        assert_eq!(
+            watch.attention(minute(5) + 30),
+            [Attention::Left {
+                name: "物置き1".into(),
+                device_id: STORAGE,
+                left_at: removed,
+                left_by: Some(LeftBy::Event),
+                reason: Reason::NoAdvert
+            }],
+            "the name, when it left, and why: the user switches it off and on"
         );
-        assert!(!text.contains("自動で"), "the user's part instead: {text}");
-        // The reason went with it, and is not told again on its own.
-        let later = run_left(&mut watch, 6, 30, |_| {
-            Some((vec![other()], vec![storage_left(None)]))
-        });
-        assert_eq!(rejoin_notices(&later), vec![], "told already");
+        // Heard and registered again: it asks nothing more.
+        watch.look(STORAGE, minute(8), true, true, true);
+        watch.attempted(STORAGE, minute(8) + 30, Ok(()));
+        assert_eq!(watch.attention(minute(9)), []);
     }
 
     #[test]
-    fn each_new_reason_that_stands_five_minutes_is_told_once() {
+    fn a_refused_code_asks_to_register_again_once_it_stood_five_minutes() {
         let mut watch = Watch::default();
-        let mut steps = run_left(&mut watch, 0, 6, |_| {
+        run_left(&mut watch, 0, 6, |_| {
             Some((vec![other()], vec![storage_left(None)]))
         });
         watch.look(STORAGE, minute(7), true, true, true);
         watch.attempted(STORAGE, minute(8), Err(Reason::WrongCode));
         for n in 9..=20 {
             watch.look(STORAGE, minute(n), true, true, true);
-            steps.extend(run_left(&mut watch, n, n, |_| {
+            run_left(&mut watch, n, n, |_| {
                 Some((vec![other()], vec![storage_left(None)]))
-            }));
+            });
         }
-        let told = rejoin_notices(&steps);
-        let [(13, notice @ Notice::NotRejoined(lights))] = told.as_slice() else {
-            panic!("five minutes after the refusal: {told:?}");
-        };
-        assert_eq!(
-            lights[0].rejoin.reason,
-            Some(Reason::WrongCode),
-            "the reason"
-        );
-        let text = notice.text();
+        assert_eq!(watch.attention(minute(13) - 1), [], "under five minutes");
         assert!(
-            text.contains("アプリで登録し直してください"),
-            "what to do: {text}"
+            matches!(
+                watch.attention(minute(13)).as_slice(),
+                [Attention::Left {
+                    reason: Reason::WrongCode,
+                    ..
+                }]
+            ),
+            "{:?}",
+            watch.attention(minute(13))
         );
     }
 
@@ -1891,21 +1505,21 @@ mod tests {
     }
 
     #[test]
-    fn tries_slowed_by_a_lost_adapter_are_not_told_but_shown_with_the_next_try() {
+    fn tries_slowed_by_a_lost_adapter_ask_nothing_but_show_the_next_try() {
         let mut watch = Watch::default();
-        let mut steps = run_left(&mut watch, 0, 6, |_| {
+        run_left(&mut watch, 0, 6, |_| {
             Some((vec![other()], vec![storage_left(None)]))
         });
         watch.look(STORAGE, minute(7), true, true, true);
         watch.attempted(STORAGE, minute(8), Err(Reason::AdapterLost));
         watch.look(STORAGE, minute(9), true, true, true);
         watch.attempted(STORAGE, minute(10), Err(Reason::AdapterLost));
-        steps.extend(run_left(&mut watch, 10, 20, |_| {
+        run_left(&mut watch, 10, 20, |_| {
             Some((vec![other()], vec![storage_left(None)]))
-        }));
+        });
         assert_eq!(
-            rejoin_notices(&steps),
-            vec![],
+            watch.attention(minute(20)),
+            [],
             "nothing for the user to do: home-link keeps trying"
         );
         let status = watch.status();
@@ -1918,10 +1532,10 @@ mod tests {
     }
 
     #[test]
-    fn how_often_a_light_left_is_kept_and_told() {
+    fn how_often_a_light_left_is_kept() {
         let mut watch = Watch::default();
         let before = |days: i64| minute(-days * 24 * 60);
-        let steps = run_left(&mut watch, 0, 5, |_| {
+        run_left(&mut watch, 0, 5, |_| {
             Some((
                 vec![other()],
                 vec![Left {
@@ -1940,53 +1554,10 @@ mod tests {
             },
             "two before this one"
         );
-        let text = Notice::Left(left_notices(&steps)[0].1.clone()).text();
-        assert!(
-            text.contains("14日で3回目です（前回 10-25 00:00）"),
-            "{text}"
-        );
-        // Back soon, before it was told it left: the return tells how often it left.
-        let mut watch = Watch::default();
-        let mut steps = run_left(&mut watch, 0, 0, |_| {
-            Some((
-                vec![other()],
-                vec![Left {
-                    leaves: vec![before(1)],
-                    ..storage_left(None)
-                }],
-            ))
-        });
-        watch.look(STORAGE, minute(0) + 30, true, true, true);
-        watch.attempted(STORAGE, minute(1), Ok(()));
-        steps.extend(run_left(&mut watch, 2, 2, |_| {
-            Some((vec![ledger_light(99, "物置き1", true), other()], vec![]))
-        }));
-        let text = notices(&steps)[0].1.text();
-        assert_eq!(
-            text, "物置き1の登録が1分ぶりに戻りました。14日で2回目です（前回 10-25 00:00）。",
-            "{text}"
-        );
-        // Back after it was told it left: that message told how often already.
-        let mut watch = Watch::default();
-        let steps = run_left(&mut watch, 0, 12, |n| {
-            Some(if n < 10 {
-                (
-                    vec![other()],
-                    vec![Left {
-                        leaves: vec![before(1)],
-                        ..storage_left(None)
-                    }],
-                )
-            } else {
-                (vec![ledger_light(99, "物置き1", true), other()], vec![])
-            })
-        });
-        let told = rejoin_notices(&steps);
-        assert!(!told[0].1.text().contains("14日"), "{told:?}");
     }
 
     #[test]
-    fn a_reason_with_nothing_for_the_user_to_do_is_not_told() {
+    fn a_reason_with_nothing_for_the_user_to_do_asks_nothing() {
         let mut watch = Watch::default();
         let mut steps = run_left(&mut watch, 0, 6, |_| {
             Some((vec![other()], vec![storage_left(None)]))
@@ -1999,7 +1570,8 @@ mod tests {
                 Some((vec![other()], vec![storage_left(None)]))
             }));
         }
-        assert_eq!(rejoin_notices(&steps), vec![], "home-link keeps trying");
+        let last = steps.last().map_or(0, |(n, _)| *n);
+        assert_eq!(watch.attention(minute(last)), [], "home-link keeps trying");
     }
 
     #[test]
@@ -2026,7 +1598,7 @@ mod tests {
     }
 
     #[test]
-    fn an_ignored_ledger_light_that_left_is_neither_watched_nor_told() {
+    fn an_ignored_ledger_light_that_left_is_not_watched() {
         let ignored = || Left {
             ignored: true,
             ..storage_left(None)
@@ -2035,11 +1607,10 @@ mod tests {
         let steps = run_left(&mut watch, 0, 30, |_| {
             Some((vec![other()], vec![ignored()]))
         });
-        assert_eq!(notices(&steps), vec![]);
         assert_eq!(changes(&steps), vec![]);
         assert_eq!(watch.status().lights.len(), 1);
 
-        // Ignored after it left: its stretch ends, untold.
+        // Ignored after it left: its stretch ends.
         let mut watch = Watch::default();
         let steps = run_left(&mut watch, 0, 30, |n| {
             Some((
@@ -2051,13 +1622,7 @@ mod tests {
                 }],
             ))
         });
-        assert_eq!(left_notices(&steps).len(), 1);
-        assert!(
-            !notices(&steps)
-                .iter()
-                .any(|(_, n)| matches!(n, Notice::Up(_))),
-            "not told back"
-        );
+        assert_eq!(lefts(&steps).len(), 1);
         assert!(
             changes(&steps)
                 .iter()
@@ -2072,28 +1637,20 @@ mod tests {
         let steps = run_left(&mut watch, 0, 20, |n| {
             (n >= 2).then(|| (vec![other()], vec![storage_left(None)]))
         });
-        let downs: Vec<_> = changes(&steps)
-            .into_iter()
-            .filter(|(_, c)| matches!(c, Change::Down(o) if o.found_by == Cause::Left))
-            .collect();
+        let downs = lefts(&steps);
         assert_eq!(downs.len(), 1);
         assert_eq!(downs[0].0, 2, "found once matterjs-server answered");
 
-        // A light that left stays left while matterjs-server is out of reach, and is not told back.
+        // A light that left stays left while matterjs-server is out of reach.
         let mut watch = Watch::default();
         let steps = run_left(&mut watch, 0, 30, |n| {
             (!(10..25).contains(&n)).then(|| (vec![other()], vec![storage_left(None)]))
         });
-        assert_eq!(left_notices(&steps).len(), 1);
+        assert_eq!(lefts(&steps).len(), 1);
         assert!(
             !changes(&steps)
                 .iter()
                 .any(|(_, c)| matches!(c, Change::Up(o) if o.found_by == Cause::Left))
-        );
-        assert!(
-            !notices(&steps)
-                .iter()
-                .any(|(_, n)| matches!(n, Notice::Up(_)))
         );
     }
 
@@ -2105,12 +1662,11 @@ mod tests {
             Some((vec![other()], vec![storage_left(None)]))
         }) {
             open.extend(step.changes.into_iter().filter_map(|c| match c {
-                Change::Down(o) | Change::Updated(o) => Some(o),
+                Change::Down(o) | Change::Left(o) | Change::Updated(o) => Some(o),
                 Change::Up(_) => None,
             }));
         }
         let last = open.last().cloned().expect("kept");
-        assert!(last.left_told(), "told before the restart");
 
         let mut after = Watch::default();
         after.resume(vec![last]);
@@ -2122,17 +1678,15 @@ mod tests {
                 (vec![ledger_light(99, "物置き1", true), other()], vec![])
             })
         });
-        let told = notices(&steps);
-        assert_eq!(told.len(), 1, "not told again that it left: {told:?}");
-        let (30, Notice::Rejoined(lights)) = &told[0] else {
-            panic!("{told:?}");
-        };
-        assert_eq!(lights[0].since, minute(0));
+        let all = changes(&steps);
         assert!(
-            !changes(&steps)
-                .iter()
-                .any(|(_, c)| matches!(c, Change::Down(_))),
-            "the same stretch"
+            !all.iter()
+                .any(|(_, c)| matches!(c, Change::Down(_) | Change::Left(_))),
+            "the same stretch: {all:?}"
+        );
+        assert!(
+            matches!(all.last(), Some((30, Change::Up(o))) if o.started_at == minute(0)),
+            "{all:?}"
         );
     }
 }

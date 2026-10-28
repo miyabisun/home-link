@@ -36,10 +36,10 @@ scripts/smoke.sh
 `/healthz`・`/api/health`（`Cargo.toml` の版）・labelの作成・404・組み込んだ画面とJSが返ることをHTTPで確かめます。
 
 `tests/api.rs` はメモリ上のSQLiteでAPIの要求と応答を検証します。
-照明の接続の見張りは、判断（いつ切れたと数え、つなぎ直し、知らせるか）を `src/watch.rs` の副作用の無い `Watch::step` に分け、
-1分ずつ時刻を進める列の単体テストで確かめます。matterjs-serverへの問い合わせ・Discordへの送信・履歴の書き込みは `src/watcher.rs` が行い、
-`tests/watch.rs` が、mockのmatterjs-serverとmockのDiscordのWebhookを相手に `Home::check_lights` を時刻を進めて呼び、
-見張り→つなぎ直し→知らせ→履歴のAPIを通して確かめます。
+照明の接続の見張りは、判断（いつ切れたと数え、つなぎ直し、何がuserの操作を要するか）を `src/watch.rs` の副作用の無い `Watch::step` と `Watch::attention` に分け、
+1分ずつ時刻を進める列の単体テストで確かめます。温度計の要対応は `src/meter/care.rs` の `Care::attention` が決めます。
+matterjs-serverへの問い合わせと履歴の書き込みは `src/watcher.rs` が行い、`tests/watch.rs` が、mockのmatterjs-serverを相手に `Home::check_lights` を時刻を進めて呼び、
+見張り→つなぎ直し→要対応（`GET /api/attention`）→履歴のAPIを通して確かめます。要対応の文は `client/src/lib/admin.ts` の `attentionText` が組み立て、vitestで確かめます。
 `src/onboarding.rs` はMatterのQRコード（Base38）と手動ペアリングコード（Verhoeff）の検証、
 同じ機器かを判定するキーの取り出しと、そのテストを持ちます。
 `src/link.rs` はmatterjs-serverとの通信の層です。`Link` は接続・送信・応答待ち・切断のすべてに期限を持ちます。

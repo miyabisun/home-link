@@ -1,11 +1,20 @@
 <script lang="ts">
-  import { adapterText, meterState, receivedTime } from "../lib/admin";
+  import Attention from "../lib/Attention.svelte";
+  import {
+    adapterText,
+    type Attention as Item,
+    attentionHref,
+    meterState,
+    receivedTime,
+  } from "../lib/admin";
   import { aborted, api, type Meter } from "../lib/api";
 
   // The meter advertises every few seconds; the page follows while it is shown.
   const REFRESH_MS = 10_000;
 
   let meter = $state<Meter | undefined>();
+  let attention = $state<Item[]>([]);
+  let now = $state(Math.floor(Date.now() / 1000));
   let pageState = $state<"loading" | "error" | "success">("loading");
   let controller: AbortController | undefined;
 
@@ -13,7 +22,15 @@
     controller?.abort();
     controller = new AbortController();
     try {
-      meter = await api.meter(controller.signal);
+      const [current, asking] = await Promise.all([
+        api.meter(controller.signal),
+        api.attention(controller.signal),
+      ]);
+      meter = current;
+      attention = asking.items.filter(
+        (item) => attentionHref(item) === "/meter",
+      );
+      now = Math.floor(Date.now() / 1000);
       pageState = "success";
     } catch (error) {
       if (!aborted(error)) pageState = "error";
@@ -48,6 +65,7 @@
 <div class="sub-header"><h1>温度計</h1></div>
 
 <section class="content" data-state={pageState}>
+  <Attention items={attention} {now} />
   {#if pageState === "loading"}
     <p class="state">
       <span class="spinner" aria-hidden="true"></span>読み込み中…

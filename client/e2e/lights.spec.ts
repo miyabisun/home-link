@@ -103,10 +103,7 @@ const server = {
   reachable: null,
 };
 
-async function watching(
-  page: Page,
-  { serverDown }: { serverDown: boolean },
-) {
+async function watching(page: Page, { serverDown }: { serverDown: boolean }) {
   await page.route("/api/lights/watch", (route) =>
     route.fulfill({
       json: {
@@ -140,6 +137,34 @@ async function watching(
   );
 }
 
+// What the server lists as asking for the user: matterjs-server has its own banner here.
+async function asking(page: Page) {
+  await page.route("/api/attention", (route) =>
+    route.fulfill({
+      json: {
+        items: [
+          { kind: "server_down", since: server.started_at },
+          {
+            kind: "power_cycle",
+            name: down.name,
+            device_id: null,
+            since: down.outage.started_at,
+          },
+          {
+            kind: "left_fabric",
+            name: "物置き1",
+            device_id: 19,
+            left_at: left.outage.left_at,
+            left_by: "event",
+            reason: "no_advert",
+          },
+          { kind: "meter_battery", battery: 19 },
+        ],
+      },
+    }),
+  );
+}
+
 async function noSideScroll(page: Page) {
   expect(
     await page.evaluate(
@@ -158,7 +183,17 @@ for (const size of widths) {
       await page.setViewportSize(size);
       await page.emulateMedia({ colorScheme: scheme });
       await watching(page, { serverDown: true });
+      await asking(page);
       await page.goto("/lights");
+
+      const attention = page
+        .getByRole("list", { name: "要対応" })
+        .getByRole("link");
+      await expect(attention).toHaveCount(2);
+      await expect(attention.nth(0)).toContainText(
+        "からつながっていません。壁のスイッチで電源を入れ直してください。",
+      );
+      await expect(attention.nth(1)).toContainText("物置き1の登録が");
 
       const cards = page.locator(".card");
       await expect(cards).toHaveCount(4);
