@@ -643,6 +643,98 @@ class RegisterScreenTest {
         }
     }
 
+    @Test fun aPcWidgetIsNamedFromTheConnectedPcsOrTypedWithNoneConnected() {
+        shell("appwidget grantbind --package ${context.packageName} --user 0")
+        val host = android.appwidget.AppWidgetHost(context, 9)
+        val widget = host.allocateAppWidgetId()
+        try {
+            assertTrue(AppWidgetManager.getInstance(context).bindAppWidgetIdIfAllowed(widget,
+                ComponentName(context, PcWidget::class.java)))
+            val setup = android.content.Intent(context, PcWidgetConfigActivity::class.java)
+                .putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, widget)
+            // None connected yet: the name is typed, as the PC will say it.
+            ActivityScenario.launchActivityForResult<PcWidgetConfigActivity>(setup).use { screen ->
+                eventually(screen) { hasLabel(it, "つながっているPCはありません") }
+                screen.onActivity { activity ->
+                    assertFalse(spinner(activity, "PC").isShown)
+                    assertFalse(button(activity, "保存").isEnabled)
+                    field(activity, "名前").setText("書斎")
+                    assertTrue(button(activity, "保存").isEnabled)
+                }
+                capture(screen, "pc-widget-setup-none")
+                screen.onActivity { button(it, "保存").performClick() }
+                assertEquals(Activity.RESULT_OK, screen.result.resultCode)
+            }
+            assertEquals("書斎", PcWidget.name(context, widget))
+
+            // Connected ones are picked from; the one named stays picked.
+            api.pcList += listOf(Pc("ゲーム", false), Pc("書斎", true))
+            ActivityScenario.launchActivityForResult<PcWidgetConfigActivity>(setup).use { screen ->
+                eventually(screen) { spinner(it, "PC").isShown && spinner(it, "PC").selectedItem == "書斎" }
+                capture(screen, "pc-widget-setup")
+                screen.onActivity { spinner(it, "PC").setSelection(0) }
+                eventually(screen) { field(it, "名前").text.toString() == "ゲーム" }
+                screen.onActivity { button(it, "保存").performClick() }
+            }
+            assertEquals("ゲーム", PcWidget.name(context, widget))
+        } finally {
+            host.deleteAppWidgetId(widget)
+            api.pcList.clear()
+        }
+    }
+
+    @Test fun thePcWidgetPutsThePcToSleepAndWakesIt() {
+        shell("appwidget grantbind --package ${context.packageName} --user 0")
+        val host = android.appwidget.AppWidgetHost(context, 10)
+        val widget = host.allocateAppWidgetId()
+        val manager = AppWidgetManager.getInstance(context)
+        try {
+            assertTrue(manager.bindAppWidgetIdIfAllowed(widget, ComponentName(context, PcWidget::class.java)))
+            PcWidget.save(context, widget, "書斎")
+            api.pcList += Pc("書斎", false)
+            host.startListening()
+            ActivityScenario.launch(MainActivity::class.java).use { screen ->
+                lateinit var shown: android.appwidget.AppWidgetHostView
+                screen.onActivity { activity ->
+                    shown = host.createView(activity, widget, manager.getAppWidgetInfo(widget))
+                    val size = (110 * activity.resources.displayMetrics.density).toInt()
+                    activity.addContentView(shown, android.widget.FrameLayout.LayoutParams(size, size,
+                        android.view.Gravity.CENTER))
+                }
+                val words = { shown.findViewById<TextView>(R.id.label_button_text).text.toString() }
+                val said = { shown.findViewById<View>(R.id.label_button).contentDescription.toString() }
+                val press = { screen.onActivity { shown.findViewById<View>(R.id.label_button).performClick() } }
+                context.sendBroadcast(android.content.Intent(AppWidgetManager.ACTION_APPWIDGET_UPDATE)
+                    .setComponent(ComponentName(context, PcWidget::class.java))
+                    .putExtra(AppWidgetManager.EXTRA_APPWIDGET_IDS, intArrayOf(widget)))
+                eventually(screen) { words() == "書斎" }
+                captureWidget(shown, "pc-awake")
+
+                press()
+                eventually(screen) { words() == "スリープ中" }
+                assertEquals("書斎（スリープ中）", said())
+                captureWidget(shown, "pc-sleeping")
+                press()
+                eventually(screen) { words() == "書斎" }
+                assertEquals(listOf("書斎" to PcAction.SLEEP, "書斎" to PcAction.WAKE), api.pcPresses.toList())
+
+                // Gone from home-link: the short failure, then the button with its state unknown.
+                api.pcList.clear()
+                press()
+                eventually(screen) { words() == "PC未接続" }
+                assertEquals("PC未接続：書斎はhome-linkにつながっていません。PCでwindows-linkが動いているか確かめてください", said())
+                captureWidget(shown, "pc-not-connected")
+                Thread.sleep(5_000)
+                eventually(screen) { words() == "書斎" && said() == "書斎（状態不明）" }
+                captureWidget(shown, "pc-unknown")
+            }
+        } finally {
+            host.stopListening()
+            host.deleteAppWidgetId(widget)
+            api.pcList.clear()
+        }
+    }
+
     @Test fun theAirconWidgetSwitchesTheControlAndShowsItsState() {
         shell("appwidget grantbind --package ${context.packageName} --user 0")
         val host = android.appwidget.AppWidgetHost(context, 8)
@@ -1212,6 +1304,21 @@ private class FakeApi : HomeLinkApi {
     @Volatile var gate: CountDownLatch? = null
 
     override fun door(command: DoorCommand): ApiResult<Unit> = ApiResult.Failed(ApiError.SERVER)
+
+    /** The PCs connected to home-link, as it lists them; a press changes the one it names. */
+    val pcList: MutableList<Pc> = Collections.synchronizedList(mutableListOf())
+    val pcPresses: MutableList<Pair<String, PcAction>> = Collections.synchronizedList(mutableListOf())
+    @Volatile var pcFailure: ApiError? = null
+
+    override fun pcs(): ApiResult<List<Pc>> = ApiResult.Ok(synchronized(pcList) { pcList.toList() })
+    override fun switchPc(name: String, action: PcAction): ApiResult<Boolean?> {
+        pcPresses += name to action
+        pcFailure?.let { return ApiResult.Failed(it) }
+        val index = pcList.indexOfFirst { it.name == name }
+        if (index < 0) return ApiResult.Failed(ApiError.PC_NOT_CONNECTED)
+        pcList[index] = Pc(name, action == PcAction.SLEEP)
+        return ApiResult.Ok(pcList[index].sleeping)
+    }
 
     /** home-link's ledger, codes included, kept the way home-link keeps it. */
     val ledger: MutableList<Device> = Collections.synchronizedList(mutableListOf())

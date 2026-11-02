@@ -80,6 +80,20 @@
             <meta-data android:name="android.appwidget.provider"
                 android:resource="@xml/aircon_widget_info" />
         </receiver>
+        <activity android:name=".PcWidgetConfigActivity" android:exported="true"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_CONFIGURE" />
+            </intent-filter>
+        </activity>
+        <receiver android:name=".PcWidget" android:exported="false"
+            android:label="@string/pc_widget_name">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data android:name="android.appwidget.provider"
+                android:resource="@xml/pc_widget_info" />
+        </receiver>
         <receiver android:name=".DoorWidget" android:exported="false"
             android:label="@string/door_widget_name">
             <intent-filter>

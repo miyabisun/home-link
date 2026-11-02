@@ -40,6 +40,7 @@ class PressService : Service() {
             "door" to ::pressDoor,
             "label" to LabelWidget::press,
             "aircon" to { context, _ -> AirconWidget.press(context) },
+            "pc" to PcWidget::press,
         )
 
         /** Whether a press is under way in this process, which will take its button back itself. */
@@ -146,6 +147,7 @@ internal object Widgets {
     fun showAll(context: Context) {
         LabelWidget.showAll(context)
         AirconWidget.showAll(context)
+        PcWidget.showAll(context)
         showDoors(context)
     }
 
@@ -181,7 +183,7 @@ class WidgetEvents : BroadcastReceiver() {
 class WidgetRefresh : JobService() {
     override fun onStartJob(params: JobParameters): Boolean {
         Thread {
-            val read = LabelWidget.read(this) and AirconWidget.read(this)
+            val read = LabelWidget.read(this) and AirconWidget.read(this) and PcWidget.read(this)
             if (!PressService.busy) Widgets.showAll(this)
             Log.i(LOG, "widgets' states read again on a network: ${if (read) "done" else "failed, later again"}")
             jobFinished(params, !read)

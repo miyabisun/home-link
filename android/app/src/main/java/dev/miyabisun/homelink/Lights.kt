@@ -40,6 +40,10 @@ internal fun failure(error: ApiError, host: String) = LightsMessage(when (error)
     ApiError.SESAME_UNREACHABLE -> "SESAMEのAPIに接続できませんでした"
     ApiError.LABEL_NOT_FOUND -> "ラベルがありません"
     ApiError.LABEL_HAS_NO_DEVICES -> "ラベルに機器がありません"
+    ApiError.PC_NOT_CONNECTED -> "PCがhome-linkにつながっていません"
+    ApiError.PC_REJECTED -> "PCが受け付けませんでした"
+    ApiError.PC_NO_ANSWER -> "PCが答えませんでした"
+    ApiError.PC_DISCONNECTED -> "PCへの接続が途中で切れました"
     else -> "home-linkでエラーが発生しました。時間をおいてお試しください"
 }, failed = true)
 
@@ -65,6 +69,10 @@ internal fun failureLabel(error: ApiError) = LightsMessage(when (error) {
     ApiError.SESAME_UNREACHABLE -> "SESAME不通"
     ApiError.LABEL_NOT_FOUND -> "ラベルなし"
     ApiError.LABEL_HAS_NO_DEVICES -> "機器なし"
+    ApiError.PC_NOT_CONNECTED -> "PC未接続"
+    ApiError.PC_REJECTED -> "PC拒否"
+    ApiError.PC_NO_ANSWER -> "PC無応答"
+    ApiError.PC_DISCONNECTED -> "PC切断"
     else -> "エラー"
 }, failed = true)
 

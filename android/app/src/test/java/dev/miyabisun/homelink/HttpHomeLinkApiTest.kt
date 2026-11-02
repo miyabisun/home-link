@@ -264,6 +264,31 @@ class HttpHomeLinkApiTest {
         }
     }
 
+    @Test fun listsPcsAndSendsSleepAndWakeByName() {
+        respond("/api/pcs", 200, """[{"name":"書斎","sleeping":false},{"name":"ゲーム","sleeping":null}]""")
+        assertEquals(ApiResult.Ok(listOf(Pc("書斎", false), Pc("ゲーム", null))), api.pcs())
+        assertEquals("GET /api/pcs", requests.last())
+
+        // The name is one path segment, escaped.
+        respond("/api/pcs/", 200, """{"status":"accepted","sleeping":true}""")
+        assertEquals(ApiResult.Ok(true), api.switchPc("書斎 PC/2", PcAction.SLEEP))
+        assertEquals("POST /api/pcs/%E6%9B%B8%E6%96%8E%20PC%2F2/sleep", requests.last())
+        respond("/api/pcs/", 200, """{"status":"accepted","sleeping":null}""")
+        assertEquals(ApiResult.Ok(null), api.switchPc("書斎", PcAction.WAKE))
+        assert(requests.last().endsWith("/wake")) { requests.last() }
+
+        val cases = listOf(
+            Triple(404, "pc_not_connected", ApiError.PC_NOT_CONNECTED),
+            Triple(502, "pc_rejected", ApiError.PC_REJECTED),
+            Triple(504, "pc_no_answer", ApiError.PC_NO_ANSWER),
+            Triple(502, "pc_disconnected", ApiError.PC_DISCONNECTED),
+        )
+        for ((status, code, expected) in cases) {
+            respond("/api/pcs/", status, """{"error":"$code","message":"…"}""")
+            assertEquals(code, ApiResult.Failed(expected), api.switchPc("書斎", PcAction.SLEEP))
+        }
+    }
+
     @Test fun aDoorCommandWithoutAnAnswerInTimeIsATimeout() {
         // Accepts the connection (the backlog does) but never answers.
         ServerSocket(0).use { silent ->

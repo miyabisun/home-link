@@ -12,6 +12,7 @@ import org.json.JSONArray
 import org.json.JSONException
 import org.json.JSONObject
 import java.io.IOException
+import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -22,7 +23,8 @@ enum class ApiError { NOT_CONFIGURED, UNREACHABLE, TIMEOUT, INVALID_QR, INVALID_
     WIFI_REVERTED, WIFI_REVERTING, NOT_ON_WIFI,
     SESAME_NOT_CONFIGURED, SESAME_REJECTED, SESAME_UNREACHABLE, SWITCH_FAILED, NO_NETWORK, BLOCKED,
     CONNECT_TIMEOUT, HTTP_DENIED, HTTP_NOT_FOUND, HTTP_GATEWAY, BAD_ANSWER,
-    SETTINGS_UNREADABLE, SETTINGS_MALFORMED, LOCAL_NETWORK_DENIED }
+    SETTINGS_UNREADABLE, SETTINGS_MALFORMED, LOCAL_NETWORK_DENIED,
+    PC_NOT_CONNECTED, PC_REJECTED, PC_NO_ANSWER, PC_DISCONNECTED }
 
 /** A Wi-Fi network to save on home-link for new devices. */
 data class WifiNetwork(val ssid: String, val password: String)
@@ -119,6 +121,10 @@ interface HomeLinkApi {
     fun deleteWifi(id: Long): ApiResult<Unit>
     /** Has the front door's SESAME unlock or lock; `Ok` once CANDY HOUSE accepts the command. */
     fun door(command: DoorCommand): ApiResult<Unit>
+    /** The PCs connected to home-link now. */
+    fun pcs(): ApiResult<List<Pc>>
+    /** Has PC `name` sleep or wake: the state it says after, or null when it does not say. Waits up to about 10 s. */
+    fun switchPc(name: String, action: PcAction): ApiResult<Boolean?>
 }
 
 /** A phone taken as always online, waiting by sleeping: for tests and the JVM. */
@@ -276,6 +282,21 @@ class HttpHomeLinkApi(private val targets: () -> Targets, private val link: Phon
 
     override fun door(command: DoorCommand): ApiResult<Unit> = call("POST", "/api/door/${command.path}", null) { }
 
+    override fun pcs(): ApiResult<List<Pc>> = call("GET", "/api/pcs", null) { body ->
+        val array = JSONArray(body)
+        (0 until array.length()).map { index ->
+            val pc = array.getJSONObject(index)
+            Pc(pc.getString("name"), if (pc.isNull("sleeping")) null else pc.getBoolean("sleeping"))
+        }
+    }
+
+    // The name is one path segment: URLEncoder escapes "/" too, and a space as "+", which a path does not read so.
+    override fun switchPc(name: String, action: PcAction): ApiResult<Boolean?> =
+        call("POST", "/api/pcs/${URLEncoder.encode(name, Charsets.UTF_8).replace("+", "%20")}/${action.path}", null) { body ->
+            val json = JSONObject(body)
+            if (json.isNull("sleeping")) null else json.getBoolean("sleeping")
+        }
+
     private fun counts(json: JSONObject): SwitchResult {
         val missing = json.getJSONArray("missing_devices")
         return SwitchResult(
@@ -368,6 +389,10 @@ internal fun apiError(status: Int, body: String): ApiError {
         "wifi_reverting" -> ApiError.WIFI_REVERTING
         "not_on_wifi" -> ApiError.NOT_ON_WIFI
         "not_switchable", "not_connected", "switch_failed" -> ApiError.SWITCH_FAILED
+        "pc_not_connected" -> ApiError.PC_NOT_CONNECTED
+        "pc_rejected" -> ApiError.PC_REJECTED
+        "pc_no_answer" -> ApiError.PC_NO_ANSWER
+        "pc_disconnected" -> ApiError.PC_DISCONNECTED
         else -> when (status) {
             401, 403 -> ApiError.HTTP_DENIED
             404 -> ApiError.HTTP_NOT_FOUND
