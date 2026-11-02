@@ -77,6 +77,11 @@ WebSocketサーバーを立て、全部オン・全部オフ、エラーや無�
 - エアコンが答えないmockで、`POST /api/aircon/toggle` が `delivered: false` を返すことを確かめます。
 - CANDY HOUSEの代わりのHTTPサーバーで、ChromeのUser-Agentと、答えないときに10秒で打ち切ることを確かめます。
 
+PCとの接続（`src/pc.rs`）は、`tests/pc.rs` が実際のポートでhome-linkを起動し、tokio-tungsteniteのクライアントをPCとしてつないで確かめます。
+helloの検査、名前ごとの結果の受け渡し、拒否・無応答・途中の切断、同じ名前でのつなぎ直し、pingに答えないPCを外すことです。
+期限は `Home::with_pc_times` で縮めます。WebSocketの読み取りでpongを返すので、テストのPCが読まない間は切れたとみなされます。
+`client/e2e/pcs.spec.ts` は、`ws` のクライアントをPCとしてつなぎ、管理画面のPCの画面を確かめます。
+
 要求のログは `capture_logs` で、起動時に温度計のアドレスを出さないことは `tests/port.rs` で実行ファイルを起動して確かめます。
 機器の種類とプラグの入り切りは、同じmockに照明・プラグ（0x010A・0x010B）・ブリッジ配下のプラグ・センサーを並べ、
 種類と入・切の値、そのnodeとendpointへのOn/Off、応答しない・使えないプラグ、照明と入り切りの無い機器の拒否、

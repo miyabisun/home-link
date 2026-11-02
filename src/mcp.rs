@@ -1,6 +1,8 @@
-//! A Model Context Protocol server (Streamable HTTP, JSON replies only) for labels.
+//! A Model Context Protocol server (Streamable HTTP, JSON replies only) for labels and PCs.
 //! Each tool is a request to the HTTP API beside it, so it checks, behaves and fails
 //! as the API does, without authentication like the API.
+
+use std::fmt::Write as _;
 
 use axum::{
     Router,
@@ -73,6 +75,21 @@ async fn call(api: Router, params: &Value) -> Result<Value, (i64, &'static str)>
             .and_then(Value::as_i64)
             .ok_or((-32602, "id (an integer) is required"))
     };
+    // The name goes in the path, so each byte outside the unreserved set is escaped.
+    let pc_name = || {
+        let name = arguments
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or((-32602, "name (a string) is required"))?;
+        Ok::<_, (i64, &'static str)>(name.bytes().fold(String::new(), |mut path, byte| {
+            if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+                path.push(char::from(byte));
+            } else {
+                let _ = write!(path, "%{byte:02X}");
+            }
+            path
+        }))
+    };
     let rest = || {
         let mut rest = arguments.clone();
         rest.remove("id");
@@ -94,6 +111,9 @@ async fn call(api: Router, params: &Value) -> Result<Value, (i64, &'static str)>
         "label_on" => ("POST", format!("/api/labels/{}/on", id()?), None),
         "label_off" => ("POST", format!("/api/labels/{}/off", id()?), None),
         "label_toggle" => ("POST", format!("/api/labels/{}/toggle", id()?), None),
+        "list_pcs" => ("GET", "/api/pcs".to_owned(), None),
+        "sleep_pc" => ("POST", format!("/api/pcs/{}/sleep", pc_name()?), None),
+        "wake_pc" => ("POST", format!("/api/pcs/{}/wake", pc_name()?), None),
         _ => return Err((-32602, "unknown tool")),
     };
     let request = Request::builder()
@@ -139,6 +159,11 @@ fn tools() -> Value {
     let by_id = |description: &str| {
         json!({ "description": description,
                 "inputSchema": { "type": "object", "required": ["id"], "properties": { "id": id } } })
+    };
+    let by_name = |description: &str| {
+        json!({ "description": description,
+                "inputSchema": { "type": "object", "required": ["name"], "properties": {
+                    "name": { "type": "string", "description": "PCの名前（list_pcsで分かる）" } } } })
     };
     let named = |name: &str, mut tool: Value| {
         tool["name"] = json!(name);
@@ -187,5 +212,12 @@ fn tools() -> Value {
                 "labelを切り替える。上書き中のlabelは上書きをやめ、照明をほかのlabelの状態へ戻す"
             )
         ),
+        named(
+            "list_pcs",
+            json!({ "description": "home-linkにつながっているPCの一覧（名前・スリープ中か。nullはPCが知らせていない）",
+            "inputSchema": { "type": "object", "properties": {} } })
+        ),
+        named("sleep_pc", by_name("PCをスリープさせる")),
+        named("wake_pc", by_name("PCをスリープから戻す")),
     ])
 }

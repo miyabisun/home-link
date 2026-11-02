@@ -68,6 +68,9 @@
         <a class="menu-item" href="/aircon" onclick={() => (menuOpen = false)}>
           エアコン
         </a>
+        <a class="menu-item" href="/pcs" onclick={() => (menuOpen = false)}>
+          PC
+        </a>
       </nav>
     {/if}
   </div>

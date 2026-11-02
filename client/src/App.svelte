@@ -8,6 +8,7 @@
   import Labels from "./pages/Labels.svelte";
   import Lights from "./pages/Lights.svelte";
   import Meter from "./pages/Meter.svelte";
+  import Pcs from "./pages/Pcs.svelte";
 
   $effect(() => initRouter());
 </script>
@@ -31,6 +32,8 @@
     <Aircon />
   {:else if router.index === 6}
     <Lights />
+  {:else if router.index === 7}
+    <Pcs />
   {:else}
     <Devices />
   {/if}

@@ -10,6 +10,7 @@ home-linkのサーバーが出すWebの管理画面で行います。labelの操
 同じ部屋のMatterのエアコン（Room Air Conditioner）へは、home-linkが運転モードと設定温度を送ります。
 温度計が目標の温度（既定25℃）の前後になるように、登録した住所の外気温も見て決めます。
 長く家を空けるときは、ホーム画面のボタンで切り、帰る前に入れ直せます。
+PCは、自分からhome-linkへWebSocketでつないでおくと、home-linkの画面・API・MCPからスリープと復帰の命令を受けられます（下の「PC」）。
 玄関のSESAME 5なども、ホーム画面のボタン1つで家の外から解錠・施錠できます（CANDY HOUSEのWeb API経由）。
 機器に印刷されたMatterのQRコードをAndroidアプリで読み取り、名前とlabelを付けて登録します。
 QRコードが無い機器は、印字された11桁の数字（Matterの手動ペアリングコード）を入力して登録します。
@@ -37,6 +38,9 @@ MatterのQRコードと手動ペアリングコードには、機器のsetup pas
 解錠と施錠のAPI（`POST /api/door/unlock`・`/lock`）も、ほかのAPIと同じく送信元を問わず受け付けます。
 APIに届く経路にいる機器なら、どれからでも玄関を開けられます。公開する範囲はこれを踏まえて決めてください。
 CANDY HOUSEのAPIキーとSESAMEの秘密鍵は、データベース・ログ・応答には出しません。
+
+PCがつなぐ口（`GET /api/pcs/connect`）も、送信元を問わず受け付けます。
+同じ名前で後からつないだ側が前の接続に取って代わるため、APIに届く機器なら、PCを名乗ってスリープと復帰の命令を受け取れます。
 
 機器に渡すWi-FiのSSIDとパスワードは、home-linkのデータベースに平文で保存します。
 データベースファイルとそのバックアップ（R2などへのコピーを含む）には、Wi-Fiのパスワードが入ります。
@@ -215,6 +219,7 @@ curl http://home-link.example:5011/api/lights/watch
 | labelの画面 | 名前の変更、入り切り、調光（なし・自動調光・固定）、固定の明るさ（%）と色温度（K）、毎日の時刻での入・切、機器の割り当て、削除（確認してから） |
 | 温度計（右上のメニュー） | 温度計の今の温度・湿度・CO2・電池と受けた時刻。受信が途絶えたときは、最後に受けた時刻だけを示します。温度計の要対応を上部に示します |
 | 照明の接続（右上のメニュー） | 照明ごとに、いつからつながっているかと最後に答えた時刻、切れている照明はいつからか・つなぎ直した回数・網の層で届くか。登録が外れた照明は「登録が外れた」といつから、自動で登録し直していること、戻らない理由・試した回数・14日で何回目かを示します。matterjs-serverに届かないときと、照明の要対応は画面の上部に示します。「14日の履歴」を開くとつながらなかった区間を新しい順に並べます |
+| PC（右上のメニュー） | home-linkにつながっているPCの一覧。ボタンはPCの状態（「動作中」「スリープ中」）を示し、押すとスリープと復帰を切り替えます。状態を知らせないPCには「スリープ」「復帰」の2つを出します。PCが受け付けなかったときと、つながっていないときは理由を画面の上部に示します |
 | エアコン（右上のメニュー） | 目標の温度（18〜30℃）の変更、自動調整の入・切、室温・湿度・外気温とその時刻、エアコンの今の運転（「冷房 25℃」「切」など）、直近の判断の理由。「設定」に家の住所の登録と夜の時間帯 |
 
 変えた値はその場でAPIへ送り、保存ボタンはありません。値の誤りはその入力の下に、サーバーが受け付けなかった理由は画面の上部に示します。
@@ -466,6 +471,9 @@ Thread網の資格情報（dataset）は、matterjs-serverに `set_thread_datase
 | `PUT /api/lights/schedule` | 自動調整の設定のうち、送った項目だけを変更します。応答は `GET` と同じ形です | 400 `invalid_schedule` |
 | `POST /api/door/unlock` | 玄関のSESAMEの解錠をCANDY HOUSEのWeb APIへ送り、受け付けられたら `{"status":"accepted"}` を返します | 503 `sesame_not_configured`、502 `sesame_rejected`（CANDY HOUSEのHTTPステータスを `message` に含みます）・`sesame_unreachable` |
 | `POST /api/door/lock` | 玄関のSESAMEの施錠をCANDY HOUSEのWeb APIへ送り、受け付けられたら `{"status":"accepted"}` を返します | 503 `sesame_not_configured`、502 `sesame_rejected`（CANDY HOUSEのHTTPステータスを `message` に含みます）・`sesame_unreachable` |
+| `GET /api/pcs` | つながっているPCの一覧（名前の順）。`[{"name":"書斎","sleeping":false}]`。`sleeping` はPCが最後に知らせた状態で、知らせていなければ `null` です | |
+| `GET /api/pcs/connect` | PCがつなぐWebSocket（下の「PC」） | |
+| `POST /api/pcs/{name}/sleep`・`/wake` | PCへスリープ・復帰を送り、PCの結果を待ちます（最長10秒）。受け付けられたら `{"status":"accepted","sleeping":true}` を返します。名前はパスに入れるので、URLエンコードします | 404 `pc_not_connected`、502 `pc_rejected`（PCの理由を `message` に含みます）・`pc_disconnected`、504 `pc_no_answer` |
 | `POST /mcp` | MCP（Streamable HTTP、JSONの応答だけ）。下の「MCP」 | |
 | `GET /api/health` | 稼働確認と版（`{"status":"ok","version":"0.1.4"}`） | |
 | `GET /healthz` | 稼働確認。1行目は `ok`、2行目からずっと動かす処理ごとの状態と起こし直した回数（上の「サーバーの起動」）。処理が終わってしまったら1行目が `stopped` | 503（処理が終わったとき） |
@@ -781,6 +789,40 @@ curl http://home-link.example:5011/api/lights/schedule
 - `GET /api/lights/schedule` の `intent` はなくなりました。0.1.37までのアプリが読む `labels` の `name`・`boosted` は残ります。
 - `POST /api/labels`・`PATCH /api/labels/{id}` に `day_level` などの値や `dedicated` を送ると400 `invalid_label` です。
 
+### PC
+
+PCは `ws://home-link.example:5011/api/pcs/connect` へ自分からつなぎ、つないだままにします。PCに受信のポートを開ける必要はありません。
+home-linkは今つながっているPCだけをメモリに持ち、台帳には保存しません。
+メッセージはJSONのテキストで、`type` で分かれます。
+
+| 向き | `type` | 内容 |
+| --- | --- | --- |
+| PC → home-link | `hello` | つないで最初の10秒以内に1回。`{"type":"hello","name":"書斎","sleeping":false}`。`name` は1〜100文字で、PCごとに分けます。`sleeping` は省略できます |
+| PC → home-link | `state` | 状態が変わったとき。`{"type":"state","sleeping":true}` |
+| home-link → PC | `command` | `{"type":"command","id":7,"action":"sleep"}`。`action` は `sleep`・`wake` |
+| PC → home-link | `result` | 命令ごとに1回。`{"type":"result","id":7,"ok":true,"sleeping":true}`。断るときは `"ok":false` と理由の `message` |
+| home-link → PC | `error` | helloが正しくないとき、理由を送って接続を閉じます |
+
+- 同じ名前で新しくつなぐと、home-linkは前の接続を閉じて新しい方を使います。
+- home-linkは20秒ごとにpingを送ります。pongを含めて60秒何も届かなければ、切れたものとして一覧から外します。
+- 何をスリープと呼ぶか（画面を暗くするだけか、OSのスリープか）はPCが決めます。
+
+[websocat](https://github.com/vi/websocat)でPCの代わりにつなぎ、命令が届くことを試せます。
+
+```sh
+websocat ws://home-link.example:5011/api/pcs/connect
+{"type":"hello","name":"pc1","sleeping":false}
+```
+
+別の端末から送ると、websocatの画面に命令が出ます。10秒以内に `result` を返さなければ、APIは504 `pc_no_answer` を返します。
+
+```sh
+curl -X POST http://home-link.example:5011/api/pcs/pc1/sleep
+# websocatの画面: {"action":"sleep","id":1,"type":"command"}
+# websocatへ入力: {"type":"result","id":1,"ok":true,"sleeping":true}
+# 200 {"sleeping":true,"status":"accepted"}
+```
+
 ### MCP
 
 `POST /mcp` は、[MCP](https://modelcontextprotocol.io/)のStreamable HTTPのサーバーです。JSON-RPCの1件に、JSONで1件を返します（SSEは使いません）。
@@ -795,6 +837,8 @@ APIと同じポートで、認証はありません。道具はAPIへの要求�
 | `list_devices` | なし | `GET /api/devices` |
 | `set_device_labels` | 機器の `id`、`label_ids` | `PATCH /api/devices/{id}` |
 | `label_on`・`label_off`・`label_toggle` | `id` | `POST /api/labels/{id}/on`・`/off`・`/toggle` |
+| `list_pcs` | なし | `GET /api/pcs` |
+| `sleep_pc`・`wake_pc` | PCの `name` | `POST /api/pcs/{name}/sleep`・`/wake` |
 
 ```sh
 claude mcp add --transport http home-link http://home-link.example:5011/mcp

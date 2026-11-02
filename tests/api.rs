@@ -5644,8 +5644,11 @@ async fn mcp_tools_manage_and_switch_labels_over_http() {
             "label_toggle",
             "list_devices",
             "list_labels",
+            "list_pcs",
             "set_device_labels",
+            "sleep_pc",
             "update_label",
+            "wake_pc",
         ]
     );
 

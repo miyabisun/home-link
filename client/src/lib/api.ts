@@ -44,6 +44,12 @@ export interface Device {
   left_at?: number | null;
 }
 
+export interface Pc {
+  name: string;
+  /** `null` while the PC does not say. */
+  sleeping: boolean | null;
+}
+
 export interface Label extends LabelTraits {
   id: number;
   name: string;
@@ -165,6 +171,13 @@ export const api = {
       devices: SwitchEntry[];
       missing_devices: { id: number; name: string }[];
     }>("POST", `/api/labels/${id}/toggle`),
+  pcs: (signal?: AbortSignal) =>
+    request<Pc[]>("GET", "/api/pcs", undefined, signal),
+  sleepPc: (name: string, sleep: boolean) =>
+    request<{ status: string; sleeping: boolean | null }>(
+      "POST",
+      `/api/pcs/${encodeURIComponent(name)}/${sleep ? "sleep" : "wake"}`,
+    ),
   watch: (signal?: AbortSignal) =>
     request<Watch>("GET", "/api/lights/watch", undefined, signal),
   attention: (signal?: AbortSignal) =>

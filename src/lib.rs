@@ -7,6 +7,7 @@ mod mcp;
 pub mod meter;
 pub mod onboarding;
 pub mod outside;
+pub mod pc;
 pub mod rejoin;
 mod rejoiner;
 pub mod schedule;
@@ -472,6 +473,9 @@ struct AppState {
     bluetooth_adapter: Option<String>,
     /// matterjs-server's BLE proxy, else the one beside its WebSocket API.
     ble_proxy_url: Option<String>,
+    /// The PCs connected over a WebSocket now; kept in memory only.
+    pcs: pc::Pcs,
+    pc_times: pc::Times,
 }
 
 /// How a task run forever under [`Home::supervise`] is doing.
@@ -550,6 +554,8 @@ impl Home {
             removed: Mutex::new(Vec::new()),
             bluetooth_adapter: None,
             ble_proxy_url: None,
+            pcs: pc::Pcs::default(),
+            pc_times: pc::Times::default(),
         }))
     }
 
@@ -659,6 +665,18 @@ impl Home {
         Arc::get_mut(&mut self.0)
             .expect("set before the Home is shared")
             .wifi_move = times;
+        self
+    }
+
+    /// Replaces how long each step with a connected PC may take.
+    ///
+    /// # Panics
+    /// Panics once the router or a clone shares this `Home`.
+    #[must_use]
+    pub fn with_pc_times(mut self, times: pc::Times) -> Self {
+        Arc::get_mut(&mut self.0)
+            .expect("set before the Home is shared")
+            .pc_times = times;
         self
     }
 
@@ -870,6 +888,10 @@ fn router(state: Db) -> Router {
         .route("/attention", get(watcher::attention))
         .route("/door/unlock", axum::routing::post(unlock_door))
         .route("/door/lock", axum::routing::post(lock_door))
+        .route("/pcs", get(pc::list))
+        .route("/pcs/connect", get(pc::connect))
+        .route("/pcs/{name}/sleep", axum::routing::post(pc::sleep))
+        .route("/pcs/{name}/wake", axum::routing::post(pc::wake))
         .fallback(not_found)
         // ponytail: one connection behind a global lock; a pool if writes ever contend.
         .with_state(state);
