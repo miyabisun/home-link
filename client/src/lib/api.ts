@@ -132,6 +132,8 @@ export const api = {
     patch: Partial<{ name: string; label_ids: number[]; ignored: boolean }>,
   ) => request<Device>("PATCH", `/api/devices/${id}`, patch),
   deleteDevice: (id: number) => request<null>("DELETE", `/api/devices/${id}`),
+  removeLightNode: (node: number) =>
+    request<null>("DELETE", `/api/lights/nodes/${node}`),
   switchDevice: (id: number, on: boolean) =>
     request<{ state: string }>(
       "POST",

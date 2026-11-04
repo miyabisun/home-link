@@ -110,6 +110,9 @@ matter.on("connection", (ws) => {
     } else if (command === "write_attribute" && node) {
       node.attributes[args.attribute_path] = args.value;
       result = [{ Path: {}, Status: 0 }];
+    } else if (command === "remove_node" && node) {
+      nodes.splice(nodes.indexOf(node), 1);
+      result = null;
     } else if (command === "device_command" && node) {
       if (args.cluster_id === 6)
         node.attributes[`${args.endpoint_id}/6/0`] = args.command_name === "On";

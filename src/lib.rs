@@ -885,6 +885,10 @@ fn router(state: Db) -> Router {
         .route("/lights/watch", get(watcher::status))
         .route("/lights/outages", get(watcher::outages))
         .route("/lights/connected", get(watcher::connected))
+        .route(
+            "/lights/nodes/{node}",
+            axum::routing::delete(remove_light_node),
+        )
         .route("/attention", get(watcher::attention))
         .route("/door/unlock", axum::routing::post(unlock_door))
         .route("/door/lock", axum::routing::post(lock_door))
@@ -1796,11 +1800,82 @@ async fn delete_label(State(db): State<Db>, Path(id): Path<i64>) -> ApiResult<St
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn delete_device(State(db): State<Db>, Path(id): Path<i64>) -> ApiResult<StatusCode> {
-    let db = db.db.lock().expect(UNPOISONED);
-    find_device(&db, id, false)?;
-    db.execute("DELETE FROM devices WHERE id = ?1", [id])?;
+/// Removes the device's own nodes from matterjs-server, then its ledger row: a row gone with
+/// its node left would leave a light no screen names. The row stays when they cannot be removed.
+async fn delete_device(State(state): State<Db>, Path(id): Path<i64>) -> ApiResult<StatusCode> {
+    let device = find_device(&state.db.lock().expect(UNPOISONED), id, false)?;
+    if let (Some(url), Some(vendor), Some(serial)) = (
+        state.matter_url.as_deref(),
+        device.vendor.as_deref(),
+        device.serial_number.as_deref(),
+    ) {
+        commission::remove_nodes(url, |nodes| matter::own_nodes(nodes, vendor, serial))
+            .await
+            .map_err(node_not_removed)?;
+    }
+    state
+        .db
+        .lock()
+        .expect(UNPOISONED)
+        .execute("DELETE FROM devices WHERE id = ?1", [id])?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Removes node `node`, which no ledger device is, from matterjs-server: a light left behind
+/// by a row deleted before home-link removed nodes with it, or never entered.
+async fn remove_light_node(
+    State(state): State<Db>,
+    Path(node): Path<u64>,
+) -> ApiResult<StatusCode> {
+    let url = matter_url(&state)?;
+    let devices = ledger(&state.db.lock().expect(UNPOISONED))?;
+    let mut held = false;
+    let removed = commission::remove_nodes(url, |nodes| {
+        held = devices.iter().any(|device| {
+            device
+                .vendor
+                .as_deref()
+                .zip(device.serial_number.as_deref())
+                .is_some_and(|(vendor, serial)| {
+                    matter::own_nodes(nodes, vendor, serial).contains(&node)
+                        || place(device, nodes).is_some_and(|(at, _)| at == node)
+                })
+        });
+        let present = nodes.iter().any(|n| n["node_id"] == node);
+        if present && !held {
+            vec![node]
+        } else {
+            Vec::new()
+        }
+    })
+    .await
+    .map_err(node_not_removed)?;
+    if held {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "device_in_ledger",
+            "台帳の機器です。機器の画面から削除してください".into(),
+        ));
+    }
+    if removed.is_empty() {
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            "node_not_found",
+            "この照明の登録はありません".into(),
+        ));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn node_not_removed(error: commission::Error) -> ApiError {
+    match error {
+        commission::Error::Unreachable(error) => matter_unreachable(error),
+        commission::Error::Failed(failure) => ApiError(
+            StatusCode::BAD_GATEWAY,
+            "node_not_removed",
+            format!("matterjs-serverが登録を消せませんでした: {failure:?}"),
+        ),
+    }
 }
 
 /// A saved Wi-Fi network; its password is write-only and never leaves the ledger but to matterjs-server.

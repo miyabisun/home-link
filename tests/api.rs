@@ -3075,6 +3075,116 @@ async fn a_reset_device_still_served_unanswering_connects_again_and_its_old_node
     assert_eq!(states(&list), vec![json!("connected")]);
 }
 
+/// The device on `node` alone, and a bridge on node 3 that lists the same device.
+fn tapo_alone_and_bridged(node: u64) -> [Value; 2] {
+    [
+        json!({ "node_id": node, "available": false, "attributes": {
+            "0/40/1": "Tapo", "0/40/15": TAPO, "0/40/3": "Smart Bulb",
+        }}),
+        json!({ "node_id": 3, "available": true, "attributes": {
+            "0/40/1": "Aqara", "0/40/15": "hub", "2/57/1": "Tapo", "2/57/15": TAPO,
+        }}),
+    ]
+}
+
+fn removed_nodes(commands: &Arc<Mutex<Vec<Value>>>) -> Vec<Value> {
+    sent(commands)
+        .into_iter()
+        .filter(|c| c["command"] == "remove_node")
+        .map(|c| c["args"]["node_id"].clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn deleting_a_device_removes_its_own_node_but_not_a_bridge_listing_it() {
+    let (addr, commands, nodes) =
+        fake_matter(server_info(true, false), Commission::Silent, json!({})).await;
+    nodes.lock().unwrap().extend(tapo_alone_and_bridged(9));
+    let (db, sql) = ledger();
+    let app = commissioning_app(addr, db);
+    let device = add_device(
+        &app,
+        &sql,
+        json!({ "vendor": "Tapo", "serial_number": TAPO, "name": "物置き1" }),
+    )
+    .await;
+    let uri = format!("/api/devices/{}", device["id"]);
+    let (status, body) = call(&app, "DELETE", &uri, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(removed_nodes(&commands), vec![json!(9)]);
+    let left: Vec<_> = nodes
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|n| n["node_id"].clone())
+        .collect();
+    assert_eq!(left, vec![json!(3)]);
+    let (status, _) = call(&app, "GET", &uri, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_device_whose_node_cannot_be_removed_stays_in_the_ledger() {
+    let closed = TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let (db, sql) = ledger();
+    let app = commissioning_app(closed, db);
+    let device = add_device(
+        &app,
+        &sql,
+        json!({ "vendor": "Tapo", "serial_number": TAPO }),
+    )
+    .await;
+    let uri = format!("/api/devices/{}", device["id"]);
+    let (status, error) = call(&app, "DELETE", &uri, None).await;
+    assert_eq!(
+        (status, error["error"].as_str().unwrap()),
+        (StatusCode::BAD_GATEWAY, "matter_server_unreachable")
+    );
+    let (status, _) = call(&app, "GET", &uri, None).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_node_outside_the_ledger_is_removed_from_the_lights_screen() {
+    let (addr, commands, nodes) =
+        fake_matter(server_info(true, false), Commission::Silent, json!({})).await;
+    nodes.lock().unwrap().extend(tapo_alone_and_bridged(81));
+    let (db, sql) = ledger();
+    let app = commissioning_app(addr, db);
+
+    // A ledger device's node goes with the device, from its own page.
+    let device = add_device(
+        &app,
+        &sql,
+        json!({ "vendor": "Tapo", "serial_number": TAPO }),
+    )
+    .await;
+    let (status, error) = call(&app, "DELETE", "/api/lights/nodes/81", None).await;
+    assert_eq!(
+        (status, error["error"].as_str().unwrap()),
+        (StatusCode::CONFLICT, "device_in_ledger")
+    );
+    assert!(removed_nodes(&commands).is_empty());
+
+    sql.execute(
+        "DELETE FROM devices WHERE id = ?1",
+        [device["id"].as_i64().unwrap()],
+    )
+    .unwrap();
+    let (status, body) = call(&app, "DELETE", "/api/lights/nodes/81", None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(removed_nodes(&commands), vec![json!(81)]);
+    let (status, error) = call(&app, "DELETE", "/api/lights/nodes/81", None).await;
+    assert_eq!(
+        (status, error["error"].as_str().unwrap()),
+        (StatusCode::NOT_FOUND, "node_not_found")
+    );
+}
+
 #[tokio::test]
 async fn devices_are_named_by_patch() {
     let (app, _) = ledger_app();

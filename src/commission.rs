@@ -91,20 +91,58 @@ async fn drop_replaced(link: &mut Link, commissioned: &Commissioned) {
         }
     };
     for node in crate::matter::replaced(&nodes, commissioned.node_id, vendor, serial) {
-        let request = json!({
-            "message_id": format!("remove-{node}"),
-            "command": "remove_node",
-            "args": { "node_id": node },
-        });
-        match call(link, &request, deadline).await {
-            Ok(reply) if link::error(&reply).is_none() => tracing::info!(
+        if remove_node(link, node, deadline).await.is_ok() {
+            tracing::info!(
                 node_id = node,
                 by = commissioned.node_id,
                 "replaced node removed"
-            ),
-            _ => tracing::warn!(node_id = node, "replaced node not removed"),
+            );
+        } else {
+            tracing::warn!(node_id = node, "replaced node not removed");
         }
     }
+}
+
+/// Has matterjs-server remove `node`: it tells the device to leave when it answers, and forgets
+/// it either way.
+async fn remove_node(link: &mut Link, node: u64, deadline: Instant) -> Result<(), Error> {
+    let request = json!({
+        "message_id": format!("remove-{node}"),
+        "command": "remove_node",
+        "args": { "node_id": node },
+    });
+    let reply = call(link, &request, deadline).await?;
+    match link::error(&reply) {
+        None => Ok(()),
+        Some(details) => Err(Error::Failed(Failure::Other(details))),
+    }
+}
+
+/// The nodes `pick` chooses from matterjs-server's, each removed in turn; `Ok` with none
+/// chosen when there is nothing to remove.
+///
+/// # Errors
+/// When matterjs-server cannot be reached or refuses a removal; the nodes before it are gone.
+pub async fn remove_nodes(
+    url: &str,
+    pick: impl FnOnce(&[Value]) -> Vec<u64>,
+) -> Result<Vec<u64>, Error> {
+    let deadline = Instant::now() + REMOVE_TIMEOUT;
+    let mut link = Link::open(url, deadline)
+        .await
+        .map_err(Error::Unreachable)?;
+    let result = async {
+        let nodes = link.nodes(deadline).await.map_err(Error::Unreachable)?;
+        let picked = pick(&nodes);
+        for &node in &picked {
+            remove_node(&mut link, node, deadline).await?;
+            tracing::info!(node_id = node, "node removed");
+        }
+        Ok(picked)
+    }
+    .await;
+    link.close().await;
+    result
 }
 
 /// Clears the Wi-Fi credentials matterjs-server keeps once handed them; nothing needs them after.

@@ -365,7 +365,7 @@ impl Watch {
         let gone: Vec<&Left> = left.iter().filter(|light| !light.ignored).collect();
         self.leave(at, &gone, step);
         self.come_back(at, &gone, step);
-        self.forget(at, seen, &watched, step);
+        self.forget(at, &watched, step);
         let mut due = Vec::new();
         for seen in watched {
             let light = self.lights.entry(seen.key).or_default();
@@ -478,23 +478,15 @@ impl Watch {
         }
     }
 
-    /// A light ignored since ends its stretch, as does one whose ledger row another node
-    /// serves now, registered again. One matterjs-server no longer serves and the ledger does
-    /// not hold stays as it was while down, and is no longer watched while up.
-    fn forget(&mut self, at: i64, seen: &[Seen], watched: &[&Seen], step: &mut Step) {
+    /// A light ignored since, or no longer served by matterjs-server, ends its stretch and is
+    /// no longer watched. A ledger light no longer served has left the fabric: [`Self::leave`]
+    /// took it first, to watch it by its row.
+    fn forget(&mut self, at: i64, watched: &[&Seen], step: &mut Step) {
         let gone: Vec<Key> = self
             .lights
-            .iter()
-            .filter(|(key, light)| {
-                let moved = light
-                    .device
-                    .is_some_and(|device| watched.iter().any(|light| light.device == Some(device)));
-                !watched.iter().any(|light| light.key == **key)
-                    && (light.outage.is_none()
-                        || moved
-                        || seen.iter().any(|light| light.key == **key))
-            })
-            .map(|(key, _)| *key)
+            .keys()
+            .filter(|key| !watched.iter().any(|light| light.key == **key))
+            .copied()
             .collect();
         for key in gone {
             if let Some(mut outage) = self.lights.remove(&key).and_then(|light| light.outage) {
@@ -916,35 +908,29 @@ mod tests {
     }
 
     #[test]
-    fn a_light_matterjs_server_stops_serving_stays_as_it_was() {
+    fn a_light_outside_the_ledger_matterjs_server_stops_serving_is_no_longer_watched() {
         let mut watch = Watch::default();
         let both = |first: bool| vec![light(1, "玄関", first, None), light(2, "廊下", true, None)];
         watch.step(minute(0), Some(&both(true)), &[]);
         watch.step(minute(1), Some(&both(false)), &[]);
-        // The first light goes missing from the nodes while down: still down.
+        // The first light's node is removed while down: its stretch ends and it is not reconnected.
         let steps = run(&mut watch, 2, 30, |_| {
             Some(vec![light(2, "廊下", true, None)])
         });
-        assert!(
-            steps
-                .iter()
-                .all(|(_, step)| !step.changes.iter().any(|c| matches!(c, Change::Up(_)))),
-            "its stretch stays open"
-        );
+        let ups: Vec<_> = changes(&steps)
+            .into_iter()
+            .filter_map(|(n, c)| match c {
+                Change::Up(o) => Some((n, o.node_id)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ups, vec![(2, Some(1))]);
         assert_eq!(reconnects(&steps, (1, 1)), Vec::<i64>::new());
         assert_eq!(
             watch.connected(),
-            vec![
-                (Some((1, 1)), None, "玄関".into(), "down"),
-                (Some((2, 1)), None, "廊下".into(), "connected")
-            ]
+            vec![(Some((2, 1)), None, "廊下".into(), "connected")]
         );
-        // A light up when it goes missing is no longer watched.
-        watch.step(minute(31), Some(&[light(1, "玄関", true, None)]), &[]);
-        assert_eq!(
-            watch.connected(),
-            vec![(Some((1, 1)), None, "玄関".into(), "connected")]
-        );
+        assert!(watch.attention(minute(30)).is_empty());
     }
 
     #[test]

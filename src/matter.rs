@@ -24,15 +24,23 @@ pub fn locate(nodes: &[Value], vendor: &str, serial: &str) -> Option<(u64, u16)>
     places(nodes, vendor, serial).max_by_key(|(node, _)| *node)
 }
 
-/// The nodes `node` replaces: the other nodes that are the device carrying `vendor` and
-/// `serial` itself, left behind when it was reset and commissioned again. Bridges that list
-/// it are not it.
+/// The nodes that are the device carrying `vendor` and `serial` itself; bridges that list it
+/// are not it.
+#[must_use]
+pub fn own_nodes(nodes: &[Value], vendor: &str, serial: &str) -> Vec<u64> {
+    places(nodes, vendor, serial)
+        .filter(|&(_, endpoint)| endpoint == 0)
+        .map(|(node, _)| node)
+        .collect()
+}
+
+/// The nodes `node` replaces: the device's other own nodes, left behind when it was reset and
+/// commissioned again.
 #[must_use]
 pub fn replaced(nodes: &[Value], node: u64, vendor: &str, serial: &str) -> Vec<u64> {
-    places(nodes, vendor, serial)
-        .filter(|&(other, endpoint)| other != node && endpoint == 0)
-        .map(|(other, _)| other)
-        .collect()
+    let mut own = own_nodes(nodes, vendor, serial);
+    own.retain(|&other| other != node);
+    own
 }
 
 /// Every node and endpoint whose identity cluster carries `vendor` and `serial`.
@@ -888,7 +896,9 @@ pub(crate) fn read_on_off(light: &Light) -> Value {
 mod tests {
     use serde_json::json;
 
-    use super::{Light, lights, locate, network, replaced, software_version, thread_parent};
+    use super::{
+        Light, lights, locate, network, own_nodes, replaced, software_version, thread_parent,
+    };
 
     // Trimmed from a matterjs-server `get_nodes` result (2026-10-05).
     fn nodes() -> Vec<serde_json::Value> {
@@ -948,6 +958,17 @@ mod tests {
         );
         assert_eq!(
             replaced(&nodes(), 5, "Tapo", "AABBCCDDEEFF"),
+            Vec::<u64>::new()
+        );
+    }
+
+    #[test]
+    fn a_devices_own_nodes_leave_out_bridges_listing_it() {
+        let mut all = nodes();
+        all.extend([bulb(29, "54ef441001372c4c"), bulb(31, "54EF441001372C4C")]);
+        assert_eq!(own_nodes(&all, "Aqara", "54EF441001372C4C"), vec![29, 31]);
+        assert_eq!(
+            own_nodes(&nodes(), "Aqara", "54ef441001372c4c"),
             Vec::<u64>::new()
         );
     }

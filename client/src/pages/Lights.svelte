@@ -1,5 +1,7 @@
 <script lang="ts">
   import Attention from "../lib/Attention.svelte";
+  import ConfirmDelete from "../lib/ConfirmDelete.svelte";
+  import Icon from "../lib/Icon.svelte";
   import {
     type Attention as Item,
     attentionHref,
@@ -7,6 +9,7 @@
     type Outage,
     watchBadge,
     watchNote,
+    type WatchLight,
   } from "../lib/admin";
   import { aborted, api, type Watch } from "../lib/api";
 
@@ -19,6 +22,15 @@
   let pageState = $state<"loading" | "error" | "success">("loading");
   let now = $state(Math.floor(Date.now() / 1000));
   let controller: AbortController | undefined;
+  /** The light outside the ledger whose registration is about to be removed. */
+  let removing = $state<WatchLight | undefined>();
+
+  async function removeNode() {
+    if (removing?.node_id == null) return;
+    await api.removeLightNode(removing.node_id);
+    removing = undefined;
+    await load();
+  }
 
   async function load() {
     controller?.abort();
@@ -90,13 +102,32 @@
       <ul class="cards">
         {#each watch.lights as light (light.node_id === null ? `device/${light.device_id}` : `${light.node_id}/${light.endpoint}`)}
           {@const badge = watchBadge(light)}
-          <li class="card">
+          {#snippet face()}
             <span class="name">{light.name}</span>
             <span class="note">{watchNote(light, now)}</span>
             {#if badge}
               <span class="badge danger">{badge}</span>
             {/if}
-          </li>
+          {/snippet}
+          {#if light.device_id != null}
+            <li>
+              <a class="card" href={`/devices/${light.device_id}`}
+                >{@render face()}</a
+              >
+            </li>
+          {:else}
+            <li class="card">
+              {@render face()}
+              <button
+                class="icon-btn"
+                type="button"
+                aria-label={`「${light.name}」の登録を消す`}
+                onclick={() => (removing = light)}
+              >
+                <Icon name="trash" />
+              </button>
+            </li>
+          {/if}
         {/each}
       </ul>
     {/if}
@@ -119,9 +150,17 @@
   {/if}
 </section>
 
+{#if removing}
+  <ConfirmDelete
+    name={removing.name}
+    ondelete={removeNode}
+    onclose={() => (removing = undefined)}
+  />
+{/if}
+
 <style lang="sass">
-  li.card:hover
-    background: var(--c-surface-raised)
+  li.card .icon-btn
+    margin-left: auto
 
   .history
     margin-top: var(--sp-3)

@@ -177,6 +177,7 @@ home-linkは外へ知らせを送りません。userの操作が要る状態は�
 | `GET /api/lights/watch` | 今の状態。`server_reachable`（最後の確かめでmatterjs-serverに届いたか）、`server_since`、`server_outage`、`wifi_all_down`（見張るWi-Fiの照明が1台以上あり、全て切れている。登録が外れた照明は数えません）、照明ごとの `connected`・`state`（`connected`・`down`・`left_fabric`）・`device_id`（台帳の行）・`since`（つながった、または切れた時刻）・`last_answer`（最後に読み取りに答えた時刻）・`outage`。登録が外れた照明は `node_id`・`endpoint`・`network` がnullで、最後の網は `outage` にあります |
 | `GET /api/lights/outages` | 14日分の、照明とmatterjs-serverがつながらなかった区間。古い順。`since`（その時刻より後に続いていた区間）、`node_id` と `endpoint`（1台の照明）で絞れます |
 | `GET /api/lights/connected?at=<Unix秒>` | その時刻の分の確かめで、照明ごとにつながっていたか（`connected`・`state`・`device_id`）。確かめた記録が無い時刻は404 `not_checked` |
+| `DELETE /api/lights/nodes/{node_id}` | 台帳に無い照明の、matterjs-serverの登録（node）を消します。画面「照明の接続」の「登録を消す」が使います | 404 `node_not_found`、409 `device_in_ledger`（台帳の機器は `DELETE /api/devices/{id}` で消します）、502 `matter_server_unreachable`・`node_not_removed`、503 `matter_server_not_configured` |
 | `GET /api/attention` | 今、userの操作が要る状態の一覧 `items`（下の「要対応」） |
 
 区間は `started_at`・`ended_at`（続いていればnull）・`network`・`found_by`（`unavailable`・`no_answer`・`left_fabric`・matterjs-serverの `unreachable`）・`reconnects`・`reconnect_result`（`accepted` か失敗の理由）・`reachable`（pingが届いたか）を持ちます。
@@ -218,7 +219,7 @@ curl http://home-link.example:5011/api/lights/watch
 | ラベル（右上のメニュー） | labelの一覧と作成。一覧は固定・自動調光の別、機器の台数、入っているかを示します。名前を入れて「追加」で作り、そのlabelの画面を開きます |
 | labelの画面 | 名前の変更、入り切り、調光（なし・自動調光・固定）、固定の明るさ（%）と色温度（K）、毎日の時刻での入・切、機器の割り当て、削除（確認してから） |
 | 温度計（右上のメニュー） | 温度計の今の温度・湿度・CO2・電池と受けた時刻。受信が途絶えたときは、最後に受けた時刻だけを示します。温度計の要対応を上部に示します |
-| 照明の接続（右上のメニュー） | 照明ごとに、いつからつながっているかと最後に答えた時刻、切れている照明はいつからか・つなぎ直した回数・網の層で届くか。登録が外れた照明は「登録が外れた」といつから、自動で登録し直していること、戻らない理由・試した回数・14日で何回目かを示します。matterjs-serverに届かないときと、照明の要対応は画面の上部に示します。「14日の履歴」を開くとつながらなかった区間を新しい順に並べます |
+| 照明の接続（右上のメニュー） | 照明ごとに、いつからつながっているかと最後に答えた時刻、切れている照明はいつからか・つなぎ直した回数・網の層で届くか。登録が外れた照明は「登録が外れた」といつから、自動で登録し直していること、戻らない理由・試した回数・14日で何回目かを示します。matterjs-serverに届かないときと、照明の要対応は画面の上部に示します。「14日の履歴」を開くとつながらなかった区間を新しい順に並べます。台帳の照明を選ぶと機器の画面（名前・label・削除）を開きます。台帳に無い照明（製品名で出ます）にはごみ箱のボタンがあり、確認してmatterjs-serverの登録を消します |
 | PC（右上のメニュー） | home-linkにつながっているPCの一覧。ボタンはPCの状態（「動作中」「スリープ中」）を示し、押すとスリープと復帰を切り替えます。状態を知らせないPCには「スリープ」「復帰」の2つを出します。PCが受け付けなかったときと、つながっていないときは理由を画面の上部に示します |
 | エアコン（右上のメニュー） | 目標の温度（18〜30℃）の変更、自動調整の入・切、室温・湿度・外気温とその時刻、エアコンの今の運転（「冷房 25℃」「切」など）、直近の判断の理由。「設定」に家の住所の登録と夜の時間帯 |
 
@@ -455,7 +456,7 @@ Thread網の資格情報（dataset）は、matterjs-serverに `set_thread_datase
 | `POST /api/devices/{id}/commission` | 台帳の機器を、記録したコードでmatterjs-serverへBluetoothで登録（commissioning）し、その行に識別子を補います。本文は要りません | 404 `device_not_found`、409 `no_setup_code`、422 `device_not_found`・`wrong_code`・`wifi_failed`・`thread_failed`・`commission_failed`、504 `commission_timeout`、502 `matter_server_unreachable`、503 `matter_server_not_configured`・`bluetooth_unavailable` |
 | `POST /api/devices/{id}/wifi` | 接続済みのWi-Fiの機器を、初期化せずに機器に渡すWi-Fi（`for_devices`）へ移します。本文は要りません。既にそのWi-Fiにいれば何も送りません。成功すると `{"device": {…}}` を200で返します | 404 `device_not_found`、409 `wifi_not_set`・`not_on_wifi`、422 `wifi_reverted`、504 `wifi_reverting`、502 `matter_server_unreachable`、503 `matter_server_not_configured` |
 | `POST /api/devices/{id}/on`・`/off` | プラグなど、照明以外で入り切りできる機器1台を入・切にします。応答は `{"state": "on"}`・`"off"`・`"no_response"`（応答しない・時間内に答えない機器。理由 `reason` と、matterjs-serverの説明 `details` を付けます）。答えない機器へは、labelと同じく1秒後にもう一度送ります | 404 `device_not_found`、409 `not_connected`・`not_switchable`（照明とエアコンと、入り切りの無い機器）、502 `switch_failed`・`matter_server_unreachable`、503 `matter_server_not_configured` |
-| `DELETE /api/devices/{id}` | 機器の削除 | 404 `device_not_found` |
+| `DELETE /api/devices/{id}` | 機器の削除。その機器自身のmatterjs-serverの登録（node）も消します。機器を一覧に並べるブリッジは消しません。matterjs-serverに届かないときは台帳の行を残します | 404 `device_not_found`、502 `matter_server_unreachable`・`node_not_removed` |
 | `GET /api/labels` | labelの一覧。性質（`auto`・`override_level`・`override_kelvin`）、毎日の切り替え `schedule`、最後のON・OFF `on`（`true`・`false`・未操作の `null`）、割り当てた機器の台数 `device_count`、上書き中か `boosted` つき | |
 | `POST /api/labels` | labelの作成。本文は `{"name": "work", "override_level": 254, "override_kelvin": 5000}`、`{"name": "ambient", "auto": true}`、`{"name": "razor", "schedule": [{"time": "00:00", "on": true}, {"time": "05:00", "on": false}]}` など（下の「label」） | 400 `invalid_label_name`・`invalid_label`、409 `duplicate_label_name` |
 | `PATCH /api/labels/{id}` | labelの名前・性質・`schedule` のうち、送った項目だけを変更します。`override_level`・`override_kelvin` を `null` にすると上書きの値を外し、`schedule` は送ったもので置き換えます（`[]` で消す） | 400 `invalid_label_name`・`invalid_label`、404 `label_not_found`、409 `duplicate_label_name` |

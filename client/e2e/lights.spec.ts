@@ -21,6 +21,7 @@ const day = (unix: number) =>
 const light = {
   node_id: 5,
   endpoint: 1,
+  device_id: 3,
   name: "玄関",
   network: "wifi",
   connected: true,
@@ -28,9 +29,11 @@ const light = {
   last_answer: minutes(2),
   outage: null,
 };
+// A light no ledger row holds, named by its product: what a deleted row used to leave behind.
 const down = {
   ...light,
   node_id: 6,
+  device_id: null,
   name: "廊下の天井の照明（階段の上の吹き抜けの側）",
   connected: false,
   since: minutes(25),
@@ -51,6 +54,7 @@ const down = {
 const thread = {
   ...light,
   node_id: 7,
+  device_id: 7,
   name: "寝室",
   network: "thread",
   since: minutes(600),
@@ -230,6 +234,38 @@ for (const size of widths) {
     });
   }
 }
+
+test("a light in the ledger opens its device, and one outside it can be removed", async ({
+  page,
+}) => {
+  await watching(page, { serverDown: false });
+  await asking(page);
+  const removed: string[] = [];
+  await page.route("/api/lights/nodes/*", (route) => {
+    removed.push(`${route.request().method()} ${new URL(route.request().url()).pathname}`);
+    return route.fulfill({ status: 204 });
+  });
+  await page.goto("/lights");
+
+  const cards = page.locator(".card");
+  await expect(cards.nth(0)).toHaveAttribute("href", "/devices/3");
+  await expect(cards.nth(2)).toHaveAttribute("href", "/devices/7");
+  await expect(cards.nth(3)).toHaveAttribute("href", "/devices/19");
+  // Only the light outside the ledger offers to remove its registration.
+  const remove = page.getByRole("button", { name: /の登録を消す$/ });
+  await expect(remove).toHaveCount(1);
+  await expect(cards.nth(1).getByRole("button")).toBeVisible();
+
+  await remove.click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toContainText(`「${down.name}」を削除`);
+  await dialog.getByRole("button", { name: "削除" }).click();
+  await expect(dialog).toHaveCount(0);
+  expect(removed).toEqual(["DELETE /api/lights/nodes/6"]);
+
+  await cards.nth(0).click();
+  await expect(page).toHaveURL(/\/devices\/3$/);
+});
 
 test("the menu leads to the light watch", async ({ page }) => {
   await page.goto("/");
