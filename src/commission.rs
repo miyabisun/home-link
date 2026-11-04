@@ -56,6 +56,9 @@ pub async fn commission(
         .await
         .map_err(Error::Unreachable)?;
     let result = session(&mut link, code, network, deadline).await;
+    if let Ok(commissioned) = &result {
+        drop_replaced(&mut link, commissioned).await;
+    }
     // Refused before anything was sent, there is nothing to forget.
     if !matches!(
         result,
@@ -70,6 +73,39 @@ pub async fn commission(
 }
 
 const FORGET_TIMEOUT: Duration = Duration::from_secs(5);
+/// matterjs-server drops a node it cannot reach at once, without contacting it.
+const REMOVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Removes the nodes the device was before it was reset, which never answer again and would
+/// stay down beside it.
+async fn drop_replaced(link: &mut Link, commissioned: &Commissioned) {
+    let Some((vendor, serial)) = &commissioned.identity else {
+        return;
+    };
+    let deadline = Instant::now() + REMOVE_TIMEOUT;
+    let nodes = match link.nodes(deadline).await {
+        Ok(nodes) => nodes,
+        Err(fault) => {
+            tracing::warn!(%fault, "nodes not read; a replaced node may remain");
+            return;
+        }
+    };
+    for node in crate::matter::replaced(&nodes, commissioned.node_id, vendor, serial) {
+        let request = json!({
+            "message_id": format!("remove-{node}"),
+            "command": "remove_node",
+            "args": { "node_id": node },
+        });
+        match call(link, &request, deadline).await {
+            Ok(reply) if link::error(&reply).is_none() => tracing::info!(
+                node_id = node,
+                by = commissioned.node_id,
+                "replaced node removed"
+            ),
+            _ => tracing::warn!(node_id = node, "replaced node not removed"),
+        }
+    }
+}
 
 /// Clears the Wi-Fi credentials matterjs-server keeps once handed them; nothing needs them after.
 async fn forget_wifi(link: &mut Link) {

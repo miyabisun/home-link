@@ -478,15 +478,21 @@ impl Watch {
         }
     }
 
-    /// A light ignored since ends its stretch. One matterjs-server no longer serves
-    /// and the ledger does not hold stays as it was while down, and is no longer watched while up.
+    /// A light ignored since ends its stretch, as does one whose ledger row another node
+    /// serves now, registered again. One matterjs-server no longer serves and the ledger does
+    /// not hold stays as it was while down, and is no longer watched while up.
     fn forget(&mut self, at: i64, seen: &[Seen], watched: &[&Seen], step: &mut Step) {
         let gone: Vec<Key> = self
             .lights
             .iter()
             .filter(|(key, light)| {
+                let moved = light
+                    .device
+                    .is_some_and(|device| watched.iter().any(|light| light.device == Some(device)));
                 !watched.iter().any(|light| light.key == **key)
-                    && (light.outage.is_none() || seen.iter().any(|light| light.key == **key))
+                    && (light.outage.is_none()
+                        || moved
+                        || seen.iter().any(|light| light.key == **key))
             })
             .map(|(key, _)| *key)
             .collect();
@@ -1386,6 +1392,44 @@ mod tests {
                 .iter()
                 .any(|(n, c)| *n == 2 && matches!(c, Change::Up(_)))
         );
+    }
+
+    #[test]
+    fn a_light_down_registered_again_on_a_new_node_ends_its_stretch() {
+        let mut watch = Watch::default();
+        let steps = run_left(&mut watch, 0, 12, |n| {
+            Some(if n < 10 {
+                (vec![ledger_light(29, "キッチン1", false), other()], vec![])
+            } else {
+                // Registered again: its old node is gone, a new one serves its ledger row.
+                (vec![ledger_light(31, "キッチン1", true), other()], vec![])
+            })
+        });
+        let ups: Vec<_> = changes(&steps)
+            .into_iter()
+            .filter_map(|(n, c)| match c {
+                Change::Up(o) => Some((n, o)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ups.len(), 1, "{ups:?}");
+        assert_eq!(
+            (ups[0].0, ups[0].1.node_id, ups[0].1.started_at),
+            (10, Some(29), minute(0))
+        );
+        assert_eq!(
+            watch.connected(),
+            vec![
+                (
+                    Some((31, 1)),
+                    Some(STORAGE),
+                    "キッチン1".into(),
+                    "connected"
+                ),
+                (Some((52, 1)), None, "物置き2".into(), "connected"),
+            ]
+        );
+        assert!(watch.attention(minute(30)).is_empty());
     }
 
     #[test]

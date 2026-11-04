@@ -44,8 +44,8 @@ fun recover(unreported: Unreported, read: ApiResult<Device>, deviceWifi: String?
     return when (job) {
         is DeviceJob.Commission -> when (device.state) {
             null -> Recovery.Later(Status.Recovering(job))
-            DeviceState.UNCONNECTED -> Recovery.Settled(Status.Interrupted(job, null), device)
-            else -> Recovery.Settled(Status.Commissioned(device.name), device)
+            DeviceState.CONNECTED -> Recovery.Settled(Status.Commissioned(device.name), device)
+            else -> Recovery.Settled(Status.Interrupted(job, null), device)
         }
         is DeviceJob.MoveWifi -> when {
             deviceWifi != null && device.wifiSsid == deviceWifi -> Recovery.Settled(Status.WifiMoved(deviceWifi), device)
@@ -77,6 +77,9 @@ enum class Stage {
 }
 
 enum class ManualError { LENGTH, CHECK_DIGIT }
+
+/** The Bluetooth action on `device`'s pane: an unanswering one, reset and left on its old node, registers again. */
+fun connectVerb(device: Device?) = if (device?.state == DeviceState.NO_RESPONSE) "登録し直す" else "接続"
 
 class RegisterForm {
     var manualError: ManualError? = null
@@ -131,8 +134,12 @@ class RegisterForm {
         }
     }
 
-    /** One device job runs at a time: a move holds connecting back, as connecting holds a move. */
-    fun canConnect() = device?.state == DeviceState.UNCONNECTED && !busy && moving == null
+    /**
+     * An unconnected device connects, and an unanswering one registers again; one device job runs at a time: a move
+     * holds connecting back, as connecting holds a move.
+     */
+    fun canConnect() = (device?.state == DeviceState.UNCONNECTED || device?.state == DeviceState.NO_RESPONSE) &&
+        !busy && moving == null
 
     /** The device whose Wi-Fi is being moved. */
     var moving: Long? = null

@@ -1992,6 +1992,11 @@ async fn fake_matter(
                     }
                     ("commission_with_code", Commission::Silent) => continue,
                     ("read_attribute", _) => json!({ "message_id": id, "result": read }),
+                    ("remove_node", _) => {
+                        let node = &command["args"]["node_id"];
+                        served.lock().unwrap().retain(|n| &n["node_id"] != node);
+                        json!({ "message_id": id, "result": null })
+                    }
                     (other, _) => panic!("unexpected command {other}"),
                 };
                 ws.send(Message::text(reply.to_string())).await.unwrap();
@@ -2182,7 +2187,7 @@ async fn commissioning_hands_over_the_wifi_for_devices_then_registers_the_new_no
             &json!(TAPO)
         )
     );
-    let commands = commands.lock().unwrap().clone();
+    let commands = sent(&commands);
     assert_eq!(
         commands
             .iter()
@@ -2524,7 +2529,7 @@ async fn thread_commissioning_uses_the_stored_dataset_and_registers_the_node() {
         )
     );
     // No Wi-Fi is handed over: matterjs-server commissions with its own dataset.
-    let commands = commands.lock().unwrap().clone();
+    let commands = sent(&commands);
     assert_eq!(
         commands.iter().map(|c| &c["command"]).collect::<Vec<_>>(),
         ["commission_with_code", "remove_wifi_credentials"]
@@ -3021,6 +3026,53 @@ async fn connecting_a_device_the_ledger_already_holds_keeps_that_row() {
     assert_eq!(list.as_array().unwrap().len(), 1);
     let (_, stored) = call(&app, "GET", &format!("/api/devices/{}", old["id"]), None).await;
     assert_eq!(stored["qr_payload"], QR);
+}
+
+#[tokio::test]
+async fn a_reset_device_still_served_unanswering_connects_again_and_its_old_node_goes() {
+    let (addr, commands, nodes) = fake_matter(
+        server_info(true, false),
+        Commission::Node(tapo_node()),
+        json!({}),
+    )
+    .await;
+    // Reset by its power switch, the bulb left its old node behind, never to answer again.
+    let stale = json!({ "node_id": 9, "available": false, "attributes": {
+        "0/40/1": "Tapo", "0/40/15": TAPO, "0/40/3": "Smart Bulb",
+    }});
+    let bridge = json!({ "node_id": 3, "available": true, "attributes": {
+        "0/40/1": "Aqara", "0/40/15": "hub", "2/57/1": "Tapo", "2/57/15": TAPO,
+    }});
+    nodes.lock().unwrap().extend([bridge, stale]);
+    let (db, sql) = ledger();
+    let app = commissioning_app(addr, db);
+    let old = add_device(
+        &app,
+        &sql,
+        json!({ "vendor": "Tapo", "serial_number": TAPO, "name": "キッチン1", "qr_payload": QR }),
+    )
+    .await;
+    assert_eq!(old["state"], "no_response");
+
+    let (status, body) = connect(&app, &old["id"]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        (
+            &body["node_id"],
+            &body["device"]["id"],
+            &body["device"]["state"]
+        ),
+        (&json!(17), &old["id"], &json!("connected"))
+    );
+    let removed: Vec<_> = sent(&commands)
+        .into_iter()
+        .filter(|c| c["command"] == "remove_node")
+        .map(|c| c["args"].clone())
+        .collect();
+    // Only the node of the device alone goes, not a bridge that lists it.
+    assert_eq!(removed, vec![json!({ "node_id": 9 })]);
+    let (_, list) = call(&app, "GET", "/api/devices", None).await;
+    assert_eq!(states(&list), vec![json!("connected")]);
 }
 
 #[tokio::test]

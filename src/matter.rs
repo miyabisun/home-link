@@ -17,10 +17,31 @@ const SERIAL_NUMBER: &str = "15";
 
 /// Finds the node and endpoint whose identity cluster carries `vendor` and
 /// `serial` in a matterjs-server `get_nodes` result. The serial matches in any case: a bridge
-/// may report in lower case what the box prints in upper.
+/// may report in lower case what the box prints in upper. A device commissioned again is on
+/// its newest node.
 #[must_use]
 pub fn locate(nodes: &[Value], vendor: &str, serial: &str) -> Option<(u64, u16)> {
-    nodes.iter().find_map(|node| {
+    places(nodes, vendor, serial).max_by_key(|(node, _)| *node)
+}
+
+/// The nodes `node` replaces: the other nodes that are the device carrying `vendor` and
+/// `serial` itself, left behind when it was reset and commissioned again. Bridges that list
+/// it are not it.
+#[must_use]
+pub fn replaced(nodes: &[Value], node: u64, vendor: &str, serial: &str) -> Vec<u64> {
+    places(nodes, vendor, serial)
+        .filter(|&(other, endpoint)| other != node && endpoint == 0)
+        .map(|(other, _)| other)
+        .collect()
+}
+
+/// Every node and endpoint whose identity cluster carries `vendor` and `serial`.
+fn places<'a>(
+    nodes: &'a [Value],
+    vendor: &'a str,
+    serial: &'a str,
+) -> impl Iterator<Item = (u64, u16)> + 'a {
+    nodes.iter().filter_map(move |node| {
         let attributes = node["attributes"].as_object()?;
         let endpoint = attributes.iter().find_map(|(path, value)| {
             let mut parts = path.split('/');
@@ -867,7 +888,7 @@ pub(crate) fn read_on_off(light: &Light) -> Value {
 mod tests {
     use serde_json::json;
 
-    use super::{Light, lights, locate, network, software_version, thread_parent};
+    use super::{Light, lights, locate, network, replaced, software_version, thread_parent};
 
     // Trimmed from a matterjs-server `get_nodes` result (2026-10-05).
     fn nodes() -> Vec<serde_json::Value> {
@@ -897,6 +918,38 @@ mod tests {
     fn locates_bridged_devices_by_their_endpoint() {
         assert_eq!(locate(&nodes(), "Aqara", "54ef441001372c4c"), Some((1, 3)));
         assert_eq!(locate(&nodes(), "Aqara", "54ef4475b119"), Some((1, 0)));
+    }
+
+    /// The device on `node` alone, as matterjs-server serves a light commissioned once more.
+    fn bulb(node: u64, serial: &str) -> serde_json::Value {
+        json!({ "node_id": node, "attributes": { "0/40/1": "Aqara", "0/40/15": serial }})
+    }
+
+    #[test]
+    fn a_device_commissioned_again_is_located_on_its_newest_node() {
+        let mut both = nodes();
+        both.extend([bulb(31, "54EF441001372C4C"), bulb(29, "54ef441001372c4c")]);
+        assert_eq!(locate(&both, "Aqara", "54EF441001372C4C"), Some((31, 0)));
+    }
+
+    #[test]
+    fn the_nodes_a_new_one_replaces_are_the_devices_own_older_ones() {
+        let mut all = nodes();
+        all.extend([
+            bulb(29, "54ef441001372c4c"),
+            bulb(31, "54EF441001372C4C"),
+            bulb(30, "OTHER"),
+        ]);
+        // The bridge on node 1 lists the device but is not it.
+        assert_eq!(replaced(&all, 31, "Aqara", "54EF441001372C4C"), vec![29]);
+        assert_eq!(
+            replaced(&all, 31, "Tapo", "54EF441001372C4C"),
+            Vec::<u64>::new()
+        );
+        assert_eq!(
+            replaced(&nodes(), 5, "Tapo", "AABBCCDDEEFF"),
+            Vec::<u64>::new()
+        );
     }
 
     #[test]

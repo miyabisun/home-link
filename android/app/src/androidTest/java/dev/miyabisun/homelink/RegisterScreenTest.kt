@@ -262,6 +262,40 @@ class RegisterScreenTest {
         }
     }
 
+    @Test fun anUnansweringLightIsRegisteredAgainOverBluetoothFromItsCode() {
+        api.wifi += homeWifi
+        // Reset by its power switch: the ledger still holds it, on a node that never answers again.
+        api.ledger += Device(1, "キッチン1", emptySet(), DeviceState.NO_RESPONSE, qrs[0], kind = DeviceKind.LIGHT)
+        ActivityScenario.launch(MainActivity::class.java).use { screen ->
+            scanner.next = ScanResult.Read(qrs[0])
+            eventually(screen) { hasLabel(it, "機器を登録") }
+            screen.onActivity { button(it, "QRを読み取る").performClick() }
+            eventually(screen) { field(it, "機器名").text.toString() == "キッチン1" && hasLabel(it, "応答なし") }
+            screen.onActivity { activity ->
+                assertTrue(inPane(activity, button(activity, "登録し直す")))
+                assertFalse(views(activity).any { it is Button && it.isShown && it.text == "接続" })
+            }
+            capture(screen, "register-again")
+
+            // Not in pairing mode, it is not found; the message names the button to press again.
+            api.failure = ApiError.DEVICE_NOT_FOUND
+            screen.onActivity { button(it, "登録し直す").performClick() }
+            eventually(screen) {
+                hasLabel(it, "機器が見つかりませんでした。機器をペアリング待ちにし、電話を近づけてから「登録し直す」を押し直してください")
+            }
+            capture(screen, "register-again-not-found")
+
+            api.failure = null
+            screen.onActivity { button(it, "登録し直す").performClick() }
+            eventually(screen) { hasLabel(it, "「キッチン1」を接続しました") }
+            screen.onActivity { activity ->
+                assertFalse(views(activity).any { it is Button && it.isShown && it.text == "登録し直す" })
+            }
+            capture(screen, "register-again-done")
+            assertEquals(listOf(1L, 1L), api.commissionings.toList())
+        }
+    }
+
     @Test fun theNameAndTheLabelsReachHomeLink() {
         api.labels += listOf(Label(1, "作業"), Label(2, "夜"))
         ActivityScenario.launch(MainActivity::class.java).use { screen ->

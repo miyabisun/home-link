@@ -635,6 +635,7 @@ class MainActivity : Activity() {
         if (device != null && form.moving == device.id) resultRow.show("Wi-Fiを移しています…", failed = false, R.drawable.ic_wifi)
         else if (form.busy && stage != null) resultRow.show(stageText(stage), failed = false, R.drawable.ic_bluetooth)
         else resultRow.show(if (device != null) result else null, failed)
+        connectButton.text = connectVerb(device)
         connectButton.visibility = if (form.canConnect()) View.VISIBLE else View.GONE
         cancelButton.visibility = if (form.busy) View.VISIBLE else View.GONE
         moveButton.text = "「${form.deviceWifi}」へ移す"
@@ -647,20 +648,21 @@ class MainActivity : Activity() {
     /** What the last action left to say, in the pane or the panel it started from; none for a code's own errors. */
     private fun resultText(status: Status?): String? {
         val ssid = form.deviceWifi?.let { "「$it」" }.orEmpty()
+        val press = "「${connectVerb(form.device)}」を押し直してください"
         return when (status) {
             is Status.Commissioned -> if (status.name.isEmpty()) "接続しました" else "「${status.name}」を接続しました"
             is Status.WifiMoved -> "「${status.ssid}」へ移しました"
             is Status.Recovering -> "アプリが途中で終了しました。" +
                 (if (status.job is DeviceJob.Commission) "接続" else "Wi-Fiの移動") + "の結果をhome-linkに確かめています…"
             is Status.Interrupted -> when (status.job) {
-                is DeviceJob.Commission -> "アプリが途中で終了したため、接続は終わりませんでした。「接続」を押し直してください"
+                is DeviceJob.Commission -> "アプリが途中で終了したため、接続は終わりませんでした。$press"
                 is DeviceJob.MoveWifi -> "アプリが途中で終了し、Wi-Fiを移せませんでした。機器は今" +
                     (status.ssid?.let { "「$it」につながっています" } ?: "どのWi-Fiにいるか分かりません")
             }
             is Status.BleFailed -> when (status.problem) {
                 BleProblem.PERMISSION -> "Bluetoothで機器を探すには「付近のデバイス」の許可が必要です。" +
-                    "許可してから「接続」を押し直してください"
-                BleProblem.BLUETOOTH_OFF -> "Bluetoothがオフです。オンにしてから「接続」を押し直してください"
+                    "許可してから$press"
+                BleProblem.BLUETOOTH_OFF -> "Bluetoothがオフです。オンにしてから$press"
                 BleProblem.PROXY_NOT_CONFIGURED -> "matterjs-serverのBLE Proxyの接続先が未設定です。「接続先の設定」で入れてください"
                 BleProblem.PROXY_UNREACHABLE -> "matterjs-server（${authority(endpoints.bleProxyUrl)}）に" +
                     "接続できません。家のWi-Fiにつないでから、もう一度お試しください"
@@ -671,12 +673,12 @@ class MainActivity : Activity() {
                 ApiError.INVALID_NAME -> "名前は${MAX_NAME}文字以内で入力してください"
                 ApiError.INVALID_QR, ApiError.INVALID_MANUAL -> null
                 ApiError.DEVICE_NOT_FOUND -> "機器が見つかりませんでした。機器をペアリング待ちにし、" +
-                    "電話を近づけてから「接続」を押し直してください"
+                    "電話を近づけてから$press"
                 ApiError.WRONG_CODE -> "機器がコードを受け付けませんでした。機器のコードを読み取り直すか、入力し直してください"
                 ApiError.WIFI_FAILED -> "機器がWi-Fi${ssid}につながりませんでした。Wi-Fiの名前とパスワードを確かめてください。" +
                     "2.4GHzにしか対応しない機器もあります"
                 ApiError.COMMISSION_TIMEOUT -> "時間内に接続が終わりませんでした。機器をペアリング待ちにし直して、もう一度お試しください"
-                ApiError.COMMISSION_FAILED -> "接続が途中で止まりました。電話を機器の近くに置いて、「接続」を押し直してください。" +
+                ApiError.COMMISSION_FAILED -> "接続が途中で止まりました。電話を機器の近くに置いて、$press。" +
                     "機器の接続待ちが終わっていたら、機器の電源を1回入れ直してから押し直してください"
                 ApiError.BLUETOOTH_UNAVAILABLE -> "matterjs-serverでBluetoothの中継が有効になっていません。サーバーの設定を確かめてください"
                 ApiError.THREAD_FAILED -> "機器がThread網につながりませんでした。Thread網（OTBR）が動いているか確かめてから、" +

@@ -82,6 +82,23 @@ class RegisterFormTest {
         assertFalse(form.canConnect())
     }
 
+    @Test fun anUnansweringDeviceCanBeRegisteredAgainOverBluetooth() {
+        val form = RegisterForm()
+        // Reset by its power switch, a light stays in the ledger on a node that never answers again.
+        form.opened(device(1, DeviceState.NO_RESPONSE, name = "キッチン1", code = qr))
+        assertTrue(form.canConnect())
+        assertEquals("登録し直す", connectVerb(form.device))
+        assertEquals("接続", connectVerb(device(2)))
+        assertEquals("接続", connectVerb(null))
+        // Not in the list of devices still to connect: it is open from its code or not at all.
+        assertEquals(emptyList<Device>(), form.unconnected)
+        form.connect(1)
+        assertFalse(form.canConnect())
+        form.commissioned(ApiResult.Ok(device(1, DeviceState.CONNECTED, name = "キッチン1")))
+        assertEquals(Status.Commissioned("キッチン1"), form.status)
+        assertFalse(form.canConnect())
+    }
+
     @Test fun aConnectedDeviceLeavesTheListAndItsPaneShowsItConnected() {
         val form = RegisterForm()
         form.devicesRead(ApiResult.Ok(listOf(device(1), device(2), device(3))))
@@ -328,10 +345,11 @@ class RegisterFormTest {
         val now = started + 10_000
         val connected = device(1, DeviceState.CONNECTED, name = "押入れ1")
         assertEquals(Recovery.Settled(Status.Commissioned("押入れ1"), connected), recover(job, ApiResult.Ok(connected), null, now))
-        assertEquals(Recovery.Settled(Status.Commissioned(""), device(1, DeviceState.NO_RESPONSE)),
-            recover(job, ApiResult.Ok(device(1, DeviceState.NO_RESPONSE)), null, now))
-        // Still unconnected: the proxy closed with the process, so the registration cannot have gone through.
+        // Still unconnected, or still the unanswering node it was: the proxy closed with the process, so the
+        // registration cannot have gone through.
         assertEquals(Recovery.Settled(Status.Interrupted(job.job, null), device(1)), recover(job, ApiResult.Ok(device(1)), null, now))
+        assertEquals(Recovery.Settled(Status.Interrupted(job.job, null), device(1, DeviceState.NO_RESPONSE)),
+            recover(job, ApiResult.Ok(device(1, DeviceState.NO_RESPONSE)), null, now))
         // Gone from the ledger: home-link kept the row that already held the device.
         assertEquals(Recovery.Settled(Status.Commissioned(""), null), recover(job, ApiResult.Failed(ApiError.DEVICE_NOT_FOUND), null, now))
         // Not read: home-link, or matterjs-server behind it, is asked again later.
