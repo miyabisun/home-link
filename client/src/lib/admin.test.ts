@@ -4,8 +4,6 @@ import {
   airconText,
   attentionHref,
   attentionText,
-  nightMinute,
-  nightTime,
   outdoorText,
   placeText,
   deviceName,
@@ -18,7 +16,6 @@ import {
   levelOf,
   meterState,
   adapterText,
-  targetError,
   overrideInput,
   percentOf,
   receivedTime,
@@ -366,12 +363,6 @@ describe("the air conditioner", () => {
     expect(airconText({ ...device, state: "no_response" })).toBe("応答なし");
     expect(airconText(null)).toBe("未登録");
   });
-
-  it("takes a whole target from 18 to 30", () => {
-    for (const ok of ["18", "25", "30"]) expect(targetError(ok)).toBeNull();
-    for (const bad of ["17", "31", "24.5", "", "a"])
-      expect(targetError(bad)).toBe("18〜30℃");
-  });
 });
 
 describe("the outside and the night", () => {
@@ -399,17 +390,6 @@ describe("the outside and the night", () => {
     expect(placeText({ ...place, name: null, registered: false })).toBe(
       "未登録",
     );
-  });
-
-  it("turns the night's minutes into times and back", () => {
-    expect(nightTime(1320)).toBe("22:00");
-    expect(nightTime(420)).toBe("07:00");
-    expect(nightTime(5)).toBe("00:05");
-    expect(nightMinute("22:00")).toBe(1320);
-    expect(nightMinute("00:05")).toBe(5);
-    expect(nightMinute("23:59")).toBe(1439);
-    for (const bad of ["", "24:00", "7:00", "aa:bb"])
-      expect(nightMinute(bad)).toBeNull();
   });
 });
 

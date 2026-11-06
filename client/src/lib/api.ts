@@ -33,8 +33,11 @@ export interface Device {
   vendor: string | null;
   product_name: string | null;
   state: "unconnected" | "connected" | "no_response" | null;
-  kind: "light" | "plug" | "aircon" | "other" | null;
+  kind: "light" | "plug" | "aircon" | "sensor" | "other" | null;
+  /** A plug's On/Off; whether a sensor drives the air conditioner under its labels. */
   on: boolean | null;
+  /** What a sensor last measured. */
+  climate: Climate | null;
   wifi_ssid: string | null;
   network: "wifi" | "thread" | "ethernet" | null;
   labels: LabelRef[];
@@ -42,6 +45,12 @@ export interface Device {
   /** Once connected and served no more: it left the fabric. `null` when unknown. */
   left_fabric?: boolean | null;
   left_at?: number | null;
+}
+
+export interface Climate {
+  temperature: number | null;
+  humidity: number | null;
+  battery: number | null;
 }
 
 export interface Pc {
@@ -59,6 +68,8 @@ export interface Label extends LabelTraits {
 }
 
 export interface Meter extends MeterView, AdapterView {
+  /** As the user named it; `null` until then. */
+  name: string | null;
   powered_on_at: number | null;
   power_cycled_at: number | null;
   reading: {
@@ -71,12 +82,10 @@ export interface Meter extends MeterView, AdapterView {
 
 export interface Aircon {
   on: boolean;
-  target: number;
-  /** The night in minutes after midnight. */
-  night_from: number;
-  night_until: number;
   device: (AirconDevice & { id: number; name: string }) | null;
-  reading: Meter["reading"];
+  /** The sensor driving it: on, under one of its labels. */
+  sensor: { id: number; name: string } | null;
+  reading: Pick<Climate, "temperature" | "humidity"> | null;
   outdoor: Outdoor | null;
   location: Place;
   /** Why the latest run did what it did. */
@@ -150,16 +159,12 @@ export const api = {
   deleteLabel: (id: number) => request<null>("DELETE", `/api/labels/${id}`),
   meter: (signal?: AbortSignal) =>
     request<Meter>("GET", "/api/meter", undefined, signal),
+  nameMeter: (name: string | null) =>
+    request<Meter>("PUT", "/api/meter", { name }),
   aircon: (signal?: AbortSignal) =>
     request<Aircon>("GET", "/api/aircon", undefined, signal),
-  updateAircon: (
-    patch: Partial<{
-      on: boolean;
-      target: number;
-      night_from: number;
-      night_until: number;
-    }>,
-  ) => request<Aircon>("PUT", "/api/aircon", patch),
+  updateAircon: (patch: { on: boolean }) =>
+    request<Aircon>("PUT", "/api/aircon", patch),
   location: (signal?: AbortSignal) =>
     request<Location>("GET", "/api/location", undefined, signal),
   updateLocation: (address: string) =>

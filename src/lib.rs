@@ -689,7 +689,7 @@ impl Home {
         adjust(&self.0, unix, trigger, None, link::budget()).await;
     }
 
-    /// Sends the air conditioner what the meter's reading at `unix` calls for, if anything.
+    /// Sends the air conditioner what its sensor calls for at `unix`, if anything.
     pub async fn adjust_aircon(&self, unix: i64) {
         adjust_aircon(&self.0, unix, "scheduled").await;
     }
@@ -871,7 +871,7 @@ fn router(state: Db) -> Router {
         .route("/wifi/{id}", axum::routing::delete(delete_wifi))
         .route("/commission", axum::routing::post(commission))
         .route("/thread", get(thread))
-        .route("/meter", get(meter_reading))
+        .route("/meter", get(meter_reading).put(name_meter))
         .route("/aircon", get(get_aircon).put(update_aircon))
         .route("/aircon/toggle", axum::routing::post(toggle_aircon))
         .route("/aircon/runs", get(aircon_runs))
@@ -1094,10 +1094,13 @@ struct Device {
     state: Option<&'static str>,
     /// As the connected device reports it.
     product_name: Option<String>,
-    /// `light`, `plug`, `aircon` or `other` by its Matter device types; `null` until it is connected.
+    /// `light`, `plug`, `aircon`, `sensor` or `other` by its Matter device types; `null` until it is connected.
     kind: Option<&'static str>,
-    /// The On/Off last read of a device that switches and is not a light.
+    /// The On/Off last read of a device that switches and is not a light; for a sensor,
+    /// whether it drives the air conditioner under its labels.
     on: Option<bool>,
+    /// What a sensor last measured.
+    climate: Option<matter::Climate>,
     /// The Wi-Fi network the device is on, as it reports it.
     wifi_ssid: Option<String>,
     /// `wifi`, `thread` or `ethernet` as the connected node runs on; a device behind a bridge is on its bridge's.
@@ -1153,6 +1156,7 @@ fn device_row(row: &rusqlite::Row, with_payload: bool) -> rusqlite::Result<Devic
         product_name: None,
         kind: None,
         on: None,
+        climate: None,
         wifi_ssid: None,
         network: None,
         left_fabric: None,
@@ -1204,6 +1208,8 @@ async fn observe(state: &AppState, devices: &mut [Device]) {
             return;
         }
     };
+    let off =
+        load::<Vec<i64>>(&state.db.lock().expect(UNPOISONED), SENSORS_OFF).unwrap_or_default();
     for device in devices.iter_mut() {
         let (state, product) = match place(device, &nodes) {
             None => ("unconnected", None),
@@ -1221,6 +1227,11 @@ async fn observe(state: &AppState, devices: &mut [Device]) {
             // The air conditioner is switched on its own page, not as a plug.
             if kind != matter::Kind::Aircon {
                 device.on = on_off.and_then(|(_, on)| on);
+            }
+            if kind == matter::Kind::Sensor {
+                device.on = Some(!off.contains(&device.id));
+                device.climate = place(device, &nodes)
+                    .and_then(|(node, endpoint)| matter::climate(&nodes, node, endpoint));
             }
         }
         device.wifi_ssid = wifi_of(device, &nodes).map(|(_, wifi)| wifi.ssid);
@@ -1304,6 +1315,24 @@ async fn device_off(state: State<Db>, id: Path<i64>) -> ApiResult<Json<serde_jso
 
 /// Switches one device that is not a light, such as a plug: `on`, `off` or `no_response`
 /// with why, sent and sent again as a label's devices are. Lights are left to labels.
+/// Switches the sensor `id` on, to drive the air conditioner under its labels at once, or off.
+async fn switch_sensor(state: &AppState, id: i64, on: bool) -> ApiResult<Json<serde_json::Value>> {
+    {
+        let db = state.db.lock().expect(UNPOISONED);
+        let mut off = load::<Vec<i64>>(&db, SENSORS_OFF)?;
+        off.retain(|&sensor| sensor != id);
+        if !on {
+            off.push(id);
+        }
+        store(&db, SENSORS_OFF, &off)?;
+    }
+    tracing::info!(device = id, on, "sensor switched");
+    if on {
+        adjust_aircon(state, (state.clock)(), "sensor").await;
+    }
+    Ok(Json(json!({ "state": if on { "on" } else { "off" } })))
+}
+
 async fn switch_device(
     State(state): State<Db>,
     Path(id): Path<i64>,
@@ -1322,6 +1351,12 @@ async fn switch_device(
             "機器がつながっていません".into(),
         )
     })?;
+    if matches!(
+        matter::kind(&nodes, node_id, endpoint),
+        Some((matter::Kind::Sensor, _))
+    ) {
+        return switch_sensor(&state, id, on).await;
+    }
     if matter::outlet(&nodes, node_id, endpoint).is_none() {
         return Err(ApiError(
             StatusCode::CONFLICT,
@@ -2271,12 +2306,42 @@ fn commission_failed(failure: commission::Failure, ssid: &str) -> ApiError {
     ApiError(status, code, message)
 }
 
-/// Whether Thread devices can be commissioned: matterjs-server holds a dataset.
-/// The meter's latest reading while it is fresh, and when it was received.
-async fn meter_reading(State(state): State<Db>) -> Json<serde_json::Value> {
-    Json(state.meter.view((state.clock)()))
+/// The name the `SwitchBot` meter is shown by, as the user gave it.
+const METER_NAME: &str = "meter_name";
+
+/// The meter's name, its latest reading while it is fresh, and when it was received.
+async fn meter_reading(State(state): State<Db>) -> ApiResult<Json<serde_json::Value>> {
+    let name = load::<Option<String>>(&state.db.lock().expect(UNPOISONED), METER_NAME)?;
+    let mut view = state.meter.view((state.clock)());
+    view["name"] = json!(name);
+    Ok(Json(view))
 }
 
+/// Names the meter, or gives its name back with `null`.
+async fn name_meter(
+    State(state): State<Db>,
+    Json(input): Json<serde_json::Value>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let name = match &input["name"] {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(name) => {
+            Some(clean_name(name, false).ok_or_else(meter_name_error)?)
+        }
+        _ => return Err(meter_name_error()),
+    };
+    store(&state.db.lock().expect(UNPOISONED), METER_NAME, &name)?;
+    meter_reading(State(state)).await
+}
+
+fn meter_name_error() -> ApiError {
+    ApiError(
+        StatusCode::BAD_REQUEST,
+        "invalid_meter",
+        format!("温度計の名前は1〜{MAX_NAME_CHARS}文字か null です"),
+    )
+}
+
+/// Whether Thread devices can be commissioned: matterjs-server holds a dataset.
 async fn thread(State(state): State<Db>) -> ApiResult<Json<serde_json::Value>> {
     let ready = commission::thread_ready(matter_url(&state)?, THREAD_TIMEOUT)
         .await
@@ -3724,10 +3789,8 @@ async fn update_schedule(
 }
 
 const AIRCON: &str = "aircon";
-/// The command last accepted by the air conditioner, kept so a restart does not make it beep.
-const AIRCON_SENT: &str = "aircon_sent";
-/// What the adjustment remembers between runs: corrections, when it last sent, the room's answer.
-const AIRCON_MEMORY: &str = "aircon_memory";
+/// The ledger's sensors switched off: they drive no air conditioner.
+const SENSORS_OFF: &str = "sensors_off";
 /// The home's place, for the temperature outside and the lights' sunrise and sunset.
 const LOCATION: &str = "location";
 /// Two weeks of runs every ten minutes are kept, and the latest day served with the state.
@@ -3736,7 +3799,7 @@ const AIRCON_RUNS_FOR: i64 = 14 * 86_400;
 const OUTDOOR_REUSED_FOR: i64 = 5 * 60;
 
 /// The ledger's air conditioner served by matterjs-server, with its node and the endpoint it is driven on.
-// ponytail: the first one; a second room's air conditioner needs a meter of its own.
+// ponytail: the first one; a second needs runs and a page of its own.
 fn find_aircon<'a>(
     devices: &'a [Device],
     nodes: &[serde_json::Value],
@@ -3747,6 +3810,48 @@ fn find_aircon<'a>(
             (matter::Kind::Aircon, Some((driven, _))) => Some((device, node, driven)),
             _ => None,
         }
+    })
+}
+
+/// The sensor that drives `aircon` and what it measured: the first of the ledger's sensors
+/// that is on, not ignored, under a label of the air conditioner's, answering, with a temperature.
+fn sensor_for<'a>(
+    aircon: &Device,
+    devices: &'a [Device],
+    nodes: &[serde_json::Value],
+    off: &[i64],
+) -> Option<(&'a Device, matter::Climate)> {
+    devices.iter().find_map(|device| {
+        let shared = device
+            .labels
+            .iter()
+            .any(|label| aircon.labels.iter().any(|l| l.id == label.id));
+        if device.ignored || off.contains(&device.id) || !shared {
+            return None;
+        }
+        let (node, endpoint) = place(device, nodes)?;
+        let (matter::Kind::Sensor, _) = matter::kind(nodes, node, endpoint)? else {
+            return None;
+        };
+        if !matter::describe(nodes, node, endpoint).0 {
+            return None;
+        }
+        let climate = matter::climate(nodes, node, endpoint)?;
+        climate.temperature.map(|_| (device, climate))
+    })
+}
+
+/// The air conditioner on `node`'s `endpoint` as its child last took it.
+fn running(nodes: &[serde_json::Value], node: u64, endpoint: u16) -> Option<aircon::Running> {
+    let attributes = &nodes.iter().find(|n| n["node_id"] == node)?["attributes"];
+    let at = |path: &str| &attributes[format!("{endpoint}/{path}")];
+    Some(aircon::Running {
+        on: at("6/0").as_bool()?,
+        mode: at(aircon::SYSTEM_MODE)
+            .as_u64()
+            .and_then(aircon::Mode::from_system_mode),
+        heating: at(aircon::HEATING_SETPOINT).as_i64(),
+        cooling: at(aircon::COOLING_SETPOINT).as_i64(),
     })
 }
 
@@ -3802,27 +3907,25 @@ async fn outdoor(state: &AppState, unix: i64) -> Option<f64> {
         .map(|o| o.celsius)
 }
 
-/// Decides and sends the air conditioner's command for `unix`, logs the run on one line
-/// (`aircon adjusted`, sent or not) and records it for two weeks; what became of it, and why.
+/// Sends the air conditioner what the user's switch or its sensor calls for at `unix`, logs the
+/// run on one line (`aircon adjusted`, sent or not) and records it for two weeks; what became
+/// of it, and why.
 async fn adjust_aircon(
     state: &AppState,
     unix: i64,
     trigger: &'static str,
 ) -> (&'static str, Option<String>) {
     let _busy = state.aircon_busy.lock().await;
-    let reading = state
-        .meter
-        .reading(unix)
-        .map(|r| (r.temperature, r.humidity));
     let outdoor = outdoor(state, unix).await;
     let mut run = json!({
         "at": schedule::timestamp(unix),
         "trigger": trigger,
-        "temperature": reading.map(|r| r.0),
-        "humidity": reading.map(|r| r.1),
+        "sensor": null,
+        "temperature": null,
+        "humidity": null,
         "outdoor": outdoor,
     });
-    let result = match drive_aircon(state, unix, trigger, reading, outdoor, &mut run).await {
+    let result = match drive_aircon(state, trigger, &mut run).await {
         Ok(result) => result,
         Err(error) => {
             tracing::warn!(trigger, %error, "aircon adjustment failed");
@@ -3834,6 +3937,7 @@ async fn adjust_aircon(
         trigger,
         result,
         command = %run["command"],
+        sensor = %run["sensor"],
         temperature = %run["temperature"],
         humidity = %run["humidity"],
         outdoor = %run["outdoor"],
@@ -3879,69 +3983,24 @@ fn aircon_missed(result: &str) -> &'static str {
 }
 
 /// What became of one run: `sent`, `unchanged`, `held`, `no_reading`, `no_aircon`,
-/// `no_response` or `refused`. The memory moves on as the command was accepted or not.
+/// `no_response` or `refused`. The user's switch goes first: off stops the air conditioner
+/// and the sensors, on starts it; otherwise its sensor decides.
 async fn drive_aircon(
     state: &AppState,
-    unix: i64,
     trigger: &'static str,
-    reading: Option<(f64, u8)>,
-    outdoor: Option<f64>,
     run: &mut serde_json::Value,
 ) -> Result<&'static str, String> {
-    let (settings, last, memory, devices) = {
+    let (settings, devices, off) = {
         let db = state.db.lock().expect(UNPOISONED);
         let loaded = (|| {
             Ok::<_, rusqlite::Error>((
                 load::<aircon::Settings>(&db, AIRCON)?,
-                load::<Option<aircon::Command>>(&db, AIRCON_SENT)?,
-                load::<aircon::Memory>(&db, AIRCON_MEMORY)?,
                 ledger(&db)?,
+                load::<Vec<i64>>(&db, SENSORS_OFF)?,
             ))
         })();
         loaded.map_err(|e| e.to_string())?
     };
-    let input = aircon::Input {
-        now: unix,
-        room: reading,
-        outdoor,
-        trigger: match trigger {
-            "switch" => aircon::Trigger::Switch,
-            "target" => aircon::Trigger::Target,
-            _ => aircon::Trigger::Loop,
-        },
-    };
-    let decision = aircon::decide(settings, &input, last, &memory);
-    run["reason"] = json!(decision.to_string());
-    run["command"] = json!(decision.command);
-    let keep = |memory: &aircon::Memory| {
-        store(&state.db.lock().expect(UNPOISONED), AIRCON_MEMORY, memory).map_err(|e| e.to_string())
-    };
-    let Some(command) = decision.send else {
-        keep(&decision.kept)?;
-        return Ok(match (decision.why, decision.hold) {
-            (aircon::Why::NoReading, _) => "no_reading",
-            (_, Some(_)) => "held",
-            (_, None) => "unchanged",
-        });
-    };
-    let result = send_aircon(state, &devices, command).await;
-    if matches!(result, Ok("sent")) {
-        let db = state.db.lock().expect(UNPOISONED);
-        store(&db, AIRCON_SENT, &Some(command))
-            .and_then(|()| store(&db, AIRCON_MEMORY, &decision.sent))
-            .map_err(|e| e.to_string())?;
-    } else {
-        keep(&decision.kept)?;
-    }
-    result
-}
-
-/// Puts `command` on the ledger's air conditioner: `sent`, `no_aircon`, `no_response` or `refused`.
-async fn send_aircon(
-    state: &AppState,
-    devices: &[Device],
-    command: aircon::Command,
-) -> Result<&'static str, String> {
     let url = state
         .matter_url
         .as_deref()
@@ -3950,19 +4009,51 @@ async fn send_aircon(
     let nodes = matter::fetch_nodes(url, deadline)
         .await
         .map_err(|fault| fault.to_string())?;
-    let Some((_, node, endpoint)) = find_aircon(devices, &nodes) else {
+    let Some((aircon, node, endpoint)) = find_aircon(&devices, &nodes) else {
+        run["reason"] = json!("台帳にエアコンがありません");
         return Ok("no_aircon");
+    };
+    let steps = match (settings.on, trigger) {
+        (false, "switch") => {
+            run["reason"] = json!("自動運転を切にしたため、エアコンを止める");
+            run["command"] = json!(aircon::Command::Off);
+            aircon::steps(aircon::Command::Off, None)
+        }
+        (false, _) => {
+            run["reason"] = json!("自動運転が切のため、送らない");
+            return Ok("held");
+        }
+        (true, "switch") => {
+            run["reason"] = json!("自動運転を入にしたため、エアコンを入れる");
+            run["command"] = json!({ "power": "on" });
+            vec![aircon::Step::Switch(true)]
+        }
+        (true, _) => {
+            let Some((sensor, climate)) = sensor_for(aircon, &devices, &nodes, &off) else {
+                run["reason"] =
+                    json!("同じラベルに入のセンサーが無いか、室温を読めないため、送らない");
+                return Ok("no_reading");
+            };
+            run["sensor"] = json!(sensor.name);
+            run["temperature"] = json!(climate.temperature);
+            run["humidity"] = json!(climate.humidity);
+            let running =
+                running(&nodes, node, endpoint).ok_or("the air conditioner's state is unknown")?;
+            let decision = aircon::decide(climate.temperature.unwrap_or_default(), running);
+            run["reason"] = json!(decision.why.to_string());
+            run["command"] = json!(decision.send);
+            let Some(command) = decision.send else {
+                return Ok("unchanged");
+            };
+            let cooling = nodes.iter().find(|n| n["node_id"] == node).and_then(|n| {
+                n["attributes"][format!("{endpoint}/{}", aircon::COOLING_SETPOINT)].as_i64()
+            });
+            aircon::steps(command, cooling)
+        }
     };
     if !matter::describe(&nodes, node, endpoint).0 {
         return Ok("no_response");
     }
-    let attributes = nodes
-        .iter()
-        .find(|n| n["node_id"] == node)
-        .map(|n| &n["attributes"]);
-    let cooling =
-        attributes.and_then(|a| a[format!("{endpoint}/{}", aircon::COOLING_SETPOINT)].as_i64());
-    let steps = aircon::steps(command, cooling);
     let outcome = matter::drive(url, deadline, node, endpoint, &steps)
         .await
         .map_err(|fault| fault.to_string())?;
@@ -4008,16 +4099,15 @@ async fn aircon_runs(
     Ok(Json(json!({ "runs": runs })))
 }
 
-/// The air conditioner's switch, target and night, its state as matterjs-server serves it,
-/// the meter's fresh reading, the outside and the home's place, the command last sent with
-/// the latest reason, and the latest runs.
+/// The air conditioner's switch, its state as matterjs-server serves it, the sensor driving it
+/// with the room it measures, the outside and the home's place, the latest reason, and the latest runs.
 async fn get_aircon(State(state): State<Db>) -> ApiResult<Json<serde_json::Value>> {
-    let (settings, sent, devices, home, runs) = {
+    let (settings, devices, off, home, runs) = {
         let db = state.db.lock().expect(UNPOISONED);
         (
             load::<aircon::Settings>(&db, AIRCON)?,
-            load::<Option<aircon::Command>>(&db, AIRCON_SENT)?,
             ledger(&db)?,
+            load::<Vec<i64>>(&db, SENSORS_OFF)?,
             load::<outside::Location>(&db, LOCATION)?,
             recorded_runs(
                 &db,
@@ -4026,7 +4116,7 @@ async fn get_aircon(State(state): State<Db>) -> ApiResult<Json<serde_json::Value
             )?,
         )
     };
-    let mut device = serde_json::Value::Null;
+    let (mut device, mut sensor, mut reading) = Default::default();
     if let Some(url) = &state.matter_url {
         match matter::fetch_nodes(url, link::budget()).await {
             Ok(nodes) => {
@@ -4058,6 +4148,13 @@ async fn get_aircon(State(state): State<Db>) -> ApiResult<Json<serde_json::Value
                         },
                         "setpoint": setpoint,
                     });
+                    if let Some((driver, climate)) = sensor_for(found, &devices, &nodes, &off) {
+                        sensor = json!({ "id": driver.id, "name": driver.name });
+                        reading = json!({
+                            "temperature": climate.temperature,
+                            "humidity": climate.humidity,
+                        });
+                    }
                 }
             }
             Err(error) => {
@@ -4074,17 +4171,11 @@ async fn get_aircon(State(state): State<Db>) -> ApiResult<Json<serde_json::Value
             "fresh": now - o.at <= outside::FRESH_FOR,
         })
     });
-    let setpoint = match sent {
-        Some(aircon::Command::On { celsius, .. }) => Some(celsius),
-        _ => None,
-    };
     Ok(Json(json!({
         "on": settings.on,
-        "target": settings.target,
-        "night_from": settings.night_from,
-        "night_until": settings.night_until,
         "device": device,
-        "reading": state.meter.reading(now),
+        "sensor": sensor,
+        "reading": reading,
         "outdoor": outdoor,
         "location": {
             "name": home.name,
@@ -4092,64 +4183,29 @@ async fn get_aircon(State(state): State<Db>) -> ApiResult<Json<serde_json::Value
             "longitude": home.longitude,
             "registered": home.name.is_some(),
         },
-        "sent": sent,
-        "setpoint": setpoint,
         "reason": runs.first().map(|run| run["reason"].clone()),
         "runs": runs,
     })))
 }
 
-/// Merges `on`, `target`, `night_from` and `night_until` into the settings and sends what
-/// they call for at once.
+/// Sets the switch, `on`, and sends what it calls for at once.
 async fn update_aircon(
     State(state): State<Db>,
     Json(input): Json<serde_json::Value>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let invalid =
-        |message: &str| ApiError(StatusCode::BAD_REQUEST, "invalid_aircon", message.into());
-    let fields = input
-        .as_object()
-        .ok_or_else(|| invalid("設定はJSONのオブジェクトで送ってください"))?;
-    let trigger = {
-        let db = state.db.lock().expect(UNPOISONED);
-        let mut settings = load::<aircon::Settings>(&db, AIRCON)?;
-        if let Some(on) = fields.get("on") {
-            settings.on = on
-                .as_bool()
-                .ok_or_else(|| invalid("on は true か false です"))?;
-        }
-        if let Some(target) = fields.get("target") {
-            settings.target = target
-                .as_u64()
-                .and_then(|t| u8::try_from(t).ok())
-                .filter(|t| aircon::TARGETS.contains(t))
-                .ok_or_else(|| invalid("目標の温度は18〜30℃の整数です"))?;
-        }
-        for (key, end) in [
-            ("night_from", &mut settings.night_from),
-            ("night_until", &mut settings.night_until),
-        ] {
-            if let Some(minute) = fields.get(key) {
-                *end = minute
-                    .as_u64()
-                    .and_then(|m| u16::try_from(m).ok())
-                    .filter(|m| *m < aircon::MINUTES_A_DAY)
-                    .ok_or_else(|| invalid("夜の時刻は0時からの分（0〜1439）です"))?;
-            }
-        }
-        store(&db, AIRCON, &settings)?;
-        if fields.contains_key("on") {
-            "switch"
-        } else if fields.contains_key("target") {
-            "target"
-        } else {
-            "scheduled"
-        }
-    };
-    // Only the night changed: nothing to send until the loop's next run.
-    if trigger != "scheduled" {
-        adjust_aircon(&state, (state.clock)(), trigger).await;
-    }
+    let on = input["on"].as_bool().ok_or_else(|| {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_aircon",
+            "on は true か false です".into(),
+        )
+    })?;
+    store(
+        &state.db.lock().expect(UNPOISONED),
+        AIRCON,
+        &aircon::Settings { on },
+    )?;
+    adjust_aircon(&state, (state.clock)(), "switch").await;
     get_aircon(State(state)).await
 }
 

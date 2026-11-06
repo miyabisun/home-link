@@ -60,7 +60,8 @@ const meters = {
 async function airconWithMeter(page: Page) {
   await page.route("/api/aircon", async (route) => {
     const json = await (await route.fetch()).json();
-    json.reading = meters.fresh().reading;
+    json.sensor = { id: 0, name: "寝室・温湿度計" };
+    json.reading = { temperature: 26.7, humidity: 57 };
     json.outdoor = {
       temperature: 30.2,
       at: "2026-10-24T16:15:00+09:00",
@@ -73,16 +74,19 @@ async function airconWithMeter(page: Page) {
       longitude: 139.691772,
       registered: true,
     };
-    json.reason = "外が30.2℃のため、25℃に下がっても冷房を続ける";
+    json.reason = "室温が26.7℃で26℃を超えたため、冷房25℃にする";
     await route.fulfill({ json });
   });
 }
 
 async function meterAs(page: Page, kind: keyof typeof meters) {
+  let name: string | null = null;
   await page.unroute("/api/meter");
-  await page.route("/api/meter", (route) =>
-    route.fulfill({ json: meters[kind]() }),
-  );
+  await page.route("/api/meter", (route) => {
+    if (route.request().method() === "PUT")
+      name = route.request().postDataJSON().name;
+    return route.fulfill({ json: { ...meters[kind](), name } });
+  });
 }
 
 test.beforeAll(async ({ request }) => {
@@ -155,7 +159,7 @@ for (const size of widths) {
       // The air conditioner's settings, opened.
       await page.goto("/aircon");
       await page.getByText("設定", { exact: true }).click();
-      await expect(page.getByLabel("夜の始まり")).toBeVisible();
+      await expect(page.getByLabel("住所")).toBeVisible();
       expect(
         await page.evaluate(
           () =>
@@ -221,7 +225,7 @@ test("the delete confirmation and an input error stay on a phone screen", async 
   }
 });
 
-test("the meter shows its values, a stopped reception, and having none", async ({
+test("the meters show their values, a stopped reception, and having none", async ({
   page,
 }) => {
   await page.setViewportSize({ width: 390, height: 844 });
@@ -229,17 +233,48 @@ test("the meter shows its values, a stopped reception, and having none", async (
     await page.emulateMedia({ colorScheme: scheme });
     await meterAs(page, "fresh");
     await page.goto("/meter");
-    const values = page.locator(".reading dd");
+    // The ledger's sensor first, linked to its device, then the SwitchBot meter.
+    const sensor = page.locator("section.meter").first();
+    await expect(sensor.locator("h2")).toHaveText("寝室・温湿度計");
+    await expect(sensor.getByRole("link")).toHaveAttribute(
+      "href",
+      /^\/devices\/\d+$/,
+    );
+    await expect(sensor.locator(".reading dd")).toHaveText([
+      "28.3℃",
+      "52%",
+      "90%",
+    ]);
+    const switchbot = page.locator('section[aria-labelledby="switchbot"]');
+    const values = switchbot.locator(".reading dd");
+    await expect(switchbot.locator("h2")).toHaveText("SwitchBot");
     await expect(values).toHaveText(["26.7℃", "57%", "717ppm", "74%"]);
-    await expect(page.locator(".content > .note")).toHaveText(
+    await expect(switchbot.locator(".received")).toHaveText(
       /^\d\d:\d\d:\d\d 受信$/,
     );
+    await page.screenshot({
+      path: `test-results/screens/meter-390-${scheme}.png`,
+      fullPage: true,
+    });
+
+    // Named, and named back by a blank.
+    await switchbot.getByRole("button", { name: "名前を変える" }).click();
+    await page.getByLabel("名前").fill("リビング");
+    await page.keyboard.press("Tab");
+    await expect(page.locator("#switchbot")).toHaveText("リビング");
+    await page.getByRole("button", { name: "名前を変える" }).click();
+    await expect(page.getByLabel("名前")).toHaveValue("リビング");
+    await page.getByLabel("名前").fill("");
+    await page.keyboard.press("Tab");
+    await expect(page.locator("#switchbot")).toHaveText("SwitchBot");
 
     await meterAs(page, "stale");
     await page.goto("/meter");
-    await expect(page.locator(".state")).toHaveText("受信が途絶えています");
+    await expect(switchbot.locator(".state")).toHaveText(
+      "受信が途絶えています",
+    );
     await expect(values).toHaveCount(0);
-    await expect(page.locator(".note")).toHaveText(
+    await expect(switchbot.locator(".note")).toHaveText(
       /^最後の受信 \d+\/\d+ \d\d:\d\d$/,
     );
     await page.screenshot({
@@ -248,8 +283,10 @@ test("the meter shows its values, a stopped reception, and having none", async (
 
     await meterAs(page, "off");
     await page.goto("/meter");
-    await expect(page.locator(".state")).toHaveText("受信が途絶えています");
-    await expect(page.locator(".note")).toHaveText([
+    await expect(switchbot.locator(".state")).toHaveText(
+      "受信が途絶えています",
+    );
+    await expect(switchbot.locator(".note")).toHaveText([
       /^最後の受信 \d+\/\d+ \d\d:\d\d$/,
       "アダプタの電源が入っていません",
       /^電源の入れ直し \d+\/\d+ \d\d:\d\d$/,
@@ -260,16 +297,17 @@ test("the meter shows its values, a stopped reception, and having none", async (
 
     await meterAs(page, "waiting");
     await page.goto("/meter");
-    await expect(page.locator(".state")).toHaveText("まだ受信していません");
+    await expect(switchbot.locator(".state")).toHaveText(
+      "まだ受信していません",
+    );
 
-    // The E2E home-link itself has no meter configured.
+    // The E2E home-link itself has no SwitchBot meter configured: the sensor alone.
     await page.unroute("/api/meter");
     await page.goto("/");
     await page.getByRole("button", { name: "メニュー", exact: true }).click();
     await page.getByRole("link", { name: "温度計" }).click();
-    await expect(page.locator(".state")).toHaveText(
-      "温度計が設定されていません",
-    );
+    await expect(sensor.locator("h2")).toHaveText("寝室・温湿度計");
+    await expect(switchbot).toHaveCount(0);
     await page.screenshot({
       path: `test-results/screens/meter-unset-390-${scheme}.png`,
     });

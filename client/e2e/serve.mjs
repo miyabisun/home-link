@@ -11,8 +11,8 @@ const binary =
   process.env.HOME_LINK_BIN ??
   new URL("../../target/debug/home-link", import.meta.url).pathname;
 
-// A light, a plug and an air conditioner as matterjs-server lists them; On/Off and the
-// written attributes follow the commands sent.
+// A light, a plug, an air conditioner and a climate sensor as matterjs-server lists them;
+// On/Off and the written attributes follow the commands sent.
 const nodes = [
   {
     node_id: 1,
@@ -49,6 +49,21 @@ const nodes = [
       "1/513/17": 2500,
       "1/513/18": 2300,
       "1/514/0": 5,
+    },
+  },
+  {
+    node_id: 4,
+    available: true,
+    attributes: {
+      "0/40/1": "Aqara",
+      "0/40/15": "E2E-SENSOR-1",
+      "0/40/3": "Aqara Climate Sensor W100",
+      "1/29/0": [{ 0: 770, 1: 1 }],
+      "1/1026/0": 2833,
+      "2/29/0": [{ 0: 775, 1: 1 }],
+      "2/1029/0": 5196,
+      "6/29/0": [{ 0: 17, 1: 1 }],
+      "6/47/12": 180,
     },
   },
 ];
@@ -175,5 +190,6 @@ insert.run(
   null,
 );
 insert.run("エアコン", "Airco", "E2E-AIRCON-1", null);
+insert.run("寝室・温湿度計", "Aqara", "E2E-SENSOR-1", null);
 db.close();
 http.listen(Number(MATTER_PORT), "127.0.0.1");

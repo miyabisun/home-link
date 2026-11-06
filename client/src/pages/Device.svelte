@@ -137,7 +137,7 @@
         <button
           class="btn"
           type="button"
-          aria-label="入り切り"
+          aria-label={device.kind === "sensor" ? "自動運転" : "入り切り"}
           aria-pressed={device.on}
           disabled={switching}
           onclick={switchPlug}

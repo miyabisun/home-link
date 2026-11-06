@@ -154,12 +154,12 @@ npm --prefix client run lint:design
 `admin.test.ts` で単体テストします。
 
 E2Eテストは、ChromiumとPlaywrightで、ビルドしたhome-link（`target/debug/home-link`）とmockのmatterjs-serverを相手に動きます。
-`client/e2e/serve.mjs` が一時ディレクトリの新しいDBでhome-linkを起動し、照明とプラグを1台ずつ返すmockを立て、台帳に機器を入れます。
+`client/e2e/serve.mjs` が一時ディレクトリの新しいDBでhome-linkを起動し、照明・プラグ・エアコン・温湿度計を1台ずつ返すmockを立て、台帳に機器を入れます。
 テストは画面を操作し、APIを通じてSQLiteのファイルに入った値を読んで確かめます（機器の名前・label・無視・削除、labelの作成・名前・調光・固定の値・スケジュール・機器・削除・入り切り）。
-エアコンの画面は、mockのエアコンを相手に、入・切と目標の温度の変更がSQLiteに入ること、範囲外の目標を示して送らないことを確かめます。
-`serve.mjs` は国土地理院とOpen-Meteoの代わりも立て（`GSI_URL`・`OPEN_METEO_URL`）、住所の登録の成功と失敗、外気温と理由の表示、夜の時刻の保存を確かめます。
+エアコンの画面は、mockのエアコンと温湿度計を相手に、同じlabelを付けると温湿度計の室温が出ること、自動運転の入・切がSQLiteに入りエアコンの運転が変わることを確かめます。
+`serve.mjs` は国土地理院とOpen-Meteoの代わりも立て（`GSI_URL`・`OPEN_METEO_URL`）、住所の登録の成功と失敗、外気温と理由の表示を確かめます。
 照明の接続の画面は、`GET /api/lights/watch` と `GET /api/lights/outages` の応答をPlaywrightで差し替え、切れた照明・網から外れた照明・長い名前・matterjs-serverに届かない状態と14日の履歴を、幅1280と390、明暗の両方で確かめます。
-温度計の画面は、E2Eのhome-linkに温度計が無いため、`GET /api/meter` の応答をPlaywrightで差し替えて、今の値・途絶え・未受信を確かめます。
+温度計の画面は、台帳の温湿度計の値と機器の画面へのリンクを確かめます。E2Eのhome-linkにSwitchBotの温度計は無いため、`GET /api/meter` の応答をPlaywrightで差し替えて、今の値・名前の変更・途絶え・未受信を確かめます。
 応答しない機器の表示は、`GET /api/devices` とlabelの入り切りの応答をPlaywrightで差し替え、Threadの機器だけが応答しないときと、Wi-Fiの機器も応答しないときを、幅1280と390、明暗の両方で確かめます。
 `screens.spec.ts` は幅1280と390の明暗で全画面を撮り（`client/test-results/screens/`）、横のはみ出しと本文の内側の縦スクロールが無いことを確かめます。
 

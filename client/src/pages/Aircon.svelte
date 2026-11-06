@@ -1,24 +1,12 @@
 <script lang="ts">
-  import {
-    airconText,
-    nightMinute,
-    nightTime,
-    outdoorText,
-    placeText,
-    TARGET_MAX,
-    TARGET_MIN,
-    targetError,
-  } from "../lib/admin";
+  import { airconText, outdoorText, placeText } from "../lib/admin";
   import { aborted, api, type Aircon } from "../lib/api";
 
-  // The meter and the air conditioner change on their own; the page follows while it is shown.
+  // The sensor and the air conditioner change on their own; the page follows while it is shown.
   const REFRESH_MS = 10_000;
 
   let aircon = $state<Aircon | undefined>();
   let pageState = $state<"loading" | "error" | "success">("loading");
-  // A number input binds a number, or null while it is empty.
-  let target = $state<number | null>(null);
-  let targetProblem = $state("");
   let error = $state("");
   let sending = $state(false);
   let address = $state("");
@@ -33,8 +21,6 @@
   function show(next: Aircon) {
     aircon = next;
     settingsOpen ??= !next.location.registered;
-    // A target being typed is not overwritten by a reload.
-    if (document.activeElement?.id !== "aircon-target") target = next.target;
   }
 
   async function load() {
@@ -69,12 +55,12 @@
     };
   });
 
-  async function update(patch: Parameters<typeof api.updateAircon>[0]) {
+  async function switchTo(on: boolean) {
     controller?.abort();
     sending = true;
     error = "";
     try {
-      show(await api.updateAircon(patch));
+      show(await api.updateAircon({ on }));
     } catch (e) {
       error = (e as Error).message;
     }
@@ -92,18 +78,6 @@
       addressProblem = (e as Error).message;
     }
     locating = false;
-  }
-
-  function saveNight(key: "night_from" | "night_until", time: string) {
-    const minute = nightMinute(time);
-    if (minute !== null && aircon && minute !== aircon[key])
-      void update({ [key]: minute });
-  }
-
-  function saveTarget() {
-    targetProblem = targetError(String(target ?? "")) ?? "";
-    if (!targetProblem && aircon && target !== aircon.target)
-      void update({ target: Number(target) });
   }
 </script>
 
@@ -123,58 +97,37 @@
     </div>
   {:else if aircon}
     {#if error}<p class="error-banner" role="alert">{error}</p>{/if}
-    <div class="field target-row">
-      <div class="grow">
-        <label for="aircon-target">目標</label>
-        <div class="unit">
-          <input
-            id="aircon-target"
-            type="number"
-            inputmode="numeric"
-            min={TARGET_MIN}
-            max={TARGET_MAX}
-            step="1"
-            bind:value={target}
-            aria-invalid={targetProblem ? "true" : undefined}
-            aria-describedby={targetProblem ? "aircon-target-error" : undefined}
-            onchange={saveTarget}
-          />
-          <span>℃</span>
-        </div>
-      </div>
+    <div class="switch-row">
+      <span>自動運転</span>
       <button
         class="btn"
         type="button"
         aria-label="入り切り"
         aria-pressed={aircon.on}
         disabled={sending}
-        onclick={() => void update({ on: !aircon!.on })}
+        onclick={() => void switchTo(!aircon!.on)}
       >
         {aircon.on ? "入" : "切"}
       </button>
     </div>
-    {#if targetProblem}<p
-        class="field-error target-error"
-        id="aircon-target-error"
-        role="alert"
-      >
-        {targetProblem}
-      </p>{/if}
 
     <dl class="readings">
       <div class="reading">
-        <dt>室温</dt>
+        <dt>
+          室温{#if aircon.sensor}<small>{aircon.sensor.name}</small>{/if}
+        </dt>
         <dd>
-          {#if aircon.reading}{aircon.reading.temperature.toFixed(1)}<span
-              >℃</span
-            >{:else}—{/if}
+          {#if aircon.reading?.temperature != null}{aircon.reading.temperature.toFixed(
+              1,
+            )}<span>℃</span>{:else}—{/if}
         </dd>
       </div>
       <div class="reading">
         <dt>湿度</dt>
         <dd>
-          {#if aircon.reading}{aircon.reading.humidity}<span>%</span
-            >{:else}—{/if}
+          {#if aircon.reading?.humidity != null}{Math.round(
+              aircon.reading.humidity,
+            )}<span>%</span>{:else}—{/if}
         </dd>
       </div>
       <div class="reading">
@@ -223,56 +176,22 @@
           >
         </p>
       </div>
-      <fieldset class="field">
-        <legend>夜</legend>
-        <div class="night">
-          <input
-            type="time"
-            aria-label="夜の始まり"
-            value={nightTime(aircon.night_from)}
-            onchange={(e) => saveNight("night_from", e.currentTarget.value)}
-          />
-          <span>〜</span>
-          <input
-            type="time"
-            aria-label="夜の終わり"
-            value={nightTime(aircon.night_until)}
-            onchange={(e) => saveNight("night_until", e.currentTarget.value)}
-          />
-        </div>
-      </fieldset>
     </details>
   {/if}
 </section>
 
 <style lang="sass">
-  .target-row
+  .switch-row
     display: flex
-    align-items: flex-end
+    align-items: center
+    justify-content: space-between
     gap: var(--sp-2)
-
-    .grow
-      flex: 1
-      min-width: 0
+    margin: 0 0 var(--sp-3)
 
     .btn
       flex-shrink: 0
       min-width: 52px
       height: 44px
-
-  .unit
-    display: flex
-    align-items: center
-    gap: var(--sp-1)
-
-    input
-      width: 6em
-
-    span
-      color: var(--c-muted)
-
-  .target-error
-    margin: calc(var(--sp-3) * -1) 0 var(--sp-4)
 
   .readings
     display: grid
@@ -308,17 +227,13 @@
     color: var(--c-muted)
     font-variant-numeric: tabular-nums
 
-  .night
-    display: flex
-    align-items: center
-    gap: var(--sp-2)
-
-    span
-      color: var(--c-muted)
-
   dt time
     margin-left: var(--sp-1)
     font-variant-numeric: tabular-nums
+
+  dt small
+    margin-left: var(--sp-1)
+    font-size: inherit
 
   .reading
     padding: 10px

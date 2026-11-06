@@ -129,6 +129,8 @@ const PLUG_TYPES: [u64; 2] = [0x010A, 0x010B];
 
 /// The Room Air Conditioner device type.
 const AIRCON_TYPES: [u64; 1] = [0x0072];
+/// Temperature Sensor and Humidity Sensor device types.
+const SENSOR_TYPES: [u64; 2] = [0x0302, 0x0307];
 
 /// What a device is, by the Matter device types of its endpoints.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -137,17 +139,20 @@ pub enum Kind {
     Plug,
     /// Driven by the air conditioner's own control, not switched as a plug or with labels.
     Aircon,
+    /// Measures the room: a temperature or humidity sensor, read as its [`Climate`].
+    Sensor,
     Other,
 }
 
 impl Kind {
-    /// `light`, `plug`, `aircon` or `other`.
+    /// `light`, `plug`, `aircon`, `sensor` or `other`.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Light => "light",
             Self::Plug => "plug",
             Self::Aircon => "aircon",
+            Self::Sensor => "sensor",
             Self::Other => "other",
         }
     }
@@ -170,12 +175,15 @@ fn has_type(types: &Value, wanted: &[u64]) -> bool {
     })
 }
 
-/// The kind of the device `locate` found and, unless it is a light, the endpoint
-/// carrying its On/Off with the On/Off last read: its own endpoint behind a
-/// bridge, else the first of its node's endpoints not behind a bridge.
-// ponytail: one On/Off per device; a power strip's other outlets wait for a ledger row per endpoint.
-#[must_use]
-pub fn kind(nodes: &[Value], node_id: u64, endpoint: u16) -> Option<(Kind, Option<OnOff>)> {
+type Attributes = serde_json::Map<String, Value>;
+
+/// The attributes of `node_id` and the endpoints of the device `locate` found there, with
+/// their device types, in order: its own endpoint behind a bridge, else those not behind one.
+fn parts(
+    nodes: &[Value],
+    node_id: u64,
+    endpoint: u16,
+) -> Option<(&Attributes, Vec<(u16, &Value)>)> {
     let node = nodes.iter().find(|n| n["node_id"] == node_id)?;
     let attributes = node["attributes"].as_object()?;
     let mut parts: Vec<(u16, &Value)> = attributes
@@ -191,6 +199,53 @@ pub fn kind(nodes: &[Value], node_id: u64, endpoint: u16) -> Option<(Kind, Optio
         })
         .collect();
     parts.sort_by_key(|(part, _)| *part);
+    Some((attributes, parts))
+}
+
+/// What a sensor last reported, as matterjs-server keeps it subscribed; `None` when not measured yet.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+pub struct Climate {
+    /// Degrees Celsius.
+    pub temperature: Option<f64>,
+    /// Percent relative humidity.
+    pub humidity: Option<f64>,
+    /// Percent of its battery remaining.
+    pub battery: Option<u8>,
+}
+
+/// The Temperature Measurement (0x0402) and Relative Humidity Measurement (0x0405) of the
+/// device `locate` found, in 0.01 steps, with its Power Source's `BatPercentRemaining` in half
+/// percents; `None` for a device measuring neither.
+#[must_use]
+pub fn climate(nodes: &[Value], node_id: u64, endpoint: u16) -> Option<Climate> {
+    let (attributes, parts) = parts(nodes, node_id, endpoint)?;
+    let first = |cluster: &str| {
+        parts
+            .iter()
+            .find_map(|(part, _)| attributes.get(&format!("{part}/{cluster}")))
+    };
+    let (temperature, humidity) = (first("1026/0"), first("1029/0"));
+    if temperature.is_none() && humidity.is_none() {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss, reason = "0.01 steps of int16 and uint16")]
+    let hundredths = |value: Option<&Value>| value?.as_i64().map(|v| v as f64 / 100.0);
+    Some(Climate {
+        temperature: hundredths(temperature),
+        humidity: hundredths(humidity),
+        battery: first("47/12")
+            .and_then(Value::as_u64)
+            .and_then(|half| u8::try_from(half / 2).ok()),
+    })
+}
+
+/// The kind of the device `locate` found and, unless it is a light, the endpoint
+/// carrying its On/Off with the On/Off last read: its own endpoint behind a
+/// bridge, else the first of its node's endpoints not behind a bridge.
+// ponytail: one On/Off per device; a power strip's other outlets wait for a ledger row per endpoint.
+#[must_use]
+pub fn kind(nodes: &[Value], node_id: u64, endpoint: u16) -> Option<(Kind, Option<OnOff>)> {
+    let (attributes, parts) = parts(nodes, node_id, endpoint)?;
     if parts.iter().any(|(_, types)| has_type(types, &LIGHT_TYPES)) {
         return Some((Kind::Light, None));
     }
@@ -201,6 +256,11 @@ pub fn kind(nodes: &[Value], node_id: u64, endpoint: u16) -> Option<(Kind, Optio
         Kind::Aircon
     } else if parts.iter().any(|(_, types)| has_type(types, &PLUG_TYPES)) {
         Kind::Plug
+    } else if parts
+        .iter()
+        .any(|(_, types)| has_type(types, &SENSOR_TYPES))
+    {
+        Kind::Sensor
     } else {
         Kind::Other
     };
@@ -897,7 +957,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        Light, lights, locate, network, own_nodes, replaced, software_version, thread_parent,
+        Climate, Kind, Light, climate, kind, lights, locate, network, own_nodes, replaced,
+        software_version, thread_parent,
     };
 
     // Trimmed from a matterjs-server `get_nodes` result (2026-10-05).
@@ -1126,5 +1187,74 @@ mod tests {
             "a router has no parent"
         );
         assert_eq!(thread_parent(&node(None), 52), None);
+    }
+
+    /// An Aqara Climate Sensor W100 as matterjs-server served it (2026-11-06), trimmed:
+    /// temperature on 1, humidity on 2, its three buttons on 3–5 and its battery on 6.
+    fn w100() -> serde_json::Value {
+        json!({ "node_id": 88, "available": true, "attributes": {
+            "0/29/0": [{ "0": 18, "1": 1 }, { "0": 22, "1": 3 }],
+            "1/29/0": [{ "0": 770, "1": 1 }], "1/1026/0": 2533,
+            "2/29/0": [{ "0": 775, "1": 1 }], "2/1029/0": 5196,
+            "3/29/0": [{ "0": 15, "1": 3 }], "3/59/0": 2,
+            "6/29/0": [{ "0": 17, "1": 1 }], "6/47/12": 200,
+        }})
+    }
+
+    #[test]
+    fn a_temperature_or_humidity_sensor_is_a_sensor_with_its_climate() {
+        let nodes = vec![w100()];
+        assert_eq!(kind(&nodes, 88, 0), Some((Kind::Sensor, None)));
+        assert_eq!(
+            climate(&nodes, 88, 0),
+            Some(Climate {
+                temperature: Some(25.33),
+                humidity: Some(51.96),
+                battery: Some(100),
+            })
+        );
+        // Only humidity, with nothing measured yet and no battery.
+        let humid = vec![json!({ "node_id": 9, "attributes": {
+            "1/29/0": [{ "0": 775, "1": 1 }], "1/1029/0": null,
+        }})];
+        assert_eq!(kind(&humid, 9, 0), Some((Kind::Sensor, None)));
+        assert_eq!(
+            climate(&humid, 9, 0),
+            Some(Climate {
+                temperature: None,
+                humidity: None,
+                battery: None,
+            })
+        );
+    }
+
+    #[test]
+    fn below_zero_is_read_and_devices_measuring_nothing_have_no_climate() {
+        let mut cold = w100();
+        cold["attributes"]["1/1026/0"] = json!(-350);
+        assert_eq!(
+            climate(&[cold], 88, 0).and_then(|c| c.temperature),
+            Some(-3.5)
+        );
+        let bulb = vec![json!({ "node_id": 5, "attributes": {
+            "1/29/0": [{ "0": 257, "1": 1 }], "1/6/0": true,
+        }})];
+        assert_eq!(climate(&bulb, 5, 0), None);
+        assert_eq!(climate(&[w100()], 7, 0), None);
+    }
+
+    #[test]
+    fn a_sensor_behind_a_bridge_is_read_on_its_own_endpoint() {
+        let bridge = vec![json!({ "node_id": 1, "attributes": {
+            "2/57/17": true, "2/29/0": [{ "0": 770, "1": 1 }], "2/1026/0": 2100,
+            "3/57/17": true, "3/29/0": [{ "0": 770, "1": 1 }], "3/1026/0": 1800,
+        }})];
+        assert_eq!(kind(&bridge, 1, 3), Some((Kind::Sensor, None)));
+        assert_eq!(
+            climate(&bridge, 1, 3).and_then(|c| c.temperature),
+            Some(18.0)
+        );
+        // The bridge itself measures nothing.
+        assert_eq!(climate(&bridge, 1, 0), None);
     }
 }

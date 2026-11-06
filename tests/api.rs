@@ -4522,7 +4522,7 @@ async fn plugs_get_their_kind_and_are_switched_one_at_a_time() {
             (json!("plug"), json!(true)),
             (json!("plug"), json!(true)),
             (json!("plug"), json!(false)),
-            (json!("other"), Value::Null),
+            (json!("sensor"), json!(true)),
             (json!("other"), Value::Null),
             (Value::Null, Value::Null),
         ]
@@ -4570,10 +4570,10 @@ async fn plugs_get_their_kind_and_are_switched_one_at_a_time() {
     );
     assert_eq!(sent(&commands), Vec::<Value>::new());
 
-    // A light, a device without On/Off and one not connected are not switched here.
+    // A light, a hub without On/Off and one not connected are not switched here.
     for (id, error) in [
         (&ids[0], "not_switchable"),
-        (&ids[6], "not_switchable"),
+        (&ids[7], "not_switchable"),
         (&unconnected["id"], "not_connected"),
     ] {
         let (status, body) = call(&app, "POST", &switch(id, "on"), None).await;
@@ -6266,9 +6266,23 @@ fn aircon_home(addr: SocketAddr, path: &std::path::Path) -> (home_link::Home, Ro
 
 #[tokio::test]
 #[allow(clippy::too_many_lines, reason = "one scenario, step after step")]
-async fn the_aircon_follows_the_meter_unless_switched_off() {
-    let (addr, commands, _) = fake_light_server(aircon_nodes(), Fake::default()).await;
-    let path = std::env::temp_dir().join(format!("home-link-aircon-{}.db", std::process::id()));
+async fn the_sensor_drives_the_aircon_under_its_label_unless_switched_off() {
+    let mut nodes = aircon_nodes();
+    nodes.as_array_mut().unwrap().extend([
+        climate_sensor(88, "w100-1", true),
+        climate_sensor(89, "w100-2", false),
+        climate_sensor(90, "w100-3", true),
+    ]);
+    let fake = Fake::default();
+    let edits = fake.edits.clone();
+    let room = |tenths: i64| {
+        edits
+            .lock()
+            .unwrap()
+            .push((88, "1/1026/0", json!(tenths * 10)));
+    };
+    let (addr, commands, _) = fake_light_server(nodes, fake).await;
+    let path = std::env::temp_dir().join(format!("home-link-sensor-{}.db", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let (home, app) = aircon_home(addr, &path);
     let sql = home_link::open_db(path.to_str().unwrap()).unwrap();
@@ -6278,81 +6292,145 @@ async fn the_aircon_follows_the_meter_unless_switched_off() {
         json!({ "vendor": "Airco", "serial_number": "ac-1", "name": "エアコン" }),
     )
     .await;
+    let bedroom = add_device(
+        &app,
+        &sql,
+        json!({ "vendor": "Aqara", "serial_number": "w100-1", "name": "寝室・温湿度計" }),
+    )
+    .await;
+    let silent = add_device(
+        &app,
+        &sql,
+        json!({ "vendor": "Aqara", "serial_number": "w100-2", "name": "寝室・予備" }),
+    )
+    .await;
+    // At 28.33℃ too, but under no label of the air conditioner's.
+    let elsewhere = add_device(
+        &app,
+        &sql,
+        json!({ "vendor": "Aqara", "serial_number": "w100-3", "name": "物置き・温湿度計" }),
+    )
+    .await;
     assert_eq!(
-        (&aircon["kind"], &aircon["on"]),
+        (&bedroom["kind"], &bedroom["on"], &bedroom["climate"]),
+        (
+            &json!("sensor"),
+            &json!(true),
+            &json!({ "temperature": 28.33, "humidity": 51.96, "battery": 100 })
+        )
+    );
+    assert_eq!(silent["state"], "no_response");
+    assert_eq!(
+        (&aircon["kind"], &aircon["climate"]),
         (&json!("aircon"), &Value::Null)
     );
 
-    let (status, view) = call(&app, "GET", "/api/aircon", None).await;
-    assert_eq!(status, StatusCode::OK, "{view}");
-    assert_eq!(
-        (&view["on"], &view["target"], &view["reading"]),
-        (&json!(true), &json!(25), &Value::Null)
-    );
-    assert_eq!(
-        view["device"],
-        json!({ "id": aircon["id"], "name": "エアコン", "state": "connected",
-                "on": false, "mode": "cool", "setpoint": 26.0 })
-    );
-
-    // No reading yet: the air conditioner is not read or written.
+    // No sensor shares a label with the air conditioner yet.
     home.adjust_aircon(NIGHT).await;
-    assert_eq!(sent(&commands), Vec::<Value>::new());
+    assert_eq!(aircon_writes(&commands), Vec::<String>::new());
+    let (_, view) = call(&app, "GET", "/api/aircon", None).await;
+    assert_eq!(
+        (
+            &view["sensor"],
+            &view["reading"],
+            &view["runs"][0]["result"]
+        ),
+        (&Value::Null, &Value::Null, &json!("no_reading"))
+    );
 
-    // Hot: cooling to the target, with the fan on Auto, once.
-    home.record_meter(HOT, NIGHT);
+    let label = create_label(&app, json!({ "name": "bedroom" })).await;
+    for device in [&aircon, &bedroom, &silent] {
+        assert_eq!(assign(&app, device, &[&label]).await.0, StatusCode::OK);
+    }
+    // Above 26℃: cooling at 25℃, once.
     home.adjust_aircon(NIGHT).await;
     assert_eq!(aircon_writes(&commands), cool(25, 2600));
     commands.lock().unwrap().clear();
     home.adjust_aircon(NIGHT + 600).await;
-    assert_eq!(sent(&commands), Vec::<Value>::new());
+    assert_eq!(aircon_writes(&commands), Vec::<String>::new());
     let (_, view) = call(&app, "GET", "/api/aircon", None).await;
     assert_eq!(
-        (&view["device"]["on"], &view["device"]["setpoint"]),
-        (&json!(true), &json!(25.0))
+        (&view["sensor"], &view["reading"]),
+        (
+            &json!({ "id": bedroom["id"], "name": "寝室・温湿度計" }),
+            &json!({ "temperature": 28.33, "humidity": 51.96 })
+        )
     );
     assert_eq!(
-        view["sent"],
-        json!({ "power": "on", "mode": "cool", "celsius": 25 })
+        view["reason"],
+        "室温が28.3℃で26℃を超えているが、冷房25℃で運転中"
     );
-    assert_eq!(view["reading"]["temperature"], 28.0);
+    assert!(view.get("target").is_none(), "{view}");
 
-    // A reading past five minutes is stale: a cold room received then changes nothing.
-    let cold = home_link::meter::Reading {
-        temperature: 18.0,
-        ..HOT
-    };
-    home.record_meter(cold, NIGHT);
-    AIRCON_CLOCK.store(NIGHT + 301, Ordering::Relaxed);
-    home.adjust_aircon(NIGHT + 301).await;
-    assert_eq!(sent(&commands), Vec::<Value>::new());
-    let (_, view) = call(&app, "GET", "/api/aircon", None).await;
-    assert_eq!(view["reading"], Value::Null);
-    AIRCON_CLOCK.store(NIGHT, Ordering::Relaxed);
-    home.record_meter(HOT, NIGHT);
-
-    // A new target is sent at once.
-    let (status, view) = call(&app, "PUT", "/api/aircon", Some(json!({ "target": 23 }))).await;
-    assert_eq!(status, StatusCode::OK, "{view}");
-    assert_eq!(view["target"], 23);
-    assert_eq!(aircon_writes(&commands), cool(23, 2500));
-    commands.lock().unwrap().clear();
-    for body in [
-        json!({ "target": 17 }),
-        json!({ "target": 31 }),
-        json!({ "target": 24.5 }),
-        json!({ "on": "no" }),
-        json!([]),
-    ] {
-        let (status, error) = call(&app, "PUT", "/api/aircon", Some(body.clone())).await;
-        assert_eq!(
-            (status, error["error"].as_str()),
-            (StatusCode::BAD_REQUEST, Some("invalid_aircon")),
-            "{body}"
-        );
+    // 20–26℃ leaves it; below 20℃ stops the cooling, once.
+    for (tenths, writes) in [(220, vec![]), (199, vec!["Off".to_owned()]), (199, vec![])] {
+        room(tenths);
+        home.adjust_aircon(NIGHT + 1200).await;
+        assert_eq!(aircon_writes(&commands), writes, "{tenths}");
+        commands.lock().unwrap().clear();
     }
+    // Below 15℃: heating at 20℃, kept heating up past 20℃; above 26℃ cooling again.
+    room(149);
+    home.adjust_aircon(NIGHT + 1800).await;
+    assert_eq!(
+        aircon_writes(&commands),
+        [
+            "1/513/18=2000",
+            "1/513/17=2200",
+            "1/513/28=4",
+            "1/514/0=5",
+            "On"
+        ]
+    );
+    commands.lock().unwrap().clear();
+    for tenths in [180, 230] {
+        room(tenths);
+        home.adjust_aircon(NIGHT + 2400).await;
+        assert_eq!(aircon_writes(&commands), Vec::<String>::new(), "{tenths}");
+    }
+    room(270);
+    home.adjust_aircon(NIGHT + 3000).await;
+    assert_eq!(aircon_writes(&commands), cool(25, 2200));
+    commands.lock().unwrap().clear();
 
-    // Off turns it off and holds over the adjustment, across a restart.
+    // A sensor switched off drives nothing; the other under the label does not answer.
+    room(149);
+    let uri = format!("/api/devices/{}/off", bedroom["id"]);
+    let (status, body) = call(&app, "POST", &uri, None).await;
+    assert_eq!(
+        (status, &body["state"]),
+        (StatusCode::OK, &json!("off")),
+        "{body}"
+    );
+    let (_, listed) = call(
+        &app,
+        "GET",
+        &format!("/api/devices/{}", bedroom["id"]),
+        None,
+    )
+    .await;
+    assert_eq!(listed["on"], false);
+    home.adjust_aircon(NIGHT + 3600).await;
+    assert_eq!(aircon_writes(&commands), Vec::<String>::new());
+    let (_, view) = call(&app, "GET", "/api/aircon", None).await;
+    assert_eq!(view["runs"][0]["result"], "no_reading");
+    // Switched on, it drives at once.
+    let uri = format!("/api/devices/{}/on", bedroom["id"]);
+    let (status, _) = call(&app, "POST", &uri, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        aircon_writes(&commands),
+        [
+            "1/513/18=2000",
+            "1/513/17=2200",
+            "1/513/28=4",
+            "1/514/0=5",
+            "On"
+        ]
+    );
+    commands.lock().unwrap().clear();
+
+    // The user's off stops the air conditioner and the sensor; on starts it again.
     let (status, view) = call(&app, "PUT", "/api/aircon", Some(json!({ "on": false }))).await;
     assert_eq!(
         (status, &view["on"]),
@@ -6361,76 +6439,23 @@ async fn the_aircon_follows_the_meter_unless_switched_off() {
     );
     assert_eq!(aircon_writes(&commands), ["Off"]);
     commands.lock().unwrap().clear();
-    for step in 1..=6 {
-        home.adjust_aircon(NIGHT + step * 600).await;
+    room(300);
+    home.adjust_aircon(NIGHT + 4200).await;
+    assert_eq!(aircon_writes(&commands), Vec::<String>::new());
+    let (_, view) = call(&app, "GET", "/api/aircon", None).await;
+    assert_eq!(view["runs"][0]["result"], "held");
+    let (_, view) = call(&app, "PUT", "/api/aircon", Some(json!({ "on": true }))).await;
+    assert_eq!(view["on"], true);
+    assert_eq!(aircon_writes(&commands), ["On"]);
+    for bad in [json!({ "target": 23 }), json!({ "on": "yes" })] {
+        let (status, error) = call(&app, "PUT", "/api/aircon", Some(bad.clone())).await;
+        assert_eq!(
+            (status, error["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_aircon")),
+            "{bad}"
+        );
     }
-    drop((home, app));
-    let (home, app) = aircon_home(addr, &path);
-    home.record_meter(HOT, NIGHT);
-    home.adjust_aircon(NIGHT).await;
-    assert_eq!(sent(&commands), Vec::<Value>::new());
-    let (_, view) = call(&app, "GET", "/api/aircon", None).await;
-    assert_eq!(
-        (&view["on"], &view["device"]["on"]),
-        (&json!(false), &json!(false))
-    );
-
-    // The widget's toggle turns the air conditioner on for the room and answers what became of
-    // it; the adjustment goes on.
-    let (status, body) = call(&app, "POST", "/api/aircon/toggle", None).await;
-    assert_eq!(
-        (status, &body["on"], &body["result"], &body["delivered"]),
-        (StatusCode::OK, &json!(true), &json!("sent"), &json!(true)),
-        "{body}"
-    );
-    assert_eq!(aircon_writes(&commands), cool(23, 2300));
-    commands.lock().unwrap().clear();
-    home.record_meter(HOT, NIGHT + 600);
-    home.adjust_aircon(NIGHT + 600).await;
-    assert_eq!(sent(&commands), Vec::<Value>::new());
-    // Changing over waits half an hour from the last command.
-    let chilly = home_link::meter::Reading {
-        temperature: 21.5,
-        ..HOT
-    };
-    home.record_meter(chilly, NIGHT + 1200);
-    home.adjust_aircon(NIGHT + 1200).await;
-    assert_eq!(sent(&commands), Vec::<Value>::new());
-    home.record_meter(chilly, NIGHT + 1800);
-    home.adjust_aircon(NIGHT + 1800).await;
-    assert_eq!(
-        aircon_writes(&commands),
-        [
-            "1/513/17=2500",
-            "1/513/18=2300",
-            "1/513/28=4",
-            "1/514/0=5",
-            "On"
-        ]
-    );
-    commands.lock().unwrap().clear();
-    let (_, body) = call(&app, "POST", "/api/aircon/toggle", None).await;
-    assert_eq!(
-        (&body["on"], &body["delivered"]),
-        (&json!(false), &json!(true))
-    );
-    assert_eq!(aircon_writes(&commands), ["Off"]);
-    let (_, view) = call(&app, "GET", "/api/aircon", None).await;
-    let results: Vec<_> = view["runs"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|r| r["result"].clone())
-        .collect();
-    assert_eq!(
-        results[..4],
-        [
-            json!("sent"),
-            json!("sent"),
-            json!("held"),
-            json!("unchanged")
-        ]
-    );
+    let _ = elsewhere;
     let _ = std::fs::remove_file(&path);
 }
 
@@ -6469,10 +6494,9 @@ async fn the_aircon_toggle_says_when_the_air_conditioner_was_not_reached() {
     let (addr, _, _) = fake_light_server(aircon_nodes(), fake).await;
     let path = std::env::temp_dir().join(format!("home-link-ac-silent-{}.db", std::process::id()));
     let _ = std::fs::remove_file(&path);
-    let (home, app) = aircon_home(addr, &path);
+    let (_home, app) = aircon_home(addr, &path);
     let sql = home_link::open_db(path.to_str().unwrap()).unwrap();
     insert_device(&sql, "Airco", "ac-1", "エアコン");
-    home.record_meter(HOT, aircon_clock());
 
     let (status, body) = call(&app, "POST", "/api/aircon/toggle", None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -6492,6 +6516,7 @@ async fn the_aircon_toggle_says_when_the_air_conditioner_was_not_reached() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines, reason = "one scenario, step after step")]
 async fn each_aircon_run_is_logged_on_one_line_without_the_address() {
     let captured = Captured::default();
     let writer = captured.clone();
@@ -6512,7 +6537,12 @@ async fn each_aircon_run_is_logged_on_one_line_without_the_address() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let outside_addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, outside).await.unwrap() });
-    let (addr, _, _) = fake_light_server(aircon_nodes(), Fake::default()).await;
+    let mut nodes = aircon_nodes();
+    nodes
+        .as_array_mut()
+        .unwrap()
+        .push(climate_sensor(88, "w100-1", true));
+    let (addr, _, _) = fake_light_server(nodes, Fake::default()).await;
     let (db, sql) = ledger();
     let home = home_link::Home::new(db, Some(format!("ws://{addr}/ws")))
         .with_clock(|| NIGHT)
@@ -6521,10 +6551,16 @@ async fn each_aircon_run_is_logged_on_one_line_without_the_address() {
             open_meteo_url: format!("http://{outside_addr}/meteo"),
         });
     let app = home.router();
-    add_device(
+    let aircon = add_device(
         &app,
         &sql,
         json!({ "vendor": "Airco", "serial_number": "ac-1", "name": "エアコン" }),
+    )
+    .await;
+    let sensor = add_device(
+        &app,
+        &sql,
+        json!({ "vendor": "Aqara", "serial_number": "w100-1", "name": "寝室・温湿度計" }),
     )
     .await;
     let (status, _) = call(
@@ -6536,51 +6572,53 @@ async fn each_aircon_run_is_logged_on_one_line_without_the_address() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    // No reading, sent, unchanged, then held for half an hour.
+    // No sensor under its label, sent, unchanged, then held while switched off.
     home.adjust_aircon(NIGHT).await;
-    home.record_meter(HOT, NIGHT);
+    let label = create_label(&app, json!({ "name": "bedroom" })).await;
+    for device in [&aircon, &sensor] {
+        assert_eq!(assign(&app, device, &[&label]).await.0, StatusCode::OK);
+    }
     home.adjust_aircon(NIGHT).await;
-    home.record_meter(HOT, NIGHT + 600);
     home.adjust_aircon(NIGHT + 600).await;
-    let chilly = home_link::meter::Reading {
-        temperature: 21.5,
-        ..HOT
-    };
-    home.record_meter(chilly, NIGHT + 1200);
+    let off = json!({ "on": false });
+    assert_eq!(
+        call(&app, "PUT", "/api/aircon", Some(off)).await.0,
+        StatusCode::OK
+    );
     home.adjust_aircon(NIGHT + 1200).await;
     // Failed: no matterjs-server to send to.
     let unset = home_link::Home::new(home_link::open_db(":memory:").unwrap(), None);
-    unset.record_meter(HOT, NIGHT);
     unset.adjust_aircon(NIGHT).await;
 
-    let lines = captured.lines("aircon adjusted");
+    let lines: Vec<_> = captured
+        .lines("aircon adjusted")
+        .into_iter()
+        .filter(|line| line.contains("trigger=\"scheduled\""))
+        .collect();
     assert_eq!(lines.len(), 5, "{lines:#?}");
     for (line, result) in lines
         .iter()
         .zip(["no_reading", "sent", "unchanged", "held", "failed"])
     {
         assert!(line.contains(" INFO "), "{line}");
-        assert!(line.contains("trigger=\"scheduled\""), "{line}");
         assert!(line.contains(&format!("result=\"{result}\"")), "{line}");
         assert!(line.contains("reason=\""), "{line}");
-        assert!(!line.contains("reason=\"\""), "{line}");
     }
     assert!(
-        lines[0].contains("command=null temperature=null"),
+        lines[0].contains("command=null sensor=null temperature=null"),
         "{}",
         lines[0]
     );
     assert!(
-        lines[1].contains(r#"command={"celsius":25,"mode":"cool","power":"on"} temperature=28.0 humidity=50 outdoor=null"#),
+        lines[1].contains(r#"command={"celsius":25,"mode":"cool","power":"on"} sensor="寝室・温湿度計" temperature=28.33 humidity=51.96 outdoor=null"#),
         "{}",
         lines[1]
     );
     assert!(
-        lines[1].contains("reason=\"外気温が無いため室温だけで判断"),
+        lines[1].contains("reason=\"室温が28.3℃で26℃を超えたため、冷房25℃にする\""),
         "{}",
         lines[1]
     );
-    assert!(lines[3].contains("temperature=21.5"), "{}", lines[3]);
     // A sent run is that one line; a failed one keeps its warning beside it.
     assert_eq!(captured.lines("aircon sent"), Vec::<String>::new());
     assert_eq!(captured.lines("aircon adjustment failed").len(), 1);
@@ -6658,7 +6696,6 @@ async fn the_aircon_is_left_to_its_own_switch() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    home.record_meter(HOT, NIGHT);
     home.adjust_aircon(NIGHT).await;
     assert!(aircon_writes(&commands).is_empty());
     let (_, view) = call(&app, "GET", "/api/aircon", None).await;
@@ -6781,8 +6818,15 @@ fn percent_decode(text: &str) -> String {
 
 #[tokio::test]
 #[allow(clippy::too_many_lines, reason = "one scenario, step after step")]
-async fn the_aircon_follows_the_outside_of_the_registered_address() {
-    let (addr, commands, _) = fake_light_server(aircon_nodes(), Fake::default()).await;
+async fn the_aircon_runs_record_the_outside_of_the_registered_address() {
+    let mut nodes = aircon_nodes();
+    nodes
+        .as_array_mut()
+        .unwrap()
+        .push(climate_sensor(88, "w100-1", true));
+    let fake = Fake::default();
+    let edits = fake.edits.clone();
+    let (addr, commands, _) = fake_light_server(nodes, fake).await;
     let (outside, asked) = fake_outside().await;
     let path = std::env::temp_dir().join(format!("home-link-outside-{}.db", std::process::id()));
     let _ = std::fs::remove_file(&path);
@@ -6794,12 +6838,19 @@ async fn the_aircon_follows_the_outside_of_the_registered_address() {
     .with_outside(outside);
     let app = home.router();
     let sql = home_link::open_db(path.to_str().unwrap()).unwrap();
-    add_device(
-        &app,
-        &sql,
-        json!({ "vendor": "Airco", "serial_number": "ac-1", "name": "エアコン" }),
-    )
-    .await;
+    let label = create_label(&app, json!({ "name": "bedroom" })).await;
+    for (vendor, serial, name) in [
+        ("Airco", "ac-1", "エアコン"),
+        ("Aqara", "w100-1", "寝室・温湿度計"),
+    ] {
+        let device = add_device(
+            &app,
+            &sql,
+            json!({ "vendor": vendor, "serial_number": serial, "name": name }),
+        )
+        .await;
+        assert_eq!(assign(&app, &device, &[&label]).await.0, StatusCode::OK);
+    }
 
     // Unregistered: Shinjuku.
     let (status, location) = call(&app, "GET", "/api/location", None).await;
@@ -6853,9 +6904,9 @@ async fn the_aircon_follows_the_outside_of_the_registered_address() {
                 "latitude": 26.212_312, "longitude": 127.681_229, "registered": true })
     );
 
-    // Hot outside: cooling, asked for the registered place with Chrome's User-Agent.
-    OUTSIDE_TENTHS.store(300, Ordering::Relaxed);
-    home.record_meter(HOT, NIGHT);
+    // Each run asks for the outside at the registered place with Chrome's User-Agent and
+    // records it; the sensor alone decides.
+    OUTSIDE_TENTHS.store(150, Ordering::Relaxed);
     home.adjust_aircon(NIGHT).await;
     assert_eq!(aircon_writes(&commands), cool(25, 2600));
     commands.lock().unwrap().clear();
@@ -6885,32 +6936,19 @@ async fn the_aircon_follows_the_outside_of_the_registered_address() {
         .unwrap();
     assert!(gsi.2.contains("Chrome/"), "{gsi:?}");
 
-    // The room at 24.5℃ half an hour on: neither heating nor stopping with 30℃ outside.
-    let cooled = home_link::meter::Reading {
-        temperature: 24.5,
-        ..HOT
-    };
+    edits.lock().unwrap().push((88, "1/1026/0", json!(2450)));
     OUTSIDE_CLOCK.store(NIGHT + 1800, Ordering::Relaxed);
-    home.record_meter(cooled, NIGHT + 1800);
     home.adjust_aircon(NIGHT + 1800).await;
     assert_eq!(sent(&commands), Vec::<Value>::new());
     let (_, view) = call(&app, "GET", "/api/aircon", None).await;
-    assert_eq!(view["outdoor"]["temperature"], 30.0, "{view}");
+    assert_eq!(view["outdoor"]["temperature"], 15.0, "{view}");
     assert_eq!(view["outdoor"]["fresh"], true);
     assert_eq!(view["outdoor"]["at"], "2026-10-05T23:30:00+09:00");
     assert_eq!(
         view["location"],
         json!({ "name": "沖縄県那覇市泉崎一丁目", "latitude": 26.212_312, "longitude": 127.681_229, "registered": true })
     );
-    assert_eq!(view["setpoint"], 25);
-    assert_eq!(
-        (&view["night_from"], &view["night_until"]),
-        (&json!(1320), &json!(420))
-    );
-    assert_eq!(
-        view["reason"],
-        "外が30.0℃のため、25℃に下がっても冷房を続ける"
-    );
+    assert_eq!(view["reason"], "室温が24.5℃で20〜26℃のため、変えない");
 
     // Two weeks of runs, oldest first, with what each saw and why.
     let (status, body) = call(&app, "GET", "/api/aircon/runs", None).await;
@@ -6919,20 +6957,23 @@ async fn the_aircon_follows_the_outside_of_the_registered_address() {
     assert_eq!(runs.len(), 2, "{body}");
     assert_eq!(
         (
+            &runs[0]["sensor"],
             &runs[0]["temperature"],
             &runs[0]["humidity"],
             &runs[0]["outdoor"],
             &runs[0]["result"]
         ),
-        (&json!(28.0), &json!(50), &json!(30.0), &json!("sent"))
+        (
+            &json!("寝室・温湿度計"),
+            &json!(28.33),
+            &json!(51.96),
+            &json!(15.0),
+            &json!("sent")
+        )
     );
     assert_eq!(
         runs[0]["command"],
         json!({ "power": "on", "mode": "cool", "celsius": 25 })
-    );
-    assert_eq!(
-        runs[0]["reason"],
-        "室温28.0℃が25℃より1℃以上高いため、冷房にする"
     );
     assert_eq!(
         (&runs[1]["temperature"], &runs[1]["result"]),
@@ -6946,63 +6987,7 @@ async fn the_aircon_follows_the_outside_of_the_registered_address() {
     )
     .await;
     assert_eq!(later["runs"].as_array().unwrap().len(), 1);
-
-    // Without the outside (Open-Meteo failing, the last value two hours old): the room alone.
-    OUTSIDE_TENTHS.store(-2000, Ordering::Relaxed);
-    let chilly = home_link::meter::Reading {
-        temperature: 23.9,
-        ..HOT
-    };
-    let late = NIGHT + 1800 + 2 * 3600 + 900;
-    OUTSIDE_CLOCK.store(late, Ordering::Relaxed);
-    home.record_meter(chilly, late);
-    home.adjust_aircon(late).await;
-    assert_eq!(
-        aircon_writes(&commands),
-        [
-            "1/513/17=2700",
-            "1/513/18=2500",
-            "1/513/28=4",
-            "1/514/0=5",
-            "On"
-        ]
-    );
-    let (_, view) = call(&app, "GET", "/api/aircon", None).await;
-    assert_eq!(view["outdoor"]["fresh"], false);
-    assert!(
-        view["reason"]
-            .as_str()
-            .unwrap()
-            .starts_with("外気温が無いため室温だけで判断"),
-        "{view}"
-    );
     OUTSIDE_TENTHS.store(300, Ordering::Relaxed);
-
-    // The night may be moved; out of range is refused.
-    let (status, view) = call(
-        &app,
-        "PUT",
-        "/api/aircon",
-        Some(json!({ "night_from": 1380, "night_until": 360 })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{view}");
-    assert_eq!(
-        (&view["night_from"], &view["night_until"]),
-        (&json!(1380), &json!(360))
-    );
-    for bad in [
-        json!({ "night_from": 1440 }),
-        json!({ "night_until": -1 }),
-        json!({ "night_until": "6:00" }),
-    ] {
-        let (status, error) = call(&app, "PUT", "/api/aircon", Some(bad.clone())).await;
-        assert_eq!(
-            (status, error["error"].as_str()),
-            (StatusCode::BAD_REQUEST, Some("invalid_aircon")),
-            "{bad}"
-        );
-    }
 
     // The lights' sunrise and sunset come from the registered place.
     home.adjust(NIGHT, "scheduled").await;
@@ -7510,4 +7495,50 @@ async fn each_request_is_logged_on_one_line_without_secrets() {
     }
     assert!(!logs.contains(PASSWORD), "{logs}");
     assert!(!logs.contains("1791208800"), "query logged: {logs}");
+}
+
+/// An Aqara Climate Sensor W100 as matterjs-server served it (2026-11-06), trimmed: temperature
+/// on 1, humidity on 2, a button on 3 and its battery on 6.
+fn climate_sensor(node: u64, serial: &str, available: bool) -> Value {
+    json!({ "node_id": node, "available": available, "attributes": {
+        "0/40/1": "Aqara", "0/40/15": serial, "0/40/3": "Aqara Climate Sensor W100",
+        "0/29/0": [{ "0": 18, "1": 1 }, { "0": 22, "1": 3 }],
+        "1/29/0": [{ "0": 770, "1": 1 }], "1/1026/0": 2833,
+        "2/29/0": [{ "0": 775, "1": 1 }], "2/1029/0": 5196,
+        "3/29/0": [{ "0": 15, "1": 3 }], "3/59/0": 2,
+        "6/29/0": [{ "0": 17, "1": 1 }], "6/47/12": 200,
+    }})
+}
+
+#[tokio::test]
+async fn the_switchbot_meter_takes_a_name() {
+    let home = home_link::Home::new(home_link::open_db(":memory:").unwrap(), None)
+        .with_meter("B0:E9:FE:00:00:01".into());
+    let app = home.router();
+    let (_, view) = call(&app, "GET", "/api/meter", None).await;
+    assert_eq!(view["name"], Value::Null);
+    let (status, view) = call(
+        &app,
+        "PUT",
+        "/api/meter",
+        Some(json!({ "name": " リビング " })),
+    )
+    .await;
+    assert_eq!(
+        (status, &view["name"]),
+        (StatusCode::OK, &json!("リビング")),
+        "{view}"
+    );
+    let (_, view) = call(&app, "GET", "/api/meter", None).await;
+    assert_eq!(view["name"], "リビング");
+    for name in [json!(""), json!("あ".repeat(101)), json!(3)] {
+        let (status, body) = call(&app, "PUT", "/api/meter", Some(json!({ "name": name }))).await;
+        assert_eq!(
+            (status, &body["error"]),
+            (StatusCode::BAD_REQUEST, &json!("invalid_meter")),
+            "{name}"
+        );
+    }
+    let (status, view) = call(&app, "PUT", "/api/meter", Some(json!({ "name": null }))).await;
+    assert_eq!((status, &view["name"]), (StatusCode::OK, &Value::Null));
 }
