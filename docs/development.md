@@ -110,6 +110,7 @@ BlueZのD-Busから受ける部分はテストしません。実際のセンサ�
 
 - 種類と状態を読めること
 - 温度計の値に応じた書き込みが、endpoint 1のThermostat・Fan Control・On/Offに届くこと
+- エアコンが2台あるとき、それぞれ同じlabelの温湿度計（台帳の温湿度計か、`Home::record_meter` で値を入れたSwitchBotの温度計）の室温で動き、他のエアコンへ届かないこと。SwitchBotの温度計の切・古い値では送らないこと
 - 同じ状態を二度送らず、温度計の値が古いと送らないこと
 - OFFが自動調整より優先し、再起動をまたいで保たれること。ONで入り、自動調整が再開すること
 - labelの操作、照明の全部オン・全部オフ、自動調整、機器の入り切りがエアコンに届かないこと
@@ -159,7 +160,7 @@ E2Eテストは、ChromiumとPlaywrightで、ビルドしたhome-link（`target/
 エアコンの画面は、mockのエアコンと温湿度計を相手に、同じlabelを付けると温湿度計の室温が出ること、自動運転の入・切がSQLiteに入りエアコンの運転が変わることを確かめます。
 `serve.mjs` は国土地理院とOpen-Meteoの代わりも立て（`GSI_URL`・`OPEN_METEO_URL`）、住所の登録の成功と失敗、外気温と理由の表示を確かめます。
 照明の接続の画面は、`GET /api/lights/watch` と `GET /api/lights/outages` の応答をPlaywrightで差し替え、切れた照明・網から外れた照明・長い名前・matterjs-serverに届かない状態と14日の履歴を、幅1280と390、明暗の両方で確かめます。
-温度計の画面は、台帳の温湿度計の値と機器の画面へのリンクを確かめます。E2Eのhome-linkにSwitchBotの温度計は無いため、`GET /api/meter` の応答をPlaywrightで差し替えて、今の値・名前の変更・途絶え・未受信を確かめます。
+温度計の画面は、台帳の温湿度計の値と機器の画面へのリンクを確かめます。E2Eのhome-linkにSwitchBotの温度計は無いため、`GET /api/meter` の応答をPlaywrightで差し替えて、今の値・名前の変更・自動運転のlabelと入・切・途絶え・未受信を確かめます。
 応答しない機器の表示は、`GET /api/devices` とlabelの入り切りの応答をPlaywrightで差し替え、Threadの機器だけが応答しないときと、Wi-Fiの機器も応答しないときを、幅1280と390、明暗の両方で確かめます。
 `screens.spec.ts` は幅1280と390の明暗で全画面を撮り（`client/test-results/screens/`）、横のはみ出しと本文の内側の縦スクロールが無いことを確かめます。
 

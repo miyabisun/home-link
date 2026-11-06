@@ -70,6 +70,9 @@ export interface Label extends LabelTraits {
 export interface Meter extends MeterView, AdapterView {
   /** As the user named it; `null` until then. */
   name: string | null;
+  /** The labels whose air conditioners it drives while `on`. */
+  labels: { id: number; name: string }[];
+  on: boolean;
   powered_on_at: number | null;
   power_cycled_at: number | null;
   reading: {
@@ -82,13 +85,18 @@ export interface Meter extends MeterView, AdapterView {
 
 export interface Aircon {
   on: boolean;
-  device: (AirconDevice & { id: number; name: string }) | null;
-  /** The sensor driving it: on, under one of its labels. */
-  sensor: { id: number; name: string } | null;
-  reading: Pick<Climate, "temperature" | "humidity"> | null;
+  aircons: AirconUnit[];
   outdoor: Outdoor | null;
   location: Place;
-  /** Why the latest run did what it did. */
+}
+
+export interface AirconUnit extends AirconDevice {
+  id: number;
+  name: string;
+  /** The sensor driving it: on, under one of its labels; the SwitchBot meter has no id. */
+  sensor: { id: number | null; name: string } | null;
+  reading: Pick<Climate, "temperature" | "humidity"> | null;
+  /** Why its latest run did what it did. */
   reason: string | null;
 }
 
@@ -159,8 +167,9 @@ export const api = {
   deleteLabel: (id: number) => request<null>("DELETE", `/api/labels/${id}`),
   meter: (signal?: AbortSignal) =>
     request<Meter>("GET", "/api/meter", undefined, signal),
-  nameMeter: (name: string | null) =>
-    request<Meter>("PUT", "/api/meter", { name }),
+  updateMeter: (
+    patch: Partial<{ name: string | null; labels: number[]; on: boolean }>,
+  ) => request<Meter>("PUT", "/api/meter", patch),
   aircon: (signal?: AbortSignal) =>
     request<Aircon>("GET", "/api/aircon", undefined, signal),
   updateAircon: (patch: { on: boolean }) =>

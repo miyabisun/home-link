@@ -9,14 +9,24 @@
     deviceNameError,
     meterState,
     receivedTime,
+    withLabel,
   } from "../lib/admin";
-  import { aborted, api, type Device, type Meter } from "../lib/api";
+  import {
+    aborted,
+    api,
+    type Device,
+    type Label,
+    type Meter,
+  } from "../lib/api";
 
   // The meter advertises every few seconds; the page follows while it is shown.
   const REFRESH_MS = 10_000;
 
   let meter = $state<Meter | undefined>();
   let sensors = $state<Device[]>([]);
+  let labels = $state<Label[]>([]);
+  let saving = $state(false);
+  let saveError = $state("");
   let attention = $state<Item[]>([]);
   let now = $state(Math.floor(Date.now() / 1000));
   let pageState = $state<"loading" | "error" | "success">("loading");
@@ -29,12 +39,14 @@
     controller?.abort();
     controller = new AbortController();
     try {
-      const [current, devices, asking] = await Promise.all([
+      const [current, devices, asking, all] = await Promise.all([
         api.meter(controller.signal),
         api.devices(controller.signal),
         api.attention(controller.signal),
+        api.labels(controller.signal),
       ]);
       meter = current;
+      labels = all;
       sensors = devices.filter((d) => d.kind === "sensor" && !d.ignored);
       attention = asking.items.filter(
         (item) => attentionHref(item) === "/meter",
@@ -74,11 +86,24 @@
     if (nameError) return;
     try {
       // Blank gives the meter its default name back.
-      meter = await api.nameMeter(name.trim() || null);
+      meter = await api.updateMeter({ name: name.trim() || null });
       naming = false;
     } catch (e) {
       nameError = (e as Error).message;
     }
+  }
+
+  // The meter drives the air conditioners under its labels while on.
+  async function update(patch: { labels?: number[]; on?: boolean }) {
+    controller?.abort();
+    saving = true;
+    saveError = "";
+    try {
+      meter = await api.updateMeter(patch);
+    } catch (e) {
+      saveError = (e as Error).message;
+    }
+    saving = false;
   }
 
   const status = $derived(meter ? meterState(meter) : undefined);
@@ -168,6 +193,9 @@
             >
               <Icon name="pencil" />
             </button>
+            {#if !meter.on}
+              <span class="badge">自動運転 切</span>
+            {/if}
           </h2>
         {/if}
         {#if status === "waiting" || (status === "stale" && meter.received_at)}
@@ -210,6 +238,54 @@
             {receivedTime(meter.received_at, false)} 受信
           </p>
         {/if}
+        <details class="settings">
+          <summary>自動運転</summary>
+          {#if saveError}<p class="field-error" role="alert">
+              {saveError}
+            </p>{/if}
+          <div class="switch-row">
+            <span>同じラベルのエアコンを動かす</span>
+            <button
+              class="btn"
+              type="button"
+              aria-label="自動運転"
+              aria-pressed={meter.on}
+              disabled={saving}
+              onclick={() => void update({ on: !meter!.on })}
+            >
+              {meter.on ? "入" : "切"}
+            </button>
+          </div>
+          <fieldset class="field">
+            <legend>ラベル</legend>
+            {#if labels.length === 0}
+              <a href="/labels">ラベルを作成</a>
+            {:else}
+              <ul class="checks">
+                {#each labels as label (label.id)}
+                  <li>
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={meter.labels.some((l) => l.id === label.id)}
+                        disabled={saving}
+                        onchange={(e) =>
+                          void update({
+                            labels: withLabel(
+                              meter!.labels.map((l) => l.id),
+                              label.id,
+                              e.currentTarget.checked,
+                            ),
+                          })}
+                      />
+                      {label.name}
+                    </label>
+                  </li>
+                {/each}
+              </ul>
+            {/if}
+          </fieldset>
+        </details>
       </section>
     {/if}
   {/if}
@@ -218,6 +294,27 @@
 <style lang="sass">
   .meter + .meter
     margin-top: var(--sp-5)
+
+  .settings
+    margin-top: var(--sp-2)
+
+    summary
+      padding: var(--sp-3) 0
+      cursor: pointer
+      color: var(--c-muted)
+      font-size: var(--fs-sm)
+
+  .switch-row
+    display: flex
+    align-items: center
+    justify-content: space-between
+    gap: var(--sp-2)
+    margin: 0 0 var(--sp-3)
+
+    .btn
+      flex-shrink: 0
+      min-width: 52px
+      height: 44px
 
   h2
     display: flex

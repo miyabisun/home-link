@@ -249,8 +249,7 @@ const MODES: Record<string, string> = {
 };
 
 /** The air conditioner sends whole degrees, so the setpoint shows rounded. */
-export function airconText(device: AirconDevice | null): string {
-  if (device === null) return "未登録";
+export function airconText(device: AirconDevice): string {
   if (device.state === "no_response") return "応答なし";
   const mode = device.mode && MODES[device.mode];
   if (!device.on || !mode) return "切";

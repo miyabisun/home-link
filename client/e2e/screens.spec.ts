@@ -60,8 +60,18 @@ const meters = {
 async function airconWithMeter(page: Page) {
   await page.route("/api/aircon", async (route) => {
     const json = await (await route.fetch()).json();
-    json.sensor = { id: 0, name: "寝室・温湿度計" };
-    json.reading = { temperature: 26.7, humidity: 57 };
+    json.aircons[0].sensor = { id: 0, name: "寝室・温湿度計" };
+    json.aircons[0].reading = { temperature: 26.7, humidity: 57 };
+    json.aircons[0].reason = "室温が26.7℃で26℃を超えたため、冷房25℃にする";
+    json.aircons.push({
+      ...json.aircons[0],
+      id: 999,
+      name: "リビングのエアコン",
+      on: false,
+      sensor: { id: null, name: "リビング" },
+      reading: { temperature: 24.1, humidity: 61 },
+      reason: "室温が24.1℃で20〜26℃のため、変えない",
+    });
     json.outdoor = {
       temperature: 30.2,
       at: "2026-10-24T16:15:00+09:00",
@@ -74,18 +84,22 @@ async function airconWithMeter(page: Page) {
       longitude: 139.691772,
       registered: true,
     };
-    json.reason = "室温が26.7℃で26℃を超えたため、冷房25℃にする";
     await route.fulfill({ json });
   });
 }
 
 async function meterAs(page: Page, kind: keyof typeof meters) {
-  let name: string | null = null;
+  const kept = {
+    name: null as string | null,
+    labels: [] as number[],
+    on: true,
+  };
   await page.unroute("/api/meter");
   await page.route("/api/meter", (route) => {
     if (route.request().method() === "PUT")
-      name = route.request().postDataJSON().name;
-    return route.fulfill({ json: { ...meters[kind](), name } });
+      Object.assign(kept, route.request().postDataJSON());
+    const labels = kept.labels.map((id) => ({ id, name: String(id) }));
+    return route.fulfill({ json: { ...meters[kind](), ...kept, labels } });
   });
 }
 
@@ -267,6 +281,26 @@ test("the meters show their values, a stopped reception, and having none", async
     await page.getByLabel("名前").fill("");
     await page.keyboard.press("Tab");
     await expect(page.locator("#switchbot")).toHaveText("SwitchBot");
+
+    // Put under a label and switched off, it says so by its name.
+    await switchbot.getByText("自動運転", { exact: true }).click();
+    const put = page.waitForRequest(
+      (r) => r.url().endsWith("/api/meter") && r.method() === "PUT",
+    );
+    await switchbot.getByRole("checkbox", { name: "作業" }).check();
+    expect((await put).postDataJSON()).toEqual({ labels: [labelId] });
+    await expect(
+      switchbot.getByRole("checkbox", { name: "作業" }),
+    ).toBeChecked();
+    const power = switchbot.getByRole("button", { name: "自動運転" });
+    await expect(power).toHaveAttribute("aria-pressed", "true");
+    await power.click();
+    await expect(power).toHaveText("切");
+    await expect(switchbot.locator(".badge")).toHaveText("自動運転 切");
+    await page.screenshot({
+      path: `test-results/screens/meter-switchbot-390-${scheme}.png`,
+      fullPage: true,
+    });
 
     await meterAs(page, "stale");
     await page.goto("/meter");

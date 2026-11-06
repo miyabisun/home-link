@@ -361,7 +361,6 @@ describe("the air conditioner", () => {
     expect(airconText({ ...device, on: false })).toBe("切");
     expect(airconText({ ...device, mode: "off" })).toBe("切");
     expect(airconText({ ...device, state: "no_response" })).toBe("応答なし");
-    expect(airconText(null)).toBe("未登録");
   });
 });
 

@@ -111,43 +111,49 @@
       </button>
     </div>
 
-    <dl class="readings">
-      <div class="reading">
-        <dt>
-          室温{#if aircon.sensor}<small>{aircon.sensor.name}</small>{/if}
-        </dt>
-        <dd>
-          {#if aircon.reading?.temperature != null}{aircon.reading.temperature.toFixed(
-              1,
-            )}<span>℃</span>{:else}—{/if}
-        </dd>
-      </div>
-      <div class="reading">
-        <dt>湿度</dt>
-        <dd>
-          {#if aircon.reading?.humidity != null}{Math.round(
-              aircon.reading.humidity,
-            )}<span>%</span>{:else}—{/if}
-        </dd>
-      </div>
-      <div class="reading">
-        <dt>
-          外気温{#if outdoor}<time>{outdoor.time}</time>{/if}
-        </dt>
-        <dd>
-          {#if outdoor}{outdoor.celsius}<span>℃</span>{:else}—{/if}
-        </dd>
-      </div>
-      <div class="reading">
-        <dt>{aircon.device?.name || "エアコン"}</dt>
-        <dd class="text" class:danger={aircon.device?.state === "no_response"}>
-          {airconText(aircon.device)}
-        </dd>
-      </div>
-    </dl>
-    {#if aircon.reason}<p class="reason" aria-live="polite">
-        {aircon.reason}
+    {#if outdoor}<p class="outdoor">
+        外気温 <strong>{outdoor.celsius}℃</strong>
+        <time>{outdoor.time}</time>
       </p>{/if}
+
+    {#each aircon.aircons as unit (unit.id)}
+      <section class="aircon" aria-labelledby={`aircon-${unit.id}`}>
+        <h2 id={`aircon-${unit.id}`}>
+          <a href={`/devices/${unit.id}`}>{unit.name || "エアコン"}</a>
+        </h2>
+        <dl class="readings">
+          <div class="reading">
+            <dt>
+              室温{#if unit.sensor}<small>{unit.sensor.name}</small>{/if}
+            </dt>
+            <dd>
+              {#if unit.reading?.temperature != null}{unit.reading.temperature.toFixed(
+                  1,
+                )}<span>℃</span>{:else}—{/if}
+            </dd>
+          </div>
+          <div class="reading">
+            <dt>湿度</dt>
+            <dd>
+              {#if unit.reading?.humidity != null}{Math.round(
+                  unit.reading.humidity,
+                )}<span>%</span>{:else}—{/if}
+            </dd>
+          </div>
+          <div class="reading">
+            <dt>運転</dt>
+            <dd class="text" class:danger={unit.state === "no_response"}>
+              {airconText(unit)}
+            </dd>
+          </div>
+        </dl>
+        {#if unit.reason}<p class="reason" aria-live="polite">
+            {unit.reason}
+          </p>{/if}
+      </section>
+    {:else}
+      <p class="state">エアコンがありません</p>
+    {/each}
 
     <details class="settings" bind:open={settingsOpen}>
       <summary>設定</summary>
@@ -193,15 +199,37 @@
       min-width: 52px
       height: 44px
 
+  .outdoor
+    margin: 0 0 var(--sp-3)
+    color: var(--c-muted)
+    font-size: var(--fs-sm)
+
+    strong
+      color: var(--c-on-surface)
+      font-size: var(--fs-md)
+      font-variant-numeric: tabular-nums
+
+    time
+      margin-left: var(--sp-1)
+      font-variant-numeric: tabular-nums
+
+  .aircon + .aircon
+    margin-top: var(--sp-5)
+
+  h2
+    margin: 0 0 var(--sp-2)
+    font-size: var(--fs-md)
+    font-weight: 500
+    overflow-wrap: anywhere
+
+    a
+      color: inherit
+
   .readings
     display: grid
-    grid-template-columns: repeat(2, minmax(0, 1fr))
+    grid-template-columns: repeat(3, minmax(0, 1fr))
     gap: var(--sp-2)
     margin: 0
-
-  @media (min-width: 768px)
-    .readings
-      grid-template-columns: repeat(4, minmax(0, 1fr))
 
   .reason
     margin: var(--sp-3) 0 0
@@ -225,10 +253,6 @@
   .coords
     margin-left: var(--sp-1)
     color: var(--c-muted)
-    font-variant-numeric: tabular-nums
-
-  dt time
-    margin-left: var(--sp-1)
     font-variant-numeric: tabular-nums
 
   dt small

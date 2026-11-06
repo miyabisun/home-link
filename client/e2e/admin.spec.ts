@@ -219,7 +219,7 @@ test("the air conditioner follows the sensor under its label and is switched off
   await expect(page.locator("h1")).toHaveText("エアコン");
   const values = page.locator(".reading dd");
   // No sensor under a label of the air conditioner's: no room, the air conditioner as it is.
-  await expect(values).toHaveText(["—", "—", /^(—|30\.2℃)$/, "冷房 25℃"]);
+  await expect(values).toHaveText(["—", "—", "冷房 25℃"]);
 
   const label = await (
     await request.post("/api/labels", { data: { name: "bedroom" } })
@@ -245,7 +245,7 @@ test("the air conditioner follows the sensor under its label and is switched off
   await power.click();
   await expect(power).toHaveText("切");
   await expect(power).toHaveAttribute("aria-pressed", "false");
-  await expect(values.nth(3)).toHaveText("切");
+  await expect(values.nth(2)).toHaveText("切");
   expect(airconSettings()).toEqual({ on: false });
   await expect(page.locator(".reason")).toHaveText(
     "自動運転を切にしたため、エアコンを止める",
@@ -254,7 +254,7 @@ test("the air conditioner follows the sensor under its label and is switched off
   await power.click();
   await expect(power).toHaveText("入");
   expect(airconSettings()).toEqual({ on: true });
-  await expect(values.nth(3)).toHaveText("冷房 25℃");
+  await expect(values.nth(2)).toHaveText("冷房 25℃");
   await page.reload();
   await expect(power).toHaveAttribute("aria-pressed", "true");
 });
@@ -297,9 +297,9 @@ test("the home's address is registered and the outside shows with the reason", a
   const power = page.getByRole("button", { name: "入り切り" });
   await power.click();
   await expect(power).toHaveText("切");
-  const outside = page.locator(".reading").nth(2);
-  await expect(outside.locator("dd")).toHaveText("30.2℃");
-  await expect(outside.locator("dt")).toHaveText(/^外気温\d\d:\d\d$/);
+  await expect(page.locator(".outdoor")).toHaveText(
+    /^外気温 30\.2℃ \d\d:\d\d$/,
+  );
   await power.click();
   await expect(page.locator(".reason")).toHaveText(
     "自動運転を入にしたため、エアコンを入れる",
