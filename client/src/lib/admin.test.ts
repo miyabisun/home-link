@@ -26,6 +26,7 @@ import {
   watchNote,
   switchProblem,
   withLabel,
+  switchesFor,
   THREAD_DOWN,
   threadDown,
 } from "./admin";
@@ -184,6 +185,16 @@ describe("label assignment", () => {
     expect(withLabel([1, 3], 2, true)).toEqual([1, 3, 2]);
     expect(withLabel([1, 3], 3, true)).toEqual([1, 3]);
     expect(withLabel([1, 3], 1, false)).toEqual([3]);
+  });
+});
+
+describe("switching in a mode", () => {
+  it("switches once, or the other way first when already there", () => {
+    expect(switchesFor(false, true)).toEqual([true]);
+    expect(switchesFor(true, false)).toEqual([false]);
+    expect(switchesFor(true, true)).toEqual([false, true]);
+    expect(switchesFor(false, false)).toEqual([true, false]);
+    expect(switchesFor(null, true)).toEqual([true]);
   });
 });
 

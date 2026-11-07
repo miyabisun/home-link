@@ -256,6 +256,32 @@ test("the air conditioner follows the sensor under its label and is switched on 
   await expect(values.nth(2)).toHaveText("冷房 25℃");
 });
 
+test("a device is switched in each of its modes on its own page", async ({
+  page,
+}) => {
+  await page.goto(`/devices/${idOf("E2E-AIRCON-1")}`);
+  const power = page.getByRole("button", { name: "入り切り" });
+  const row = (label: string) =>
+    page.locator(".modes li").filter({ hasText: label });
+  await expect(power).toHaveText("入");
+  await expect(row("HITACHI_AC424").locator(".badge")).toHaveText("使用中");
+
+  await page.getByRole("button", { name: "HITACHI_AC344で切" }).click();
+  await expect(power).toHaveText("切");
+  await expect(row("HITACHI_AC344").locator(".badge")).toHaveText("使用中");
+  await expect(row("HITACHI_AC424").locator(".badge")).toHaveCount(0);
+  // Already off: it is switched on and off again, and stays off.
+  await page.getByRole("button", { name: "HITACHI_AC344で切" }).click();
+  await expect(power).toBeEnabled();
+  await page.reload();
+  await expect(power).toHaveText("切");
+  await expect(row("HITACHI_AC344").locator(".badge")).toHaveText("使用中");
+
+  await page.getByRole("button", { name: "HITACHI_AC424で入" }).click();
+  await expect(power).toHaveText("入");
+  await expect(row("HITACHI_AC424").locator(".badge")).toHaveText("使用中");
+});
+
 const location = () =>
   sql("SELECT value FROM settings WHERE key = 'location'").map((row) =>
     JSON.parse((row as { value: string }).value),

@@ -856,6 +856,7 @@ fn router(state: Db) -> Router {
         .route("/devices/{id}/wifi", axum::routing::post(move_wifi))
         .route("/devices/{id}/on", axum::routing::post(device_on))
         .route("/devices/{id}/off", axum::routing::post(device_off))
+        .route("/devices/{id}/mode", axum::routing::post(change_mode))
         .route("/labels", get(list_labels).post(create_label))
         .route(
             "/labels/{id}",
@@ -1098,6 +1099,8 @@ struct Device {
     on: Option<bool>,
     /// What a sensor last measured.
     climate: Option<matter::Climate>,
+    /// The modes it offers on Mode Select, such as an air conditioner's IR protocols, and the one it is in.
+    modes: Option<matter::Modes>,
     /// The Wi-Fi network the device is on, as it reports it.
     wifi_ssid: Option<String>,
     /// `wifi`, `thread` or `ethernet` as the connected node runs on; a device behind a bridge is on its bridge's.
@@ -1154,6 +1157,7 @@ fn device_row(row: &rusqlite::Row, with_payload: bool) -> rusqlite::Result<Devic
         kind: None,
         on: None,
         climate: None,
+        modes: None,
         wifi_ssid: None,
         network: None,
         left_fabric: None,
@@ -1228,6 +1232,8 @@ async fn observe(state: &AppState, devices: &mut [Device]) {
                     .and_then(|(node, endpoint)| matter::climate(&nodes, node, endpoint));
             }
         }
+        device.modes = place(device, &nodes)
+            .and_then(|(node, endpoint)| matter::modes(&nodes, node, endpoint));
         device.wifi_ssid = wifi_of(device, &nodes).map(|(_, wifi)| wifi.ssid);
         device.network = place(device, &nodes).and_then(|(node, _)| matter::network(&nodes, node));
         device.left_fabric = Some(is_missing(device, &nodes));
@@ -1389,6 +1395,68 @@ async fn switch_device(
             "reason": missed.reason(),
             "details": missed.details(),
         }))),
+    }
+}
+
+#[derive(Deserialize)]
+struct ModeInput {
+    mode: u8,
+}
+
+/// Changes a device to one of the modes its Mode Select offers.
+async fn change_mode(
+    State(state): State<Db>,
+    Path(id): Path<i64>,
+    Json(input): Json<ModeInput>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let device = find_device(&state.db.lock().expect(UNPOISONED), id, false)?;
+    let url = matter_url(&state)?;
+    let deadline = link::budget();
+    let nodes = matter::fetch_nodes(url, deadline)
+        .await
+        .map_err(matter_unreachable)?;
+    let (node_id, endpoint) = place(&device, &nodes).ok_or_else(|| {
+        ApiError(
+            StatusCode::CONFLICT,
+            "not_connected",
+            "機器がつながっていません".into(),
+        )
+    })?;
+    let modes = matter::modes(&nodes, node_id, endpoint).ok_or_else(|| {
+        ApiError(
+            StatusCode::CONFLICT,
+            "no_modes",
+            "モードを持たない機器です".into(),
+        )
+    })?;
+    if !modes.options.iter().any(|option| option.mode == input.mode) {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unknown_mode",
+            format!("この機器にモード {} はありません", input.mode),
+        ));
+    }
+    let outcome = matter::change_mode(url, deadline, node_id, modes.endpoint, input.mode)
+        .await
+        .map_err(matter_unreachable)?;
+    tracing::info!(
+        device = id,
+        mode = input.mode,
+        result = outcome.result(),
+        "mode changed"
+    );
+    match outcome {
+        matter::Outcome::Accepted => Ok(Json(json!({ "mode": input.mode }))),
+        matter::Outcome::Refused(_) => Err(ApiError(
+            StatusCode::BAD_GATEWAY,
+            "mode_failed",
+            "機器がモードの切り替えを受け付けませんでした".into(),
+        )),
+        missed => Err(ApiError(
+            StatusCode::GATEWAY_TIMEOUT,
+            "no_response",
+            missed.reason().unwrap_or("機器から応答がありません").into(),
+        )),
     }
 }
 

@@ -445,13 +445,14 @@ Thread網の資格情報（dataset）は、matterjs-serverに `set_thread_datase
 
 | メソッドとパス | 内容 | 主な失敗 |
 | --- | --- | --- |
-| `GET /api/devices` | 機器の一覧。接続の状態 `state`（`unconnected`・`connected`・`no_response`）と製品の情報を含み、コードは含みません。一度つながったのにmatterjs-serverに見えない機器は `left_fabric` が `true`（読めないときはnull）で、`left_at` に外れた時刻を持ちます。接続したことのある機器には、Matterのdevice typeから求めた種類 `kind`（`light`・`plug`・`aircon`・`sensor`・`other`）を付けます。照明とエアコン以外で入り切りできる機器には、最後に読んだ入・切 `on`（`true`・`false`）を付けます。温湿度計（`sensor`）の `on` は、同じlabelのエアコンへ命令を送るか（既定は `true`）で、最後に測った値 `climate`（`{"temperature","humidity","battery"}`。℃・%・電池の%、測っていなければ `null`）も付けます | |
+| `GET /api/devices` | 機器の一覧。接続の状態 `state`（`unconnected`・`connected`・`no_response`）と製品の情報を含み、コードは含みません。一度つながったのにmatterjs-serverに見えない機器は `left_fabric` が `true`（読めないときはnull）で、`left_at` に外れた時刻を持ちます。接続したことのある機器には、Matterのdevice typeから求めた種類 `kind`（`light`・`plug`・`aircon`・`sensor`・`other`）を付けます。照明以外で入り切りできる機器には、最後に読んだ入・切 `on`（`true`・`false`）を付けます。Mode Select（エアコンの子機の赤外線の方式など）を持つ機器には、選べるモードと今のモード `modes`（`{"current": 0, "options": [{"mode": 0, "label": "HITACHI_AC424"}, …]}`）を付けます。温湿度計（`sensor`）の `on` は、同じlabelのエアコンへ命令を送るか（既定は `true`）で、最後に測った値 `climate`（`{"temperature","humidity","battery"}`。℃・%・電池の%、測っていなければ `null`）も付けます | |
 | `POST /api/devices` | QRコードか11桁のコードだけで機器を台帳に入れます。本文は `{"qr_payload": "MT:…"}` か `{"manual_code": "…"}`。新しい行は201、同じ機器の行があれば作らずに200で返します（`registered`） | 400 `missing_setup_code`・`invalid_qr_payload`・`invalid_manual_code` |
 | `GET /api/devices/{id}` | 機器1台。一覧の項目に、登録したコードの全文 `qr_payload` または `manual_code` を加えます | 404 `device_not_found` |
 | `PATCH /api/devices/{id}` | 機器の名前・labelの割り当て・無視の設定。本文は送った項目だけを変えます。`{"name": "押入れ1"}`、`{"label_ids": [1, 2]}`（割り当てを置き換え、`[]` で外す）、`{"ignored": true}`（`false` で戻す） | 400 `invalid_device_update`・`invalid_device_name`、404 `device_not_found`・`label_not_found` |
 | `POST /api/devices/{id}/commission` | 台帳の機器を、記録したコードでmatterjs-serverへBluetoothで登録（commissioning）し、その行に識別子を補います。本文は要りません | 404 `device_not_found`、409 `no_setup_code`、422 `device_not_found`・`wrong_code`・`wifi_failed`・`thread_failed`・`commission_failed`、504 `commission_timeout`、502 `matter_server_unreachable`、503 `matter_server_not_configured`・`bluetooth_unavailable` |
 | `POST /api/devices/{id}/wifi` | 接続済みのWi-Fiの機器を、初期化せずに機器に渡すWi-Fi（`for_devices`）へ移します。本文は要りません。既にそのWi-Fiにいれば何も送りません。成功すると `{"device": {…}}` を200で返します | 404 `device_not_found`、409 `wifi_not_set`・`not_on_wifi`、422 `wifi_reverted`、504 `wifi_reverting`、502 `matter_server_unreachable`、503 `matter_server_not_configured` |
-| `POST /api/devices/{id}/on`・`/off` | プラグやエアコンなど、照明以外で入り切りできる機器1台を入・切にします。温湿度計は、同じlabelのエアコンへ命令を送るかを切り替え、入にしたらその場で判断して送ります。応答は `{"state": "on"}`・`"off"`・`"no_response"`（応答しない・時間内に答えない機器。理由 `reason` と、matterjs-serverの説明 `details` を付けます）。答えない機器へは、labelと同じく1秒後にもう一度送ります | 404 `device_not_found`、409 `not_connected`・`not_switchable`（照明とエアコンと、入り切りの無い機器）、502 `switch_failed`・`matter_server_unreachable`、503 `matter_server_not_configured` |
+| `POST /api/devices/{id}/on`・`/off` | プラグやエアコンなど、照明以外で入り切りできる機器1台を入・切にします。温湿度計は、同じlabelのエアコンへ命令を送るかを切り替え、入にしたらその場で判断して送ります。応答は `{"state": "on"}`・`"off"`・`"no_response"`（応答しない・時間内に答えない機器。理由 `reason` と、matterjs-serverの説明 `details` を付けます）。答えない機器へは、labelと同じく1秒後にもう一度送ります | 404 `device_not_found`、409 `not_connected`・`not_switchable`（照明と、入り切りの無い機器）、502 `switch_failed`・`matter_server_unreachable`、503 `matter_server_not_configured` |
+| `POST /api/devices/{id}/mode` | Mode Selectを持つ機器1台を、そのモードの1つ `{"mode": 1}` に切り替えます。応答は `{"mode": 1}` | 404 `device_not_found`、409 `not_connected`・`no_modes`、422 `unknown_mode`、502 `mode_failed`・`matter_server_unreachable`、503 `matter_server_not_configured`、504 `no_response` |
 | `DELETE /api/devices/{id}` | 機器の削除。その機器自身のmatterjs-serverの登録（node）も消します。機器を一覧に並べるブリッジは消しません。matterjs-serverに届かないときは台帳の行を残します | 404 `device_not_found`、502 `matter_server_unreachable`・`node_not_removed` |
 | `GET /api/labels` | labelの一覧。性質（`auto`・`override_level`・`override_kelvin`）、毎日の切り替え `schedule`、最後のON・OFF `on`（`true`・`false`・未操作の `null`）、割り当てた機器の台数 `device_count`、上書き中か `boosted` つき | |
 | `POST /api/labels` | labelの作成。本文は `{"name": "work", "override_level": 254, "override_kelvin": 5000}`、`{"name": "ambient", "auto": true}`、`{"name": "razor", "schedule": [{"time": "00:00", "on": true}, {"time": "05:00", "on": false}]}` など（下の「label」） | 400 `invalid_label_name`・`invalid_label`、409 `duplicate_label_name` |
@@ -690,6 +691,7 @@ SwitchBotの温度計は、最後の受信から5分を過ぎると使いませ�
 - 風量は自動です。設定温度はエアコンの範囲（16〜32℃）に収まるよう、使わない側の設定温度を2℃離して送ります。
 - 温湿度計が無い・切・応答しない・室温を測れていないときは、エアコンを変えません。
 - エアコンの入り切りは、labelの操作と `POST /api/devices/{id}/on`・`/off` で行います（[エアコンをまとめて入り切りする](#エアコンをまとめて入り切りする)）。照明の全部オン・全部オフと照明の調整では切り替わりません。
+- 子機の赤外線の方式は、機器の画面の「モード」で選びます。方式ごとの「入」「切」は、その方式に切り替えてから入・切を送ります。子機は入・切が変わったときだけ送るので、既に同じ状態なら逆を送ってから送り直します。
 - 各回には、登録した住所の外気温（Open-Meteo、未登録なら東京・新宿）も記録します。判断には使いません。
   住所はhome-linkのデータベースにだけ保存し、ログには出しません。
 

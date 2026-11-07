@@ -239,6 +239,51 @@ pub fn climate(nodes: &[Value], node_id: u64, endpoint: u16) -> Option<Climate> 
     })
 }
 
+/// A mode of a device's Mode Select (0x0050), by its `ModeOptionStruct`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ModeOption {
+    pub mode: u8,
+    pub label: String,
+}
+
+/// The modes a device offers on its Mode Select and the one it is in.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Modes {
+    #[serde(skip)]
+    pub endpoint: u16,
+    /// `CurrentMode` as matterjs-server last read it.
+    pub current: Option<u8>,
+    pub options: Vec<ModeOption>,
+}
+
+/// The first Mode Select among the endpoints of the device `locate` found, as its
+/// `SupportedModes` and `CurrentMode` read; `None` for a device without one.
+#[must_use]
+pub fn modes(nodes: &[Value], node_id: u64, endpoint: u16) -> Option<Modes> {
+    let (attributes, parts) = parts(nodes, node_id, endpoint)?;
+    parts.iter().find_map(|(part, _)| {
+        let supported = attributes.get(&format!("{part}/80/2"))?.as_array()?;
+        let options = supported
+            .iter()
+            .filter_map(|option| {
+                Some(ModeOption {
+                    mode: u8::try_from(option["1"].as_u64()?).ok()?,
+                    label: option["0"].as_str()?.to_owned(),
+                })
+            })
+            .collect();
+        let current = attributes
+            .get(&format!("{part}/80/3"))
+            .and_then(Value::as_u64)
+            .and_then(|mode| u8::try_from(mode).ok());
+        Some(Modes {
+            endpoint: *part,
+            current,
+            options,
+        })
+    })
+}
+
 /// The kind of the device `locate` found and, unless it is a light, the endpoint
 /// carrying its On/Off with the On/Off last read: its own endpoint behind a
 /// bridge, else the first of its node's endpoints not behind a bridge.
@@ -788,6 +833,41 @@ pub async fn drive(
     result
 }
 
+/// Sends Mode Select's `ChangeToMode` with `mode` to `endpoint` of `node_id` and reports
+/// whether it was accepted; nothing runs past `deadline`.
+///
+/// # Errors
+/// Fails when the server cannot be reached or drops the connection.
+pub async fn change_mode(
+    url: &str,
+    deadline: Instant,
+    node_id: u64,
+    endpoint: u16,
+    mode: u8,
+) -> Result<Outcome, Fault> {
+    let mut link = Link::open(url, deadline).await?;
+    let command = json!({
+        "command": "device_command",
+        "args": {
+            "node_id": node_id,
+            "endpoint_id": endpoint,
+            "cluster_id": 80,
+            "command_name": "ChangeToMode",
+            "payload": { "newMode": mode },
+        },
+    });
+    let by = deadline.min(Instant::now() + REPLY_TIMEOUT);
+    let result = link
+        .request(command, by)
+        .await
+        .map(|reply| Outcome::of(reply.as_ref()));
+    link.close().await;
+    if let Ok(outcome) = &result {
+        outcome.warn("change mode", node_id, endpoint);
+    }
+    result
+}
+
 /// What became of one light in an adjustment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Decision {
@@ -959,8 +1039,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        Climate, Kind, Light, climate, kind, lights, locate, network, own_nodes, replaced,
-        software_version, thread_parent,
+        Climate, Kind, Light, ModeOption, Modes, climate, kind, lights, locate, modes, network,
+        own_nodes, replaced, software_version, thread_parent,
     };
 
     // Trimmed from a matterjs-server `get_nodes` result (2026-10-05).
@@ -1258,5 +1338,36 @@ mod tests {
         );
         // The bridge itself measures nothing.
         assert_eq!(climate(&bridge, 1, 0), None);
+    }
+
+    #[test]
+    fn a_device_with_mode_select_lists_its_modes_and_the_current_one() {
+        let nodes = vec![json!({ "node_id": 89, "attributes": {
+            "0/29/0": [{ "0": 22, "1": 1 }],
+            "1/29/0": [{ "0": 114, "1": 1 }], "1/6/0": false,
+            "1/80/2": [
+                { "0": "HITACHI_AC424", "1": 0, "2": [] },
+                { "0": "HITACHI_AC344", "1": 1, "2": [] },
+            ],
+            "1/80/3": 1,
+        }})];
+        assert_eq!(
+            modes(&nodes, 89, 0),
+            Some(Modes {
+                endpoint: 1,
+                current: Some(1),
+                options: vec![
+                    ModeOption {
+                        mode: 0,
+                        label: "HITACHI_AC424".into()
+                    },
+                    ModeOption {
+                        mode: 1,
+                        label: "HITACHI_AC344".into()
+                    },
+                ],
+            })
+        );
+        assert_eq!(modes(&[w100()], 88, 0), None);
     }
 }

@@ -38,6 +38,8 @@ export interface Device {
   on: boolean | null;
   /** What a sensor last measured. */
   climate: Climate | null;
+  /** The modes it offers, such as an air conditioner's IR protocols, and the one it is in. */
+  modes: Modes | null;
   wifi_ssid: string | null;
   network: "wifi" | "thread" | "ethernet" | null;
   labels: LabelRef[];
@@ -45,6 +47,11 @@ export interface Device {
   /** Once connected and served no more: it left the fabric. `null` when unknown. */
   left_fabric?: boolean | null;
   left_at?: number | null;
+}
+
+export interface Modes {
+  current: number | null;
+  options: { mode: number; label: string }[];
 }
 
 export interface Climate {
@@ -155,6 +162,8 @@ export const api = {
       "POST",
       `/api/devices/${id}/${on ? "on" : "off"}`,
     ),
+  changeMode: (id: number, mode: number) =>
+    request<{ mode: number }>("POST", `/api/devices/${id}/mode`, { mode }),
   labels: (signal?: AbortSignal) =>
     request<Label[]>("GET", "/api/labels", undefined, signal),
   createLabel: (name: string) =>

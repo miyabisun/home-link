@@ -515,9 +515,11 @@ async fn fake_light_server(
                         } else {
                             // The light takes the level and colour temperature sent.
                             let payload = &args["payload"];
-                            for (field, path) in
-                                [("level", "8/0"), ("colorTemperatureMireds", "768/7")]
-                            {
+                            for (field, path) in [
+                                ("level", "8/0"),
+                                ("colorTemperatureMireds", "768/7"),
+                                ("newMode", "80/3"),
+                            ] {
                                 if let Some(value) = payload.get(field) {
                                     for node in nodes.lock().unwrap().as_array_mut().unwrap() {
                                         if node["node_id"] == target.0 {
@@ -6195,7 +6197,7 @@ async fn rooms_are_gone_from_the_api_and_the_mcp() {
 }
 
 /// A Room Air Conditioner on Wi-Fi as the home-server child serves it, beside a bulb and a plug:
-/// cooling at 26℃, off, its fan read as Off.
+/// cooling at 26℃, off, its fan read as Off, sending in the first of two IR protocols.
 fn aircon_nodes() -> Value {
     let mut nodes = plug_nodes();
     nodes.as_array_mut().unwrap().push(json!(
@@ -6204,6 +6206,11 @@ fn aircon_nodes() -> Value {
             "0/29/0": [{ "0": 22, "1": 1 }],
             "1/29/0": [{ "0": 114, "1": 1 }], "1/6/0": false,
             "1/513/28": 3, "1/513/17": 2600, "1/513/18": 2000, "1/514/0": 0,
+            "1/80/2": [
+                { "0": "HITACHI_AC424", "1": 0, "2": [] },
+                { "0": "HITACHI_AC344", "1": 1, "2": [] },
+            ],
+            "1/80/3": 0,
         }}
     ));
     nodes
@@ -6854,6 +6861,75 @@ async fn an_aircon_switches_alone_and_under_its_labels_as_a_plug_does() {
         (&view["aircons"], &view["runs"][0]["result"]),
         (&json!([]), &json!("no_aircon"))
     );
+}
+
+#[tokio::test]
+async fn a_device_changes_to_one_of_its_modes() {
+    let (addr, commands, _) = fake_light_server(aircon_nodes(), Fake::default()).await;
+    let (db, sql) = ledger();
+    let app = home_link::Home::new(db, Some(format!("ws://{addr}/ws"))).router();
+    let aircon = add_device(
+        &app,
+        &sql,
+        json!({ "vendor": "Airco", "serial_number": "ac-1" }),
+    )
+    .await;
+    let plug = add_device(
+        &app,
+        &sql,
+        json!({ "vendor": "Plugco", "serial_number": "plug-a" }),
+    )
+    .await;
+    assert_eq!(
+        aircon["modes"],
+        json!({ "current": 0, "options": [
+            { "mode": 0, "label": "HITACHI_AC424" },
+            { "mode": 1, "label": "HITACHI_AC344" },
+        ]})
+    );
+    assert!(plug["modes"].is_null(), "{plug}");
+
+    let uri = format!("/api/devices/{}/mode", aircon["id"]);
+    let (status, body) = call(&app, "POST", &uri, Some(json!({ "mode": 1 }))).await;
+    assert_eq!(
+        (status, &body["mode"]),
+        (StatusCode::OK, &json!(1)),
+        "{body}"
+    );
+    let changes: Vec<_> = sent(&commands)
+        .iter()
+        .filter(|c| c["node_id"] == 40)
+        .map(|c| {
+            (
+                c["endpoint_id"].clone(),
+                c["command_name"].clone(),
+                c["payload"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        changes,
+        [(json!(1), json!("ChangeToMode"), json!({ "newMode": 1 }))]
+    );
+    let (_, device) = call(&app, "GET", &format!("/api/devices/{}", aircon["id"]), None).await;
+    assert_eq!(device["modes"]["current"], 1);
+    commands.lock().unwrap().clear();
+
+    // A mode it does not offer, and a device without modes, are refused unsent.
+    let (status, body) = call(&app, "POST", &uri, Some(json!({ "mode": 7 }))).await;
+    assert_eq!(
+        (status, &body["error"]),
+        (StatusCode::UNPROCESSABLE_ENTITY, &json!("unknown_mode")),
+        "{body}"
+    );
+    let uri = format!("/api/devices/{}/mode", plug["id"]);
+    let (status, body) = call(&app, "POST", &uri, Some(json!({ "mode": 0 }))).await;
+    assert_eq!(
+        (status, &body["error"]),
+        (StatusCode::CONFLICT, &json!("no_modes")),
+        "{body}"
+    );
+    assert!(sent(&commands).is_empty());
 }
 
 /// What the stand-in for GSI and Open-Meteo was asked: path, query and User-Agent.

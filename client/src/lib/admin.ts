@@ -124,6 +124,15 @@ export function withLabel(ids: number[], id: number, on: boolean): number[] {
   return ids.filter((other) => other !== id);
 }
 
+/**
+ * The switches that make a device act on `want` in a mode it was just changed to. A device acts
+ * on a change of its On/Off only (an air conditioner's IR child sends then), so a device already
+ * there is switched the other way first.
+ */
+export function switchesFor(on: boolean | null, want: boolean): boolean[] {
+  return on === want ? [!want, want] : [want];
+}
+
 export function errorMessage(status: number, body: unknown): string {
   const message = (body as { message?: unknown } | null)?.message;
   return typeof message === "string" && message

@@ -4,6 +4,7 @@
     deviceName,
     deviceNameError,
     stateText,
+    switchesFor,
     withLabel,
   } from "../lib/admin";
   import { aborted, api, missing, type Device, type Label } from "../lib/api";
@@ -68,6 +69,29 @@
       const result = await api.switchDevice(device.id, !device.on);
       if (result.state === "no_response") error = "応答なし";
       else device.on = result.state === "on";
+    } catch (e) {
+      error = (e as Error).message;
+    }
+    switching = false;
+  }
+
+  async function switchInMode(mode: number, want: boolean) {
+    if (!device?.modes) return;
+    switching = true;
+    error = "";
+    try {
+      if (device.modes.current !== mode) {
+        await api.changeMode(device.id, mode);
+        device.modes.current = mode;
+      }
+      for (const on of switchesFor(device.on, want)) {
+        const result = await api.switchDevice(device.id, on);
+        if (result.state === "no_response") {
+          error = "応答なし";
+          break;
+        }
+        device.on = result.state === "on";
+      }
     } catch (e) {
       error = (e as Error).message;
     }
@@ -154,6 +178,36 @@
         {nameError}
       </p>{/if}
 
+    {#if device.modes && device.kind !== "sensor" && device.on !== null}
+      <fieldset class="field">
+        <legend>モード</legend>
+        <ul class="modes">
+          {#each device.modes.options as option (option.mode)}
+            <li>
+              <span class="mode-name">{option.label}</span>
+              {#if option.mode === device.modes.current}
+                <span class="badge">使用中</span>
+              {/if}
+              <button
+                class="btn"
+                type="button"
+                aria-label="{option.label}で入"
+                disabled={switching}
+                onclick={() => void switchInMode(option.mode, true)}>入</button
+              >
+              <button
+                class="btn"
+                type="button"
+                aria-label="{option.label}で切"
+                disabled={switching}
+                onclick={() => void switchInMode(option.mode, false)}>切</button
+              >
+            </li>
+          {/each}
+        </ul>
+      </fieldset>
+    {/if}
+
     <fieldset class="field">
       <legend>ラベル</legend>
       {#if labels.length === 0}
@@ -223,6 +277,28 @@
     .grow
       flex: 1
       min-width: 0
+
+    .btn
+      flex-shrink: 0
+      min-width: 52px
+      height: 44px
+
+  .modes
+    display: grid
+    gap: var(--sp-2)
+    margin: 0
+    padding: 0
+    list-style: none
+
+    li
+      display: flex
+      align-items: center
+      gap: var(--sp-2)
+
+    .mode-name
+      flex: 1
+      min-width: 0
+      overflow-wrap: anywhere
 
     .btn
       flex-shrink: 0

@@ -49,6 +49,11 @@ const nodes = [
       "1/513/17": 2500,
       "1/513/18": 2300,
       "1/514/0": 5,
+      "1/80/2": [
+        { 0: "HITACHI_AC424", 1: 0, 2: [] },
+        { 0: "HITACHI_AC344", 1: 1, 2: [] },
+      ],
+      "1/80/3": 0,
     },
   },
   {
@@ -131,6 +136,8 @@ matter.on("connection", (ws) => {
     } else if (command === "device_command" && node) {
       if (args.cluster_id === 6)
         node.attributes[`${args.endpoint_id}/6/0`] = args.command_name === "On";
+      if (args.command_name === "ChangeToMode")
+        node.attributes[`${args.endpoint_id}/80/3`] = args.payload.newMode;
     } else {
       ws.send(
         JSON.stringify({
