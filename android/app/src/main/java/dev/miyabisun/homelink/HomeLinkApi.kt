@@ -88,7 +88,6 @@ sealed interface ApiResult<out T> {
  * air conditioner took it. Not [delivered], home-link sends it again every 10 minutes. [result] is home-link's word
  * for the send and [reason] its sentence, both null from a home-link that answered before sending.
  */
-data class AirconToggle(val on: Boolean, val delivered: Boolean, val result: String? = null, val reason: String? = null)
 
 /** The home-link ledger API. Calls block; run them off the main thread. */
 interface HomeLinkApi {
@@ -100,10 +99,6 @@ interface HomeLinkApi {
     fun labels(): ApiResult<List<Label>>
     /** Switches label `id`'s lights and plugs on or off, or toggles them. */
     fun switchLabel(id: Long, op: LabelOp): ApiResult<LabelResult>
-    /** Whether the air conditioner's control is on: off holds it off until switched on again. */
-    fun aircon(): ApiResult<Boolean>
-    /** Switches the air conditioner's control the other way: its new state, and whether the air conditioner took it. */
-    fun toggleAircon(): ApiResult<AirconToggle>
     /**
      * Has matterjs-server commission ledger device `id` by its code over the BLE proxy this phone holds open;
      * home-link hands over its Wi-Fi for devices, and matterjs-server picks Wi-Fi or Thread. Takes up to minutes.
@@ -203,17 +198,6 @@ class HttpHomeLinkApi(private val targets: () -> Targets, private val link: Phon
             LabelResult(json.getString("action"), if (json.isNull("on")) null else json.getBoolean("on"), counts(json))
         }
 
-    override fun aircon(): ApiResult<Boolean> =
-        call("GET", "/api/aircon", null) { JSONObject(it).getBoolean("on") }
-
-    // home-link answers once the air conditioner took the switch, or did not, in about 12 s at most.
-    override fun toggleAircon(): ApiResult<AirconToggle> =
-        call("POST", "/api/aircon/toggle", null) { body ->
-            val json = JSONObject(body)
-            AirconToggle(json.getBoolean("on"), json.isNull("delivered") || json.getBoolean("delivered"),
-                json.optString("result").takeUnless { json.isNull("result") },
-                json.optString("reason").takeUnless { json.isNull("reason") })
-        }
 
     private fun label(json: JSONObject): Label {
         val schedule = json.optJSONArray("schedule") ?: JSONArray()

@@ -84,7 +84,6 @@ export interface Meter extends MeterView, AdapterView {
 }
 
 export interface Aircon {
-  on: boolean;
   aircons: AirconUnit[];
   outdoor: Outdoor | null;
   location: Place;
@@ -172,8 +171,6 @@ export const api = {
   ) => request<Meter>("PUT", "/api/meter", patch),
   aircon: (signal?: AbortSignal) =>
     request<Aircon>("GET", "/api/aircon", undefined, signal),
-  updateAircon: (patch: { on: boolean }) =>
-    request<Aircon>("PUT", "/api/aircon", patch),
   location: (signal?: AbortSignal) =>
     request<Location>("GET", "/api/location", undefined, signal),
   updateLocation: (address: string) =>

@@ -67,29 +67,6 @@ class HttpHomeLinkApiTest {
         assertEquals(ApiResult.Failed(ApiError.DEVICE_NOT_FOUND), api.device(9))
     }
 
-    @Test fun readsAndTogglesTheAirconSwitch() {
-        respond("/api/aircon", 200, """{"on":false,"target":25,"device":null,"reading":null,"sent":null,"runs":[]}""")
-        assertEquals(ApiResult.Ok(false), api.aircon())
-        assertEquals("GET /api/aircon", requests.last())
-        respond("/api/aircon/toggle", 200, """{"on":true,"result":"sent","delivered":true,"reason":null}""")
-        assertEquals(ApiResult.Ok(AirconToggle(on = true, delivered = true, result = "sent")), api.toggleAircon())
-        assertEquals("POST /api/aircon/toggle", requests.last())
-        respond("/api/aircon/toggle", 500, """{"error":"internal"}""")
-        assertEquals(ApiResult.Failed(ApiError.SERVER), api.toggleAircon())
-    }
-
-    @Test fun readsWhetherTheToggleReachedTheAircon() {
-        // Kept, but the air conditioner did not take it: home-link sends it again every 10 minutes.
-        respond("/api/aircon/toggle", 200, """{"on":false,"result":"no_response","delivered":false,"reason":"子機が応答しませんでした"}""")
-        assertEquals(ApiResult.Ok(AirconToggle(on = false, delivered = false, result = "no_response", reason = "子機が応答しませんでした")),
-            api.toggleAircon())
-        respond("/api/aircon/toggle", 200, """{"on":true,"result":"pending","delivered":false,"reason":null}""")
-        assertEquals(ApiResult.Ok(AirconToggle(on = true, delivered = false, result = "pending")), api.toggleAircon())
-        // A home-link that answered before sending says nothing of it: taken as reached, as it always was.
-        respond("/api/aircon/toggle", 200, """{"on":true}""")
-        assertEquals(ApiResult.Ok(AirconToggle(on = true, delivered = true)), api.toggleAircon())
-    }
-
     @Test fun changesANameAndTheLabels() {
         respond("/api/devices/9", 200, ledgerRow)
         assertEquals(ApiResult.Ok(ledgerDevice), api.updateDevice(9, DeviceUpdate.Name("押入れ1")))
@@ -313,11 +290,11 @@ class HttpHomeLinkApiTest {
     }
 
     @Test fun aPrimaryThatTookTheRequestButNeverAnsweredSendsNothingToTheFallback() {
-        respond("/api/aircon", 200, """{"on":true}""")
+        respond("/api/labels", 200, "[]")
         // Accepts the connection (the backlog does) but never answers.
         ServerSocket(0).use { silent ->
             assertEquals(ApiResult.Failed(ApiError.TIMEOUT),
-                api("http://127.0.0.1:${silent.localPort}", "http://127.0.0.1:${server.address.port}").aircon())
+                api("http://127.0.0.1:${silent.localPort}", "http://127.0.0.1:${server.address.port}").labels())
         }
         assertEquals(emptyList<String>(), requests)
     }
@@ -355,7 +332,7 @@ class HttpHomeLinkApiTest {
                 Thread {
                     val input = socket.getInputStream().bufferedReader()
                     while (input.readLine()?.isNotEmpty() == true) { }
-                    val body = """{"on":true}"""
+                    val body = "[]"
                     socket.getOutputStream().write("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: ${body.length}\r\n\r\n$body".toByteArray())
                     socket.getOutputStream().flush()
                 }.start()
@@ -363,8 +340,8 @@ class HttpHomeLinkApiTest {
         }.start()
         listener.use {
             val reused = api("http://127.0.0.1:${listener.localPort}")
-            assertEquals(ApiResult.Ok(true), reused.aircon())
-            assertEquals(ApiResult.Ok(true), reused.aircon())
+            assertEquals(ApiResult.Ok(emptyList<Label>()), reused.labels())
+            assertEquals(ApiResult.Ok(emptyList<Label>()), reused.labels())
             assertEquals(2, connections.get())
         }
     }
@@ -375,15 +352,15 @@ class HttpHomeLinkApiTest {
             502 to ApiError.HTTP_GATEWAY, 503 to ApiError.HTTP_GATEWAY, 504 to ApiError.HTTP_GATEWAY, 500 to ApiError.SERVER,
         )
         for ((status, expected) in cases) {
-            respond("/api/aircon/toggle", status, "<html>$status</html>")
-            assertEquals("$status", ApiResult.Failed(expected), api.toggleAircon())
+            respond("/api/labels/4/toggle", status, "<html>$status</html>")
+            assertEquals("$status", ApiResult.Failed(expected), api.switchLabel(4, LabelOp.TOGGLE))
         }
         // home-link's own codes keep their meaning, whatever the status.
         respond("/api/labels/9/on", 404, """{"error":"label_not_found"}""")
         assertEquals(ApiResult.Failed(ApiError.LABEL_NOT_FOUND), api.switchLabel(9, LabelOp.ON))
         // A success that is not home-link's JSON, such as a sign-in page.
-        respond("/api/aircon/toggle", 200, "<html>sign in</html>")
-        assertEquals(ApiResult.Failed(ApiError.BAD_ANSWER), api.toggleAircon())
+        respond("/api/labels/4/toggle", 200, "<html>sign in</html>")
+        assertEquals(ApiResult.Failed(ApiError.BAD_ANSWER), api.switchLabel(4, LabelOp.TOGGLE))
     }
 
     @Test fun eachFailureIsLoggedWithWhatWasTriedAndThePhonesNetwork() {
@@ -430,7 +407,7 @@ class HttpHomeLinkApiTest {
             read(HttpHomeLinkApi({ Targets(listOf("http://127.0.0.1:$port")) }, phone, limits = limits) { phone.clock })
             return phone.clock
         }
-        for (read in listOf<(HttpHomeLinkApi) -> Unit>({ it.labels() }, { it.aircon() }, { it.devices() })) {
+        for (read in listOf<(HttpHomeLinkApi) -> Unit>({ it.labels() }, { it.devices() })) {
             assertEquals(15_000L, waited(Limits.SCREEN, read))
             assertEquals(5_000L, waited(Limits.RECEIVER, read))
         }

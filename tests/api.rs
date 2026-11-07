@@ -6438,31 +6438,6 @@ async fn the_sensor_drives_the_aircon_under_its_label_unless_switched_off() {
     );
     commands.lock().unwrap().clear();
 
-    // The user's off stops the air conditioner and the sensor; on starts it again.
-    let (status, view) = call(&app, "PUT", "/api/aircon", Some(json!({ "on": false }))).await;
-    assert_eq!(
-        (status, &view["on"]),
-        (StatusCode::OK, &json!(false)),
-        "{view}"
-    );
-    assert_eq!(aircon_writes(&commands), ["Off"]);
-    commands.lock().unwrap().clear();
-    room(300);
-    home.adjust_aircon(NIGHT + 4200).await;
-    assert_eq!(aircon_writes(&commands), Vec::<String>::new());
-    let (_, view) = call(&app, "GET", "/api/aircon", None).await;
-    assert_eq!(view["runs"][0]["result"], "held");
-    let (_, view) = call(&app, "PUT", "/api/aircon", Some(json!({ "on": true }))).await;
-    assert_eq!(view["on"], true);
-    assert_eq!(aircon_writes(&commands), ["On"]);
-    for bad in [json!({ "target": 23 }), json!({ "on": "yes" })] {
-        let (status, error) = call(&app, "PUT", "/api/aircon", Some(bad.clone())).await;
-        assert_eq!(
-            (status, error["error"].as_str()),
-            (StatusCode::BAD_REQUEST, Some("invalid_aircon")),
-            "{bad}"
-        );
-    }
     let _ = elsewhere;
     let _ = std::fs::remove_file(&path);
 }
@@ -6612,13 +6587,24 @@ async fn each_aircon_follows_the_sensor_under_its_own_label() {
     assert_eq!(view["aircons"][1]["sensor"], Value::Null);
     assert_eq!(sent(&commands), Vec::<Value>::new());
 
-    // The user's off stops both air conditioners.
-    let (status, _) = call(&app, "PUT", "/api/aircon", Some(json!({ "on": false }))).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        (aircon_writes(&commands), aircon_writes_to(&commands, 41)),
-        (vec!["Off".to_owned()], vec!["Off".to_owned()])
-    );
+    // Under one more label, 空調, both are switched together: off stops both, on starts both.
+    let together = create_label(&app, json!({ "name": "空調" })).await;
+    for (device, room) in [(&bedroom_ac, &bedroom), (&living_ac, &living)] {
+        assert_eq!(
+            assign(&app, device, &[room, &together]).await.0,
+            StatusCode::OK
+        );
+    }
+    for (op, command) in [("off", "Off"), ("on", "On")] {
+        let (status, body) = label_op(&app, &together, op).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            (aircon_writes(&commands), aircon_writes_to(&commands, 41)),
+            (vec![command.to_owned()], vec![command.to_owned()]),
+            "{op}"
+        );
+        commands.lock().unwrap().clear();
+    }
 
     for bad in [
         json!({}),
@@ -6665,36 +6651,6 @@ impl Captured {
             .map(str::to_owned)
             .collect()
     }
-}
-
-#[tokio::test]
-async fn the_aircon_toggle_says_when_the_air_conditioner_was_not_reached() {
-    let fake = Fake {
-        silent: vec![(40, 1)],
-        ..Fake::default()
-    };
-    let (addr, _, _) = fake_light_server(aircon_nodes(), fake).await;
-    let path = std::env::temp_dir().join(format!("home-link-ac-silent-{}.db", std::process::id()));
-    let _ = std::fs::remove_file(&path);
-    let (_home, app) = aircon_home(addr, &path);
-    let sql = home_link::open_db(path.to_str().unwrap()).unwrap();
-    insert_device(&sql, "Airco", "ac-1", "エアコン");
-
-    let (status, body) = call(&app, "POST", "/api/aircon/toggle", None).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(
-        (&body["result"], &body["delivered"], &body["reason"]),
-        (
-            &json!("no_response"),
-            &json!(false),
-            &json!("エアコンが応答しませんでした")
-        ),
-        "{body}"
-    );
-    // The switch is kept: the loop sends it again.
-    let (_, view) = call(&app, "GET", "/api/aircon", None).await;
-    assert_eq!(view["on"], body["on"]);
-    let _ = std::fs::remove_file(&path);
 }
 
 #[tokio::test]
@@ -6754,7 +6710,7 @@ async fn each_aircon_run_is_logged_on_one_line_without_the_address() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    // No sensor under its label, sent, unchanged, then held while switched off.
+    // No sensor under its label, sent, then unchanged.
     home.adjust_aircon(NIGHT).await;
     let label = create_label(&app, json!({ "name": "bedroom" })).await;
     for device in [&aircon, &sensor] {
@@ -6762,12 +6718,6 @@ async fn each_aircon_run_is_logged_on_one_line_without_the_address() {
     }
     home.adjust_aircon(NIGHT).await;
     home.adjust_aircon(NIGHT + 600).await;
-    let off = json!({ "on": false });
-    assert_eq!(
-        call(&app, "PUT", "/api/aircon", Some(off)).await.0,
-        StatusCode::OK
-    );
-    home.adjust_aircon(NIGHT + 1200).await;
     // Failed: no matterjs-server to send to.
     let unset = home_link::Home::new(home_link::open_db(":memory:").unwrap(), None);
     unset.adjust_aircon(NIGHT).await;
@@ -6777,10 +6727,10 @@ async fn each_aircon_run_is_logged_on_one_line_without_the_address() {
         .into_iter()
         .filter(|line| line.contains("trigger=\"scheduled\""))
         .collect();
-    assert_eq!(lines.len(), 5, "{lines:#?}");
+    assert_eq!(lines.len(), 4, "{lines:#?}");
     for (line, result) in lines
         .iter()
-        .zip(["no_reading", "sent", "unchanged", "held", "failed"])
+        .zip(["no_reading", "sent", "unchanged", "failed"])
     {
         assert!(line.contains(" INFO "), "{line}");
         assert!(line.contains(&format!("result=\"{result}\"")), "{line}");
@@ -6810,7 +6760,7 @@ async fn each_aircon_run_is_logged_on_one_line_without_the_address() {
 }
 
 #[tokio::test]
-async fn the_aircon_is_left_to_its_own_switch() {
+async fn an_aircon_switches_alone_and_under_its_labels_as_a_plug_does() {
     let (addr, commands, _) = fake_light_server(aircon_nodes(), Fake::default()).await;
     let (db, sql) = ledger();
     let home = home_link::Home::new(db, Some(format!("ws://{addr}/ws"))).with_clock(|| NIGHT);
@@ -6837,18 +6787,25 @@ async fn the_aircon_is_left_to_its_own_switch() {
     assert_eq!(assign(&app, &aircon, &[&label]).await.0, StatusCode::OK);
     assert_eq!(assign(&app, &plug, &[&label]).await.0, StatusCode::OK);
 
-    // The plug's label, the lights and the plug's own switch reach no further than before.
-    let (status, body) = call(
-        &app,
-        "POST",
-        &format!("/api/devices/{}/on", aircon["id"]),
-        None,
-    )
-    .await;
     assert_eq!(
-        (status, body["error"].as_str()),
-        (StatusCode::CONFLICT, Some("not_switchable"))
+        (&aircon["kind"], &aircon["on"]),
+        (&json!("aircon"), &json!(false))
     );
+
+    // Its own switch reaches it.
+    for op in ["on", "off"] {
+        let uri = format!("/api/devices/{}/{op}", aircon["id"]);
+        let (status, body) = call(&app, "POST", &uri, None).await;
+        assert_eq!(
+            (status, &body["state"]),
+            (StatusCode::OK, &json!(op)),
+            "{body}"
+        );
+    }
+    assert_eq!(aircon_writes(&commands), ["On", "Off"]);
+    commands.lock().unwrap().clear();
+
+    // Its label's switch reaches it with the plug; the lights' switch and adjustment do not.
     for op in ["on", "off"] {
         let (status, body) = label_op(&app, &label, op).await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -6857,7 +6814,7 @@ async fn the_aircon_is_left_to_its_own_switch() {
     }
     enable(&app).await;
     home.adjust(NIGHT, "scheduled").await;
-    assert!(aircon_writes(&commands).is_empty());
+    assert_eq!(aircon_writes(&commands), ["On", "Off"]);
     let touched: Vec<_> = sent(&commands)
         .iter()
         .map(|c| {
@@ -6868,6 +6825,18 @@ async fn the_aircon_is_left_to_its_own_switch() {
         })
         .collect();
     assert!(touched.contains(&20) && touched.contains(&5), "{touched:?}");
+    commands.lock().unwrap().clear();
+
+    // No switch of the air conditioners' own is left: labels switch them.
+    for (method, uri, status) in [
+        ("PUT", "/api/aircon", StatusCode::METHOD_NOT_ALLOWED),
+        ("POST", "/api/aircon/toggle", StatusCode::NOT_FOUND),
+    ] {
+        let body = Some(json!({ "on": false }));
+        assert_eq!(call(&app, method, uri, body).await.0, status, "{uri}");
+    }
+    let (_, view) = call(&app, "GET", "/api/aircon", None).await;
+    assert!(view.get("on").is_none(), "{view}");
 
     // An ignored air conditioner is not driven.
     let (status, _) = call(
@@ -7259,8 +7228,6 @@ fn moves_changed_schedule_coordinates_to_the_home_location() {
 /// Within this a request returns when matterjs-server takes the connection but never answers
 /// the WebSocket upgrade: the three seconds a connection may take to open, and a margin.
 const HUNG_WITHIN: Duration = Duration::from_secs(5);
-/// `HUNG_WITHIN` for a request that tries two connections, one to act and one to read back.
-const HUNG_TWICE_WITHIN: Duration = Duration::from_secs(8);
 
 /// The longest a light request may take however slowly matterjs-server answers: the fifteen
 /// seconds of its budget, and a margin.
@@ -7361,12 +7328,7 @@ async fn a_matter_server_that_never_answers_the_upgrade_holds_up_no_request_or_l
             Some(commission_body()),
             HUNG_WITHIN,
         ),
-        (
-            "PUT",
-            "/api/aircon".to_owned(),
-            Some(json!({ "on": true })),
-            HUNG_TWICE_WITHIN,
-        ),
+        ("GET", "/api/aircon".to_owned(), None, HUNG_WITHIN),
         ("GET", "/api/lights".to_owned(), None, HUNG_WITHIN),
     ] {
         let (status, error) = within(uri.as_str(), limit, call(&app, method, &uri, body)).await;

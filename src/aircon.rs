@@ -10,20 +10,6 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-/// The user's switch, kept across restarts: off turns the air conditioner off and keeps the
-/// sensors from driving it until switched on again.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Settings {
-    pub on: bool,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self { on: true }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
@@ -327,20 +313,6 @@ mod tests {
         assert_eq!(
             decide(27.5, OFF).why.to_string(),
             "室温が27.5℃で26℃を超えたため、冷房25℃にする"
-        );
-    }
-
-    #[test]
-    fn settings_default_to_on() {
-        assert_eq!(
-            serde_json::from_str::<Settings>("{}").unwrap(),
-            Settings { on: true }
-        );
-        // Settings written before keep their switch.
-        assert_eq!(
-            serde_json::from_str::<Settings>(r#"{"on":false,"target":25,"night_from":1320}"#)
-                .unwrap(),
-            Settings { on: false }
         );
     }
 

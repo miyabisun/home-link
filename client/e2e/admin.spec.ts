@@ -201,12 +201,14 @@ test("labels keep their names unique and are deleted", async ({ page }) => {
   expect(labelRow("常夜灯")).toBeUndefined();
 });
 
-const airconSettings = () =>
-  sql("SELECT value FROM settings WHERE key = 'aircon'").map((row) =>
-    JSON.parse((row as { value: string }).value),
-  )[0];
+const idOf = (serial: string) =>
+  (
+    sql("SELECT id FROM devices WHERE serial_number = ?", serial) as {
+      id: number;
+    }[]
+  )[0].id;
 
-test("the air conditioner follows the sensor under its label and is switched off and on", async ({
+test("the air conditioner follows the sensor under its label and is switched on its own page", async ({
   page,
   request,
 }) => {
@@ -225,11 +227,7 @@ test("the air conditioner follows the sensor under its label and is switched off
     await request.post("/api/labels", { data: { name: "bedroom" } })
   ).json();
   for (const serial of ["E2E-AIRCON-1", "E2E-SENSOR-1"]) {
-    const [{ id }] = sql(
-      "SELECT id FROM devices WHERE serial_number = ?",
-      serial,
-    ) as { id: number }[];
-    await request.patch(`/api/devices/${id}`, {
+    await request.patch(`/api/devices/${idOf(serial)}`, {
       data: { label_ids: [label.id] },
     });
   }
@@ -240,23 +238,22 @@ test("the air conditioner follows the sensor under its label and is switched off
     "室温寝室・温湿度計",
   );
 
+  // Its name leads to its own page, where it is switched as a plug is.
+  await page.getByRole("link", { name: "エアコン", exact: true }).click();
+  await expect(page).toHaveURL(`/devices/${idOf("E2E-AIRCON-1")}`);
   const power = page.getByRole("button", { name: "入り切り" });
   await expect(power).toHaveAttribute("aria-pressed", "true");
   await power.click();
   await expect(power).toHaveText("切");
-  await expect(power).toHaveAttribute("aria-pressed", "false");
+  await page.goto("/aircon");
   await expect(values.nth(2)).toHaveText("切");
-  expect(airconSettings()).toEqual({ on: false });
-  await expect(page.locator(".reason")).toHaveText(
-    "自動運転を切にしたため、エアコンを止める",
-  );
 
+  await page.goto(`/devices/${idOf("E2E-AIRCON-1")}`);
+  await expect(power).toHaveText("切");
   await power.click();
   await expect(power).toHaveText("入");
-  expect(airconSettings()).toEqual({ on: true });
+  await page.goto("/aircon");
   await expect(values.nth(2)).toHaveText("冷房 25℃");
-  await page.reload();
-  await expect(power).toHaveAttribute("aria-pressed", "true");
 });
 
 const location = () =>
@@ -266,6 +263,7 @@ const location = () =>
 
 test("the home's address is registered and the outside shows with the reason", async ({
   page,
+  request,
 }) => {
   await page.goto("/aircon");
   // Unregistered, the settings are open.
@@ -293,16 +291,15 @@ test("the home's address is registered and the outside shows with the reason", a
     longitude: 139.691772,
   });
 
-  // A run asks for the outside of the registered place and says why.
-  const power = page.getByRole("button", { name: "入り切り" });
-  await power.click();
-  await expect(power).toHaveText("切");
+  // A run, here on switching the sensor on, asks for the outside of the registered place and
+  // says why.
+  await request.post(`/api/devices/${idOf("E2E-SENSOR-1")}/on`);
+  await page.reload();
   await expect(page.locator(".outdoor")).toHaveText(
     /^外気温 30\.2℃ \d\d:\d\d$/,
   );
-  await power.click();
   await expect(page.locator(".reason")).toHaveText(
-    "自動運転を入にしたため、エアコンを入れる",
+    "室温が28.3℃で26℃を超えているが、冷房25℃で運転中",
   );
 
   // A reload shows the address, the settings closed once registered.

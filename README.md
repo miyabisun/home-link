@@ -221,7 +221,7 @@ curl http://home-link.example:5011/api/lights/watch
 | 温度計（右上のメニュー） | 台帳の温湿度計ごとの温度・湿度・電池（名前から機器の画面へ。応答なし・自動運転の切も示します）と、SwitchBotの温度計の温度・湿度・CO2・電池と受けた時刻。SwitchBotの温度計は鉛筆のボタンで名前を付けられ、「自動運転」を開くと、エアコンを動かすかの入・切とlabelを選べます。受信が途絶えたときは、最後に受けた時刻だけを示します。温度計の要対応を上部に示します |
 | 照明の接続（右上のメニュー） | 照明ごとに、いつからつながっているかと最後に答えた時刻、切れている照明はいつからか・つなぎ直した回数・網の層で届くか。登録が外れた照明は「登録が外れた」といつから、自動で登録し直していること、戻らない理由・試した回数・14日で何回目かを示します。matterjs-serverに届かないときと、照明の要対応は画面の上部に示します。「14日の履歴」を開くとつながらなかった区間を新しい順に並べます。台帳の照明を選ぶと機器の画面（名前・label・削除）を開きます。台帳に無い照明（製品名で出ます）にはごみ箱のボタンがあり、確認してmatterjs-serverの登録を消します |
 | PC（右上のメニュー） | home-linkにつながっているPCの一覧。ボタンはPCの状態（「動作中」「スリープ中」）を示し、押すとスリープと復帰を切り替えます。状態を知らせないPCには「スリープ」「復帰」の2つを出します。PCが受け付けなかったときと、つながっていないときは理由を画面の上部に示します |
-| エアコン（右上のメニュー） | 自動運転の入・切、外気温とその時刻。エアコンごとに、動かす温湿度計の名前と室温・湿度、今の運転（「冷房 25℃」「切」など）、直近の判断の理由。「設定」に家の住所の登録 |
+| エアコン（右上のメニュー） | 外気温とその時刻。エアコンごとに、動かす温湿度計の名前と室温・湿度、今の運転（「冷房 25℃」「切」など）、直近の判断の理由。「設定」に家の住所の登録 |
 
 変えた値はその場でAPIへ送り、保存ボタンはありません。値の誤りはその入力の下に、サーバーが受け付けなかった理由は画面の上部に示します。
 テーマは右上のメニューの「テーマ設定」で、自動（OSに従う）・ライト・ダークから選べます。
@@ -323,19 +323,16 @@ adb -s DEVICE_SERIAL push home-link.yaml /sdcard/Android/data/dev.miyabisun.home
 
 0.1.37までの照明のウィジェット（照明オン・照明オフ・仕事・作業）は、アプリを更新するとホーム画面から消えます。上のウィジェットを置き直してください。
 
-### エアコンを止めて戻す
+### エアコンをまとめて入り切りする
 
-ホーム画面のウィジェットの一覧から、home-linkの「エアコン」（1×1マス）を置きます。
-押すたびに、エアコンの自動運転の入・切を切り替えます。台帳のエアコンすべてに効きます。
+エアコンは、照明やプラグと同じくlabelで入り切りします。
+例えば、label「空調」を作ってエアコンをすべて入れ、上のlabelの切り替えのウィジェットを「空調」で置きます。
+入はエアコンを前の運転モードと設定温度のまま入れ、切はエアコンを切ります。
 
-- 切: エアコンを切り、入れ直すまで温湿度計からの命令を止めます。長く家を空ける間に使います。
-- 入: エアコンを入れ（前の運転モードと設定温度のまま）、温湿度計からの命令を再開します。入っている間は「エアコン中」とアクセントの面で示します。
+切った後も、同じlabelの温湿度計が入なら、[エアコンの自動運転](#エアコンの自動運転)が室温に応じて命令を送ります。
+自動運転を止めるときは、温湿度計を切にします（機器の画面、またはSwitchBotの温度計は温度計の画面の「自動運転」）。
 
-入・切はhome-linkが保存し、サーバーを再起動しても保ちます。状態は、置いたとき、押した後、30分ごとにhome-linkから読み直します。
-状態が分からないときは「?」のアイコンで示します。
-押すと、home-linkがエアコンへ送り終えるまで（最長十数秒）「送信中…」を示します。
-押してうまくいかなかったときは、数秒だけ[ボタンの表示](#ボタンの表示)の結果を示してから元の表示に戻ります。
-入・切は保存できたのにエアコンへ届かなかったときは、数秒だけ「届かず」を示してから新しい入・切を示します。home-linkが10分ごとに送り直します。
+0.1.72までのエアコンのウィジェットは、アプリを更新するとホーム画面から消えます。labelの切り替えのウィジェットを置き直してください。
 
 ### PCをスリープ・復帰させる
 
@@ -377,7 +374,6 @@ SESAMEアプリの履歴には `home-link` の名前で記録されます。
 | 一部無応答 | 照明 | 一部の照明が応答しませんでした |
 | 網外れ・一部網外れ | 照明 | labelの照明（全部か一部）が網（fabric）から外れています。アプリで登録し直してください。アプリでは照明の名前を示します |
 | 一部失敗・失敗 | 照明 | 照明が切り替えを受け付けませんでした |
-| 届かず | エアコン | 入・切はhome-linkに保存しましたが、エアコン（子機）へ届いていません。home-linkが10分ごとに送り直します |
 | Matter不通・Matter未設定 | home-linkの奥 | home-linkから照明のサーバー（matterjs-server）に届かないか、設定がありません |
 | SESAME不通・SESAME未設定・SESAME拒否 | home-linkの奥 | home-linkからCANDY HOUSEに届かない、`SESAME_` の環境変数が無い、またはCANDY HOUSEが受け付けませんでした |
 | ラベルなし・機器なし | home-link | labelが無いか、labelに機器がありません |
@@ -455,13 +451,13 @@ Thread網の資格情報（dataset）は、matterjs-serverに `set_thread_datase
 | `PATCH /api/devices/{id}` | 機器の名前・labelの割り当て・無視の設定。本文は送った項目だけを変えます。`{"name": "押入れ1"}`、`{"label_ids": [1, 2]}`（割り当てを置き換え、`[]` で外す）、`{"ignored": true}`（`false` で戻す） | 400 `invalid_device_update`・`invalid_device_name`、404 `device_not_found`・`label_not_found` |
 | `POST /api/devices/{id}/commission` | 台帳の機器を、記録したコードでmatterjs-serverへBluetoothで登録（commissioning）し、その行に識別子を補います。本文は要りません | 404 `device_not_found`、409 `no_setup_code`、422 `device_not_found`・`wrong_code`・`wifi_failed`・`thread_failed`・`commission_failed`、504 `commission_timeout`、502 `matter_server_unreachable`、503 `matter_server_not_configured`・`bluetooth_unavailable` |
 | `POST /api/devices/{id}/wifi` | 接続済みのWi-Fiの機器を、初期化せずに機器に渡すWi-Fi（`for_devices`）へ移します。本文は要りません。既にそのWi-Fiにいれば何も送りません。成功すると `{"device": {…}}` を200で返します | 404 `device_not_found`、409 `wifi_not_set`・`not_on_wifi`、422 `wifi_reverted`、504 `wifi_reverting`、502 `matter_server_unreachable`、503 `matter_server_not_configured` |
-| `POST /api/devices/{id}/on`・`/off` | プラグなど、照明以外で入り切りできる機器1台を入・切にします。温湿度計は、同じlabelのエアコンへ命令を送るかを切り替え、入にしたらその場で判断して送ります。応答は `{"state": "on"}`・`"off"`・`"no_response"`（応答しない・時間内に答えない機器。理由 `reason` と、matterjs-serverの説明 `details` を付けます）。答えない機器へは、labelと同じく1秒後にもう一度送ります | 404 `device_not_found`、409 `not_connected`・`not_switchable`（照明とエアコンと、入り切りの無い機器）、502 `switch_failed`・`matter_server_unreachable`、503 `matter_server_not_configured` |
+| `POST /api/devices/{id}/on`・`/off` | プラグやエアコンなど、照明以外で入り切りできる機器1台を入・切にします。温湿度計は、同じlabelのエアコンへ命令を送るかを切り替え、入にしたらその場で判断して送ります。応答は `{"state": "on"}`・`"off"`・`"no_response"`（応答しない・時間内に答えない機器。理由 `reason` と、matterjs-serverの説明 `details` を付けます）。答えない機器へは、labelと同じく1秒後にもう一度送ります | 404 `device_not_found`、409 `not_connected`・`not_switchable`（照明とエアコンと、入り切りの無い機器）、502 `switch_failed`・`matter_server_unreachable`、503 `matter_server_not_configured` |
 | `DELETE /api/devices/{id}` | 機器の削除。その機器自身のmatterjs-serverの登録（node）も消します。機器を一覧に並べるブリッジは消しません。matterjs-serverに届かないときは台帳の行を残します | 404 `device_not_found`、502 `matter_server_unreachable`・`node_not_removed` |
 | `GET /api/labels` | labelの一覧。性質（`auto`・`override_level`・`override_kelvin`）、毎日の切り替え `schedule`、最後のON・OFF `on`（`true`・`false`・未操作の `null`）、割り当てた機器の台数 `device_count`、上書き中か `boosted` つき | |
 | `POST /api/labels` | labelの作成。本文は `{"name": "work", "override_level": 254, "override_kelvin": 5000}`、`{"name": "ambient", "auto": true}`、`{"name": "razor", "schedule": [{"time": "00:00", "on": true}, {"time": "05:00", "on": false}]}` など（下の「label」） | 400 `invalid_label_name`・`invalid_label`、409 `duplicate_label_name` |
 | `PATCH /api/labels/{id}` | labelの名前・性質・`schedule` のうち、送った項目だけを変更します。`override_level`・`override_kelvin` を `null` にすると上書きの値を外し、`schedule` は送ったもので置き換えます（`[]` で消す） | 400 `invalid_label_name`・`invalid_label`、404 `label_not_found`、409 `duplicate_label_name` |
 | `DELETE /api/labels/{id}` | labelの削除。割り当てた機器は、ほかのlabelだけになります | 404 `label_not_found` |
-| `POST /api/labels/{id}/on`・`/off`・`/toggle` | labelの機器（照明とプラグ、無視の機器を除く）をON・OFF・切り替えにします（下の「label」）。応答は、行った操作 `action`（`on`・`off`・`release`）、操作後の `on`・`boosted`、件数（`switched`・`no_response`・`failed`・`missing`）、機器ごとの結果 `devices` と、登録が外れた機器 `missing_devices` です | 404 `label_not_found`、422 `label_has_no_devices`、503 `matter_server_not_configured`、502 `matter_server_unreachable` |
+| `POST /api/labels/{id}/on`・`/off`・`/toggle` | labelの機器（照明・プラグ・エアコン、無視の機器を除く）をON・OFF・切り替えにします（下の「label」）。応答は、行った操作 `action`（`on`・`off`・`release`）、操作後の `on`・`boosted`、件数（`switched`・`no_response`・`failed`・`missing`）、機器ごとの結果 `devices` と、登録が外れた機器 `missing_devices` です | 404 `label_not_found`、422 `label_has_no_devices`、503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `GET /api/wifi` | 保存したWi-Fiの一覧（`id`・`ssid`・機器に渡すものか `for_devices`）。パスワードは返しません | |
 | `POST /api/wifi` | Wi-Fiの保存。本文は `{"ssid": "home-2g", "password": "…"}`。同じSSIDならパスワードを置き換えます。最初の1つ、または `"for_devices": true` で送ったものを機器に渡します | 400 `invalid_wifi` |
 | `PUT /api/wifi/devices` | 機器に渡すWi-Fiの指定。本文は `{"id": 2}` | 404 `wifi_not_found` |
@@ -469,12 +465,10 @@ Thread網の資格情報（dataset）は、matterjs-serverに `set_thread_datase
 | `POST /api/commission` | 0.1.32までのアプリの登録。Wi-FiかThreadかを指定して機器をmatterjs-serverへBluetoothで登録（commissioning）し、台帳に登録 | 400 `missing_setup_code`・`invalid_qr_payload`・`invalid_manual_code`・`invalid_network`・`invalid_device_name`、409 `wifi_not_set`、422 `device_not_found`・`wrong_code`・`wifi_failed`・`thread_failed`・`commission_failed`、504 `commission_timeout`、502 `matter_server_unreachable`、503 `matter_server_not_configured`・`bluetooth_unavailable`・`thread_not_ready` |
 | `GET /api/meter` | SwitchBotの温度計の今の値。`{"address":"AA:BB:CC:DD:EE:01","name":"リビング","labels":[{"id":8,"name":"living"}],"on":true,"reading":{"temperature":26.7,"humidity":57,"co2":717,"battery":74},"received_at":1792143307,"fresh_for":300}`。`received_at` はUnix秒で、それから `fresh_for` 秒を過ぎると `reading` は `null` になります。未設定なら `address` も `null`、名前を付けていなければ `name` は `null` です。`labels` と `on` は、[エアコンの自動運転](#エアコンの自動運転)で温湿度計として動かすlabelと、動かすか（既定は `true`）です | |
 | `PUT /api/meter` | SwitchBotの温度計の、本文にある項目だけを変えます。`name`（前後の空白を除いて1〜100文字。`null` で付けていない状態へ戻します）、`labels`（labelのidの配列）、`on`（`true`・`false`）。labelを変えるか入にすると、その場で判断してエアコンへ送ります。応答は `GET /api/meter` と同じです | 400 `invalid_meter`、404 `label_not_found` |
-| `GET /api/aircon` | エアコンの自動運転。入・切 `on`、台帳のエアコンごとの今の状態 `aircons`（台帳の順。各要素は `{"id","name","state","on","mode","setpoint","sensor","reading","reason"}`。`mode` は `cool`・`heat`・`dry`・`fan_only`・`auto`・`off`、`setpoint` は今の運転の設定温度℃。`sensor` は動かす温湿度計 `{"id","name"}`（SwitchBotの温度計は `id` が `null`、無ければ `null`）、`reading` はその室温・湿度 `{"temperature","humidity"}`、`reason` はそのエアコンの直近の判断の理由。matterjs-serverから読めないかエアコンが無ければ空の配列）、外気温 `outdoor`（`{"temperature","at","fetched_at","fresh"}`。`at` はその値の時刻、`fresh` は2時間以内か。まだ取っていなければ `null`）、家の位置 `location`（`{"name","latitude","longitude","registered"}`）、直近の実行 `runs`（新しい順に144回分） | |
-| `PUT /api/aircon` | 自動運転を入・切にします。本文は `{"on": false}` で、その場でエアコンを切ります（入はエアコンを入れます）。応答は `GET /api/aircon` と同じです | 400 `invalid_aircon` |
-| `GET /api/aircon/runs` | 14日分の実行の記録（古い順）。`?since=`（Unix秒）でそれ以降に絞れます。各回はエアコン1台分で、時刻 `at`、きっかけ `trigger`（`scheduled`・`switch`・`sensor`）、エアコンの名前 `aircon` とid `aircon_id`、温湿度計の名前 `sensor`、室温 `temperature`・湿度 `humidity`・外気温 `outdoor`、決めた命令 `command`、結果 `result`、理由 `reason` を持ちます | |
+| `GET /api/aircon` | エアコンの自動運転。台帳のエアコンごとの今の状態 `aircons`（台帳の順。各要素は `{"id","name","state","on","mode","setpoint","sensor","reading","reason"}`。`mode` は `cool`・`heat`・`dry`・`fan_only`・`auto`・`off`、`setpoint` は今の運転の設定温度℃。`sensor` は動かす温湿度計 `{"id","name"}`（SwitchBotの温度計は `id` が `null`、無ければ `null`）、`reading` はその室温・湿度 `{"temperature","humidity"}`、`reason` はそのエアコンの直近の判断の理由。matterjs-serverから読めないかエアコンが無ければ空の配列）、外気温 `outdoor`（`{"temperature","at","fetched_at","fresh"}`。`at` はその値の時刻、`fresh` は2時間以内か。まだ取っていなければ `null`）、家の位置 `location`（`{"name","latitude","longitude","registered"}`）、直近の実行 `runs`（新しい順に144回分） | |
+| `GET /api/aircon/runs` | 14日分の実行の記録（古い順）。`?since=`（Unix秒）でそれ以降に絞れます。各回はエアコン1台分で、時刻 `at`、きっかけ `trigger`（`scheduled`・`sensor`。0.1.72までの記録には自動運転の入・切の `switch` もあります）、エアコンの名前 `aircon` とid `aircon_id`、温湿度計の名前 `sensor`、室温 `temperature`・湿度 `humidity`・外気温 `outdoor`、決めた命令 `command`、結果 `result`、理由 `reason` を持ちます | |
 | `GET /api/location` | 家の位置。登録した住所 `address`、見つかった場所の名前 `name`、`latitude`・`longitude`、登録済みか `registered`。未登録なら東京（新宿）の座標です | |
 | `PUT /api/location` | 本文 `{"address": "東京都新宿区西新宿2-8-1"}` の住所を国土地理院の住所検索で引き、最初の候補を家の位置にします。見つからないときと届かないときは前の位置のままです。応答は `GET /api/location` と同じです | 400 `invalid_location`、404 `address_not_found`、502 `address_search_unreachable` |
-| `POST /api/aircon/toggle` | 入・切を切り替えます（ウィジェットのボタン）。保存してから台帳のエアコンすべてへ送り、その結果を返します（最長12秒）。届かないエアコンがあればその結果を返します。`{"on": true, "result": "sent", "delivered": true, "reason": "…"}`。`delivered` が `false`（`result` が `no_aircon`・`no_response`・`refused`・`failed`、12秒で分からなければ `pending`）のときも入・切は保存済みで、10分ごとの処理が送り直します。`reason` はそのときの理由です | |
 | `GET /api/thread` | Threadの機器を登録できるか（matterjs-serverがThread網のdatasetを持つか）を `{"ready": true}` で返します | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `GET /api/status` | 台帳の機器ごとに、matterjs-serverで見えるか（`visible`）と今の `node_id`・`endpoint` | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `GET /api/lights` | 照明ごとの今の状態（`on`・`off`・`no_response`・`ignored`）と、無視の照明を除いた件数 | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
@@ -612,7 +606,7 @@ labelには、次の性質を持たせられます。
 | `override_level`・`override_kelvin` | 上書きの値（明るさ1〜254、色温度1000〜10000K）。2つは両方を指定するか、両方を `null` にします。ONの間、labelの照明をこの値に固定し、自動調整しません。`auto` とは同じlabelに持てません |
 | `schedule` | 毎日の切り替え。`[{"time": "00:00", "on": true}, {"time": "05:00", "on": false}]` の形で、時刻（Asia/Tokyo、`00:00`〜`23:59`）ごとにONかOFFを送ります。間に手で切り替えた状態は、次の時刻まで保ちます。下の「予定の実行」 |
 
-labelの操作（`POST /api/labels/{id}/on`・`/off`・`/toggle`）は、labelの機器のうち無視の機器を除く照明とプラグに送ります。
+labelの操作（`POST /api/labels/{id}/on`・`/off`・`/toggle`）は、labelの機器のうち無視の機器を除く照明・プラグ・エアコンに送ります。
 
 - **ON**: 機器をオンにします。上書きの値を持つlabelなら、その照明を上書きの値ですぐに点けます（`MoveToLevelWithOnOff` と `ExecuteIfOff` 付きの `MoveToColorTemperature`、`transitionTime` 0）。
   自動調整の対象になった照明があり、自動調整が有効なら、続けて自動調整を行います（`runs` の `trigger` は `label_on`）。
@@ -694,16 +688,14 @@ SwitchBotの温度計は、最後の受信から5分を過ぎると使いませ�
 - エアコンは信号のたびに鳴るので、エアコンの子機の今の状態（Matterの属性）と比べ、変わるときだけ送ります。
   リモコンで変えた状態は子機に伝わらないため、比べる対象は最後にhome-linkなどが子機へ送った状態です。
 - 風量は自動です。設定温度はエアコンの範囲（16〜32℃）に収まるよう、使わない側の設定温度を2℃離して送ります。
-- 温湿度計が無い・自動運転が切・応答しない・室温を測れていないときは、エアコンを変えません。
-- エアコンの自動運転（画面・ウィジェット）を切ると、すべてのエアコンを切り、入れ直すまで温湿度計からの命令を止めます。
-- エアコンは、labelの操作、照明の全部オン・全部オフ、`POST /api/devices/{id}/on`・`/off` では切り替わりません。
+- 温湿度計が無い・切・応答しない・室温を測れていないときは、エアコンを変えません。
+- エアコンの入り切りは、labelの操作と `POST /api/devices/{id}/on`・`/off` で行います（[エアコンをまとめて入り切りする](#エアコンをまとめて入り切りする)）。照明の全部オン・全部オフと照明の調整では切り替わりません。
 - 各回には、登録した住所の外気温（Open-Meteo、未登録なら東京・新宿）も記録します。判断には使いません。
   住所はhome-linkのデータベースにだけ保存し、ログには出しません。
 
 ```sh
 curl -s localhost:5011/api/aircon
-# {"on":true,
-#  "aircons":[{"id":23,"name":"エアコン","state":"connected","on":true,"mode":"cool","setpoint":25.0,
+# {"aircons":[{"id":23,"name":"エアコン","state":"connected","on":true,"mode":"cool","setpoint":25.0,
 #              "sensor":{"id":27,"name":"寝室・温湿度計"},"reading":{"temperature":26.4,"humidity":48.2},
 #              "reason":"室温が26.4℃で26℃を超えているが、冷房25℃で運転中"},
 #             {"id":28,"name":"リビングのエアコン","state":"connected","on":false,"mode":"cool","setpoint":26.0,
@@ -721,7 +713,7 @@ curl -s localhost:5011/api/aircon
 | --- | --- |
 | `sent` | エアコンが受け付けた |
 | `unchanged` | 送る必要が無かった |
-| `held` | 自動運転が切のため送らなかった |
+| `held` | 自動運転が切のため送らなかった（0.1.72までの記録） |
 | `no_reading` | 同じlabelに入の温湿度計が無いか、室温を測れていない |
 | `no_aircon` | エアコンが見つからない |
 | `no_response`・`refused`・`failed` | 届かなかった・断られた・matterjs-serverに届かない。次の回にもう一度判断します |

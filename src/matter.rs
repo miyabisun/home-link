@@ -271,11 +271,13 @@ pub fn kind(nodes: &[Value], node_id: u64, endpoint: u16) -> Option<(Kind, Optio
     Some((kind, on_off))
 }
 
-/// The On/Off endpoint of the device `locate` found when it is not a light, such as a
-/// plug, in the shape of a light that neither dims nor changes colour.
+/// The On/Off endpoint of the device `locate` found when it is not a light or a sensor, such
+/// as a plug or an air conditioner, in the shape of a light that neither dims nor changes colour.
 #[must_use]
 pub fn outlet(nodes: &[Value], node_id: u64, endpoint: u16) -> Option<Light> {
-    let (Kind::Plug | Kind::Other, Some((switch, on))) = kind(nodes, node_id, endpoint)? else {
+    let (Kind::Plug | Kind::Aircon | Kind::Other, Some((switch, on))) =
+        kind(nodes, node_id, endpoint)?
+    else {
         return None;
     };
     let node = nodes.iter().find(|n| n["node_id"] == node_id)?;

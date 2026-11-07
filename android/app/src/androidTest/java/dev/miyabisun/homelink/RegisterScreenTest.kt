@@ -769,71 +769,6 @@ class RegisterScreenTest {
         }
     }
 
-    @Test fun theAirconWidgetSwitchesTheControlAndShowsItsState() {
-        shell("appwidget grantbind --package ${context.packageName} --user 0")
-        val host = android.appwidget.AppWidgetHost(context, 8)
-        val widget = host.allocateAppWidgetId()
-        val manager = AppWidgetManager.getInstance(context)
-        try {
-            assertTrue(manager.bindAppWidgetIdIfAllowed(widget, ComponentName(context, AirconWidget::class.java)))
-            host.startListening()
-            ActivityScenario.launch(MainActivity::class.java).use { screen ->
-                lateinit var shown: android.appwidget.AppWidgetHostView
-                screen.onActivity { activity ->
-                    shown = host.createView(activity, widget, manager.getAppWidgetInfo(widget))
-                    val size = (110 * activity.resources.displayMetrics.density).toInt()
-                    activity.addContentView(shown, android.widget.FrameLayout.LayoutParams(size, size,
-                        android.view.Gravity.CENTER))
-                }
-                val words = { shown.findViewById<TextView>(R.id.label_button_text).text.toString() }
-                val press = { screen.onActivity { shown.findViewById<View>(R.id.label_button).performClick() } }
-                // Placed: home-link's word, off.
-                context.sendBroadcast(android.content.Intent(AppWidgetManager.ACTION_APPWIDGET_UPDATE)
-                    .setComponent(ComponentName(context, AirconWidget::class.java))
-                    .putExtra(AppWidgetManager.EXTRA_APPWIDGET_IDS, intArrayOf(widget)))
-                eventually(screen) { words() == "エアコン" }
-                captureWidget(shown, "aircon-off")
-
-                press()
-                eventually(screen) { words() == "エアコン中" }
-                assertEquals(1, api.airconToggles.get())
-                assertTrue(api.airconOn)
-                captureWidget(shown, "aircon-on")
-
-                // Off again, as it was before.
-                press()
-                eventually(screen) { words() == "エアコン" }
-                assertFalse(api.airconOn)
-
-                // Unreachable: the short failure, then the button as home-link has it.
-                api.airconFailure = ApiError.UNREACHABLE
-                press()
-                eventually(screen) { words() == "接続不可" }
-                captureWidget(shown, "aircon-failed")
-                Thread.sleep(5_000)
-                eventually(screen) { words() == "エアコン" }
-                assertEquals(3, api.airconToggles.get())
-
-                // Kept but not taken by the air conditioner: the short failure, then the new state.
-                api.airconFailure = null
-                api.airconUndelivered = "子機が応答しませんでした"
-                press()
-                eventually(screen) { words() == "届かず" }
-                assertTrue(api.airconOn)
-                assertEquals("届かず：子機が応答しませんでした。入・切は保存済みで、10分ごとにエアコンへ送り直します",
-                    shown.findViewById<View>(R.id.label_button).contentDescription.toString())
-                captureWidget(shown, "aircon-undelivered")
-                Thread.sleep(5_000)
-                eventually(screen) { words() == "エアコン中" }
-                captureWidget(shown, "aircon-undelivered-after")
-                assertEquals(4, api.airconToggles.get())
-            }
-        } finally {
-            host.stopListening()
-            host.deleteAppWidgetId(widget)
-        }
-    }
-
     /** Saves the screen with the widget `view` on it, asserting its button keeps a 48dp target and unclipped words. */
     private fun captureWidget(view: View, name: String) {
         InstrumentationRegistry.getInstrumentation().waitForIdleSync()
@@ -1403,26 +1338,6 @@ private class FakeApi : HomeLinkApi {
     @Volatile var labelGate: CountDownLatch? = null
     /** What a label switch reports; null switches every device. */
     @Volatile var labelCounts: SwitchResult? = null
-
-    /**
-     * home-link's air conditioner switch, what a toggle fails with instead of switching it, and why a switch it keeps
-     * does not reach the air conditioner (null: it does).
-     */
-    @Volatile var airconOn = false
-    @Volatile var airconFailure: ApiError? = null
-    @Volatile var airconUndelivered: String? = null
-    val airconToggles = java.util.concurrent.atomic.AtomicInteger()
-
-    override fun aircon(): ApiResult<Boolean> = ApiResult.Ok(airconOn)
-
-    override fun toggleAircon(): ApiResult<AirconToggle> {
-        airconToggles.incrementAndGet()
-        airconFailure?.let { return ApiResult.Failed(it) }
-        airconOn = !airconOn
-        val reason = airconUndelivered
-        return ApiResult.Ok(if (reason == null) AirconToggle(airconOn, delivered = true, result = "sent")
-            else AirconToggle(airconOn, delivered = false, result = "no_response", reason = reason))
-    }
 
     override fun switchLabel(id: Long, op: LabelOp): ApiResult<LabelResult> {
         labelGate?.await()

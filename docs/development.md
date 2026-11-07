@@ -74,7 +74,6 @@ WebSocketサーバーを立て、全部オン・全部オフ、エラーや無�
 - ファイルのDBを開き直す `Home` で、再起動をまたいだ予定を確かめます。止めている間の分は起動（`Home::start_schedules`）で実行し、11分以上なら実行しない。
   最初の送信の途中で止めたら起動後に送り直し、送り直しを待つ間に止めたら重ねて送らない（`tokio::spawn` した実行を `abort` して止める）。
 - `Home::supervise` にpanicする処理を渡し、起こし直されて `/healthz` に出ること、終わった処理で503になることを確かめます。
-- エアコンが答えないmockで、`POST /api/aircon/toggle` が `delivered: false` を返すことを確かめます。
 - CANDY HOUSEの代わりのHTTPサーバーで、ChromeのUser-Agentと、答えないときに10秒で打ち切ることを確かめます。
 
 PCとの接続（`src/pc.rs`）は、`tests/pc.rs` が実際のポートでhome-linkを起動し、tokio-tungsteniteのクライアントをPCとしてつないで確かめます。
@@ -157,7 +156,7 @@ npm --prefix client run lint:design
 E2Eテストは、ChromiumとPlaywrightで、ビルドしたhome-link（`target/debug/home-link`）とmockのmatterjs-serverを相手に動きます。
 `client/e2e/serve.mjs` が一時ディレクトリの新しいDBでhome-linkを起動し、照明・プラグ・エアコン・温湿度計を1台ずつ返すmockを立て、台帳に機器を入れます。
 テストは画面を操作し、APIを通じてSQLiteのファイルに入った値を読んで確かめます（機器の名前・label・無視・削除、labelの作成・名前・調光・固定の値・スケジュール・機器・削除・入り切り）。
-エアコンの画面は、mockのエアコンと温湿度計を相手に、同じlabelを付けると温湿度計の室温が出ること、自動運転の入・切がSQLiteに入りエアコンの運転が変わることを確かめます。
+エアコンの画面は、mockのエアコンと温湿度計を相手に、同じlabelを付けると温湿度計の室温が出ること、機器の画面の入り切りでエアコンの運転が変わることを確かめます。
 `serve.mjs` は国土地理院とOpen-Meteoの代わりも立て（`GSI_URL`・`OPEN_METEO_URL`）、住所の登録の成功と失敗、外気温と理由の表示を確かめます。
 照明の接続の画面は、`GET /api/lights/watch` と `GET /api/lights/outages` の応答をPlaywrightで差し替え、切れた照明・網から外れた照明・長い名前・matterjs-serverに届かない状態と14日の履歴を、幅1280と390、明暗の両方で確かめます。
 温度計の画面は、台帳の温湿度計の値と機器の画面へのリンクを確かめます。E2Eのhome-linkにSwitchBotの温度計は無いため、`GET /api/meter` の応答をPlaywrightで差し替えて、今の値・名前の変更・自動運転のlabelと入・切・途絶え・未受信を確かめます。
@@ -286,9 +285,6 @@ PCのウィジェットも、テストの中でAppWidgetHostに置いて画面�
 スリープと復帰の切り替え、つながっていないPCの短い結果と、その後の状態不明の表示を扱います。
 PCのウィジェットの設定の画面は、つながっているPCが無いときに名前を入れて置けること、つながっているPCから選べることを扱います。
 ボタンの表示・押したときの操作・結果の文は `PcsTest`、PCの一覧と名前をパスに入れたスリープ・復帰の要求は `HttpHomeLinkApiTest` で検証します。
-エアコンのウィジェットは、テストの中でAppWidgetHostに置いて画面に描き、fakeのAPIを相手に確かめます。
-読んだ状態の表示と、押して入と切が切り替わることを扱います。届かないときに短い結果を示し、元の表示へ戻ることも扱います。
-入・切は保存されたがエアコンへ届かなかった応答（`delivered` が false）では「届かず」と理由の読み上げを示し、その後に新しい状態へ戻ることも扱います。
 接続とWi-Fiの移動は、ホストのfakeのhome-linkが応答を40秒遅らせ、押した直後にホームへ戻って別のアプリを開き、画面を消して確かめます。
 モバイル回線だけ＋データセーバー＋充電を外して `dumpsys deviceidle force-idle` の状態で、要求が最後まで届き、アプリへ戻ると結果が出ることを確かめます。
 待つあいだ `dumpsys activity services dev.miyabisun.homelink` で `DeviceWorkService` が `isForeground=true`（connectedDevice）になります。

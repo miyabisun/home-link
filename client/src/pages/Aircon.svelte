@@ -7,8 +7,6 @@
 
   let aircon = $state<Aircon | undefined>();
   let pageState = $state<"loading" | "error" | "success">("loading");
-  let error = $state("");
-  let sending = $state(false);
   let address = $state("");
   let addressProblem = $state("");
   let locating = $state(false);
@@ -55,18 +53,6 @@
     };
   });
 
-  async function switchTo(on: boolean) {
-    controller?.abort();
-    sending = true;
-    error = "";
-    try {
-      show(await api.updateAircon({ on }));
-    } catch (e) {
-      error = (e as Error).message;
-    }
-    sending = false;
-  }
-
   async function saveAddress() {
     if (!address.trim()) return;
     locating = true;
@@ -96,21 +82,6 @@
       >
     </div>
   {:else if aircon}
-    {#if error}<p class="error-banner" role="alert">{error}</p>{/if}
-    <div class="switch-row">
-      <span>自動運転</span>
-      <button
-        class="btn"
-        type="button"
-        aria-label="入り切り"
-        aria-pressed={aircon.on}
-        disabled={sending}
-        onclick={() => void switchTo(!aircon!.on)}
-      >
-        {aircon.on ? "入" : "切"}
-      </button>
-    </div>
-
     {#if outdoor}<p class="outdoor">
         外気温 <strong>{outdoor.celsius}℃</strong>
         <time>{outdoor.time}</time>
@@ -187,18 +158,6 @@
 </section>
 
 <style lang="sass">
-  .switch-row
-    display: flex
-    align-items: center
-    justify-content: space-between
-    gap: var(--sp-2)
-    margin: 0 0 var(--sp-3)
-
-    .btn
-      flex-shrink: 0
-      min-width: 52px
-      height: 44px
-
   .outdoor
     margin: 0 0 var(--sp-3)
     color: var(--c-muted)
