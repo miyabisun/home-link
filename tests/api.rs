@@ -6377,8 +6377,8 @@ async fn the_sensor_drives_the_aircon_under_its_label_unless_switched_off() {
     );
     assert!(view.get("target").is_none(), "{view}");
 
-    // 20–26℃ leaves it; below 20℃ stops the cooling, once.
-    for (tenths, writes) in [(220, vec![]), (199, vec!["Off".to_owned()]), (199, vec![])] {
+    // 22–26℃ leaves it; below 22℃ stops the cooling, once.
+    for (tenths, writes) in [(220, vec![]), (219, vec!["Off".to_owned()]), (219, vec![])] {
         room(tenths);
         home.adjust_aircon(NIGHT + 1200).await;
         assert_eq!(aircon_writes(&commands), writes, "{tenths}");
@@ -6522,7 +6522,7 @@ async fn each_aircon_follows_the_sensor_under_its_own_label() {
         (
             &json!("寝室のエアコン"),
             &json!({ "id": sensor["id"], "name": "寝室・温湿度計" }),
-            &json!("室温が22.0℃で20〜26℃のため、変えない")
+            &json!("室温が22.0℃で22〜26℃のため、変えない")
         )
     );
     assert_eq!(
@@ -7177,7 +7177,7 @@ async fn the_aircon_runs_record_the_outside_of_the_registered_address() {
     );
     assert_eq!(
         view["aircons"][0]["reason"],
-        "室温が24.5℃で20〜26℃のため、変えない"
+        "室温が24.5℃で22〜26℃のため、変えない"
     );
 
     // Two weeks of runs, oldest first, with what each saw and why.

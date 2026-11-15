@@ -1,5 +1,5 @@
 //! What a room's sensor tells the air conditioner under the same label, for now: above 26℃
-//! cool at 25℃, below 15℃ heat at 20℃, below 20℃ stop whatever else it runs, and otherwise
+//! cool at 25℃, below 15℃ heat at 20℃, below 22℃ stop whatever else it runs, and otherwise
 //! leave it as it is.
 //!
 //! The air conditioner hears infrared only and beeps at every frame, so a command goes out only
@@ -58,7 +58,7 @@ pub const HEAT_BELOW: f64 = 15.0;
 /// The setpoint it is heated to.
 pub const HEAT_TO: u8 = 20;
 /// Below this anything but heating stops.
-pub const STOP_BELOW: f64 = 20.0;
+pub const STOP_BELOW: f64 = 22.0;
 
 /// Why a run sends what it sends, with the room's ℃.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -152,12 +152,12 @@ impl fmt::Display for Why {
             ),
             Self::Cooled(room) => write!(
                 f,
-                "室温が{}で20℃を下回ったため、エアコンを止める",
+                "室温が{}で22℃を下回ったため、エアコンを止める",
                 celsius(room)
             ),
             Self::StillHeating(room) => write!(f, "室温が{}で、暖房中のため続ける", celsius(room)),
             Self::Stopped(room) => write!(f, "室温が{}で、止まっているためそのまま", celsius(room)),
-            Self::Warm(room) => write!(f, "室温が{}で20〜26℃のため、変えない", celsius(room)),
+            Self::Warm(room) => write!(f, "室温が{}で22〜26℃のため、変えない", celsius(room)),
         }
     }
 }
@@ -254,7 +254,7 @@ mod tests {
     }
 
     #[test]
-    fn below_20_stops_anything_but_heating() {
+    fn below_22_stops_anything_but_heating() {
         let auto = Running {
             mode: None,
             ..COOLING
@@ -264,13 +264,13 @@ mod tests {
             ..COOLING
         };
         for running in [COOLING, auto, dry] {
-            assert_eq!(sent(19.9, running), Some(Command::Off));
+            assert_eq!(sent(21.9, running), Some(Command::Off));
         }
         assert_eq!(sent(15.0, COOLING), Some(Command::Off));
-        assert_eq!(sent(19.9, OFF), None);
-        // Heating goes on up to 20℃ and past it: it is left to the air conditioner.
+        assert_eq!(sent(21.9, OFF), None);
+        // Heating goes on up to 22℃ and past it: it is left to the air conditioner.
         assert_eq!(sent(15.0, HEATING), None);
-        assert_eq!(sent(19.9, HEATING), None);
+        assert_eq!(sent(21.9, HEATING), None);
     }
 
     #[test]
@@ -289,9 +289,9 @@ mod tests {
     }
 
     #[test]
-    fn from_20_to_26_nothing_is_sent() {
+    fn from_22_to_26_nothing_is_sent() {
         for running in [OFF, COOLING, HEATING] {
-            assert_eq!(sent(20.0, running), None);
+            assert_eq!(sent(22.0, running), None);
             assert_eq!(sent(26.0, running), None);
         }
     }
@@ -303,12 +303,12 @@ mod tests {
             "室温が14.0℃で15℃を下回ったため、暖房20℃にする"
         );
         assert_eq!(
-            decide(19.5, COOLING).why.to_string(),
-            "室温が19.5℃で20℃を下回ったため、エアコンを止める"
+            decide(21.5, COOLING).why.to_string(),
+            "室温が21.5℃で22℃を下回ったため、エアコンを止める"
         );
         assert_eq!(
             decide(24.0, COOLING).why.to_string(),
-            "室温が24.0℃で20〜26℃のため、変えない"
+            "室温が24.0℃で22〜26℃のため、変えない"
         );
         assert_eq!(
             decide(27.5, OFF).why.to_string(),

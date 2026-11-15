@@ -682,8 +682,8 @@ SwitchBotの温度計は、最後の受信から5分を過ぎると使いませ�
 | 室温 | 送るもの |
 | --- | --- |
 | 26℃を超える | 冷房25℃（冷房25℃で運転中なら送らない） |
-| 20〜26℃ | 何も送らない |
-| 20℃未満 | 冷房・除湿などの運転を止める。暖房中は止めない |
+| 22〜26℃ | 何も送らない |
+| 22℃未満 | 冷房・除湿などの運転を止める。暖房中は止めない |
 | 15℃未満 | 暖房20℃（暖房20℃で運転中なら送らない） |
 
 - エアコンは信号のたびに鳴るので、エアコンの子機の今の状態（Matterの属性）と比べ、変わるときだけ送ります。
@@ -702,11 +702,11 @@ curl -s localhost:5011/api/aircon
 #              "reason":"室温が26.4℃で26℃を超えているが、冷房25℃で運転中"},
 #             {"id":28,"name":"リビングのエアコン","state":"connected","on":false,"mode":"cool","setpoint":26.0,
 #              "sensor":{"id":null,"name":"リビング"},"reading":{"temperature":24.1,"humidity":61.0},
-#              "reason":"室温が24.1℃で20〜26℃のため、変えない"}],
+#              "reason":"室温が24.1℃で22〜26℃のため、変えない"}],
 #  "outdoor":{"temperature":15.0,"at":"2026-11-06T20:00:00+09:00","fetched_at":"2026-11-06T20:00:12+09:00","fresh":true},
 #  "location":{"name":"東京都新宿区西新宿二丁目８番","latitude":35.689629,"longitude":139.691772,"registered":true},
 #  "runs":[{"at":"2026-11-06T20:00:12+09:00","trigger":"scheduled","aircon":"リビングのエアコン","aircon_id":28,"sensor":"リビング",
-#           "temperature":24.1,"humidity":61.0,"outdoor":15.0,"command":null,"reason":"室温が24.1℃で20〜26℃のため、変えない","result":"unchanged"},…]}
+#           "temperature":24.1,"humidity":61.0,"outdoor":15.0,"command":null,"reason":"室温が24.1℃で22〜26℃のため、変えない","result":"unchanged"},…]}
 ```
 
 `runs` の `result` は次のどれかです。

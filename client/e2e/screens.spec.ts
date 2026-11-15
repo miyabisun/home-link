@@ -70,7 +70,7 @@ async function airconWithMeter(page: Page) {
       on: false,
       sensor: { id: null, name: "リビング" },
       reading: { temperature: 24.1, humidity: 61 },
-      reason: "室温が24.1℃で20〜26℃のため、変えない",
+      reason: "室温が24.1℃で22〜26℃のため、変えない",
     });
     json.outdoor = {
       temperature: 30.2,
