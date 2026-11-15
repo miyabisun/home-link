@@ -1,6 +1,6 @@
 //! What a room's sensor tells the air conditioner under the same label, for now: above 26℃
-//! cool at 25℃, below 15℃ heat at 20℃, below 22℃ stop whatever else it runs, and otherwise
-//! leave it as it is.
+//! cool at 25℃, below 15℃ heat at 20℃, below 22℃ stop whatever else it runs, from 22℃ stop
+//! the heating, and otherwise leave it as it is.
 //!
 //! The air conditioner hears infrared only and beeps at every frame, so a command goes out only
 //! when it differs from what its child last took; once on, the air conditioner's own
@@ -59,6 +59,8 @@ pub const HEAT_BELOW: f64 = 15.0;
 pub const HEAT_TO: u8 = 20;
 /// Below this anything but heating stops.
 pub const STOP_BELOW: f64 = 22.0;
+/// From this up heating stops.
+pub const HEAT_UNTIL: f64 = 22.0;
 
 /// Why a run sends what it sends, with the room's ℃.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -73,8 +75,10 @@ pub enum Why {
     Heating(f64),
     /// Below [`STOP_BELOW`] while running other than heating: stopping it.
     Cooled(f64),
-    /// Below [`STOP_BELOW`] and heating: left heating.
+    /// From [`HEAT_BELOW`] up to [`HEAT_UNTIL`] and heating: left heating.
     StillHeating(f64),
+    /// From [`HEAT_UNTIL`] up while heating: stopping it.
+    Warmed(f64),
     /// Below [`STOP_BELOW`] and off already.
     Stopped(f64),
     /// From [`STOP_BELOW`] to [`COOL_ABOVE`]: left as it is.
@@ -113,10 +117,14 @@ pub fn decide(room: f64, running: Running) -> Decision {
             };
             (Some(heat), Why::Cold(room))
         }
-    } else if room < STOP_BELOW {
-        if heating {
+    } else if heating {
+        if room < HEAT_UNTIL {
             (None, Why::StillHeating(room))
-        } else if running.on {
+        } else {
+            (Some(Command::Off), Why::Warmed(room))
+        }
+    } else if room < STOP_BELOW {
+        if running.on {
             (Some(Command::Off), Why::Cooled(room))
         } else {
             (None, Why::Stopped(room))
@@ -156,6 +164,11 @@ impl fmt::Display for Why {
                 celsius(room)
             ),
             Self::StillHeating(room) => write!(f, "室温が{}で、暖房中のため続ける", celsius(room)),
+            Self::Warmed(room) => write!(
+                f,
+                "室温が{}で22℃以上になったため、暖房を止める",
+                celsius(room)
+            ),
             Self::Stopped(room) => write!(f, "室温が{}で、止まっているためそのまま", celsius(room)),
             Self::Warm(room) => write!(f, "室温が{}で22〜26℃のため、変えない", celsius(room)),
         }
@@ -268,9 +281,24 @@ mod tests {
         }
         assert_eq!(sent(15.0, COOLING), Some(Command::Off));
         assert_eq!(sent(21.9, OFF), None);
-        // Heating goes on up to 22℃ and past it: it is left to the air conditioner.
+        // Heating goes on up to 22℃.
         assert_eq!(sent(15.0, HEATING), None);
         assert_eq!(sent(21.9, HEATING), None);
+        assert_eq!(decide(21.9, HEATING).why, Why::StillHeating(21.9));
+    }
+
+    #[test]
+    fn from_22_heating_stops() {
+        for room in [22.0, 24.0, 26.0] {
+            assert_eq!(sent(room, HEATING), Some(Command::Off));
+        }
+        assert_eq!(decide(22.0, HEATING).why, Why::Warmed(22.0));
+        // Stopped while set to heating, it is left off.
+        let stopped = Running {
+            on: false,
+            ..HEATING
+        };
+        assert_eq!(sent(22.0, stopped), None);
     }
 
     #[test]
@@ -289,8 +317,8 @@ mod tests {
     }
 
     #[test]
-    fn from_22_to_26_nothing_is_sent() {
-        for running in [OFF, COOLING, HEATING] {
+    fn from_22_to_26_nothing_but_heating_is_touched() {
+        for running in [OFF, COOLING] {
             assert_eq!(sent(22.0, running), None);
             assert_eq!(sent(26.0, running), None);
         }
@@ -305,6 +333,10 @@ mod tests {
         assert_eq!(
             decide(21.5, COOLING).why.to_string(),
             "室温が21.5℃で22℃を下回ったため、エアコンを止める"
+        );
+        assert_eq!(
+            decide(22.4, HEATING).why.to_string(),
+            "室温が22.4℃で22℃以上になったため、暖房を止める"
         );
         assert_eq!(
             decide(24.0, COOLING).why.to_string(),

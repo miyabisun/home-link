@@ -6384,7 +6384,7 @@ async fn the_sensor_drives_the_aircon_under_its_label_unless_switched_off() {
         assert_eq!(aircon_writes(&commands), writes, "{tenths}");
         commands.lock().unwrap().clear();
     }
-    // Below 15℃: heating at 20℃, kept heating up past 20℃; above 26℃ cooling again.
+    // Below 15℃: heating at 20℃, kept heating below 22℃ and stopped from it, once; above 26℃ cooling again.
     room(149);
     home.adjust_aircon(NIGHT + 1800).await;
     assert_eq!(
@@ -6398,10 +6398,11 @@ async fn the_sensor_drives_the_aircon_under_its_label_unless_switched_off() {
         ]
     );
     commands.lock().unwrap().clear();
-    for tenths in [180, 230] {
+    for (tenths, writes) in [(219, vec![]), (220, vec!["Off".to_owned()]), (220, vec![])] {
         room(tenths);
         home.adjust_aircon(NIGHT + 2400).await;
-        assert_eq!(aircon_writes(&commands), Vec::<String>::new(), "{tenths}");
+        assert_eq!(aircon_writes(&commands), writes, "{tenths}");
+        commands.lock().unwrap().clear();
     }
     room(270);
     home.adjust_aircon(NIGHT + 3000).await;
