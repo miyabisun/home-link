@@ -1,4 +1,5 @@
-//! A Model Context Protocol server (Streamable HTTP, JSON replies only) for labels and PCs.
+//! A Model Context Protocol server (Streamable HTTP, JSON replies only) for labels, PCs and
+//! the routines.
 //! Each tool is a request to the HTTP API beside it, so it checks, behaves and fails
 //! as the API does, without authentication like the API.
 
@@ -76,7 +77,7 @@ async fn call(api: Router, params: &Value) -> Result<Value, (i64, &'static str)>
             .ok_or((-32602, "id (an integer) is required"))
     };
     // The name goes in the path, so each byte outside the unreserved set is escaped.
-    let pc_name = || {
+    let name_in_path = || {
         let name = arguments
             .get("name")
             .and_then(Value::as_str)
@@ -112,8 +113,11 @@ async fn call(api: Router, params: &Value) -> Result<Value, (i64, &'static str)>
         "label_off" => ("POST", format!("/api/labels/{}/off", id()?), None),
         "label_toggle" => ("POST", format!("/api/labels/{}/toggle", id()?), None),
         "list_pcs" => ("GET", "/api/pcs".to_owned(), None),
-        "sleep_pc" => ("POST", format!("/api/pcs/{}/sleep", pc_name()?), None),
-        "wake_pc" => ("POST", format!("/api/pcs/{}/wake", pc_name()?), None),
+        "sleep_pc" => ("POST", format!("/api/pcs/{}/sleep", name_in_path()?), None),
+        "wake_pc" => ("POST", format!("/api/pcs/{}/wake", name_in_path()?), None),
+        "get_scenes" => ("GET", "/api/scenes".to_owned(), None),
+        "set_scenes" => ("PUT", "/api/scenes".to_owned(), Some(rest())),
+        "run_scene" => ("POST", format!("/api/scenes/{}/run", name_in_path()?), None),
         _ => return Err((-32602, "unknown tool")),
     };
     let request = Request::builder()
@@ -219,5 +223,22 @@ fn tools() -> Value {
         ),
         named("sleep_pc", by_name("PCをスリープさせる")),
         named("wake_pc", by_name("PCをスリープから戻す")),
+        named(
+            "get_scenes",
+            json!({ "description": "操作（おやすみ・おはよう・外出・帰宅など）の定義。yamlが書かれたままの文書、scenesが名前と各ステップ",
+            "inputSchema": { "type": "object", "properties": {} } })
+        ),
+        named(
+            "set_scenes",
+            json!({ "description": "操作の定義をyamlの文書ごと置き換える。書き方は get_scenes の yaml の冒頭のコメントにある。読めない文書は理由を返して前のまま",
+            "inputSchema": { "type": "object", "required": ["yaml"], "properties": {
+                "yaml": { "type": "string", "description": "操作の名前ごとに、上から順に実行するステップを並べたYAML" } } } })
+        ),
+        named(
+            "run_scene",
+            json!({ "description": "操作を実行し、各ステップの結果を返す。near のステップは登録した電話の位置が要るので、ここからは waiting で止まり、その先（解錠など）は実行しない",
+            "inputSchema": { "type": "object", "required": ["name"], "properties": {
+                "name": { "type": "string", "description": "操作の名前（get_scenesで分かる）" } } } })
+        ),
     ])
 }

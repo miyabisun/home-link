@@ -10,6 +10,7 @@ pub mod outside;
 pub mod pc;
 pub mod rejoin;
 mod rejoiner;
+pub mod scene;
 pub mod schedule;
 pub mod sesame;
 pub mod watch;
@@ -894,6 +895,13 @@ fn router(state: Db) -> Router {
         .route("/pcs/connect", get(pc::connect))
         .route("/pcs/{name}/sleep", axum::routing::post(pc::sleep))
         .route("/pcs/{name}/wake", axum::routing::post(pc::wake))
+        .route("/scenes", get(get_scenes).put(update_scenes))
+        .route("/scenes/{name}/run", axum::routing::post(run_scene))
+        .route("/phones", get(list_phones))
+        .route(
+            "/phones/{id}",
+            axum::routing::put(register_phone).delete(delete_phone),
+        )
         .fallback(not_found)
         // ponytail: one connection behind a global lock; a pool if writes ever contend.
         .with_state(state);
@@ -983,25 +991,29 @@ fn clean_name(name: &str, allow_empty: bool) -> Option<String> {
 }
 
 async fn unlock_door(
-    state: State<Db>,
-    peer: ConnectInfo<SocketAddr>,
+    State(state): State<Db>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    door(state, peer, sesame::Command::Unlock).await
+    door(&state, Some(peer.ip()), sesame::Command::Unlock)
+        .await
+        .map(Json)
 }
 
 async fn lock_door(
-    state: State<Db>,
-    peer: ConnectInfo<SocketAddr>,
+    State(state): State<Db>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    door(state, peer, sesame::Command::Lock).await
+    door(&state, Some(peer.ip()), sesame::Command::Lock)
+        .await
+        .map(Json)
 }
 
 /// Unlocks or locks the front door; `peer` is only logged.
 async fn door(
-    State(state): State<Db>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    state: &AppState,
+    peer: Option<std::net::IpAddr>,
     command: sesame::Command,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<serde_json::Value> {
     let (name, verb) = match command {
         sesame::Command::Unlock => ("unlock", "解錠"),
         sesame::Command::Lock => ("lock", "施錠"),
@@ -1015,8 +1027,9 @@ async fn door(
     })?;
     match sesame::send(config, command, (state.clock)()).await {
         Ok(()) => {
-            tracing::info!(peer = %peer.ip(), "{name} accepted");
-            Ok(Json(json!({ "status": "accepted" })))
+            let peer = peer.map(|peer| peer.to_string()).unwrap_or_default();
+            tracing::info!(%peer, "{name} accepted");
+            Ok(json!({ "status": "accepted" }))
         }
         Err(sesame::Failure::Rejected(status)) => {
             tracing::warn!(status, "{name} rejected by CANDY HOUSE");
@@ -1363,6 +1376,12 @@ async fn switch_device(
             "not_switchable",
             "入り切りできない機器です".into(),
         ));
+    }
+    if matches!(
+        matter::kind(&nodes, node_id, endpoint),
+        Some((matter::Kind::Aircon, _))
+    ) {
+        hold_aircons(&state, &[id], !on)?;
     }
     let outlet = |nodes: &[serde_json::Value]| {
         matter::outlet(nodes, node_id, endpoint)
@@ -3425,6 +3444,14 @@ impl<'a> LabelSwitch<'a> {
         }
         let label = find_label(&state.db.lock().expect(UNPOISONED), self.label.id)?;
         let nodes = run.nodes;
+        if action != "release" {
+            let members: Vec<i64> = aircons(&self.devices, &nodes)
+                .iter()
+                .map(|(aircon, ..)| aircon.id)
+                .filter(|id| self.members.contains(id))
+                .collect();
+            hold_aircons(state, &members, action == "off")?;
+        }
         let (lights, done): (Vec<_>, Vec<Done>) = run.results.into_iter().unzip();
         let outcomes: Vec<&str> = done.iter().map(|d| d.result).collect();
         let (names, _) = match_ledger(&self.devices, &nodes, &lights);
@@ -3942,6 +3969,24 @@ async fn update_schedule(
 
 /// The ledger's sensors switched off: they drive no air conditioner.
 const SENSORS_OFF: &str = "sensors_off";
+/// The air conditioners switched off by their own switch or a label's, by ledger id: left off
+/// by the sensors until switched on.
+const AIRCONS_OFF: &str = "aircons_off";
+
+/// Keeps the air conditioners `ids` as switched off (`off`) or on by hand.
+fn hold_aircons(state: &AppState, ids: &[i64], off: bool) -> rusqlite::Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let db = state.db.lock().expect(UNPOISONED);
+    let mut held = load::<Vec<i64>>(&db, AIRCONS_OFF)?;
+    held.retain(|id| !ids.contains(id));
+    if off {
+        held.extend(ids);
+    }
+    store(&db, AIRCONS_OFF, &held)
+}
+
 /// The home's place, for the temperature outside and the lights' sunrise and sunset.
 const LOCATION: &str = "location";
 /// Two weeks of runs every ten minutes are kept, and the latest day served with the state.
@@ -4198,14 +4243,22 @@ async fn adjust_aircon(
 struct AirconHome<'a> {
     devices: Vec<Device>,
     sensors: Sensors,
+    /// The air conditioners switched off by hand, by ledger id.
+    held: Vec<i64>,
     url: &'a str,
     nodes: Vec<serde_json::Value>,
 }
 
 async fn aircon_home(state: &AppState, unix: i64) -> Result<AirconHome<'_>, String> {
-    let (devices, sensors) = {
+    let (devices, sensors, held) = {
         let db = state.db.lock().expect(UNPOISONED);
-        let loaded = (|| Ok::<_, rusqlite::Error>((ledger(&db)?, sensors(state, &db, unix)?)))();
+        let loaded = (|| {
+            Ok::<_, rusqlite::Error>((
+                ledger(&db)?,
+                sensors(state, &db, unix)?,
+                load(&db, AIRCONS_OFF)?,
+            ))
+        })();
         loaded.map_err(|e| e.to_string())?
     };
     let url = state
@@ -4218,13 +4271,14 @@ async fn aircon_home(state: &AppState, unix: i64) -> Result<AirconHome<'_>, Stri
     Ok(AirconHome {
         devices,
         sensors,
+        held,
         url,
         nodes,
     })
 }
 
 /// What became of one air conditioner's run, as its sensor decides: `sent`, `unchanged`,
-/// `no_reading`, `no_response` or `refused`.
+/// `no_reading`, `no_response` or `refused`; `held` while it is switched off by hand.
 async fn drive_aircon(
     home: &AirconHome<'_>,
     aircon: &Device,
@@ -4232,6 +4286,10 @@ async fn drive_aircon(
     run: &mut serde_json::Value,
 ) -> Result<&'static str, String> {
     let nodes = &home.nodes;
+    if home.held.contains(&aircon.id) {
+        run["reason"] = json!("切ってあるため、入れるまで自動では動かしません");
+        return Ok("held");
+    }
     let Some(sensor) = sensor_for(aircon, &home.devices, nodes, &home.sensors) else {
         run["reason"] = json!("同じラベルに入のセンサーが無いか、室温を読めないため、送らない");
         return Ok("no_reading");
@@ -4404,6 +4462,27 @@ async fn update_location(
     State(state): State<Db>,
     Json(input): Json<serde_json::Value>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    if let Some(pin) = input.get("pin") {
+        let pin = if pin.is_null() {
+            None
+        } else {
+            Some(outside::Pin::read(pin).ok_or_else(|| {
+                ApiError(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_location",
+                    "pin は latitude（-90〜90）と longitude（-180〜180）で指定してください".into(),
+                )
+            })?)
+        };
+        {
+            let db = state.db.lock().expect(UNPOISONED);
+            let mut home = load::<outside::Location>(&db, LOCATION)?;
+            home.pin = pin;
+            store(&db, LOCATION, &home)?;
+        }
+        tracing::info!(pinned = pin.is_some(), "home pinned");
+        return get_location(State(state)).await;
+    }
     let address = input["address"]
         .as_str()
         .map(str::trim)
@@ -4439,17 +4518,337 @@ async fn update_location(
             "住所が見つかりませんでした。前の位置のままです".into(),
         )
     })?;
-    store(
-        &state.db.lock().expect(UNPOISONED),
-        LOCATION,
-        &outside::Location {
-            address: Some(address.to_owned()),
-            name: Some(name),
-            latitude,
-            longitude,
-        },
-    )?;
+    {
+        let db = state.db.lock().expect(UNPOISONED);
+        let pin = load::<outside::Location>(&db, LOCATION)?.pin;
+        store(
+            &db,
+            LOCATION,
+            &outside::Location {
+                address: Some(address.to_owned()),
+                name: Some(name),
+                latitude,
+                longitude,
+                pin,
+            },
+        )?;
+    }
     // The next run asks for the new place's temperature.
     *state.outdoor.lock().expect(UNPOISONED) = None;
     get_location(State(state)).await
+}
+
+/// The routines' YAML document, kept as it was written.
+const SCENES: &str = "scenes";
+/// The phones whose place a routine's `near` step takes.
+const PHONES: &str = "phones";
+
+/// A phone registered from the app, by the id the app made up for itself.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Phone {
+    id: String,
+    name: String,
+    registered_at: i64,
+}
+
+fn scenes_yaml(db: &Connection) -> rusqlite::Result<String> {
+    Ok(load::<Option<String>>(db, SCENES)?.unwrap_or_else(|| scene::DEFAULT.to_owned()))
+}
+
+fn scenes_view(yaml: &str, scenes: &[scene::Scene]) -> serde_json::Value {
+    let scenes: Vec<_> = scenes
+        .iter()
+        .map(|scene| {
+            let steps: Vec<String> = scene.steps.iter().map(ToString::to_string).collect();
+            json!({ "name": scene.name, "steps": steps })
+        })
+        .collect();
+    json!({ "yaml": yaml, "scenes": scenes })
+}
+
+/// The routines as written, and each one's name with its steps a line each.
+async fn get_scenes(State(state): State<Db>) -> ApiResult<Json<serde_json::Value>> {
+    let yaml = scenes_yaml(&state.db.lock().expect(UNPOISONED))?;
+    // A document kept is one that was read; an older home-link's reads as none.
+    let scenes = scene::parse(&yaml).unwrap_or_default();
+    Ok(Json(scenes_view(&yaml, &scenes)))
+}
+
+fn invalid_scenes(message: String) -> ApiError {
+    ApiError(StatusCode::BAD_REQUEST, "invalid_scenes", message)
+}
+
+/// Replaces the routines with `yaml`, once it reads.
+async fn update_scenes(
+    State(state): State<Db>,
+    Json(input): Json<serde_json::Value>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let yaml = input["yaml"]
+        .as_str()
+        .ok_or_else(|| invalid_scenes("yaml に操作を書いてください".into()))?;
+    let scenes = scene::parse(yaml).map_err(invalid_scenes)?;
+    store(&state.db.lock().expect(UNPOISONED), SCENES, &yaml)?;
+    tracing::info!(scenes = scenes.len(), "scenes written");
+    Ok(Json(scenes_view(yaml, &scenes)))
+}
+
+/// What a client sends to run a routine: the step to go on from, and from a phone, which one
+/// and where it is.
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RunInput {
+    from: usize,
+    phone: Option<String>,
+    location: Option<scene::Fix>,
+}
+
+impl RunInput {
+    fn read(body: &[u8]) -> Option<Self> {
+        if body.is_empty() {
+            return Some(Self::default());
+        }
+        let input: Self = serde_json::from_slice(body).ok()?;
+        let on_the_globe = input.location.is_none_or(|fix| {
+            (-90.0..=90.0).contains(&fix.latitude)
+                && (-180.0..=180.0).contains(&fix.longitude)
+                && fix.accuracy >= 0.0
+        });
+        on_the_globe.then_some(input)
+    }
+}
+
+/// The longest body a run is sent with, in bytes.
+const MAX_RUN_BYTES: usize = 4096;
+
+/// Runs the routine `name` from its step `from` on, in order: a step that fails is told and
+/// the next goes on; a `near` step the phone does not pass ends the run as `waiting`, with the
+/// step to go on from once it is near.
+async fn run_scene(
+    State(state): State<Db>,
+    Path(name): Path<String>,
+    request: axum::extract::Request,
+) -> ApiResult<Json<serde_json::Value>> {
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|peer| peer.0.ip());
+    let yaml = scenes_yaml(&state.db.lock().expect(UNPOISONED))?;
+    let scenes = scene::parse(&yaml).unwrap_or_default();
+    let scene = scenes.iter().find(|s| s.name == name).ok_or_else(|| {
+        ApiError(
+            StatusCode::NOT_FOUND,
+            "scene_not_found",
+            format!("操作の「{name}」がありません"),
+        )
+    })?;
+    let invalid = || {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_run",
+            "from（始めるステップ）、phone、location（latitude・longitude・accuracy・age_ms）を確かめてください".into(),
+        )
+    };
+    let body = axum::body::to_bytes(request.into_body(), MAX_RUN_BYTES)
+        .await
+        .map_err(|_| invalid())?;
+    let input = RunInput::read(&body)
+        .filter(|input| input.from == 0 || input.from < scene.steps.len())
+        .ok_or_else(invalid)?;
+
+    let mut steps = Vec::new();
+    let mut failed = 0;
+    let mut run = json!({ "scene": scene.name, "status": "done" });
+    for (index, step) in scene.steps.iter().enumerate().skip(input.from) {
+        let mut told = json!({ "step": step.to_string() });
+        if let scene::Step::Near { metres, wait } = step {
+            match near_home(&state, &input, *metres) {
+                Ok(distance) => {
+                    told["result"] = json!("ok");
+                    told["distance"] = json!(distance.round());
+                }
+                Err((reason, distance)) => {
+                    run["status"] = json!("waiting");
+                    run["next"] = json!(index);
+                    run["wait"] = json!(wait);
+                    run["reason"] = json!(reason);
+                    if let Some(distance) = distance {
+                        run["distance"] = json!(distance.round());
+                    }
+                    break;
+                }
+            }
+        } else {
+            match run_step(&state, step, peer).await {
+                Ok(()) => told["result"] = json!("ok"),
+                Err(ApiError(_, code, message)) => {
+                    failed += 1;
+                    told["result"] = json!("failed");
+                    told["error"] = json!(code);
+                    told["message"] = json!(message);
+                }
+            }
+        }
+        steps.push(told);
+    }
+    tracing::info!(
+        scene = scene.name,
+        from = input.from,
+        status = %run["status"],
+        reason = %run["reason"],
+        distance = %run["distance"],
+        steps = steps.len(),
+        failed,
+        "scene run"
+    );
+    run["failed"] = json!(failed);
+    run["steps"] = json!(steps);
+    Ok(Json(run))
+}
+
+/// The metres from the pinned home to the phone that sent `input`, when it is registered and
+/// its fix puts it within `metres`; else why not, and how far it is if that is known.
+fn near_home(
+    state: &AppState,
+    input: &RunInput,
+    metres: f64,
+) -> Result<f64, (&'static str, Option<f64>)> {
+    let phone = input.phone.as_deref().ok_or(("no_phone", None))?;
+    let (phones, home) = {
+        let db = state.db.lock().expect(UNPOISONED);
+        (
+            load::<Vec<Phone>>(&db, PHONES).unwrap_or_default(),
+            load::<outside::Location>(&db, LOCATION).unwrap_or_default(),
+        )
+    };
+    if !phones.iter().any(|registered| registered.id == phone) {
+        return Err(("phone_not_registered", None));
+    }
+    let pin = home.pin.ok_or(("home_not_set", None))?;
+    let fix = input.location.as_ref().ok_or(("no_location", None))?;
+    scene::near((pin.latitude, pin.longitude), fix, metres).map_err(|away| match away {
+        scene::Away::Stale => ("stale", None),
+        scene::Away::Vague(_) => ("vague", None),
+        scene::Away::Far(distance) => ("far", Some(distance)),
+    })
+}
+
+/// Does one step that is no wait, as the API beside it does.
+async fn run_step(state: &Db, step: &scene::Step, peer: Option<std::net::IpAddr>) -> ApiResult<()> {
+    match step {
+        scene::Step::Label { name, on } => {
+            let label = labels(&state.db.lock().expect(UNPOISONED))?
+                .into_iter()
+                .find(|label| label.name == *name)
+                .ok_or_else(|| {
+                    ApiError(
+                        StatusCode::NOT_FOUND,
+                        "label_not_found",
+                        format!("labelの「{name}」がありません"),
+                    )
+                })?;
+            let op = if *on { Op::On } else { Op::Off };
+            switch_label(state, label.id, op).await.map(|_| ())
+        }
+        scene::Step::Door(command) => door(state, peer, *command).await.map(|_| ()),
+        scene::Step::Pc { name, sleep: true } => {
+            pc::sleep(State(state.clone()), Path(name.clone()))
+                .await
+                .map(|_| ())
+        }
+        scene::Step::Pc { name, sleep: false } => {
+            pc::wake(State(state.clone()), Path(name.clone()))
+                .await
+                .map(|_| ())
+        }
+        scene::Step::Http { method, url, body } => {
+            let method =
+                reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::POST);
+            let mut request = outside::client().request(method, url);
+            if let Some(body) = body {
+                request = request
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(body.to_string());
+            }
+            let response = request.send().await.map_err(|error| {
+                tracing::warn!(error = %error.without_url(), "scene's request not answered");
+                ApiError(
+                    StatusCode::BAD_GATEWAY,
+                    "http_unreachable",
+                    "接続できませんでした".into(),
+                )
+            })?;
+            let status = response.status();
+            if status.is_success() {
+                Ok(())
+            } else {
+                Err(ApiError(
+                    StatusCode::BAD_GATEWAY,
+                    "http_refused",
+                    format!("HTTP {} が返りました", status.as_u16()),
+                ))
+            }
+        }
+        scene::Step::Near { .. } => Ok(()),
+    }
+}
+
+async fn list_phones(State(state): State<Db>) -> ApiResult<Json<Vec<Phone>>> {
+    Ok(Json(load(&state.db.lock().expect(UNPOISONED), PHONES)?))
+}
+
+/// Registers the phone `id` under a name, or renames it.
+async fn register_phone(
+    State(state): State<Db>,
+    Path(id): Path<String>,
+    Json(input): Json<serde_json::Value>,
+) -> ApiResult<Json<Phone>> {
+    let well_formed =
+        (8..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    let name = input["name"]
+        .as_str()
+        .and_then(|name| clean_name(name, false))
+        .filter(|_| well_formed)
+        .ok_or_else(|| {
+            ApiError(
+                StatusCode::BAD_REQUEST,
+                "invalid_phone",
+                format!("idは英数字とハイフンの8〜64文字、名前は1〜{MAX_NAME_CHARS}文字で指定してください"),
+            )
+        })?;
+    let db = state.db.lock().expect(UNPOISONED);
+    let mut phones = load::<Vec<Phone>>(&db, PHONES)?;
+    let phone = if let Some(known) = phones.iter_mut().find(|phone| phone.id == id) {
+        known.name = name;
+        known.clone()
+    } else {
+        phones.push(Phone {
+            id,
+            name,
+            registered_at: (state.clock)(),
+        });
+        phones[phones.len() - 1].clone()
+    };
+    store(&db, PHONES, &phones)?;
+    tracing::info!(
+        phone = phone.name,
+        phones = phones.len(),
+        "phone registered"
+    );
+    Ok(Json(phone))
+}
+
+async fn delete_phone(State(state): State<Db>, Path(id): Path<String>) -> ApiResult<StatusCode> {
+    let db = state.db.lock().expect(UNPOISONED);
+    let mut phones = load::<Vec<Phone>>(&db, PHONES)?;
+    let before = phones.len();
+    phones.retain(|phone| phone.id != id);
+    if phones.len() == before {
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            "phone_not_found",
+            "登録されていない電話です".into(),
+        ));
+    }
+    store(&db, PHONES, &phones)?;
+    Ok(StatusCode::NO_CONTENT)
 }

@@ -32,6 +32,30 @@ pub struct Location {
     pub name: Option<String>,
     pub latitude: f64,
     pub longitude: f64,
+    /// The home itself, to the metre, as a phone standing in it measured: what a routine's
+    /// `near` step measures from. The address search finds a town, not a house.
+    pub pin: Option<Pin>,
+}
+
+/// A place in degrees.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Pin {
+    pub latitude: f64,
+    pub longitude: f64,
+}
+
+impl Pin {
+    /// The place `value` writes as `latitude` and `longitude`, both numbers on the globe.
+    #[must_use]
+    pub fn read(value: &serde_json::Value) -> Option<Self> {
+        let (latitude, longitude) = (value["latitude"].as_f64()?, value["longitude"].as_f64()?);
+        ((-90.0..=90.0).contains(&latitude) && (-180.0..=180.0).contains(&longitude)).then_some(
+            Self {
+                latitude,
+                longitude,
+            },
+        )
+    }
 }
 
 impl Default for Location {
@@ -42,6 +66,7 @@ impl Default for Location {
             name: None,
             latitude: 35.6895,
             longitude: 139.6917,
+            pin: None,
         }
     }
 }

@@ -1,5 +1,6 @@
 #![cfg(test)]
 
+use std::fmt::Write as _;
 use std::{
     net::SocketAddr,
     sync::{
@@ -5803,13 +5804,16 @@ async fn mcp_tools_manage_and_switch_labels_over_http() {
         [
             "create_label",
             "delete_label",
+            "get_scenes",
             "label_off",
             "label_on",
             "label_toggle",
             "list_devices",
             "list_labels",
             "list_pcs",
+            "run_scene",
             "set_device_labels",
+            "set_scenes",
             "sleep_pc",
             "update_label",
             "wake_pc",
@@ -7085,7 +7089,7 @@ async fn the_aircon_runs_record_the_outside_of_the_registered_address() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         location,
-        json!({ "address": null, "name": null, "latitude": 35.6895, "longitude": 139.6917, "registered": false })
+        json!({ "address": null, "name": null, "latitude": 35.6895, "longitude": 139.6917, "pin": null, "registered": false })
     );
 
     // Not found, unreachable or blank: the last place stays.
@@ -7129,7 +7133,7 @@ async fn the_aircon_runs_record_the_outside_of_the_registered_address() {
     assert_eq!(
         location,
         json!({ "address": "沖縄県那覇市泉崎1-1-1", "name": "沖縄県那覇市泉崎一丁目",
-                "latitude": 26.212_312, "longitude": 127.681_229, "registered": true })
+                "latitude": 26.212_312, "longitude": 127.681_229, "pin": null, "registered": true })
     );
 
     // Each run asks for the outside at the registered place with Chrome's User-Agent and
@@ -7765,4 +7769,534 @@ async fn the_switchbot_meter_takes_a_name() {
     }
     let (status, view) = call(&app, "PUT", "/api/meter", Some(json!({ "name": null }))).await;
     assert_eq!((status, &view["name"]), (StatusCode::OK, &Value::Null));
+}
+
+/// A stand-in for another service: each request's method, path and body as it arrived.
+async fn fake_hook(status: StatusCode) -> (String, Arc<Mutex<Vec<(String, String, String)>>>) {
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let log = received.clone();
+    let app = Router::new().fallback(
+        move |method: axum::http::Method, uri: axum::http::Uri, body: String| async move {
+            log.lock()
+                .unwrap()
+                .push((method.to_string(), uri.path().to_owned(), body));
+            status
+        },
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), received)
+}
+
+async fn put_scenes(app: &Router, yaml: &str) -> (StatusCode, Value) {
+    call(app, "PUT", "/api/scenes", Some(json!({ "yaml": yaml }))).await
+}
+
+/// Runs the routine `name`, percent-encoded as a client sends it.
+async fn run_scene(app: &Router, name: &str, body: Option<Value>) -> (StatusCode, Value) {
+    let path = name.bytes().fold(String::new(), |mut path, byte| {
+        let _ = write!(path, "%{byte:02X}");
+        path
+    });
+    call(app, "POST", &format!("/api/scenes/{path}/run"), body).await
+}
+
+/// Each step a run reports: how it is written and how it went.
+fn step_results(body: &Value) -> Vec<(&str, &str)> {
+    body["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| (s["step"].as_str().unwrap(), s["result"].as_str().unwrap()))
+        .collect()
+}
+
+#[tokio::test]
+async fn scenes_are_written_in_yaml_read_back_and_checked() {
+    let app = app();
+    let (status, view) = call(&app, "GET", "/api/scenes", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(view["yaml"], home_link::scene::DEFAULT);
+    assert_eq!(
+        view["scenes"],
+        json!([
+            { "name": "おやすみ", "steps": ["door: lock"] },
+            { "name": "おはよう", "steps": [] },
+            { "name": "外出", "steps": ["door: lock"] },
+            { "name": "帰宅", "steps": ["near: 100", "door: unlock"] },
+        ])
+    );
+
+    let yaml = "# 朝の分\nおはよう:\n  - on: room # 全部\n";
+    let (status, view) = put_scenes(&app, yaml).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    let (_, read) = call(&app, "GET", "/api/scenes", None).await;
+    assert_eq!(read, view);
+    assert_eq!(
+        (&read["yaml"], &read["scenes"]),
+        (
+            &json!(yaml),
+            &json!([{ "name": "おはよう", "steps": ["on: room"] }])
+        )
+    );
+
+    // What cannot be read is refused with why, and the last document stays.
+    for (body, message) in [
+        (
+            json!({ "yaml": "おはよう:\n  - door: open" }),
+            "「おはよう」の1番目: door は lock か unlock です",
+        ),
+        (json!({ "yaml": 3 }), "yaml に操作を書いてください"),
+        (json!({}), "yaml に操作を書いてください"),
+    ] {
+        let (status, refused) = call(&app, "PUT", "/api/scenes", Some(body)).await;
+        assert_eq!(
+            (status, &refused["error"], &refused["message"]),
+            (
+                StatusCode::BAD_REQUEST,
+                &json!("invalid_scenes"),
+                &json!(message)
+            )
+        );
+    }
+    assert_eq!(call(&app, "GET", "/api/scenes", None).await.1["yaml"], yaml);
+
+    let (status, missing) = run_scene(&app, "帰宅", None).await;
+    assert_eq!(
+        (status, &missing["error"]),
+        (StatusCode::NOT_FOUND, &json!("scene_not_found")),
+        "{missing}"
+    );
+}
+
+#[tokio::test]
+async fn a_scene_runs_its_steps_in_order_and_tells_how_each_went() {
+    let (addr, commands, _) = fake_light_server(aircon_nodes(), Fake::default()).await;
+    let (candy_house, locks) = fake_candy_house(StatusCode::OK).await;
+    let (hook, hooked) = fake_hook(StatusCode::OK).await;
+    let (refusing, _) = fake_hook(StatusCode::INTERNAL_SERVER_ERROR).await;
+    let (db, sql) = ledger();
+    let app = home_link::Home::new(db, Some(format!("ws://{addr}/ws")))
+        .with_clock(|| 1_791_856_659)
+        .with_sesame(sesame_config(&candy_house))
+        .router();
+    let plug = add_device(
+        &app,
+        &sql,
+        json!({ "vendor": "Plugco", "serial_number": "plug-a" }),
+    )
+    .await;
+    let label = create_label(&app, json!({ "name": "居間" })).await;
+    assert_eq!(assign(&app, &plug, &[&label]).await.0, StatusCode::OK);
+
+    let yaml = format!(
+        "外出:
+  - on: 居間
+  - off: 居間
+  - door: lock
+  - http: POST {hook}/todos/notify
+    body: {{ to: discord }}
+  - http: GET {hook}/plain
+  - on: 無い
+  - sleep: desk
+  - http: POST {refusing}/x
+  - http: POST http://127.0.0.1:1/x
+"
+    );
+    assert_eq!(put_scenes(&app, &yaml).await.0, StatusCode::OK);
+    let (status, run) = run_scene(&app, "外出", None).await;
+    assert_eq!(status, StatusCode::OK, "{run}");
+    assert_eq!(
+        (&run["scene"], &run["status"], &run["failed"]),
+        (&json!("外出"), &json!("done"), &json!(4)),
+        "{run}"
+    );
+    assert_eq!(
+        step_results(&run),
+        [
+            ("on: 居間", "ok"),
+            ("off: 居間", "ok"),
+            ("door: lock", "ok"),
+            (&*format!("http: POST {hook}/todos/notify"), "ok"),
+            (&*format!("http: GET {hook}/plain"), "ok"),
+            ("on: 無い", "failed"),
+            ("sleep: desk", "failed"),
+            (&*format!("http: POST {refusing}/x"), "failed"),
+            ("http: POST http://127.0.0.1:1/x", "failed"),
+        ]
+    );
+    let errors: Vec<&Value> = run["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s.get("error"))
+        .collect();
+    assert_eq!(
+        errors,
+        [
+            "label_not_found",
+            "pc_not_connected",
+            "http_refused",
+            "http_unreachable"
+        ]
+    );
+    assert_eq!(run["steps"][7]["message"], "HTTP 500 が返りました");
+
+    // The plug went on, then off; the door was locked once; the hook got both requests.
+    assert_eq!(aircon_writes_to(&commands, 20), ["On", "Off"]);
+    let locks = locks.lock().unwrap().clone();
+    assert_eq!(locks.len(), 1);
+    assert_eq!(locks[0].2["cmd"], 82);
+    assert_eq!(
+        *hooked.lock().unwrap(),
+        [
+            (
+                "POST".to_owned(),
+                "/todos/notify".to_owned(),
+                r#"{"to":"discord"}"#.to_owned()
+            ),
+            ("GET".to_owned(), "/plain".to_owned(), String::new()),
+        ]
+    );
+}
+
+/// A place and the phone's fix about `north` metres north of it.
+const HOME: (f64, f64) = (34.0, 132.0);
+
+fn fix(north: f64, accuracy: f64, age_ms: u64) -> Value {
+    json!({ "latitude": HOME.0 + north / 111_195.0, "longitude": HOME.1, "accuracy": accuracy, "age_ms": age_ms })
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines, reason = "one scenario, step after step")]
+async fn a_near_step_waits_for_a_registered_phone_near_the_pinned_home() {
+    let (candy_house, unlocks) = fake_candy_house(StatusCode::OK).await;
+    let (hook, hooked) = fake_hook(StatusCode::OK).await;
+    let app = home_link::Home::new(home_link::open_db(":memory:").unwrap(), None)
+        .with_clock(|| 1_791_856_659)
+        .with_sesame(sesame_config(&candy_house))
+        .router();
+    let yaml = format!(
+        "帰宅:\n  - http: POST {hook}/before\n  - near: 100\n    wait: 20\n  - door: unlock\n  - http: POST {hook}/after\n"
+    );
+    assert_eq!(put_scenes(&app, &yaml).await.0, StatusCode::OK);
+    let phone = "3f2b6c1e-9a4d-4c55-8d1f-0e6a7b9c2d10";
+    let waiting = |run: &Value| {
+        (
+            run["status"].clone(),
+            run["next"].clone(),
+            run["wait"].clone(),
+            run["reason"].clone(),
+        )
+    };
+    let at_gate = |reason: &str| (json!("waiting"), json!(1), json!(20), json!(reason));
+    let resume = |location: Value| json!({ "from": 1, "phone": phone, "location": location });
+
+    // Pressed where no phone tells its place, as on the admin screen: the steps before the
+    // wait run, the door stays shut.
+    let (status, run) = run_scene(&app, "帰宅", None).await;
+    assert_eq!(status, StatusCode::OK, "{run}");
+    assert_eq!(waiting(&run), at_gate("no_phone"), "{run}");
+    assert_eq!(
+        step_results(&run),
+        [(&*format!("http: POST {hook}/before"), "ok")]
+    );
+
+    // A phone that is not registered opens nothing, wherever it is.
+    let (_, run) = run_scene(&app, "帰宅", Some(resume(fix(10.0, 5.0, 0)))).await;
+    assert_eq!(waiting(&run), at_gate("phone_not_registered"), "{run}");
+    assert_eq!(step_results(&run), []);
+    let (status, registered) = call(
+        &app,
+        "PUT",
+        &format!("/api/phones/{phone}"),
+        Some(json!({ "name": " Pixel 9 " })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{registered}");
+    assert_eq!(
+        registered,
+        json!({ "id": phone, "name": "Pixel 9", "registered_at": 1_791_856_659 })
+    );
+    assert_eq!(
+        call(&app, "GET", "/api/phones", None).await.1,
+        json!([registered])
+    );
+
+    // Nor without the home's place pinned.
+    let (_, run) = run_scene(&app, "帰宅", Some(resume(fix(10.0, 5.0, 0)))).await;
+    assert_eq!(waiting(&run), at_gate("home_not_set"), "{run}");
+    let pin = json!({ "latitude": HOME.0, "longitude": HOME.1 });
+    let (status, location) = call(&app, "PUT", "/api/location", Some(json!({ "pin": pin }))).await;
+    assert_eq!(
+        (status, &location["pin"]),
+        (StatusCode::OK, &pin),
+        "{location}"
+    );
+
+    // A registered phone with no fix yet, far, unsure or with an old fix waits on.
+    let (_, run) = run_scene(&app, "帰宅", Some(json!({ "from": 1, "phone": phone }))).await;
+    assert_eq!(waiting(&run), at_gate("no_location"), "{run}");
+    for (location, reason) in [
+        (fix(101.0, 5.0, 0), "far"),
+        (fix(10.0, 101.0, 0), "vague"),
+        (fix(10.0, 5.0, 60_001), "stale"),
+    ] {
+        let (status, run) = run_scene(&app, "帰宅", Some(resume(location))).await;
+        assert_eq!(status, StatusCode::OK, "{run}");
+        assert_eq!(waiting(&run), at_gate(reason), "{run}");
+    }
+    let (_, run) = run_scene(&app, "帰宅", Some(resume(fix(250.0, 5.0, 0)))).await;
+    assert_eq!(run["distance"], 250.0, "{run}");
+    assert!(unlocks.lock().unwrap().is_empty());
+    assert_eq!(hooked.lock().unwrap().len(), 1);
+
+    // Within 100 m the wait ends: the door opens and the rest runs, the steps before it not again.
+    let (status, run) = run_scene(&app, "帰宅", Some(resume(fix(99.0, 20.0, 60_000)))).await;
+    assert_eq!(status, StatusCode::OK, "{run}");
+    assert_eq!(
+        (&run["status"], &run["failed"], run.get("next")),
+        (&json!("done"), &json!(0), None),
+        "{run}"
+    );
+    assert_eq!(
+        step_results(&run),
+        [
+            ("near: 100", "ok"),
+            ("door: unlock", "ok"),
+            (&*format!("http: POST {hook}/after"), "ok")
+        ]
+    );
+    assert_eq!(run["steps"][0]["distance"], 99.0);
+    let unlocked = unlocks.lock().unwrap().clone();
+    assert_eq!(unlocked.len(), 1);
+    assert_eq!(unlocked[0].2["cmd"], 83);
+    let paths: Vec<String> = hooked.lock().unwrap().iter().map(|h| h.1.clone()).collect();
+    assert_eq!(paths, ["/before", "/after"]);
+
+    // What is no run is refused before anything is sent.
+    for body in [
+        json!({ "from": 4 }),
+        json!({ "from": -1 }),
+        json!({ "phone": 3 }),
+        json!({ "phone": phone, "location": { "latitude": 91, "longitude": 0, "accuracy": 1, "age_ms": 0 } }),
+        json!({ "phone": phone, "location": { "latitude": 0, "longitude": 181, "accuracy": 1, "age_ms": 0 } }),
+        json!({ "phone": phone, "location": { "latitude": 0, "longitude": 0, "accuracy": -1, "age_ms": 0 } }),
+        json!({ "phone": phone, "location": { "latitude": 0 } }),
+    ] {
+        let (status, refused) = run_scene(&app, "帰宅", Some(body.clone())).await;
+        assert_eq!(
+            (status, &refused["error"]),
+            (StatusCode::BAD_REQUEST, &json!("invalid_run")),
+            "{body}"
+        );
+    }
+    assert_eq!(hooked.lock().unwrap().len(), 2);
+
+    // A phone removed opens nothing again.
+    let uri = format!("/api/phones/{phone}");
+    assert_eq!(
+        call(&app, "DELETE", &uri, None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        call(&app, "DELETE", &uri, None).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(call(&app, "GET", "/api/phones", None).await.1, json!([]));
+    let (_, run) = run_scene(&app, "帰宅", Some(resume(fix(10.0, 5.0, 0)))).await;
+    assert_eq!(waiting(&run), at_gate("phone_not_registered"), "{run}");
+    assert_eq!(unlocks.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn phones_and_the_pin_are_checked_and_the_pin_outlives_the_address() {
+    let app = app();
+    for (id, name) in [
+        ("short", json!("a")),
+        ("has space in the id 0123456789", json!("a")),
+        ("3f2b6c1e-9a4d-4c55-8d1f-0e6a7b9c2d10", json!("")),
+        ("3f2b6c1e-9a4d-4c55-8d1f-0e6a7b9c2d10", json!(3)),
+    ] {
+        let uri = format!("/api/phones/{}", id.replace(' ', "%20"));
+        let (status, refused) = call(&app, "PUT", &uri, Some(json!({ "name": name }))).await;
+        assert_eq!(
+            (status, &refused["error"]),
+            (StatusCode::BAD_REQUEST, &json!("invalid_phone")),
+            "{id} {name}"
+        );
+    }
+    // Registering again renames, and keeps when it was first registered.
+    let uri = "/api/phones/3f2b6c1e-9a4d-4c55-8d1f-0e6a7b9c2d10";
+    let (_, first) = call(&app, "PUT", uri, Some(json!({ "name": "Pixel" }))).await;
+    let (_, again) = call(&app, "PUT", uri, Some(json!({ "name": "Pixel 9" }))).await;
+    assert_eq!(
+        (&again["name"], &again["registered_at"]),
+        (&json!("Pixel 9"), &first["registered_at"])
+    );
+    assert_eq!(
+        call(&app, "GET", "/api/phones", None).await.1,
+        json!([again])
+    );
+
+    let (_, location) = call(&app, "GET", "/api/location", None).await;
+    assert_eq!(location["pin"], Value::Null);
+    for pin in [
+        json!({ "latitude": 91, "longitude": 0 }),
+        json!({ "latitude": 0, "longitude": -181 }),
+        json!({ "latitude": "34", "longitude": 132 }),
+        json!(3),
+    ] {
+        let (status, refused) =
+            call(&app, "PUT", "/api/location", Some(json!({ "pin": pin }))).await;
+        assert_eq!(
+            (status, &refused["error"]),
+            (StatusCode::BAD_REQUEST, &json!("invalid_location")),
+            "{pin}"
+        );
+    }
+    let pin = json!({ "latitude": 34.25, "longitude": 132.5 });
+    let (status, location) = call(&app, "PUT", "/api/location", Some(json!({ "pin": pin }))).await;
+    assert_eq!((status, &location["pin"]), (StatusCode::OK, &pin));
+    // The place the weather is asked for stays the address's.
+    assert_eq!(location["latitude"], 35.6895);
+    let (status, location) = call(&app, "PUT", "/api/location", Some(json!({ "pin": null }))).await;
+    assert_eq!((status, &location["pin"]), (StatusCode::OK, &Value::Null));
+}
+
+#[tokio::test]
+async fn an_aircon_switched_off_is_left_off_until_it_is_switched_on() {
+    let mut nodes = aircon_nodes();
+    nodes
+        .as_array_mut()
+        .unwrap()
+        .push(climate_sensor(88, "w100-1", true));
+    let (addr, commands, _) = fake_light_server(nodes, Fake::default()).await;
+    let (db, sql) = ledger();
+    let home = home_link::Home::new(db, Some(format!("ws://{addr}/ws"))).with_clock(|| NIGHT);
+    let app = home.router();
+    let aircon = add_device(
+        &app,
+        &sql,
+        json!({ "vendor": "Airco", "serial_number": "ac-1", "name": "エアコン" }),
+    )
+    .await;
+    let sensor = add_device(
+        &app,
+        &sql,
+        json!({ "vendor": "Aqara", "serial_number": "w100-1" }),
+    )
+    .await;
+    let bedroom = create_label(&app, json!({ "name": "bedroom" })).await;
+    let all = create_label(&app, json!({ "name": "空調" })).await;
+    assert_eq!(
+        assign(&app, &aircon, &[&bedroom, &all]).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(assign(&app, &sensor, &[&bedroom]).await.0, StatusCode::OK);
+    let last = |view: &Value| {
+        let run = &view["runs"][0];
+        (run["result"].clone(), run["reason"].clone())
+    };
+    let held = (
+        json!("held"),
+        json!("切ってあるため、入れるまで自動では動かしません"),
+    );
+
+    // At 28.33℃ it cools.
+    home.adjust_aircon(NIGHT).await;
+    assert_eq!(aircon_writes(&commands), cool(25, 2600));
+    commands.lock().unwrap().clear();
+
+    // Off by a label of its, it is left off however hot the room is, across a restart's read.
+    assert_eq!(label_op(&app, &all, "off").await.0, StatusCode::OK);
+    assert_eq!(aircon_writes(&commands), ["Off"]);
+    commands.lock().unwrap().clear();
+    home.adjust_aircon(NIGHT + 600).await;
+    assert!(aircon_writes(&commands).is_empty());
+    assert_eq!(last(&call(&app, "GET", "/api/aircon", None).await.1), held);
+
+    // On by any label of its, the sensor drives it again.
+    assert_eq!(label_op(&app, &bedroom, "on").await.0, StatusCode::OK);
+    assert_eq!(aircon_writes(&commands), ["On"]);
+    commands.lock().unwrap().clear();
+    home.adjust_aircon(NIGHT + 1200).await;
+    assert_eq!(
+        last(&call(&app, "GET", "/api/aircon", None).await.1).0,
+        "unchanged"
+    );
+
+    // Its own switch holds and releases it the same.
+    let switch = |op: &'static str| {
+        let uri = format!("/api/devices/{}/{op}", aircon["id"]);
+        let app = app.clone();
+        async move { call(&app, "POST", &uri, None).await.0 }
+    };
+    assert_eq!(switch("off").await, StatusCode::OK);
+    commands.lock().unwrap().clear();
+    home.adjust_aircon(NIGHT + 1800).await;
+    assert!(aircon_writes(&commands).is_empty());
+    assert_eq!(last(&call(&app, "GET", "/api/aircon", None).await.1), held);
+    assert_eq!(switch("on").await, StatusCode::OK);
+    commands.lock().unwrap().clear();
+    home.adjust_aircon(NIGHT + 2400).await;
+    assert_eq!(
+        last(&call(&app, "GET", "/api/aircon", None).await.1).0,
+        "unchanged"
+    );
+}
+
+#[tokio::test]
+async fn mcp_reads_rewrites_and_runs_the_scenes() {
+    let (hook, hooked) = fake_hook(StatusCode::OK).await;
+    let home = home_link::Home::new(home_link::open_db(":memory:").unwrap(), None);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let router = home.router();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let client = reqwest::Client::new();
+    let tool = |name: &'static str, arguments: Value| {
+        let (client, base) = (client.clone(), base.clone());
+        async move {
+            let message = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": name, "arguments": arguments } });
+            tool_result(&mcp(&client, &base, message).await.1)
+        }
+    };
+
+    let (scenes, failed) = tool("get_scenes", json!({})).await;
+    assert_eq!(
+        (&scenes["yaml"], failed),
+        (&json!(home_link::scene::DEFAULT), false)
+    );
+    let yaml = format!("おはよう:\n  - http: POST {hook}/todos\n");
+    let (scenes, failed) = tool("set_scenes", json!({ "yaml": yaml })).await;
+    assert_eq!(
+        (&scenes["scenes"][0]["name"], failed),
+        (&json!("おはよう"), false),
+        "{scenes}"
+    );
+    let (refused, failed) = tool("set_scenes", json!({ "yaml": "おはよう: 3" })).await;
+    assert_eq!(
+        (&refused["error"], failed),
+        (&json!("invalid_scenes"), true)
+    );
+    assert_eq!(tool("get_scenes", json!({})).await.0["yaml"], yaml);
+
+    let (run, failed) = tool("run_scene", json!({ "name": "おはよう" })).await;
+    assert_eq!((&run["status"], failed), (&json!("done"), false), "{run}");
+    assert_eq!(hooked.lock().unwrap().len(), 1);
+    let (missing, failed) = tool("run_scene", json!({ "name": "無い" })).await;
+    assert_eq!(
+        (&missing["error"], failed),
+        (&json!("scene_not_found"), true)
+    );
 }
