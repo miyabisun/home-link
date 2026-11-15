@@ -120,7 +120,7 @@ class PhoneActivity : Activity() {
             return resultRow.show(WatchEnd.LOCATION_OFF.message, failed = true)
         }
         busy = true
-        resultRow.show("今いる場所を測っています", failed = false, progress = R.drawable.ic_home_link)
+        resultRow.show("今いる場所を測っています", failed = false, progress = R.drawable.ic_place)
         render()
         val signal = CancellationSignal().also { fixing = it }
         val request = LocationRequest.Builder(0).setQuality(LocationRequest.QUALITY_HIGH_ACCURACY)

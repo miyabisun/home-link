@@ -468,7 +468,7 @@ class MainActivity : Activity() {
     private fun build() {
         content = headedPage(menu = listOf(
             MenuEntry("接続先の設定", R.drawable.ic_settings) { openSettings() },
-            MenuEntry("この電話の位置", R.drawable.ic_home_link) { startActivity(Intent(this, PhoneActivity::class.java)) },
+            MenuEntry("この電話の位置", R.drawable.ic_place) { startActivity(Intent(this, PhoneActivity::class.java)) },
         ))
 
         // Until home-link's URL is set or its ledger read, nothing below works: the way out comes first.
