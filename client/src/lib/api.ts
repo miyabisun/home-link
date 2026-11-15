@@ -8,6 +8,7 @@ import {
   type Outage,
   type Outdoor,
   type Place,
+  type SceneRun,
   type Switch,
   type SwitchEntry,
   type WatchLight,
@@ -108,6 +109,26 @@ export interface AirconUnit extends AirconDevice {
 
 export interface Location extends Place {
   address: string | null;
+  /** The home itself, as a phone standing in it measured; what `near` measures from. */
+  pin: { latitude: number; longitude: number } | null;
+}
+
+export interface Scene {
+  name: string;
+  /** Each step as it is written, on a line. */
+  steps: string[];
+}
+
+export interface Scenes {
+  /** The document as written, comments and all. */
+  yaml: string;
+  scenes: Scene[];
+}
+
+export interface Phone {
+  id: string;
+  name: string;
+  registered_at: number;
 }
 
 export class ApiError extends Error {
@@ -184,6 +205,16 @@ export const api = {
     request<Location>("GET", "/api/location", undefined, signal),
   updateLocation: (address: string) =>
     request<Location>("PUT", "/api/location", { address }),
+  clearPin: () => request<Location>("PUT", "/api/location", { pin: null }),
+  scenes: (signal?: AbortSignal) =>
+    request<Scenes>("GET", "/api/scenes", undefined, signal),
+  saveScenes: (yaml: string) => request<Scenes>("PUT", "/api/scenes", { yaml }),
+  runScene: (name: string) =>
+    request<SceneRun>("POST", `/api/scenes/${encodeURIComponent(name)}/run`),
+  phones: (signal?: AbortSignal) =>
+    request<Phone[]>("GET", "/api/phones", undefined, signal),
+  deletePhone: (id: string) =>
+    request<null>("DELETE", `/api/phones/${encodeURIComponent(id)}`),
   toggleLabel: (id: number) =>
     request<{
       on: boolean | null;

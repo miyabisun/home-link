@@ -19,6 +19,9 @@ import {
   overrideInput,
   percentOf,
   receivedTime,
+  registeredDay,
+  sceneRunText,
+  stepsNote,
   scheduleInput,
   stateText,
   outageText,
@@ -652,5 +655,102 @@ describe("what asks for the user", () => {
       "温度計の電池が残り19%です。交換してください。",
     );
     expect(attentionHref(item)).toBe("/meter");
+  });
+});
+
+describe("routines", () => {
+  it("puts a routine's steps on one line, and says when it has none", () => {
+    expect(stepsNote(["near: 100", "door: unlock", "on: room"])).toBe(
+      "near: 100 → door: unlock → on: room",
+    );
+    expect(stepsNote([])).toBe("ステップなし");
+  });
+
+  it("words a finished run by how many steps failed", () => {
+    const ok = { step: "door: lock", result: "ok" as const };
+    const failed = {
+      step: "on: 無い",
+      result: "failed" as const,
+      error: "label_not_found",
+      message: "labelの「無い」がありません",
+    };
+    const done = { scene: "外出", status: "done" as const };
+    expect(sceneRunText({ ...done, failed: 0, steps: [ok] }, [])).toEqual({
+      text: "完了",
+      problem: false,
+    });
+    expect(
+      sceneRunText({ ...done, failed: 2, steps: [ok, failed, failed] }, []),
+    ).toEqual({ text: "2件失敗", problem: true });
+  });
+
+  it("words a run that waits by the step it stopped at and why", () => {
+    const steps = ["on: 空調", "near: 100", "door: unlock"];
+    const waiting = (reason: string, distance?: number) =>
+      sceneRunText(
+        {
+          scene: "帰宅",
+          status: "waiting",
+          failed: 0,
+          steps: [],
+          next: 1,
+          wait: 30,
+          reason,
+          distance,
+        },
+        steps,
+      );
+    expect(waiting("no_phone")).toEqual({
+      text: "「near: 100」で停止。続きは電話のウィジェットから実行します",
+      problem: false,
+    });
+    expect(waiting("phone_not_registered")).toEqual({
+      text: "「near: 100」で停止。電話が登録されていません",
+      problem: true,
+    });
+    expect(waiting("home_not_set")).toEqual({
+      text: "「near: 100」で停止。自宅の位置が未登録です",
+      problem: true,
+    });
+    expect(waiting("no_location").text).toBe(
+      "「near: 100」で停止。電話の位置を待っています",
+    );
+    expect(waiting("stale").text).toBe(
+      "「near: 100」で停止。電話の位置が古いため待っています",
+    );
+    expect(waiting("vague").text).toBe(
+      "「near: 100」で停止。電話の位置があいまいなため待っています",
+    );
+    expect(waiting("far", 250).text).toBe(
+      "「near: 100」で停止。自宅まで250mのため待っています",
+    );
+    expect(waiting("far", 12_340).text).toBe(
+      "「near: 100」で停止。自宅まで12.3kmのため待っています",
+    );
+    expect(waiting("far").text).toBe(
+      "「near: 100」で停止。自宅から離れているため待っています",
+    );
+    // A reason a newer server names, or a step the document no longer has.
+    expect(waiting("else").text).toBe("「near: 100」で停止。待っています");
+    expect(
+      sceneRunText(
+        {
+          scene: "帰宅",
+          status: "waiting",
+          failed: 0,
+          steps: [],
+          next: 9,
+          reason: "no_phone",
+        },
+        steps,
+      ).text,
+    ).toBe("停止。続きは電話のウィジェットから実行します");
+  });
+
+  it("shows the day a phone was registered, in Tokyo", () => {
+    // 2026-11-15 00:30 in Tokyo.
+    expect(registeredDay(Date.UTC(2026, 10, 14, 15, 30) / 1000)).toBe(
+      "2026/11/15",
+    );
   });
 });

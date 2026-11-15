@@ -26,6 +26,8 @@ describe("Header menu and theme flow", () => {
     expect(screen.queryByText("トップ")).toBeNull();
     const labels = screen.getByRole("link", { name: "ラベル" });
     expect(labels.getAttribute("href")).toBe("/labels");
+    const scenes = screen.getByRole("link", { name: "操作" });
+    expect(scenes.getAttribute("href")).toBe("/scenes");
   });
 
   it("a screen link closes the dropdown", async () => {

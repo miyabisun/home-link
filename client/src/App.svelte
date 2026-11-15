@@ -9,6 +9,7 @@
   import Lights from "./pages/Lights.svelte";
   import Meter from "./pages/Meter.svelte";
   import Pcs from "./pages/Pcs.svelte";
+  import Scenes from "./pages/Scenes.svelte";
 
   $effect(() => initRouter());
 </script>
@@ -34,6 +35,8 @@
     <Lights />
   {:else if router.index === 7}
     <Pcs />
+  {:else if router.index === 8}
+    <Scenes />
   {:else}
     <Devices />
   {/if}

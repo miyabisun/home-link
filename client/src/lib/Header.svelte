@@ -56,6 +56,9 @@
         <button class="menu-item" type="button" onclick={openTheme}>
           テーマ設定
         </button>
+        <a class="menu-item" href="/scenes" onclick={() => (menuOpen = false)}>
+          操作
+        </a>
         <a class="menu-item" href="/labels" onclick={() => (menuOpen = false)}>
           ラベル
         </a>

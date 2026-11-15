@@ -21,6 +21,10 @@ describe("matchRoute", () => {
     });
   });
 
+  it("maps the routines' screen", () => {
+    expect(matchRoute("/scenes")).toEqual({ index: 8, params: {} });
+  });
+
   it("normalizes unknown paths to home", () => {
     expect(matchRoute("/no/such/page")).toEqual({ index: 0, params: {} });
   });

@@ -17,6 +17,7 @@ export const routes: RouteDef[] = [
   { pattern: /^\/aircon$/, params: [] },
   { pattern: /^\/lights$/, params: [] },
   { pattern: /^\/pcs$/, params: [] },
+  { pattern: /^\/scenes$/, params: [] },
 ];
 
 export function matchRoute(pathname: string): RouteMatch {

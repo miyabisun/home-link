@@ -504,3 +504,97 @@ export function attentionHref(item: Attention): string {
     ? "/meter"
     : "/lights";
 }
+
+/** One step a run did: as it is written, and how it went. */
+export interface SceneStep {
+  step: string;
+  result: "ok" | "failed";
+  error?: string;
+  message?: string;
+  /** The metres from home a `near` step measured. */
+  distance?: number;
+}
+
+/** What running a routine answered: done, or waiting at its step `next` and why. */
+export interface SceneRun {
+  scene: string;
+  status: "done" | "waiting";
+  failed: number;
+  steps: SceneStep[];
+  next?: number;
+  wait?: number;
+  reason?: string;
+  distance?: number;
+}
+
+/** A routine's steps on one line, in order. */
+export function stepsNote(steps: string[]): string {
+  return steps.length === 0 ? "ステップなし" : steps.join(" → ");
+}
+
+function distanceText(metres: number): string {
+  return metres < 1000
+    ? `${Math.round(metres)}m`
+    : `${(metres / 1000).toFixed(1)}km`;
+}
+
+/** Why a run waits at a `near` step; `problem` when the user has something to set up first. */
+function waitingText(run: SceneRun): { text: string; problem: boolean } {
+  switch (run.reason) {
+    case "no_phone":
+      return {
+        text: "続きは電話のウィジェットから実行します",
+        problem: false,
+      };
+    case "phone_not_registered":
+      return { text: "電話が登録されていません", problem: true };
+    case "home_not_set":
+      return { text: "自宅の位置が未登録です", problem: true };
+    case "no_location":
+      return { text: "電話の位置を待っています", problem: false };
+    case "stale":
+      return { text: "電話の位置が古いため待っています", problem: false };
+    case "vague":
+      return {
+        text: "電話の位置があいまいなため待っています",
+        problem: false,
+      };
+    case "far":
+      return {
+        text:
+          run.distance === undefined
+            ? "自宅から離れているため待っています"
+            : `自宅まで${distanceText(run.distance)}のため待っています`,
+        problem: false,
+      };
+    default:
+      return { text: "待っています", problem: false };
+  }
+}
+
+/** A run in a few words: how it ended, or the step of `steps` it stopped at and why. */
+export function sceneRunText(
+  run: SceneRun,
+  steps: string[],
+): { text: string; problem: boolean } {
+  if (run.status === "done") {
+    return run.failed === 0
+      ? { text: "完了", problem: false }
+      : { text: `${run.failed}件失敗`, problem: true };
+  }
+  const at = run.next === undefined ? undefined : steps[run.next];
+  const why = waitingText(run);
+  return { ...why, text: `${at ? `「${at}」で` : ""}停止。${why.text}` };
+}
+
+const REGISTERED_DAY = new Intl.DateTimeFormat("ja-JP", {
+  timeZone: "Asia/Tokyo",
+  year: "numeric",
+  month: "numeric",
+  day: "numeric",
+});
+
+/** The day, in Tokyo, a phone was registered. */
+export function registeredDay(unix: number): string {
+  return REGISTERED_DAY.format(unix * 1000);
+}
