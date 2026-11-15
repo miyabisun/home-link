@@ -241,6 +241,56 @@ class HttpHomeLinkApiTest {
         }
     }
 
+    @Test fun listsScenesAndRunsOneFromAStepWithThePhonesFix() {
+        respond("/api/scenes", 200, """{"yaml":"…","scenes":[{"name":"おやすみ","steps":["door: lock"]},{"name":"帰宅","steps":["near: 100","door: unlock"]}]}""")
+        assertEquals(ApiResult.Ok(listOf(Scene("おやすみ", listOf("door: lock")), Scene("帰宅", listOf("near: 100", "door: unlock")))), api.scenes())
+        assertEquals("GET /api/scenes", requests.last())
+
+        // The name is one path segment, escaped; the first run carries the phone alone.
+        respond("/api/scenes/", 200, """{"scene":"帰宅","status":"waiting","next":1,"wait":30,"reason":"far","distance":812.0,"failed":0,"steps":[]}""")
+        assertEquals(ApiResult.Ok(SceneRun.Waiting(1, 30, "far", 812.0)), api.runScene("帰宅 2/3", 0, "phone-1234", null))
+        val (first, sent) = requests.last().split(" ").let { "${it[0]} ${it[1]}" to JSONObject(it[2]) }
+        assertEquals("POST /api/scenes/%E5%B8%B0%E5%AE%85%202%2F3/run", first)
+        assertEquals(setOf("from", "phone"), sent.keys().asSequence().toSet())
+        assertEquals(0 to "phone-1234", sent.getInt("from") to sent.getString("phone"))
+        respond("/api/scenes/", 200, """{"scene":"帰宅","status":"waiting","next":0,"wait":20,"reason":"no_location","failed":0,"steps":[]}""")
+        assertEquals(ApiResult.Ok(SceneRun.Waiting(0, 20, "no_location", null)), api.runScene("帰宅", 0, "phone-1234", null))
+
+        // Going on from the wait carries where the phone is.
+        respond("/api/scenes/", 200, """{"scene":"帰宅","status":"done","failed":1,"steps":[
+            {"step":"near: 100","result":"ok","distance":42.0},{"step":"door: unlock","result":"failed","error":"sesame_rejected","message":"…"},
+            {"step":"on: room","result":"ok"}]}""")
+        assertEquals(ApiResult.Ok(SceneRun.Done(1, "door: unlock")), api.runScene("帰宅", 1, "phone-1234", Fix(34.25, 132.5, 12.5, 800)))
+        val location = JSONObject(requests.last().substringAfter("/run ")).also { assertEquals(1, it.getInt("from")) }.getJSONObject("location")
+        assertEquals(listOf(34.25, 132.5, 12.5), listOf("latitude", "longitude", "accuracy").map { location.getDouble(it) })
+        assertEquals(800L, location.getLong("age_ms"))
+        respond("/api/scenes/", 200, """{"scene":"帰宅","status":"done","failed":0,"steps":[]}""")
+        assertEquals(ApiResult.Ok(SceneRun.Done(0, null)), api.runScene("帰宅", 0, "phone-1234", null))
+
+        respond("/api/scenes/", 404, """{"error":"scene_not_found"}""")
+        assertEquals(ApiResult.Failed(ApiError.SCENE_NOT_FOUND), api.runScene("無い", 0, "phone-1234", null))
+    }
+
+    @Test fun registersThisPhoneAndPinsTheHome() {
+        respond("/api/phones/", 200, """{"id":"phone-1234","name":"Pixel 9","registered_at":1}""")
+        assertEquals(ApiResult.Ok(Unit), api.registerPhone("phone-1234", "Pixel 9"))
+        assertEquals("""PUT /api/phones/phone-1234 {"name":"Pixel 9"}""", requests.last())
+        respond("/api/phones", 200, """[{"id":"phone-1234","name":"Pixel 9","registered_at":1},{"id":"other-5678","name":"Y700","registered_at":2}]""")
+        assertEquals(ApiResult.Ok(setOf("phone-1234", "other-5678")), api.phones())
+        respond("/api/phones/", 204, "")
+        assertEquals(ApiResult.Ok(Unit), api.unregisterPhone("phone-1234"))
+        assertEquals("DELETE /api/phones/phone-1234", requests.last())
+
+        respond("/api/location", 200, """{"address":null,"name":null,"latitude":35.6895,"longitude":139.6917,"pin":null,"registered":false}""")
+        assertEquals(ApiResult.Ok(false), api.homePinned())
+        respond("/api/location", 200, """{"address":null,"name":null,"latitude":35.6895,"longitude":139.6917,"pin":{"latitude":34.25,"longitude":132.5},"registered":false}""")
+        assertEquals(ApiResult.Ok(Unit), api.pinHome(34.25, 132.5))
+        val pin = JSONObject(requests.last().substringAfter("/api/location ")).getJSONObject("pin")
+        assertEquals(34.25 to 132.5, pin.getDouble("latitude") to pin.getDouble("longitude"))
+        assert(requests.last().startsWith("PUT /api/location ")) { requests.last() }
+        assertEquals(ApiResult.Ok(true), api.homePinned())
+    }
+
     @Test fun listsPcsAndSendsSleepAndWakeByName() {
         respond("/api/pcs", 200, """[{"name":"書斎","sleeping":false},{"name":"ゲーム","sleeping":null}]""")
         assertEquals(ApiResult.Ok(listOf(Pc("書斎", false), Pc("ゲーム", null))), api.pcs())

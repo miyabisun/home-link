@@ -6,7 +6,8 @@
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <!-- Android 17 blocks LAN connections, including to the BLE proxy, without it; 16 ignores it. -->
     <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
-    <!-- Android names the connected Wi-Fi only to apps with fine location; used to fill in the SSID. -->
+    <!-- Android names the connected Wi-Fi only to apps with fine location; used to fill in the SSID. A routine that
+         waits for the phone to come near home reads where it is, and the home is pinned where the phone stands. -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <!-- Reading the connected network through ConnectivityManager. -->
@@ -16,6 +17,8 @@
     <!-- Keeping the process up while a registration or Wi-Fi move waits for home-link; the type asks for one of
          a set of permissions, of which CHANGE_NETWORK_STATE is granted at install. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <!-- Reading the location while a routine waits for the phone to come near home. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
     <!-- Keeping the job that reads the widgets' states again across a reboot. -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
@@ -33,6 +36,7 @@
         </activity>
         <activity android:name=".SettingsActivity" android:exported="false"
             android:windowSoftInputMode="adjustResize" />
+        <activity android:name=".PhoneActivity" android:exported="false" />
         <!-- The launcher opens it when a label widget is placed or set up again. -->
         <activity android:name=".WidgetConfigActivity" android:exported="true"
             android:windowSoftInputMode="adjustResize">
@@ -86,6 +90,19 @@
             <meta-data android:name="android.appwidget.provider"
                 android:resource="@xml/pc_widget_info" />
         </receiver>
+        <activity android:name=".SceneWidgetConfigActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_CONFIGURE" />
+            </intent-filter>
+        </activity>
+        <receiver android:name=".SceneWidget" android:exported="false"
+            android:label="@string/scene_widget_name">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data android:name="android.appwidget.provider"
+                android:resource="@xml/scene_widget_info" />
+        </receiver>
         <receiver android:name=".DoorWidget" android:exported="false"
             android:label="@string/door_widget_name">
             <intent-filter>
@@ -109,6 +126,8 @@
             android:permission="android.permission.BIND_JOB_SERVICE" />
         <service android:name=".PressService" android:exported="false"
             android:foregroundServiceType="shortService" />
+        <service android:name=".SceneService" android:exported="false"
+            android:foregroundServiceType="shortService|location" />
         <service android:name=".DeviceWorkService" android:exported="false"
             android:foregroundServiceType="connectedDevice" />
     </application>

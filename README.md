@@ -10,6 +10,8 @@ SwitchBot CO2センサー（温湿度計）の温度・湿度・CO2を、サー�
 Matterの温湿度計（Aqara Climate Sensor W100など）は台帳に入れると、温度・湿度・電池を画面とAPIで示します。
 Matterのエアコン（Room Air Conditioner）へは、同じlabelの温湿度計（台帳の温湿度計か、SwitchBotの温度計）の室温から、home-linkが運転モードと設定温度を送ります。
 長く家を空けるときは、ホーム画面のボタンで切り、帰る前に入れ直せます。
+「おやすみ」「おはよう」「外出」「帰宅」のような操作は、labelの入り切り・玄関の施錠と解錠・PCのスリープ・HTTPの要求を順に並べたYAMLで書き、ホーム画面のボタン・管理画面・API・MCPから実行できます（下の「[操作](#操作)」）。
+「帰宅」は、登録した電話が自宅の近くに着くのを待ってから解錠する、という書き方ができます。
 PCは、自分からhome-linkへWebSocketでつないでおくと、home-linkの画面・API・MCPからスリープと復帰の命令を受けられます（下の「PC」）。
 玄関のSESAME 5なども、ホーム画面のボタン1つで家の外から解錠・施錠できます（CANDY HOUSEのWeb API経由）。
 機器に印刷されたMatterのQRコードをAndroidアプリで読み取り、名前とlabelを付けて登録します。
@@ -221,6 +223,7 @@ curl http://home-link.example:5011/api/lights/watch
 | 温度計（右上のメニュー） | 台帳の温湿度計ごとの温度・湿度・電池（名前から機器の画面へ。応答なし・自動運転の切も示します）と、SwitchBotの温度計の温度・湿度・CO2・電池と受けた時刻。SwitchBotの温度計は鉛筆のボタンで名前を付けられ、「自動運転」を開くと、エアコンを動かすかの入・切とlabelを選べます。受信が途絶えたときは、最後に受けた時刻だけを示します。温度計の要対応を上部に示します |
 | 照明の接続（右上のメニュー） | 照明ごとに、いつからつながっているかと最後に答えた時刻、切れている照明はいつからか・つなぎ直した回数・網の層で届くか。登録が外れた照明は「登録が外れた」といつから、自動で登録し直していること、戻らない理由・試した回数・14日で何回目かを示します。matterjs-serverに届かないときと、照明の要対応は画面の上部に示します。「14日の履歴」を開くとつながらなかった区間を新しい順に並べます。台帳の照明を選ぶと機器の画面（名前・label・削除）を開きます。台帳に無い照明（製品名で出ます）にはごみ箱のボタンがあり、確認してmatterjs-serverの登録を消します |
 | PC（右上のメニュー） | home-linkにつながっているPCの一覧。ボタンはPCの状態（「動作中」「スリープ中」）を示し、押すとスリープと復帰を切り替えます。状態を知らせないPCには「スリープ」「復帰」の2つを出します。PCが受け付けなかったときと、つながっていないときは理由を画面の上部に示します |
+| 操作（右上のメニュー） | 操作（「おやすみ」「帰宅」など）ごとのステップと「実行」。結果は操作の下に示し、失敗したステップはその理由を示します。電話の位置を待つステップでは止まり、続きは電話のウィジェットから実行します。「定義」を開くとYAMLを編集して保存できます。登録した電話の一覧と削除、自宅の位置が登録済みかと削除もここにあります |
 | エアコン（右上のメニュー） | 外気温とその時刻。エアコンごとに、動かす温湿度計の名前と室温・湿度、今の運転（「冷房 25℃」「切」など）、直近の判断の理由。「設定」に家の住所の登録 |
 
 変えた値はその場でAPIへ送り、保存ボタンはありません。値の誤りはその入力の下に、サーバーが受け付けなかった理由は画面の上部に示します。
@@ -236,7 +239,7 @@ Android 16以降の端末で動きます。
 接続先（home-linkのURLと、Bluetoothでの登録に使うmatterjs-serverのBLE ProxyのURL）は、アプリに埋め込まず端末に保存します。
 家の外から使うなら、電話から届くURL（VPNの中だけで引ける名前など）を設定します。
 QRの読み取りにはGoogle Playサービスのコードスキャナーを使うため、カメラの権限は求めません。
-位置情報の許可は、接続先の設定の画面で機器に渡すWi-Fiを追加するときに、今つながっているWi-FiのSSIDを読むためだけに求めます。
+位置情報の許可は、次の2つのために求めます。接続先の設定の画面で機器に渡すWi-Fiを追加するときに、今つながっているWi-FiのSSIDを読むため。「この電話の位置」の画面で電話を登録し、[操作](#操作を実行するおやすみ帰宅など)が自宅の近くに着くのを待つあいだ位置を読むため。許可は「アプリの使用時のみ」で足ります。
 
 [リリース](https://github.com/miyabisun/home-link/releases/latest)のAssetsから
 `home-link-vX.Y.Z.apk` をダウンロードし、端末で開いてインストールします。
@@ -329,8 +332,8 @@ adb -s DEVICE_SERIAL push home-link.yaml /sdcard/Android/data/dev.miyabisun.home
 例えば、label「空調」を作ってエアコンをすべて入れ、上のlabelの切り替えのウィジェットを「空調」で置きます。
 入はエアコンを前の運転モードと設定温度のまま入れ、切はエアコンを切ります。
 
-切った後も、同じlabelの温湿度計が入なら、[エアコンの自動運転](#エアコンの自動運転)が室温に応じて命令を送ります。
-自動運転を止めるときは、温湿度計を切にします（機器の画面、またはSwitchBotの温度計は温度計の画面の「自動運転」）。
+切ったエアコンは、入れるまで切のままです。[エアコンの自動運転](#エアコンの自動運転)は、labelか機器の入り切りで切ったエアコンへ命令を送りません。
+エアコンの付いたlabelのどれか、または機器の入り切りで入にすると、自動運転が再開します。
 
 0.1.72までのエアコンのウィジェットは、アプリを更新するとホーム画面から消えます。labelの切り替えのウィジェットを置き直してください。
 
@@ -353,6 +356,29 @@ SESAMEアプリの履歴には `home-link` の名前で記録されます。
 
 ボタンの文字は「送信中…」のあと、数秒だけ結果に変わります。CANDY HOUSEが受け付けると「受付済み」です。
 扉が開いた・閉まったことの確認ではありません。うまくいかなかったときは、下の[ボタンの表示](#ボタンの表示)を示します。
+
+### 操作を実行する（おやすみ・帰宅など）
+
+操作の中身（どのlabelを入り切りし、玄関をどうするか）は、Webの管理画面の「操作」で確かめ、書き換えます（下の「[操作](#操作)」）。
+電話では、次の順に用意します。2と3は、自宅の近くに着くのを待つステップ（`near`）を持つ操作にだけ要ります。
+
+1. ホーム画面のウィジェットの一覧から、home-linkの「操作」（1×1マス）を置きます。置くときに、home-linkに書かれた操作から1つを選ぶ画面が開きます。操作ごとに置き、置いた後もウィジェットの長押しの設定から選び直せます。
+2. アプリのメニューの「この電話の位置」で「この電話を登録」を押し、位置情報を「アプリの使用時のみ」「正確」で許可します。待つステップを通すのは、登録した電話の位置だけです。
+3. 自宅で、同じ画面の「今いる場所を自宅にする」を押します。測位の精度が50mより粗いときは登録しません。屋外か窓の近くでやり直してください。
+
+ウィジェットを押すと、その操作のステップを上から順に実行し、数秒だけ「完了」か「一部失敗」を示します。
+待つステップがある操作は、そこまでを実行してから「待機中」になります。
+待機中は電話の位置を読み、自宅から決めた距離に入ると続き（解錠など）を実行して、その場で位置の読み取りをやめます。
+待つ時間（既定は30分）を過ぎると「未到着」を示し、続きは実行しません。待機中にもう一度押すと取り消します。
+
+| 表示 | 意味 |
+| --- | --- |
+| 待機中 | 自宅の近くに着くのを待っています。押すと取り消します |
+| 未到着 | 待つ時間のうちに自宅の近くに着かなかったため、続きを実行していません |
+| 取り消し | 待機を取り消しました |
+| 電話未登録・自宅未登録 | 「この電話の位置」で、電話か自宅の位置が登録されていません |
+| 位置未許可・位置オフ | アプリに位置情報が許可されていないか、電話の位置情報がオフです |
+| 操作なし | home-linkにその名前の操作がありません。ウィジェットを設定し直してください |
 
 ### ボタンの表示
 
@@ -468,8 +494,14 @@ Thread網の資格情報（dataset）は、matterjs-serverに `set_thread_datase
 | `PUT /api/meter` | SwitchBotの温度計の、本文にある項目だけを変えます。`name`（前後の空白を除いて1〜100文字。`null` で付けていない状態へ戻します）、`labels`（labelのidの配列）、`on`（`true`・`false`）。labelを変えるか入にすると、その場で判断してエアコンへ送ります。応答は `GET /api/meter` と同じです | 400 `invalid_meter`、404 `label_not_found` |
 | `GET /api/aircon` | エアコンの自動運転。台帳のエアコンごとの今の状態 `aircons`（台帳の順。各要素は `{"id","name","state","on","mode","setpoint","sensor","reading","reason"}`。`mode` は `cool`・`heat`・`dry`・`fan_only`・`auto`・`off`、`setpoint` は今の運転の設定温度℃。`sensor` は動かす温湿度計 `{"id","name"}`（SwitchBotの温度計は `id` が `null`、無ければ `null`）、`reading` はその室温・湿度 `{"temperature","humidity"}`、`reason` はそのエアコンの直近の判断の理由。matterjs-serverから読めないかエアコンが無ければ空の配列）、外気温 `outdoor`（`{"temperature","at","fetched_at","fresh"}`。`at` はその値の時刻、`fresh` は2時間以内か。まだ取っていなければ `null`）、家の位置 `location`（`{"name","latitude","longitude","registered"}`）、直近の実行 `runs`（新しい順に144回分） | |
 | `GET /api/aircon/runs` | 14日分の実行の記録（古い順）。`?since=`（Unix秒）でそれ以降に絞れます。各回はエアコン1台分で、時刻 `at`、きっかけ `trigger`（`scheduled`・`sensor`。0.1.72までの記録には自動運転の入・切の `switch` もあります）、エアコンの名前 `aircon` とid `aircon_id`、温湿度計の名前 `sensor`、室温 `temperature`・湿度 `humidity`・外気温 `outdoor`、決めた命令 `command`、結果 `result`、理由 `reason` を持ちます | |
-| `GET /api/location` | 家の位置。登録した住所 `address`、見つかった場所の名前 `name`、`latitude`・`longitude`、登録済みか `registered`。未登録なら東京（新宿）の座標です | |
-| `PUT /api/location` | 本文 `{"address": "東京都新宿区西新宿2-8-1"}` の住所を国土地理院の住所検索で引き、最初の候補を家の位置にします。見つからないときと届かないときは前の位置のままです。応答は `GET /api/location` と同じです | 400 `invalid_location`、404 `address_not_found`、502 `address_search_unreachable` |
+| `GET /api/location` | 家の位置。登録した住所 `address`、見つかった場所の名前 `name`、`latitude`・`longitude`、登録済みか `registered`。未登録なら東京（新宿）の座標です。`pin` は、電話が自宅で測った自宅そのものの位置 `{"latitude","longitude"}`（未登録なら `null`）で、[操作](#操作)の `near` が距離を測る起点です | |
+| `PUT /api/location` | 本文 `{"address": "東京都新宿区西新宿2-8-1"}` の住所を国土地理院の住所検索で引き、最初の候補を家の位置にします。見つからないときと届かないときは前の位置のままです。本文が `{"pin": {"latitude": 35.6895, "longitude": 139.6917}}` なら自宅の位置 `pin` だけを置き、`{"pin": null}` で消します。住所を変えても `pin` は残ります。応答は `GET /api/location` と同じです | 400 `invalid_location`、404 `address_not_found`、502 `address_search_unreachable` |
+| `GET /api/scenes` | [操作](#操作)の定義。書かれたままのYAML `yaml` と、読んだ結果 `scenes`（`[{"name": "帰宅", "steps": ["near: 100", "door: unlock"]}, …]`） | |
+| `PUT /api/scenes` | 操作の定義を、本文 `{"yaml": "…"}` のYAMLで置き換えます。読めないYAMLは理由を返し、前の定義のままです。応答は `GET /api/scenes` と同じです | 400 `invalid_scenes` |
+| `POST /api/scenes/{name}/run` | 操作を実行します（下の「[操作](#操作)」）。本文は無くてもよく、電話からは `{"from": 0, "phone": "…", "location": {"latitude","longitude","accuracy","age_ms"}}` を送ります | 400 `invalid_run`、404 `scene_not_found` |
+| `GET /api/phones` | 登録した電話の一覧（`id`・`name`・登録した時刻 `registered_at`） | |
+| `PUT /api/phones/{id}` | 電話を登録します。本文は `{"name": "Pixel 9"}`。`id` は電話のアプリが自分で作る英数字とハイフンの8〜64文字で、同じ `id` なら名前だけを変えます | 400 `invalid_phone` |
+| `DELETE /api/phones/{id}` | 電話の登録を消します | 404 `phone_not_found` |
 | `GET /api/thread` | Threadの機器を登録できるか（matterjs-serverがThread網のdatasetを持つか）を `{"ready": true}` で返します | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `GET /api/status` | 台帳の機器ごとに、matterjs-serverで見えるか（`visible`）と今の `node_id`・`endpoint` | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `GET /api/lights` | 照明ごとの今の状態（`on`・`off`・`no_response`・`ignored`）と、無視の照明を除いた件数 | 503 `matter_server_not_configured`、502 `matter_server_unreachable` |
@@ -715,7 +747,7 @@ curl -s localhost:5011/api/aircon
 | --- | --- |
 | `sent` | エアコンが受け付けた |
 | `unchanged` | 送る必要が無かった |
-| `held` | 自動運転が切のため送らなかった（0.1.72までの記録） |
+| `held` | labelか機器の入り切りで切ってあるため送らなかった（入れると再開します。0.1.72までの記録では、自動運転の切） |
 | `no_reading` | 同じlabelに入の温湿度計が無いか、室温を測れていない |
 | `no_aircon` | エアコンが見つからない |
 | `no_response`・`refused`・`failed` | 届かなかった・断られた・matterjs-serverに届かない。次の回にもう一度判断します |
@@ -796,6 +828,58 @@ curl http://home-link.example:5011/api/lights/schedule
 - `GET /api/lights/schedule` の `intent` はなくなりました。0.1.37までのアプリが読む `labels` の `name`・`boosted` は残ります。
 - `POST /api/labels`・`PATCH /api/labels/{id}` に `day_level` などの値や `dedicated` を送ると400 `invalid_label` です。
 
+### 操作
+
+操作は、名前と、上から順に実行するステップの並びです。定義は1つのYAMLで、管理画面の「操作」・`PUT /api/scenes`・MCPの `set_scenes` で書き換えます。
+書き換えはすぐ効き、home-linkを作り直す必要はありません。何も書いていないhome-linkは、次の定義を持ちます。
+
+```yaml
+おやすみ:
+  - door: lock
+おはよう: []
+外出:
+  - door: lock
+帰宅:
+  - near: 100
+    wait: 30
+  - door: unlock
+```
+
+| ステップ | 内容 |
+| --- | --- |
+| `on: <label>`・`off: <label>` | その名前のlabelを入・切にします（`POST /api/labels/{id}/on`・`/off` と同じ） |
+| `door: lock`・`door: unlock` | 玄関を施錠・解錠します |
+| `sleep: <PC>`・`wake: <PC>` | その名前のPCをスリープ・復帰させます |
+| `http: POST http://…` | HTTPの要求を送ります（GET・POST・PUT・PATCH・DELETE）。`body:` にYAMLで書いた値をJSONで付けられます。2xx以外は失敗です |
+| `near: 100` | 登録した電話が自宅（`pin`）から100m以内に入るまで、ここで待ちます。`wait: 30` は電話が待つ分（1〜180、既定30）で、過ぎたら続きは実行しません |
+
+たとえば、エアコンは押した時に入れ、解錠と照明は自宅に着いてからにするなら、こう書きます。
+
+```yaml
+帰宅:
+  - on: 空調
+  - near: 100
+    wait: 30
+  - door: unlock
+  - on: room
+```
+
+`POST /api/scenes/{name}/run` は、`from` 番目（0から）のステップから順に実行し、各ステップの結果を返します。
+`from` に指定できるのは、0か、止まった `near` のステップの番号だけです。
+
+```json
+{"scene": "帰宅", "status": "done", "failed": 1,
+ "steps": [{"step": "near: 100", "result": "ok", "distance": 42.0},
+           {"step": "door: unlock", "result": "ok"},
+           {"step": "on: room", "result": "failed", "error": "label_not_found", "message": "labelの「room」がありません"}]}
+```
+
+- 失敗したステップがあっても、次のステップへ進みます。`failed` は失敗した数です。
+- `near` を通せないときは、そこで止まって `{"status": "waiting", "next": 1, "wait": 30, "reason": "far", "distance": 812.0, …}` を返します。電話は位置を読むたびに `from` に `next` を入れて送り直し、`done` が返るか `wait` 分が過ぎるまで続けます。
+- `near` を通すのは、登録した電話（`phone`）が送った位置 `location` で、測ってから60秒以内（`age_ms`）、精度（`accuracy`、m）が指定の距離以内、自宅の `pin` からの距離が指定以内のものだけです。
+- `reason` は `no_phone`（電話からの要求でない。管理画面やMCPからの実行）、`phone_not_registered`、`home_not_set`（`pin` が無い）、`no_location`、`stale`、`vague`、`far` のどれかです。
+- 位置はログに出しません。出すのは操作の名前・結果・自宅からの距離です。
+
 ### PC
 
 PCは `ws://home-link.example:5011/api/pcs/connect` へ自分からつなぎ、つないだままにします。PCに受信のポートを開ける必要はありません。
@@ -846,6 +930,9 @@ APIと同じポートで、認証はありません。道具はAPIへの要求�
 | `label_on`・`label_off`・`label_toggle` | `id` | `POST /api/labels/{id}/on`・`/off`・`/toggle` |
 | `list_pcs` | なし | `GET /api/pcs` |
 | `sleep_pc`・`wake_pc` | PCの `name` | `POST /api/pcs/{name}/sleep`・`/wake` |
+| `get_scenes` | なし | `GET /api/scenes` |
+| `set_scenes` | `yaml` | `PUT /api/scenes` |
+| `run_scene` | 操作の `name` | `POST /api/scenes/{name}/run`（`near` のステップで止まります） |
 
 ```sh
 claude mcp add --transport http home-link http://home-link.example:5011/mcp

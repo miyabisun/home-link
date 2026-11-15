@@ -4652,7 +4652,10 @@ async fn run_scene(
         .await
         .map_err(|_| invalid())?;
     let input = RunInput::read(&body)
-        .filter(|input| input.from == 0 || input.from < scene.steps.len())
+        // A run goes on only from the step it waited at: any other would skip that wait.
+        .filter(|input| {
+            input.from == 0 || matches!(scene.steps.get(input.from), Some(scene::Step::Near { .. }))
+        })
         .ok_or_else(invalid)?;
 
     let mut steps = Vec::new();

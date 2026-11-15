@@ -7135,6 +7135,24 @@ async fn the_aircon_runs_record_the_outside_of_the_registered_address() {
         json!({ "address": "沖縄県那覇市泉崎1-1-1", "name": "沖縄県那覇市泉崎一丁目",
                 "latitude": 26.212_312, "longitude": 127.681_229, "pin": null, "registered": true })
     );
+    // The home pinned by a phone outlives an address registered again.
+    let pin = json!({ "latitude": 26.2125, "longitude": 127.6811 });
+    let pinned = call(&app, "PUT", "/api/location", Some(json!({ "pin": pin }))).await;
+    assert_eq!(pinned.0, StatusCode::OK);
+    let (_, again) = call(
+        &app,
+        "PUT",
+        "/api/location",
+        Some(json!({ "address": "沖縄県那覇市泉崎1-1-1" })),
+    )
+    .await;
+    assert_eq!(
+        (&again["pin"], &again["latitude"]),
+        (&pin, &json!(26.212_312)),
+        "{again}"
+    );
+    let cleared = call(&app, "PUT", "/api/location", Some(json!({ "pin": null }))).await;
+    assert_eq!(cleared.1["pin"], Value::Null);
 
     // Each run asks for the outside at the registered place with Chrome's User-Agent and
     // records it; the sensor alone decides.
@@ -8079,6 +8097,9 @@ async fn a_near_step_waits_for_a_registered_phone_near_the_pinned_home() {
     for body in [
         json!({ "from": 4 }),
         json!({ "from": -1 }),
+        // Past the wait: only the step waited at is one to go on from.
+        json!({ "from": 2, "phone": phone, "location": fix(10.0, 5.0, 0) }),
+        json!({ "from": 3 }),
         json!({ "phone": 3 }),
         json!({ "phone": phone, "location": { "latitude": 91, "longitude": 0, "accuracy": 1, "age_ms": 0 } }),
         json!({ "phone": phone, "location": { "latitude": 0, "longitude": 181, "accuracy": 1, "age_ms": 0 } }),

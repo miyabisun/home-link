@@ -24,7 +24,7 @@ enum class ApiError { NOT_CONFIGURED, UNREACHABLE, TIMEOUT, INVALID_QR, INVALID_
     SESAME_NOT_CONFIGURED, SESAME_REJECTED, SESAME_UNREACHABLE, SWITCH_FAILED, NO_NETWORK, BLOCKED,
     CONNECT_TIMEOUT, HTTP_DENIED, HTTP_NOT_FOUND, HTTP_GATEWAY, BAD_ANSWER,
     SETTINGS_UNREADABLE, SETTINGS_MALFORMED, LOCAL_NETWORK_DENIED,
-    PC_NOT_CONNECTED, PC_REJECTED, PC_NO_ANSWER, PC_DISCONNECTED }
+    PC_NOT_CONNECTED, PC_REJECTED, PC_NO_ANSWER, PC_DISCONNECTED, SCENE_NOT_FOUND }
 
 /** A Wi-Fi network to save on home-link for new devices. */
 data class WifiNetwork(val ssid: String, val password: String)
@@ -120,6 +120,22 @@ interface HomeLinkApi {
     fun pcs(): ApiResult<List<Pc>>
     /** Has PC `name` sleep or wake: the state it says after, or null when it does not say. Waits up to about 10 s. */
     fun switchPc(name: String, action: PcAction): ApiResult<Boolean?>
+    /** The routines home-link has written, in their order. */
+    fun scenes(): ApiResult<List<Scene>>
+    /**
+     * Runs the routine `name` from its step `from` as the phone `phone`, at `fix` once it knows where it is: done,
+     * or waiting for the phone to come near home. Takes as long as its steps do.
+     */
+    fun runScene(name: String, from: Int, phone: String, fix: Fix?): ApiResult<SceneRun>
+    /** The ids of the phones registered on home-link. */
+    fun phones(): ApiResult<Set<String>>
+    /** Registers the phone `id` under `name`, or renames it. */
+    fun registerPhone(id: String, name: String): ApiResult<Unit>
+    fun unregisterPhone(id: String): ApiResult<Unit>
+    /** Whether the home's own place is pinned on home-link. */
+    fun homePinned(): ApiResult<Boolean>
+    /** Pins the home's place, as this phone standing in it measured. */
+    fun pinHome(latitude: Double, longitude: Double): ApiResult<Unit>
 }
 
 /** A phone taken as always online, waiting by sleeping: for tests and the JVM. */
@@ -274,12 +290,56 @@ class HttpHomeLinkApi(private val targets: () -> Targets, private val link: Phon
         }
     }
 
-    // The name is one path segment: URLEncoder escapes "/" too, and a space as "+", which a path does not read so.
+    // A name is one path segment: URLEncoder escapes "/" too, and a space as "+", which a path does not read so.
+    private fun segment(name: String) = URLEncoder.encode(name, Charsets.UTF_8).replace("+", "%20")
+
     override fun switchPc(name: String, action: PcAction): ApiResult<Boolean?> =
-        call("POST", "/api/pcs/${URLEncoder.encode(name, Charsets.UTF_8).replace("+", "%20")}/${action.path}", null) { body ->
+        call("POST", "/api/pcs/${segment(name)}/${action.path}", null) { body ->
             val json = JSONObject(body)
             if (json.isNull("sleeping")) null else json.getBoolean("sleeping")
         }
+
+    override fun scenes(): ApiResult<List<Scene>> = call("GET", "/api/scenes", null) { body ->
+        val scenes = JSONObject(body).getJSONArray("scenes")
+        (0 until scenes.length()).map { index ->
+            val scene = scenes.getJSONObject(index)
+            val steps = scene.getJSONArray("steps")
+            Scene(scene.getString("name"), (0 until steps.length()).map(steps::getString))
+        }
+    }
+
+    // A routine switches label after label, each waiting up to 15 s for its devices, then the door.
+    override fun runScene(name: String, from: Int, phone: String, fix: Fix?): ApiResult<SceneRun> {
+        val body = JSONObject().put("from", from).put("phone", phone)
+        if (fix != null) body.put("location", JSONObject().put("latitude", fix.latitude).put("longitude", fix.longitude)
+            .put("accuracy", fix.accuracy).put("age_ms", fix.ageMs))
+        return call("POST", "/api/scenes/${segment(name)}/run", body, readMs = 120_000) { answer ->
+            val run = JSONObject(answer)
+            if (run.getString("status") == "waiting") {
+                SceneRun.Waiting(run.getInt("next"), run.getInt("wait"), run.getString("reason"),
+                    if (run.isNull("distance")) null else run.getDouble("distance"))
+            } else {
+                val steps = run.getJSONArray("steps")
+                val failure = (0 until steps.length()).map(steps::getJSONObject).firstOrNull { it.getString("result") == "failed" }
+                SceneRun.Done(run.getInt("failed"), failure?.getString("step"))
+            }
+        }
+    }
+
+    override fun phones(): ApiResult<Set<String>> = call("GET", "/api/phones", null) { body ->
+        val phones = JSONArray(body)
+        (0 until phones.length()).map { phones.getJSONObject(it).getString("id") }.toSet()
+    }
+
+    override fun registerPhone(id: String, name: String): ApiResult<Unit> =
+        call("PUT", "/api/phones/${segment(id)}", JSONObject().put("name", name)) { }
+
+    override fun unregisterPhone(id: String): ApiResult<Unit> = call("DELETE", "/api/phones/${segment(id)}", null) { }
+
+    override fun homePinned(): ApiResult<Boolean> = call("GET", "/api/location", null) { !JSONObject(it).isNull("pin") }
+
+    override fun pinHome(latitude: Double, longitude: Double): ApiResult<Unit> =
+        call("PUT", "/api/location", JSONObject().put("pin", JSONObject().put("latitude", latitude).put("longitude", longitude))) { }
 
     private fun counts(json: JSONObject): SwitchResult {
         val missing = json.getJSONArray("missing_devices")
@@ -377,6 +437,7 @@ internal fun apiError(status: Int, body: String): ApiError {
         "pc_rejected" -> ApiError.PC_REJECTED
         "pc_no_answer" -> ApiError.PC_NO_ANSWER
         "pc_disconnected" -> ApiError.PC_DISCONNECTED
+        "scene_not_found" -> ApiError.SCENE_NOT_FOUND
         else -> when (status) {
             401, 403 -> ApiError.HTTP_DENIED
             404 -> ApiError.HTTP_NOT_FOUND

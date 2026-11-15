@@ -1273,6 +1273,13 @@ private class FakeApi : HomeLinkApi {
     @Volatile var gate: CountDownLatch? = null
 
     override fun door(command: DoorCommand): ApiResult<Unit> = ApiResult.Failed(ApiError.SERVER)
+    override fun scenes(): ApiResult<List<Scene>> = ApiResult.Ok(emptyList())
+    override fun runScene(name: String, from: Int, phone: String, fix: Fix?): ApiResult<SceneRun> = ApiResult.Failed(ApiError.SERVER)
+    override fun phones(): ApiResult<Set<String>> = ApiResult.Ok(emptySet())
+    override fun registerPhone(id: String, name: String): ApiResult<Unit> = ApiResult.Failed(ApiError.SERVER)
+    override fun unregisterPhone(id: String): ApiResult<Unit> = ApiResult.Failed(ApiError.SERVER)
+    override fun homePinned(): ApiResult<Boolean> = ApiResult.Ok(false)
+    override fun pinHome(latitude: Double, longitude: Double): ApiResult<Unit> = ApiResult.Failed(ApiError.SERVER)
 
     /** The PCs connected to home-link, as it lists them; a press changes the one it names. */
     val pcList: MutableList<Pc> = Collections.synchronizedList(mutableListOf())

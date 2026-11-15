@@ -146,6 +146,7 @@ internal object Widgets {
     fun showAll(context: Context) {
         LabelWidget.showAll(context)
         PcWidget.showAll(context)
+        SceneWidget.showAll(context)
         showDoors(context)
     }
 
