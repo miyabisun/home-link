@@ -138,7 +138,16 @@ class SceneService : Service() {
             SceneWidget.show(this, id, end?.label ?: scenePress(result),
                 message = end?.message?.format(name) ?: sceneMessage(name, result, homeLinkHost(this)))
             true
-        }, reread = {}, restore = { SceneWidget.show(this, id) })
+        }, reread = {
+            // A routine switches labels and PCs: their buttons read the new states at once, not at the next update.
+            val read = LabelWidget.read(this) and PcWidget.read(this)
+            if (!read) Widgets.refreshWhenOnline(this)
+            // A press still running takes its own buttons back.
+            if (!PressService.busy) {
+                LabelWidget.showAll(this)
+                PcWidget.showAll(this)
+            }
+        }, restore = { SceneWidget.show(this, id) })
     }
 
     /**

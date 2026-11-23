@@ -131,7 +131,7 @@
     switching = true;
     error = "";
     try {
-      const result = await api.toggleLabel(label.id);
+      const result = await api.toggleLabel(label.id, label.on);
       label.on = result.on;
       error = switchProblem(result) ?? "";
     } catch (e) {

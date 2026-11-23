@@ -769,6 +769,70 @@ class RegisterScreenTest {
         }
     }
 
+    @Test fun aToggleGoesTheWayItReadsAndARoutineHasTheLabelsReadAgain() {
+        shell("appwidget grantbind --package ${context.packageName} --user 0")
+        val host = android.appwidget.AppWidgetHost(context, 11)
+        val toggle = host.allocateAppWidgetId()
+        val routine = host.allocateAppWidgetId()
+        val manager = AppWidgetManager.getInstance(context)
+        try {
+            assertTrue(manager.bindAppWidgetIdIfAllowed(toggle, ComponentName(context, LabelToggleWidget::class.java)))
+            assertTrue(manager.bindAppWidgetIdIfAllowed(routine, ComponentName(context, SceneWidget::class.java)))
+            LabelWidget.save(context, toggle, WidgetConfig(2, "ゲーム"))
+            SceneWidget.save(context, routine, "おやすみ")
+            api.labels += Label(2, "game", override = Override(203, 5000), on = true)
+            host.startListening()
+            ActivityScenario.launch(MainActivity::class.java).use { screen ->
+                val views = mutableMapOf<Int, android.appwidget.AppWidgetHostView>()
+                screen.onActivity { activity ->
+                    val size = (110 * activity.resources.displayMetrics.density).toInt()
+                    for ((id, gravity) in listOf(toggle to android.view.Gravity.START, routine to android.view.Gravity.END)) {
+                        views[id] = host.createView(activity, id, manager.getAppWidgetInfo(id))
+                        activity.addContentView(views[id], android.widget.FrameLayout.LayoutParams(size, size,
+                            android.view.Gravity.CENTER_VERTICAL or gravity))
+                    }
+                }
+                val words = { id: Int -> views.getValue(id).findViewById<TextView>(R.id.label_button_text).text.toString() }
+                val press = { id: Int -> screen.onActivity { views.getValue(id).findViewById<View>(R.id.label_button).performClick() } }
+                for (provider in listOf(LabelToggleWidget::class.java, SceneWidget::class.java)) {
+                    context.sendBroadcast(android.content.Intent(AppWidgetManager.ACTION_APPWIDGET_UPDATE)
+                        .setComponent(ComponentName(context, provider))
+                        .putExtra(AppWidgetManager.EXTRA_APPWIDGET_IDS, intArrayOf(if (provider == SceneWidget::class.java) routine else toggle)))
+                }
+                eventually(screen) { words(toggle) == "ゲーム中" && words(routine) == "おやすみ" }
+
+                // Switched off elsewhere, the button still reads on: pressed, it is sent as read and stays off.
+                api.labels[0] = api.labels[0].copy(on = false)
+                press(toggle)
+                eventually(screen) { words(toggle) == "ゲーム" }
+                assertEquals(listOf(Triple(2L, LabelOp.TOGGLE, true)), api.labelSwitches.toList())
+                assertEquals(false, api.labels[0].on)
+                captureWidget(views.getValue(toggle), "toggle-as-read")
+
+                // Read as off, it goes on.
+                press(toggle)
+                eventually(screen) { words(toggle) == "ゲーム中" }
+                assertEquals(Triple(2L, LabelOp.TOGGLE, false), api.labelSwitches.last())
+
+                // A routine that switches the label off has its button read so at once, not at the next update.
+                api.sceneRun = {
+                    api.labels[0] = api.labels[0].copy(on = false)
+                    ApiResult.Ok(SceneRun.Done(0, null))
+                }
+                press(routine)
+                eventually(screen) { words(toggle) == "ゲーム" }
+                captureWidget(views.getValue(toggle), "toggle-after-routine")
+                assertEquals(2, api.labelSwitches.size)
+            }
+        } finally {
+            host.stopListening()
+            host.deleteAppWidgetId(toggle)
+            host.deleteAppWidgetId(routine)
+            api.labels.clear()
+            api.sceneRun = null
+        }
+    }
+
     /** Saves the screen with the widget `view` on it, asserting its button keeps a 48dp target and unclipped words. */
     private fun captureWidget(view: View, name: String) {
         InstrumentationRegistry.getInstrumentation().waitForIdleSync()
@@ -1274,7 +1338,10 @@ private class FakeApi : HomeLinkApi {
 
     override fun door(command: DoorCommand): ApiResult<Unit> = ApiResult.Failed(ApiError.SERVER)
     override fun scenes(): ApiResult<List<Scene>> = ApiResult.Ok(emptyList())
-    override fun runScene(name: String, from: Int, phone: String, fix: Fix?): ApiResult<SceneRun> = ApiResult.Failed(ApiError.SERVER)
+    /** What running a routine does and answers; null fails it. */
+    @Volatile var sceneRun: (() -> ApiResult<SceneRun>)? = null
+    override fun runScene(name: String, from: Int, phone: String, fix: Fix?): ApiResult<SceneRun> =
+        sceneRun?.invoke() ?: ApiResult.Failed(ApiError.SERVER)
     override fun phones(): ApiResult<Set<String>> = ApiResult.Ok(emptySet())
     override fun registerPhone(id: String, name: String): ApiResult<Unit> = ApiResult.Failed(ApiError.SERVER)
     override fun unregisterPhone(id: String): ApiResult<Unit> = ApiResult.Failed(ApiError.SERVER)
@@ -1341,14 +1408,15 @@ private class FakeApi : HomeLinkApi {
     override fun labels(): ApiResult<List<Label>> = labelsFailure?.let { ApiResult.Failed(it) } ?: ApiResult.Ok(labels.toList())
 
     @Volatile var labelsFailure: ApiError? = null
-    val labelSwitches: MutableList<Pair<Long, LabelOp>> = Collections.synchronizedList(mutableListOf())
+    /** Each switch sent: the label, the op and the state its button showed. */
+    val labelSwitches: MutableList<Triple<Long, LabelOp, Boolean?>> = Collections.synchronizedList(mutableListOf())
     @Volatile var labelGate: CountDownLatch? = null
     /** What a label switch reports; null switches every device. */
     @Volatile var labelCounts: SwitchResult? = null
 
-    override fun switchLabel(id: Long, op: LabelOp): ApiResult<LabelResult> {
+    override fun switchLabel(id: Long, op: LabelOp, shown: Boolean?): ApiResult<LabelResult> {
         labelGate?.await()
-        labelSwitches += id to op
+        labelSwitches += Triple(id, op, shown)
         return synchronized(labels) {
             val index = labels.indexOfFirst { it.id == id }
             if (index < 0) return ApiResult.Failed(ApiError.LABEL_NOT_FOUND)
@@ -1356,7 +1424,7 @@ private class FakeApi : HomeLinkApi {
             val on = when (op) {
                 LabelOp.ON -> true
                 LabelOp.OFF -> false
-                LabelOp.TOGGLE -> label.on != true
+                LabelOp.TOGGLE -> !(shown ?: (label.on == true))
             }
             val action = if (on) "on" else if (label.override != null) "release" else "off"
             labels[index] = label.copy(on = on)

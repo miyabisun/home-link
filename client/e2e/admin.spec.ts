@@ -130,6 +130,13 @@ test("a label assigns devices and switches them", async ({ page }) => {
   await expect(toggle).toHaveAttribute("aria-pressed", "true");
   await expect.poll(() => labelRow("常夜灯")?.on).toBe(1);
 
+  // Switched off elsewhere, the button still reads on: pressed, it goes the way it reads.
+  await page.request.post(`/api/labels/${label.id}/off`);
+  await expect(toggle).toHaveText("入");
+  await toggle.click();
+  await expect(toggle).toHaveText("切");
+  expect(labelRow("常夜灯")?.on).toBe(0);
+
   await page.getByRole("checkbox", { name: "居間の照明" }).uncheck();
   await expect.poll(() => labelsOf(deviceId("居間の照明"))).toEqual([]);
 });

@@ -5001,6 +5001,69 @@ async fn a_released_override_returns_each_light_to_what_its_other_labels_say() {
 }
 
 #[tokio::test]
+async fn a_toggle_goes_the_way_its_presser_saw_the_label() {
+    let (addr, commands, _) = fake_light_server(tuning_nodes(), Fake::default()).await;
+    let (_home, app, [ambient, game, _]) = override_home(addr, || AFTER_MIDNIGHT).await;
+    let toggle = |label: &Value, body: Value| {
+        let uri = format!("/api/labels/{}/toggle", label["id"]);
+        let app = app.clone();
+        async move { call(&app, "POST", &uri, Some(body)).await }
+    };
+    let sent = || -> Vec<Value> {
+        let sent = switches(&commands).into_iter().map(|s| s.2).collect();
+        commands.lock().unwrap().clear();
+        sent
+    };
+
+    // Room's off ended game's override, as a routine does: a button drawn before still reads
+    // game as on. Pressed as on, it goes off and lights nothing.
+    label_op(&app, &game, "on").await;
+    label_op(&app, &ambient, "off").await;
+    sent();
+    let (status, body) = toggle(&game, json!({ "from": true })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        (&body["action"], &body["on"]),
+        (&json!("release"), &json!(false))
+    );
+    assert_eq!(sent(), [json!("Off"), json!("Off")]);
+
+    // Pressed as off while it is on, it stays on.
+    label_op(&app, &game, "on").await;
+    sent();
+    let (_, body) = toggle(&game, json!({ "from": false })).await;
+    assert_eq!((&body["action"], &body["on"]), (&json!("on"), &json!(true)));
+    assert_eq!(sent(), [json!("On"), json!("On")]);
+
+    // A label without an override pressed as on goes off, whatever it was.
+    label_op(&app, &ambient, "off").await;
+    sent();
+    let (_, body) = toggle(&ambient, json!({ "from": true })).await;
+    assert_eq!(
+        (&body["action"], &body["on"]),
+        (&json!("off"), &json!(false))
+    );
+    assert_eq!(sent(), [json!("Off")]);
+
+    // With nothing seen, the label's own state decides, as before.
+    let (_, body) = toggle(&ambient, json!({})).await;
+    assert_eq!(body["action"], "on");
+    let (_, body) = label_op(&app, &ambient, "toggle").await;
+    assert_eq!(body["action"], "off");
+
+    for wrong in [
+        json!({ "from": "on" }),
+        json!({ "from": null }),
+        json!({ "seen": true }),
+        json!([true]),
+    ] {
+        let (status, body) = toggle(&ambient, wrong.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{wrong}");
+        assert_eq!(body["error"], "invalid_toggle", "{wrong}");
+    }
+}
+
+#[tokio::test]
 async fn an_override_that_reaches_no_light_is_not_kept() {
     let fake = Fake {
         silent: vec![(6, 1)],

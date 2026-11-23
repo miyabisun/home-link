@@ -107,6 +107,19 @@ class HttpHomeLinkApiTest {
         assertEquals(listOf("POST /api/labels/2/toggle", "POST /api/labels/2/on", "POST /api/labels/2/off"), requests)
     }
 
+    @Test fun aToggleSaysTheStateItsButtonShowed() {
+        val answer = """{"action":"on","on":true,"switched":1,"no_response":0,"failed":0,"missing_devices":[]}"""
+        respond("/api/labels/2/toggle", 200, answer)
+        respond("/api/labels/2/on", 200, answer)
+        api.switchLabel(2, LabelOp.TOGGLE, shown = true)
+        api.switchLabel(2, LabelOp.TOGGLE, shown = false)
+        // A button that showed no state says none; on and off name their side themselves.
+        api.switchLabel(2, LabelOp.TOGGLE, shown = null)
+        api.switchLabel(2, LabelOp.ON, shown = false)
+        assertEquals(listOf("""POST /api/labels/2/toggle {"from":true}""", """POST /api/labels/2/toggle {"from":false}""",
+            "POST /api/labels/2/toggle", "POST /api/labels/2/on"), requests)
+    }
+
     @Test fun connectsALedgerRowWithoutABody() {
         respond("/api/devices/9/commission", 200, """{"node_id":17,"device":${ledgerRow.replace("unconnected", "connected")}}""")
         assertEquals(ApiResult.Ok(ledgerDevice.copy(state = DeviceState.CONNECTED)), api.commission(9))

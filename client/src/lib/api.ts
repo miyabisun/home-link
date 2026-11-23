@@ -215,7 +215,9 @@ export const api = {
     request<Phone[]>("GET", "/api/phones", undefined, signal),
   deletePhone: (id: string) =>
     request<null>("DELETE", `/api/phones/${encodeURIComponent(id)}`),
-  toggleLabel: (id: number) =>
+  // `from` is the state the button pressed read as, so that a page read before the label last
+  // changed still does what it reads; null leaves the way to home-link.
+  toggleLabel: (id: number, from: boolean | null) =>
     request<{
       on: boolean | null;
       no_response: number;
@@ -223,7 +225,11 @@ export const api = {
       missing: number;
       devices: SwitchEntry[];
       missing_devices: { id: number; name: string }[];
-    }>("POST", `/api/labels/${id}/toggle`),
+    }>(
+      "POST",
+      `/api/labels/${id}/toggle`,
+      from === null ? undefined : { from },
+    ),
   pcs: (signal?: AbortSignal) =>
     request<Pc[]>("GET", "/api/pcs", undefined, signal),
   sleepPc: (name: string, sleep: boolean) =>

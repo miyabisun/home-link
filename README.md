@@ -321,7 +321,9 @@ adb -s DEVICE_SERIAL push home-link.yaml /sdcard/Android/data/dev.miyabisun.home
 
 例えば、label「work」の切り替えに「仕事」、label「game」の切り替えに「ゲーム」と名前を付けて置きます。
 押したボタンの文字は「送信中…」のあと、数秒だけ結果（「オン完了」「オフ完了」と、下の[ボタンの表示](#ボタンの表示)）に変わります。
-切り替えは、すべての機器を切り替えられたときは新しい状態をすぐに示します。切り替えの状態は、置いたとき、押した後、30分ごとにhome-linkから読み直します。
+切り替えは、すべての機器を切り替えられたときは新しい状態をすぐに示します。切り替えの状態は、置いたとき、押した後、操作（「おやすみ」など）のウィジェットを実行した後、30分ごとにhome-linkから読み直します。
+切り替えは、ボタンが示していた状態から切り替えます。「<名前>中」と示していれば切り、そうでなければONにします。
+操作やスケジュール、別の端末がlabelを変えた後で表示が古くても、押した結果は表示のとおりになります。状態が不明の表示のときは、home-linkの状態で決めます。
 状態を読めないときは前の状態を残し、まだ一度も読めていないときや、押した結果が分からないときは「?」のアイコンで示します。
 
 0.1.37までの照明のウィジェット（照明オン・照明オフ・仕事・作業）は、アプリを更新するとホーム画面から消えます。上のウィジェットを置き直してください。
@@ -344,7 +346,7 @@ home-linkにつながっているPCは一覧から選べます。まだつなが
 PCが複数あるときは、PCごとに置きます。置いた後も、ウィジェットの長押しの設定から変えられます。
 
 押すたびに、PCをスリープさせ、スリープ中なら復帰させます。スリープ中は「スリープ中」とアクセントの面で示します。
-状態は、置いたとき、押した後、30分ごとにhome-linkから読み直します。PCがhome-linkにつながっていないときと、状態が分からないときは「?」のアイコンで示します。
+状態は、置いたとき、押した後、操作のウィジェットを実行した後、30分ごとにhome-linkから読み直します。PCがhome-linkにつながっていないときと、状態が分からないときは「?」のアイコンで示します。
 押すと、PCが答えるまで（最長10秒）「送信中…」を示します。うまくいかなかったときは、数秒だけ[ボタンの表示](#ボタンの表示)の結果を示してから元の表示に戻ります。
 
 ### 玄関を解錠・施錠する
@@ -484,7 +486,7 @@ Thread網の資格情報（dataset）は、matterjs-serverに `set_thread_datase
 | `POST /api/labels` | labelの作成。本文は `{"name": "work", "override_level": 254, "override_kelvin": 5000}`、`{"name": "ambient", "auto": true}`、`{"name": "razor", "schedule": [{"time": "00:00", "on": true}, {"time": "05:00", "on": false}]}` など（下の「label」） | 400 `invalid_label_name`・`invalid_label`、409 `duplicate_label_name` |
 | `PATCH /api/labels/{id}` | labelの名前・性質・`schedule` のうち、送った項目だけを変更します。`override_level`・`override_kelvin` を `null` にすると上書きの値を外し、`schedule` は送ったもので置き換えます（`[]` で消す） | 400 `invalid_label_name`・`invalid_label`、404 `label_not_found`、409 `duplicate_label_name` |
 | `DELETE /api/labels/{id}` | labelの削除。割り当てた機器は、ほかのlabelだけになります | 404 `label_not_found` |
-| `POST /api/labels/{id}/on`・`/off`・`/toggle` | labelの機器（照明・プラグ・エアコン、無視の機器を除く）をON・OFF・切り替えにします（下の「label」）。応答は、行った操作 `action`（`on`・`off`・`release`）、操作後の `on`・`boosted`、件数（`switched`・`no_response`・`failed`・`missing`）、機器ごとの結果 `devices` と、登録が外れた機器 `missing_devices` です | 404 `label_not_found`、422 `label_has_no_devices`、503 `matter_server_not_configured`、502 `matter_server_unreachable` |
+| `POST /api/labels/{id}/on`・`/off`・`/toggle` | labelの機器（照明・プラグ・エアコン、無視の機器を除く）をON・OFF・切り替えにします（下の「label」）。`/toggle` は本文 `{"from": true\|false}`（押した時に見えていた状態）を受けます。応答は、行った操作 `action`（`on`・`off`・`release`）、操作後の `on`・`boosted`、件数（`switched`・`no_response`・`failed`・`missing`）、機器ごとの結果 `devices` と、登録が外れた機器 `missing_devices` です | 400 `invalid_toggle`、404 `label_not_found`、422 `label_has_no_devices`、503 `matter_server_not_configured`、502 `matter_server_unreachable` |
 | `GET /api/wifi` | 保存したWi-Fiの一覧（`id`・`ssid`・機器に渡すものか `for_devices`）。パスワードは返しません | |
 | `POST /api/wifi` | Wi-Fiの保存。本文は `{"ssid": "home-2g", "password": "…"}`。同じSSIDならパスワードを置き換えます。最初の1つ、または `"for_devices": true` で送ったものを機器に渡します | 400 `invalid_wifi` |
 | `PUT /api/wifi/devices` | 機器に渡すWi-Fiの指定。本文は `{"id": 2}` | 404 `wifi_not_found` |
@@ -647,6 +649,9 @@ labelの操作（`POST /api/labels/{id}/on`・`/off`・`/toggle`）は、label�
 - **OFF**: 機器をオフにします。オフにできた機器に付いた上書きのlabelも、上書きをやめます。
 - **切り替え（toggle）**: labelの `on` が `true` でなければONにします。`true` なら、上書きの値を持たないlabelはOFFにし、
   上書きの値を持つlabelは上書きをやめます。上書きをやめた照明は、ほかのlabelで決まる状態に戻ります。
+  本文に `{"from": true}` か `{"from": false}`（押した時にボタンが示していたlabelの状態）を送ると、labelの `on` の代わりにその状態から切り替えます。
+  `from` が `true` なら切る側、`false` ならONです。表示が古いボタンでも、押した結果が表示のとおりになります。
+  本文が無いか `{}` なら、labelの `on` で決めます。ほかの本文は400 `invalid_toggle` です。
   ほかの上書き中のlabelがあればその値のまま、ONの（OFFでない）自動調光連動のlabelがあればその時刻の目標値へすぐ戻り（`ExecuteIfOff` なし、`transitionTime` 0）、
   どちらでもなければ消えます。プラグも同じく、自動調光連動のlabelに入っていなければ切ります。
   ほかの上書き中のlabelが持つ照明へは何も送らず、結果は `override` です（`switched` に数えません）。

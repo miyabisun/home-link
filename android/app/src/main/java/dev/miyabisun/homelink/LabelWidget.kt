@@ -66,6 +66,14 @@ abstract class LabelWidget(private val kind: Kind) : AppWidgetProvider() {
                 .putStringSet("off", states.filterValues { !it }.keys.map(Long::toString).toSet()).commit()
         }
 
+        /** The state the toggle of widget `id` last read as; null while it read as unknown. */
+        private fun shown(context: Context, id: Int): Boolean? = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString("$id.shown", null)?.toBooleanStrictOrNull()
+
+        private fun saveShown(context: Context, id: Int, on: Boolean?) {
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString("$id.shown", on?.toString()).apply()
+        }
+
         /** Keeps what a read of the labels found; a failed read keeps what was known. */
         fun saveStates(context: Context, read: ApiResult<List<Label>>) = save(context, readStates(states(context), read))
 
@@ -110,7 +118,10 @@ abstract class LabelWidget(private val kind: Kind) : AppWidgetProvider() {
                     putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, id).putExtra(OP, op.ordinal).putExtra(KIND, kind.ordinal)
                 })
                 val pressed = press?.takeIf { it.op == op }
-                val face = labelFace(op, config.name, states(context)[config.labelId], pressed?.label, pressed?.sending == true)
+                val on = states(context)[config.labelId]
+                // A press's progress and result cover the state for a while: what the button last read as stays.
+                if (op == LabelOp.TOGGLE && pressed?.label == null && pressed?.sending != true) saveShown(context, id, on)
+                val face = labelFace(op, config.name, on, pressed?.label, pressed?.sending == true)
                 views.showFace(button, words, face)
                 // A press that shows the new state is read as that state, not as the result.
                 views.setContentDescription(button, pressed?.message?.takeIf { pressed.label != null }?.let { "${face.text}：$it" } ?: face.description)
@@ -128,7 +139,9 @@ abstract class LabelWidget(private val kind: Kind) : AppWidgetProvider() {
             val op = LabelOp.entries.getOrNull(intent.getIntExtra(OP, -1)) ?: return
             val config = config(context, id) ?: return
             flow.run(context, sending = { show(context, kind, id, Press(op, SENDING, sending = true)) }, send = {
-                val result = homeLinkApi(context).switchLabel(config.labelId, op)
+                // A toggle goes the way its button read: another press, a routine or a schedule may have switched
+                // the label since it was drawn.
+                val result = homeLinkApi(context).switchLabel(config.labelId, op, shown(context, id))
                 val known = states(context)
                 val after = pressedState(known[config.labelId], when (result) {
                     is ApiResult.Ok -> ApiResult.Ok(result.value.on)
@@ -153,7 +166,7 @@ abstract class LabelWidget(private val kind: Kind) : AppWidgetProvider() {
 
     override fun onDeleted(context: Context, ids: IntArray) {
         val edit = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-        for (id in ids) edit.remove("$id.label").remove("$id.name")
+        for (id in ids) edit.remove("$id.label").remove("$id.name").remove("$id.shown")
         edit.apply()
     }
 }

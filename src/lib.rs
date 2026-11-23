@@ -2842,16 +2842,17 @@ async fn boost(
         .find(|l| l.name == name.trim())
         .ok_or_else(label_not_found)?
         .id;
-    let mut body = switch_label(&state, id, Op::Toggle)
-        .await
-        .map_err(|error| match error.1 {
-            "label_has_no_devices" => ApiError(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "label_has_no_lights",
-                format!("labelの「{}」に照明が割り当てられていません", name.trim()),
-            ),
-            _ => error,
-        })?;
+    let mut body =
+        switch_label(&state, id, Op::Toggle(None))
+            .await
+            .map_err(|error| match error.1 {
+                "label_has_no_devices" => ApiError(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "label_has_no_lights",
+                    format!("labelの「{}」に照明が割り当てられていません", name.trim()),
+                ),
+                _ => error,
+            })?;
     body["action"] = json!(if body["action"] == "on" {
         "boost"
     } else {
@@ -2865,7 +2866,8 @@ async fn boost(
 enum Op {
     On,
     Off,
-    Toggle,
+    /// To the other state than the one given: the one its presser saw, or else the label's own.
+    Toggle(Option<bool>),
 }
 
 async fn label_on(
@@ -2882,11 +2884,31 @@ async fn label_off(
     switch_label(&state, id, Op::Off).await.map(Json)
 }
 
+/// Toggles the label from the state the body's `from` says its presser saw, so that a button
+/// drawn before the label last changed still does what it reads; without one, from the label's own.
 async fn label_toggle(
     State(state): State<Db>,
     Path(id): Path<i64>,
+    body: axum::body::Bytes,
 ) -> ApiResult<Json<serde_json::Value>> {
-    switch_label(&state, id, Op::Toggle).await.map(Json)
+    let invalid = || {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_toggle",
+            "本文は無しか、{\"from\": true} か {\"from\": false}（押した時に見えていたlabelの状態）で送ってください".into(),
+        )
+    };
+    let seen = if body.is_empty() {
+        None
+    } else {
+        let input: serde_json::Value = serde_json::from_slice(&body).map_err(|_| invalid())?;
+        match input.as_object() {
+            Some(fields) if fields.is_empty() => None,
+            Some(fields) if fields.len() == 1 => Some(input["from"].as_bool().ok_or_else(invalid)?),
+            _ => return Err(invalid()),
+        }
+    };
+    switch_label(&state, id, Op::Toggle(seen)).await.map(Json)
 }
 
 /// Runs the label switches due at `unix`'s minute, and those of the minutes since the last run
@@ -3092,6 +3114,7 @@ fn missed_devices(body: &serde_json::Value) -> Vec<(u64, u16)> {
 /// them off and ends every override of theirs. A toggle turns an override label that is
 /// on back to what its lights' other labels say: held by another override, adjusted
 /// under an auto label that is on, else off; any other label that is on, off; else on.
+/// "On" is what the toggle's presser saw when it says so, else the label's own state.
 ///
 /// A label takes its new state as soon as the switch reaches one of its devices, before any
 /// values are sent: values that cannot be sent are that light's result, not the request's.
@@ -3111,9 +3134,12 @@ async fn switch_label_among(
     let fixed = switch.label.traits.override_level.is_some();
     let action = match op {
         Op::On => "on",
-        Op::Toggle if switch.label.traits.on != Some(true) => "on",
-        Op::Toggle if fixed => "release",
-        Op::Off | Op::Toggle => "off",
+        Op::Off => "off",
+        Op::Toggle(seen) => match seen.unwrap_or(switch.label.traits.on == Some(true)) {
+            false => "on",
+            true if fixed => "release",
+            true => "off",
+        },
     };
     let deadline = link::budget();
     let run = match action {

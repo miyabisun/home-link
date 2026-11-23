@@ -97,8 +97,12 @@ interface HomeLinkApi {
     fun addDevice(payload: String): ApiResult<Device>
     fun updateDevice(id: Long, update: DeviceUpdate): ApiResult<Device>
     fun labels(): ApiResult<List<Label>>
-    /** Switches label `id`'s lights and plugs on or off, or toggles them. */
-    fun switchLabel(id: Long, op: LabelOp): ApiResult<LabelResult>
+    /**
+     * Switches label `id`'s lights and plugs on or off, or toggles them: from the state `shown` on the button
+     * pressed, so that a button drawn before the label last changed still does what it reads; null leaves the
+     * way to home-link.
+     */
+    fun switchLabel(id: Long, op: LabelOp, shown: Boolean? = null): ApiResult<LabelResult>
     /**
      * Has matterjs-server commission ledger device `id` by its code over the BLE proxy this phone holds open;
      * home-link hands over its Wi-Fi for devices, and matterjs-server picks Wi-Fi or Thread. Takes up to minutes.
@@ -208,8 +212,8 @@ class HttpHomeLinkApi(private val targets: () -> Targets, private val link: Phon
         (0 until array.length()).map { label(array.getJSONObject(it)) }
     }
 
-    override fun switchLabel(id: Long, op: LabelOp): ApiResult<LabelResult> =
-        call("POST", "/api/labels/$id/${op.path}", null) { body ->
+    override fun switchLabel(id: Long, op: LabelOp, shown: Boolean?): ApiResult<LabelResult> =
+        call("POST", "/api/labels/$id/${op.path}", shown?.takeIf { op == LabelOp.TOGGLE }?.let { JSONObject().put("from", it) }) { body ->
             val json = JSONObject(body)
             LabelResult(json.getString("action"), if (json.isNull("on")) null else json.getBoolean("on"), counts(json))
         }
