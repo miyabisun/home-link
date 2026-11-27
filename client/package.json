@@ -14,16 +14,13 @@
     "format:check": "prettier --plugin=prettier-plugin-svelte --check \"src/**/*.{svelte,ts,css}\" \"*.{js,ts,html}\"",
     "check": "svelte-check --tsconfig ./tsconfig.json --fail-on-warnings",
     "test": "vitest run",
-    "lint:design": "designmd lint ../DESIGN.md",
-    "test:e2e": "playwright test"
+    "lint:design": "designmd lint ../DESIGN.md"
   },
   "devDependencies": {
     "@google/design.md": "0.4.0",
-    "@playwright/test": "1.63.0",
     "@sveltejs/vite-plugin-svelte": "7.2.0",
     "@testing-library/svelte": "5.4.2",
     "@types/node": "24.13.3",
-    "@types/ws": "8.18.2",
     "jsdom": "29.1.1",
     "normalize.css": "8.0.1",
     "prettier": "3.9.6",
@@ -33,7 +30,6 @@
     "svelte-check": "4.7.4",
     "typescript": "6.0.3",
     "vite": "8.1.5",
-    "vitest": "4.1.10",
-    "ws": "8.22.0"
+    "vitest": "4.1.10"
   }
 }

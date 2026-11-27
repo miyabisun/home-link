@@ -30,6 +30,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --locked
 cargo build --locked
 scripts/smoke.sh
+python3 -B bin/test_browser.py
 ```
 
 `scripts/smoke.sh` は、ビルドした `target/debug/home-link` を一時ディレクトリへ写して起動し、
@@ -140,7 +141,7 @@ APIを `cargo run` で3000番に立てたまま、Viteの開発サーバーで�
 npm --prefix client run dev
 ```
 
-変更後は、commitの前に次の検証とE2Eテストを手元で通してください。
+変更後は、commitの前に次の検証を手元で通してください。
 
 ```sh
 npm --prefix client run format:check
@@ -153,21 +154,29 @@ npm --prefix client run lint:design
 表示の組み立て（名前の無い機器の呼び名、状態、labelの要約、明るさの%と254段階の変換、入り切りの結果）を持ち、
 `admin.test.ts` で単体テストします。
 
-E2Eテストは、ChromiumとPlaywrightで、ビルドしたhome-link（`target/debug/home-link`）とmockのmatterjs-serverを相手に動きます。
-`client/e2e/serve.mjs` が一時ディレクトリの新しいDBでhome-linkを起動し、照明・プラグ・エアコン・温湿度計を1台ずつ返すmockを立て、台帳に機器を入れます。
-テストは画面を操作し、APIを通じてSQLiteのファイルに入った値を読んで確かめます（機器の名前・label・無視・削除、labelの作成・名前・調光・固定の値・スケジュール・機器・削除・入り切り）。
-エアコンの画面は、mockのエアコンと温湿度計を相手に、同じlabelを付けると温湿度計の室温が出ること、機器の画面の入り切りでエアコンの運転が変わることを確かめます。
-`serve.mjs` は国土地理院とOpen-Meteoの代わりも立て（`GSI_URL`・`OPEN_METEO_URL`）、住所の登録の成功と失敗、外気温と理由の表示を確かめます。
-照明の接続の画面は、`GET /api/lights/watch` と `GET /api/lights/outages` の応答をPlaywrightで差し替え、切れた照明・網から外れた照明・長い名前・matterjs-serverに届かない状態と14日の履歴を、幅1280と390、明暗の両方で確かめます。
-温度計の画面は、台帳の温湿度計の値と機器の画面へのリンクを確かめます。E2Eのhome-linkにSwitchBotの温度計は無いため、`GET /api/meter` の応答をPlaywrightで差し替えて、今の値・名前の変更・自動運転のlabelと入・切・途絶え・未受信を確かめます。
-応答しない機器の表示は、`GET /api/devices` とlabelの入り切りの応答をPlaywrightで差し替え、Threadの機器だけが応答しないときと、Wi-Fiの機器も応答しないときを、幅1280と390、明暗の両方で確かめます。
-`screens.spec.ts` は幅1280と390の明暗で全画面を撮り（`client/test-results/screens/`）、横のはみ出しと本文の内側の縦スクロールが無いことを確かめます。
+画面の試験は2つの層に分けます。
+
+- jsdomの層（`client/src/pages/page.*.test.ts`、`npm --prefix client test`）: 画面全体（`App.svelte`）をjsdomで描き、
+  APIの応答は試験の中の代役（`client/src/testing/home.ts` が `fetch` を差し替える）が返します。
+  代役はサーバーの規則を持たず、各試験が応答を決め、画面が送った要求を読み返します。
+  文言・表示の出し分け・入力の誤り・確認の窓・押した後に送る要求（機器の名前・label・無視・削除、labelの作成・名前・調光・固定の値・スケジュール・機器・削除・入り切り、
+  エアコンのモードと入り切り、住所の登録、温度計の名前と自動運転、照明の登録の削除、PCのスリープと復帰、操作のYAMLの保存と実行、電話と自宅の位置の削除）を確かめます。
+  サーバーが要求をDBへ入れることは `tests/api.rs`・`tests/pc.rs` が確かめます。
+- engineの層（`tests/page.rs`、`cargo test --locked` に含まれる）: ビルドしたhome-linkを一時ディレクトリの新しいDBで、
+  ChromeDriverとChrome for Testingの `chrome-headless-shell` を1つずつ、どれもOSが選ぶ空きのportで起こし、
+  W3C WebDriverのHTTPで1つのbrowserから試験を順に流します。
+  幅1280と390・明暗の全画面で、横のはみ出し・本文の内側の縦スクロールが無いこと・背景の色、要対応の行の高さ44px以上、
+  390pxのメニューと削除の確認の窓の位置、応答しない機器の知らせと、何も無い画面のはみ出しを測ります。
+  matterjs-serverは立てず、国土地理院とOpen-Meteoは閉じたportへ向けます。実物の機器が無いと返らない応答（温度計・エアコン・照明の接続・要対応・PC・操作の実行の結果）は、
+  page内で `fetch` に答えるscriptで渡します。
+  browserは `bin/browser`（python3の標準libraryだけ）が版を固定して `${XDG_CACHE_HOME:-~/.cache}/chrome-for-testing/<版>/` へ取り、
+  在ればnetworkに出ません。`bin/test_browser.py` がその取り方を確かめます。
+
+engineの層は組み込んだ画面を使うので、画面を変えたら先にビルドします。
 
 ```sh
 npm --prefix client run build
-cargo build --locked
-npx --prefix client playwright install chromium
-npm --prefix client run test:e2e
+cargo test --locked --test page
 ```
 
 コンテナは次のように作成し、確認できます。

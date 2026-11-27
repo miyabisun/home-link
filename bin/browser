@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""Fetches the browser the page tests (tests/page.rs) drive: chrome-headless-shell and the
+chromedriver of the same version of Chrome for Testing. It keeps them in the cache of the user
+and prints the directory that holds them; once they are there it does not go out to the
+network."""
+import hashlib
+import os
+import shutil
+import stat
+import sys
+import tempfile
+import urllib.request
+import zipfile
+from pathlib import Path
+
+VERSION = "158.0.8127.88"
+# What is fetched of the version, each archive with its SHA-256.
+ARCHIVES = {
+    "chrome-headless-shell-linux64.zip": "63401333cc587645bfaeea7f0c90958b327d249251e23954a47f30112ca23d5b",
+    "chromedriver-linux64.zip": "afabc2d0f866af4d9e209389f930ce34b5f2d365fb1b6c83874845cc123b0e2e",
+}
+URL = "https://storage.googleapis.com/chrome-for-testing-public/{version}/linux64/{name}"
+# The programs the tests start, under the directory.
+PROGRAMS = ("chrome-headless-shell-linux64/chrome-headless-shell", "chromedriver-linux64/chromedriver")
+
+
+def home(environ):
+    """Where the browser of VERSION is kept: under XDG_CACHE_HOME, or ~/.cache when it names no
+    absolute path."""
+    cache = environ.get("XDG_CACHE_HOME", "")
+    base = Path(cache) if os.path.isabs(cache) else Path(environ["HOME"]) / ".cache"
+    return base / "chrome-for-testing" / VERSION
+
+
+def agent(version):
+    """The User-Agent a browser of `version` sends."""
+    major = version.split(".")[0]
+    return f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+
+
+def download(url, path):
+    """Writes what `url` answers to `path`."""
+    asked = urllib.request.Request(url, headers={"User-Agent": agent(VERSION)})
+    with urllib.request.urlopen(asked, timeout=60) as answer, open(path, "wb") as out:
+        shutil.copyfileobj(answer, out, 1 << 20)
+
+
+def sha256(path):
+    whole = hashlib.sha256()
+    with open(path, "rb") as file:
+        for chunk in iter(lambda: file.read(1 << 20), b""):
+            whole.update(chunk)
+    return whole.hexdigest()
+
+
+def unpack(archive, into):
+    """Unpacks `archive` into `into`, each file with the permissions it was packed with."""
+    with zipfile.ZipFile(archive) as packed:
+        for info in packed.infolist():
+            path = Path(packed.extract(info, into))
+            mode = info.external_attr >> 16
+            if not info.is_dir() and stat.S_ISREG(mode):
+                path.chmod(stat.S_IMODE(mode))
+
+
+def fetch(place, get, url=URL, archives=ARCHIVES, programs=PROGRAMS):
+    """The directory `place`, holding `programs`: when they are not there yet, `archives` are
+    fetched with `get(url, path)` and unpacked beside it under another name, which is then
+    renamed to it. An archive whose SHA-256 is not the pinned one is refused. A browser another
+    run put there meanwhile is kept."""
+    if all((place / program).is_file() for program in programs):
+        return place
+    place.parent.mkdir(parents=True, exist_ok=True)
+    making = Path(tempfile.mkdtemp(prefix=f".{place.name}-", dir=place.parent))
+    try:
+        for name, pinned in archives.items():
+            archive = making / name
+            get(url.format(version=place.name, name=name), archive)
+            found = sha256(archive)
+            if found != pinned:
+                raise SystemExit(f"{name} of {place.name} is not the one pinned in bin/browser: its SHA-256 is {found}")
+            unpack(archive, making)
+            archive.unlink()
+        try:
+            making.rename(place)
+        except OSError:
+            if not place.is_dir():
+                raise
+    finally:
+        shutil.rmtree(making, ignore_errors=True)
+    return place
+
+
+def main():
+    print(fetch(home(os.environ), download))
+
+
+if __name__ == "__main__":
+    main()

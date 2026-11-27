@@ -27,6 +27,12 @@ zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }
 [dev-dependencies]
 tokio = { version = "1.53.1", features = ["io-util"] }
 
+# The admin screen in a real browser: its own runner runs the tests one after another (tests/page.rs).
+# The image copies no tests/, so the path is named for the manifest to read without it.
+[[test]]
+name = "page"
+path = "tests/page.rs"
+harness = false
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
