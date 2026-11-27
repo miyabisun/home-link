@@ -4,11 +4,12 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 port=${PORT:-3100}
 binary_dir=$(mktemp -d)
+server_pid=
+trap 'if [[ -n "$server_pid" ]]; then kill -TERM "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; fi; rm -rf "$binary_dir"' EXIT
 cp "$root/target/debug/home-link" "$binary_dir/"
 cd "$binary_dir"
 PORT=$port DATABASE_PATH=smoke.db ./home-link &
 server_pid=$!
-trap 'kill -TERM "$server_pid" 2>/dev/null || true; rm -rf "$binary_dir"' EXIT
 
 base=http://127.0.0.1:$port
 for attempt in {1..20}; do

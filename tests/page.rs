@@ -11,8 +11,11 @@
 //! the PCs) the page is given by a script that answers those requests in the page.
 #[path = "support/browser.rs"]
 mod browser;
+#[path = "support/scratch.rs"]
+mod scratch;
 
-use browser::{Page, Scratch, TRIES, free_port};
+use browser::{Page, TRIES, free_port};
+use scratch::Scratch;
 use serde_json::{Value, json};
 use std::{
     future::Future,

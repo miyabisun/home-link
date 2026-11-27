@@ -1,5 +1,9 @@
 #![cfg(test)]
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
+use scratch::Scratch;
 use std::fmt::Write as _;
 use std::{
     net::SocketAddr,
@@ -185,8 +189,8 @@ async fn devices_hide_their_codes_in_list_but_not_alone() {
 
 #[test]
 fn opening_a_ledger_from_the_code_only_schema_keeps_its_devices() {
-    let path = std::env::temp_dir().join(format!("home-link-migrate-{}.db", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+    let scratch = Scratch::new("migrate");
+    let path = scratch.path().join("home-link.db");
     let old = rusqlite::Connection::open(&path).unwrap();
     old.execute_batch(
         "CREATE TABLE rooms (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
@@ -222,7 +226,6 @@ fn opening_a_ledger_from_the_code_only_schema_keeps_its_devices() {
         )
         .unwrap();
     }
-    let _ = std::fs::remove_file(&path);
 }
 
 /// Serves one `get_nodes` result the way matterjs-server does: a server
@@ -1566,8 +1569,8 @@ fn label_rows(db: &rusqlite::Connection) -> Vec<LabelRow> {
 
 #[test]
 fn opening_a_ledger_with_floors_moves_them_to_labels() {
-    let path = std::env::temp_dir().join(format!("home-link-labels-{}.db", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+    let scratch = Scratch::new("labels");
+    let path = scratch.path().join("home-link.db");
     {
         // A version 2 ledger: three Tapo with 3500 K, one with 4000 K and a T2 without.
         let old = home_link::open_db(path.to_str().unwrap()).unwrap();
@@ -1630,7 +1633,6 @@ fn opening_a_ledger_with_floors_moves_them_to_labels() {
             .unwrap();
         assert!(!has_floor);
     }
-    let _ = std::fs::remove_file(&path);
 }
 
 #[tokio::test]
@@ -1658,8 +1660,8 @@ async fn an_auto_labels_off_stops_its_adjustment_until_it_is_on_across_restarts(
     };
     let (addr, commands, _) = fake_light_server(tuning_nodes(), fake).await;
     let url = Some(format!("ws://{addr}/ws"));
-    let path = std::env::temp_dir().join(format!("home-link-intent-{}.db", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+    let scratch = Scratch::new("intent");
+    let path = scratch.path().join("home-link.db");
     let db_path = path.to_str().unwrap();
     let ambient = {
         let home = home_link::Home::new(home_link::open_db(db_path).unwrap(), url.clone());
@@ -1763,7 +1765,6 @@ async fn an_auto_labels_off_stops_its_adjustment_until_it_is_on_across_restarts(
     assert_eq!(body["runs"][0]["trigger"], "lights_on");
     assert_eq!(body["labels"][0]["on"], true);
     assert_eq!(tunings(&commands).len(), 6);
-    let _ = std::fs::remove_file(&path);
 }
 
 #[tokio::test]
@@ -3236,8 +3237,8 @@ async fn devices_are_named_by_patch() {
 
 #[tokio::test]
 async fn opening_a_v0_1_30_ledger_keeps_its_lights_connected_with_their_labels() {
-    let path = std::env::temp_dir().join(format!("home-link-v6-{}.db", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+    let scratch = Scratch::new("v6");
+    let path = scratch.path().join("home-link.db");
     {
         // The schema of v0.1.30 (user_version 6).
         let old = rusqlite::Connection::open(&path).unwrap();
@@ -3320,7 +3321,6 @@ async fn opening_a_v0_1_30_ledger_keeps_its_lights_connected_with_their_labels()
     );
     let (status, body) = scan(&app, json!({ "qr_payload": QRS[0] })).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
-    let _ = std::fs::remove_file(&path);
 }
 
 #[tokio::test]
@@ -3537,8 +3537,8 @@ async fn ignored_lights_get_no_adjustment() {
 
 #[test]
 fn opening_a_version_4_ledger_moves_each_lights_label_to_its_labels() {
-    let path = std::env::temp_dir().join(format!("home-link-v4-{}.db", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+    let scratch = Scratch::new("v4");
+    let path = scratch.path().join("home-link.db");
     {
         let old = home_link::open_db(path.to_str().unwrap()).unwrap();
         old.execute_batch(
@@ -3629,7 +3629,6 @@ fn opening_a_version_4_ledger_moves_each_lights_label_to_its_labels() {
         .query_row("SELECT count(*) FROM device_labels", [], |r| r.get(0))
         .unwrap();
     assert_eq!(left, 0);
-    let _ = std::fs::remove_file(&path);
 }
 
 async fn create_label(app: &Router, body: Value) -> Value {
@@ -5347,8 +5346,8 @@ async fn schedules_switch_a_label_at_their_times_across_midnight() {
 #[tokio::test]
 async fn a_schedule_due_while_home_link_was_restarting_runs_once_it_is_back() {
     let (addr, commands, _) = fake_light_server(plug_nodes(), Fake::default()).await;
-    let path = std::env::temp_dir().join(format!("home-link-restart-{}.db", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+    let scratch = Scratch::new("restart");
+    let path = scratch.path().join("home-link.db");
     let open = || {
         home_link::Home::new(
             home_link::open_db(path.to_str().unwrap()).unwrap(),
@@ -5398,7 +5397,6 @@ async fn a_schedule_due_while_home_link_was_restarting_runs_once_it_is_back() {
     open().run_schedules(minute(23, 29) + 2 * day).await;
     open().start_schedules(minute(23, 40) + 2 * day).await;
     assert_eq!(on(), 1);
-    let _ = std::fs::remove_file(&path);
 }
 
 #[tokio::test]
@@ -5409,8 +5407,8 @@ async fn a_restart_while_a_schedule_is_sent_again_does_not_send_it_twice() {
         ..Fake::default()
     };
     let (addr, commands, _) = fake_light_server(plug_nodes(), fake).await;
-    let path = std::env::temp_dir().join(format!("home-link-resend-{}.db", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+    let scratch = Scratch::new("resend");
+    let path = scratch.path().join("home-link.db");
     let open = || {
         home_link::Home::new(
             home_link::open_db(path.to_str().unwrap()).unwrap(),
@@ -5464,7 +5462,6 @@ async fn a_restart_while_a_schedule_is_sent_again_does_not_send_it_twice() {
     drop(home);
     open().run_schedules(minute(23, 32)).await;
     assert_eq!(plug_ons(), 2);
-    let _ = std::fs::remove_file(&path);
 }
 
 #[tokio::test]
@@ -5522,8 +5519,8 @@ async fn schedules_of_missed_minutes_run_and_devices_that_missed_are_sent_again(
 
 #[test]
 fn opening_a_v0_1_36_ledger_keeps_its_labels_and_how_its_lights_behave() {
-    let path = std::env::temp_dir().join(format!("home-link-v8-{}.db", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+    let scratch = Scratch::new("v8");
+    let path = scratch.path().join("home-link.db");
     v0_1_36_ledger(&path);
     for _ in 0..2 {
         let db = home_link::open_db(path.to_str().unwrap()).unwrap();
@@ -5560,7 +5557,6 @@ fn opening_a_v0_1_36_ledger_keeps_its_labels_and_how_its_lights_behave() {
             .unwrap();
         assert_eq!(intent, 0);
     }
-    let _ = std::fs::remove_file(&path);
 }
 
 /// A v0.1.36 (`user_version` 8) ledger with the schedule on and "all on" pressed last:
@@ -5625,8 +5621,8 @@ fn v0_1_36_ledger(path: &std::path::Path) {
 #[tokio::test]
 #[allow(clippy::too_many_lines, reason = "one scenario, step after step")]
 async fn after_the_update_the_v0_1_36_widgets_and_lights_behave_as_before() {
-    let path = std::env::temp_dir().join(format!("home-link-v8-app-{}.db", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+    let scratch = Scratch::new("v8-app");
+    let path = scratch.path().join("home-link.db");
     v0_1_36_ledger(&path);
     let (addr, commands, _) = fake_light_server(tuning_nodes(), Fake::default()).await;
     let home = home_link::Home::new(
@@ -5772,7 +5768,6 @@ async fn after_the_update_the_v0_1_36_widgets_and_lights_behave_as_before() {
             &json!("label_has_no_lights")
         )
     );
-    let _ = std::fs::remove_file(&path);
 }
 
 /// Posts one JSON-RPC message to the MCP endpoint at `base`.
@@ -6097,8 +6092,8 @@ const DEVICE_COLUMNS: &str =
 
 #[test]
 fn opening_a_v0_1_39_ledger_drops_rooms_and_keeps_everything_else() {
-    let path = std::env::temp_dir().join(format!("home-link-v9-{}.db", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+    let scratch = Scratch::new("v9");
+    let path = scratch.path().join("home-link.db");
     v0_1_39_ledger(&path);
     let before = {
         let old = rusqlite::Connection::open(&path).unwrap();
@@ -6178,7 +6173,6 @@ fn opening_a_v0_1_39_ledger_drops_rooms_and_keeps_everything_else() {
         [],
     )
     .unwrap();
-    let _ = std::fs::remove_file(&path);
 }
 
 #[tokio::test]
@@ -6361,8 +6355,8 @@ async fn the_sensor_drives_the_aircon_under_its_label_unless_switched_off() {
             .push((88, "1/1026/0", json!(tenths * 10)));
     };
     let (addr, commands, _) = fake_light_server(nodes, fake).await;
-    let path = std::env::temp_dir().join(format!("home-link-sensor-{}.db", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+    let scratch = Scratch::new("sensor");
+    let path = scratch.path().join("home-link.db");
     let (home, app) = aircon_home(addr, &path);
     let sql = home_link::open_db(path.to_str().unwrap()).unwrap();
     let aircon = add_device(
@@ -6514,7 +6508,6 @@ async fn the_sensor_drives_the_aircon_under_its_label_unless_switched_off() {
     commands.lock().unwrap().clear();
 
     let _ = elsewhere;
-    let _ = std::fs::remove_file(&path);
 }
 
 #[tokio::test]
@@ -6537,8 +6530,8 @@ async fn each_aircon_follows_the_sensor_under_its_own_label() {
         .unwrap()
         .push((88, "1/1026/0", json!(2200)));
     let (addr, commands, _) = fake_light_server(nodes, fake).await;
-    let path = std::env::temp_dir().join(format!("home-link-two-ac-{}.db", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+    let scratch = Scratch::new("two-ac");
+    let path = scratch.path().join("home-link.db");
     let (home, app) = aircon_home(addr, &path);
     home.record_meter(HOT, aircon_clock());
     let sql = home_link::open_db(path.to_str().unwrap()).unwrap();
@@ -6699,7 +6692,6 @@ async fn each_aircon_follows_the_sensor_under_its_own_label() {
         (status, &body["error"]),
         (StatusCode::NOT_FOUND, &json!("label_not_found"))
     );
-    let _ = std::fs::remove_file(&path);
 }
 
 /// Everything logged on this thread, as the container's log shows it.
@@ -7123,8 +7115,8 @@ async fn the_aircon_runs_record_the_outside_of_the_registered_address() {
     let edits = fake.edits.clone();
     let (addr, commands, _) = fake_light_server(nodes, fake).await;
     let (outside, asked) = fake_outside().await;
-    let path = std::env::temp_dir().join(format!("home-link-outside-{}.db", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+    let scratch = Scratch::new("outside");
+    let path = scratch.path().join("home-link.db");
     let home = home_link::Home::new(
         home_link::open_db(path.to_str().unwrap()).unwrap(),
         Some(format!("ws://{addr}/ws")),
@@ -7324,13 +7316,12 @@ async fn the_aircon_runs_record_the_outside_of_the_registered_address() {
         home_link::schedule::sun_times(day, 35.6895, 139.6917),
         (rise, set)
     );
-    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
 fn moves_changed_schedule_coordinates_to_the_home_location() {
-    let path = std::env::temp_dir().join(format!("home-link-location-{}.db", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+    let scratch = Scratch::new("location");
+    let path = scratch.path().join("home-link.db");
     for (place, moved) in [
         ((34.69, 135.5), Some((34.69, 135.5))),
         ((35.6895, 139.6917), None),
@@ -7441,8 +7432,8 @@ fn night() -> i64 {
 #[tokio::test]
 async fn a_matter_server_that_never_answers_the_upgrade_holds_up_no_request_or_loop() {
     let hung = hanging(None, |_| false).await;
-    let path = std::env::temp_dir().join(format!("home-link-hung-{}.db", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+    let scratch = Scratch::new("hung");
+    let path = scratch.path().join("home-link.db");
     let sql = home_link::open_db(path.to_str().unwrap()).unwrap();
     let home = home_link::Home::new(
         home_link::open_db(path.to_str().unwrap()).unwrap(),
@@ -7514,7 +7505,6 @@ async fn a_matter_server_that_never_answers_the_upgrade_holds_up_no_request_or_l
     )
     .await;
     within("aircon adjustment", HUNG_WITHIN, home.adjust_aircon(NIGHT)).await;
-    let _ = std::fs::remove_file(&path);
 }
 
 #[tokio::test]

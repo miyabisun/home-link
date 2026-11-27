@@ -5,10 +5,11 @@
 //! the window, the mouse and the keys as a person works them, and scripts every document of
 //! the page runs first.
 //! `bin/browser` fetches both programs, of the version it pins, into the cache.
+use crate::scratch::Scratch;
 use serde_json::{Value, json};
 use std::{
     os::unix::process::CommandExt,
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
@@ -26,32 +27,6 @@ pub fn free_port() -> u16 {
         .and_then(|listener| listener.local_addr())
         .expect("the system gives a free port")
         .port()
-}
-
-/// A directory of its own under the system's temporary one, removed with what is in it once
-/// dropped.
-pub struct Scratch(PathBuf);
-
-impl Scratch {
-    pub fn new(name: &str) -> Self {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |since| since.subsec_nanos());
-        let path =
-            std::env::temp_dir().join(format!("home-link-{name}-{}-{nanos}", std::process::id()));
-        std::fs::create_dir_all(&path).expect("the temporary directory takes a directory");
-        Self(path)
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
 }
 
 /// One browser with one page, for every test of a run, one test after another.
